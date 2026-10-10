@@ -1097,6 +1097,55 @@ new_tunnel() { # [kharej|iran]
 # ======================================================================================
 #  Diagnosis, speed test, logs
 # ======================================================================================
+# ICMP path check (Iran side, icmp carrier): ping the Kharej at four packet sizes and read the tunnel's own packet
+# counters, then say which cause fits. Uses plain ping, so it needs nothing installed on Kharej.
+icmp_path_report() { # name host
+  local n=$1 host=$2 s sz loss ok_sizes='' bad_sizes='' maxok=0 pin pout ign fw
+  echo
+  say "  ${BOLD}ICMP path to $host${RST}"
+  for sz in 56 200 400 640; do
+    spin_start "ping with $sz bytes"
+    loss=$(ping -c 4 -i 0.3 -W 2 -q -M do -s "$sz" "$host" 2>/dev/null | grep -o '[0-9]*% packet loss' | grep -o '^[0-9]*')
+    spin_stop
+    [ -n "$loss" ] || loss=100
+    if [ "$loss" -le 25 ]; then ok_sizes="$ok_sizes $sz"; maxok=$sz; ok "$sz bytes: answered (loss ${loss}%)"
+    else bad_sizes="$bad_sizes $sz"; err "$sz bytes: no answer (loss ${loss}%)"; fi
+  done
+  s=$(stats "$n"); pin=$(jget "$s" pkts_in); pout=$(jget "$s" pkts_out); pin=${pin:-0}; pout=${pout:-0}
+  ign=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
+  fw=''
+  if command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP' && ! iptables -S INPUT 2>/dev/null | grep -qi icmp; then
+    fw=1
+  fi
+  [ "$ign" = 1 ] && warn "This server ignores ping (net.ipv4.icmp_echo_ignore_all=1)."
+  [ -n "$fw" ] && warn "The firewall on this server drops everything not allowed, and no ICMP rule exists. Replies would be dropped here."
+  echo
+  say "  ${BOLD}What this means${RST}"
+  if [ -z "$ok_sizes" ]; then
+    err "Kharej does not answer ping at any size."
+    hint "Either ICMP is blocked on the route, or Kharej drops it (cloud firewall, or net.ipv4.icmp_echo_ignore_all=1 there)."
+    hint "Allow ICMP on Kharej's cloud firewall. If the route itself blocks ICMP right now, no ICMP tunnel can work until it opens;"
+    hint "the tunnel reconnects by itself when it does (keep auto-heal on). Meanwhile, switch both sides to another carrier:"
+    hint "wattun-manager → Kharej setup / Iran setup with udp, tcp or wss."
+  elif [ -n "$bad_sizes" ] && [ "$maxok" -lt 256 ]; then
+    err "Only tiny packets pass: the route drops ICMP packets larger than about $maxok bytes, below the tunnel's 256-byte minimum."
+    hint "An ICMP tunnel cannot work on this route. Use another carrier (udp, tcp, wss) on both sides."
+  elif [ -n "$bad_sizes" ] && [ "$maxok" -lt 640 ]; then
+    err "Small packets pass, big ones do not: the route drops packets larger than about $maxok bytes."
+    hint "Set the same smaller size on BOTH sides: add  mtu: $maxok  to /etc/wattun/NAME.yml on Kharej and Iran, then restart both."
+  elif [ "$pout" -gt 0 ] && [ "$pin" -eq 0 ]; then
+    err "Ping works at every size, but the tunnel's own packets get no answer."
+    hint "Check, in this order: 1) both sides have the SAME key (paste the Kharej token on Iran again), 2) the same carrier and icmp-type,"
+    hint "3) the Kharej tunnel is running ('wattun-manager status' there), 4) try icmp-type: timestamp on BOTH sides (some filters only"
+    hint "pass plain echo, others only pass other ICMP types), 5) otherwise use another carrier (udp, tcp, wss)."
+  elif [ "$pin" -gt 0 ]; then
+    warn "Ping works and the tunnel did receive packets earlier, but it is silent now."
+    hint "The route is probably blocking the answers right now. The tunnel reconnects by itself when they return (auto-heal helps)."
+  else
+    ok "The ICMP path looks fine. If the tunnel is still down, check the key and carrier on both sides."
+  fi
+}
+
 test_tunnel() {
   local n=$1 cr peer host port s p r it e
   cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer); r=$(role "$n")
@@ -1127,6 +1176,20 @@ test_tunnel() {
     if [ "$r" = Kharej ]; then err "No Iran server is connected yet"; else err "Tunnel link is DISCONNECTED"; fi
     say "  ${GRY}Common causes: different key on the two sides, different carrier/icmp-type, the other side not running,${RST}"
     say "  ${GRY}or the carrier is filtered on this route. Paste the Kharej token on Iran again to be sure.${RST}"
+  fi
+  if [ "$r" = Iran ] && [ "$cr" = icmp ] && [ "$(jget "$s" alive)" != true ]; then icmp_path_report "$n" "${peer%:*}"; fi
+  if [ "$r" = Kharej ] && [ "$(jget "$s" alive)" != true ]; then
+    local seen idle
+    seen=$(journalctl -u "wattun@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'new client session')
+    idle=$(journalctl -u "wattun@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'idle, closing')
+    echo
+    if [ "$seen" -gt 0 ]; then
+      warn "Iran reached this server $seen time(s) in the last 6 hours and went silent $idle time(s)."
+      hint "Iran's packets arrive here, but this server's answers may not be reaching Iran. Run Diagnose on the Iran side for the path check."
+    else
+      warn "Iran never reached this server in the last 6 hours."
+      hint "Check on Iran: the same key and carrier, and for icmp that ping to this server works. For other carriers the listen port must be open here."
+    fi
   fi
   while IFS= read -r it; do
     [ -n "$it" ] || continue

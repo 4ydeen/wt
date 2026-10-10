@@ -164,6 +164,30 @@ func TestClientRestart(t *testing.T) {
 	}
 }
 
+// The server's cumulative counters must not go backwards when a client session closes: the stats log subtracts
+// the previous total, and a smaller total wrapped to ~1.8e19 ("out=18446744073709551594").
+func TestServerStatsMonotonicAfterSessionCloses(t *testing.T) {
+	h, srv := newHub(t)
+	a, _ := NewSession(Config{Key: []byte("hub-key"), Paths: 4}, h.client("m1", 0, 10*time.Millisecond, 10e6, 50))
+	echoOnce(t, a, 200000, 3)
+	before := srv.Stats()
+	if before.PktsOut == 0 || before.PktsIn == 0 {
+		t.Fatalf("no traffic counted: %+v", before)
+	}
+	a.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.Sessions() != 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := srv.Sessions(); n != 0 {
+		t.Fatalf("session did not expire (%d left)", n)
+	}
+	after := srv.Stats()
+	if after.PktsOut < before.PktsOut || after.PktsIn < before.PktsIn || after.BytesOut < before.BytesOut || after.BytesIn < before.BytesIn {
+		t.Fatalf("totals went backwards after the session closed: before %+v after %+v", before, after)
+	}
+}
+
 // A draining server serves its sessions to the end but takes no new ones.
 func TestDrain(t *testing.T) {
 	h, srv := newHub(t)

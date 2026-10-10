@@ -337,6 +337,8 @@ curl -s 127.0.0.1:19700/ports       # traffic per port
 | Symptom | Likely cause and fix |
 |---|---|
 | `DISCONNECTED`, no errors | The key or carrier differs between the two sides. Paste the token again on Iran. For ICMP, check that `ping` works from Iran to Kharej. |
+| The Iran log says `no reply from the server` or `lost contact` | The tunnel is sending but nothing comes back. Run **Diagnose** on Iran: it pings Kharej at four packet sizes and tells you which case it is (ICMP blocked, large packets dropped, wrong key or carrier, or the route blocking the answers right now). |
+| It works some days and not others | The route between the servers is being filtered on the bad days. No tunnel can carry data while its packets are blocked. WatTunnel reconnects by itself when they pass again (keep auto-heal on). For bad days, keep a second tunnel with another carrier (`wss`, `tcp`, `udp`) as a backup. |
 | ICMP: small pings work but the tunnel stalls | MTU. Keep the default 640. |
 | `tcp`, `tls` or `ws` never connect | That carrier is filtered on your route, or the port is closed. Try `icmp` or `wss` behind a CDN. |
 | Connected, but users can't open sites | Nothing listens on Kharej's `127.0.0.1:PORT`. The doctor checks this. |
