@@ -136,4 +136,14 @@ if [ -n "$running" ] && [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
   echo "Running tunnels still use the old version: $running"
   echo "Restart them from wattun-manager when convenient (a restart drops open connections)."
 fi
-green "Done. Run: wattun-manager"
+green "Done."
+if [ -t 0 ] && [ -z "$running" ]; then
+  echo
+  echo "Which side is this server?"
+  echo "  1) Kharej - outside server, where your service runs (set this up first)"
+  echo "  2) Iran   - inside server that users connect to (needs the token from Kharej)"
+  echo "  3) Later"
+  read -rp "Choice [3]: " side
+  case "$side" in 1) exec "$MGR" kharej ;; 2) exec "$MGR" iran ;; esac
+fi
+echo "Manage tunnels any time with: wattun-manager"

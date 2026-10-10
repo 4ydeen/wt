@@ -1,119 +1,332 @@
-# WatTunnel
+<div align="center">
 
-**English** | [فارسی](README.fa.md)
+# 🪁 WatTunnel
 
-WatTunnel forwards TCP and UDP ports from one server to another over a filtered network. It is a single static Go
-binary with no other dependencies. It can carry traffic over:
+**A fast, encrypted port-forwarding tunnel that keeps working when the network only lets ping through.**
 
-- **ICMP** (ping). This works even when only ping gets through.
-- **UDP, TCP or TLS**.
-- **WebSocket, HTTP/2 or gRPC**. These work behind a CDN such as Cloudflare.
+[![Release](https://img.shields.io/github/v/release/JohnWatsoon/WatTunnel?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
+![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
 
-Every carrier runs the same encrypted session (ChaCha20-Poly1305 with a pre-shared key), with its own congestion
-control, so it stays fast on lossy links.
+**English** · [فارسی](README.fa.md)
 
-## How it works
+</div>
 
-```
-users ──► CLIENT (inside server) ══ tunnel (icmp / udp / tcp / tls / ws / grpc …) ══► SERVER (outside server) ──► 127.0.0.1:PORT
-```
+---
 
-- The **server** runs on the outside server, where your real service (VPN panel, web server, …) listens.
-- The **client** runs on the inside server. Users connect to the client's ports, and each connection is delivered to
-  the same port on the server's `127.0.0.1`.
+WatTunnel connects two servers, an **Iran** server (inside) and a **Kharej** server (outside), and forwards any
+TCP or UDP port between them. It's a single static binary with no runtime dependencies. One interactive manager
+covers setup, monitoring, diagnosis and updates.
 
-## Install
+It was built for one hard case: a route where **TCP, UDP, GRE, IPIP and ESP are cut after a few packets, and only
+ICMP echo (ping) gets through**. Other tools treat that link as a clean TCP pipe and stall. WatTunnel is designed
+around it. When the route is less hostile, the same encrypted session also runs over UDP, TCP, TLS, WebSocket,
+HTTP/2 or gRPC, including behind Cloudflare.
 
-Run this on **both** servers as root (Linux with systemd, amd64 or arm64):
+## Table of contents
+
+- [Highlights](#-highlights)
+- [Why WatTunnel?](#-why-wattunnel)
+- [Benchmarks and comparison](#-benchmarks-and-comparison)
+- [Quick start](#-quick-start)
+- [The manager](#-the-manager)
+- [Choosing a carrier](#-choosing-a-carrier)
+- [Configuration](#-configuration)
+- [Monitoring and troubleshooting](#-monitoring-and-troubleshooting)
+- [Security](#-security)
+- [FAQ](#-faq)
+- [Building from source](#-building-from-source)
+- [License](#-license)
+
+## ✨ Highlights
+
+- **Works when only ping works.** It hides the tunnel inside ICMP echo, timestamp, info or mask messages, with
+  640-byte datagrams sized to what filtered routes actually deliver.
+- **Fast on lossy links.** Pacing is delay-based, so random loss doesn't slow it down. It has selective acks, fast
+  loss repair and optional adaptive FEC. Interactive traffic goes ahead of bulk downloads.
+- **Nine carriers, one session.** `icmp`, `udp`, `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc`. You can also
+  bond several carriers into one link, or use **reverse mode** when only one side can dial out.
+- **One process for every port.** It forwards TCP and UDP and adds or removes ports **live, without a restart**.
+- **Light.** About 40 MB of RAM, and a third of GOST's CPU per megabyte on the ICMP path.
+- **Encrypted and authenticated.** ChaCha20-Poly1305 with a pre-shared key and per-session keys. Unauthenticated
+  packets are dropped silently, so a port scan gets no reply.
+- **Easy to run.** One-line installer, a one-paste **connection token**, a live status dashboard, a connection
+  doctor, auto-heal, update and rollback.
+- **Observable.** JSON `/stats` with RTT, rate, loss, streams and clients, plus per-port traffic counters and
+  quotas.
+
+## 🤔 Why WatTunnel?
+
+On heavily filtered routes, the usual tunnels fail in measurable ways:
+
+| Problem on a filtered route | What usual tools do | What WatTunnel does |
+|---|---|---|
+| TCP and UDP are cut after a few packets | Tunnel dies or flaps | Rides ICMP, which isn't cut |
+| 0.2 – 2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
+| Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default |
+| One process per port | Server CPU saturates | One process for all ports, batched syscalls |
+| Changing ports | Restart drops every user | `ports:` list is hot-reloaded every 3 s |
+| Link silently dies | You find out from your users | Live status, connection doctor, auto-heal |
+
+## 📊 Benchmarks and comparison
+
+### Real filtered route (Iran ⇄ Europe, ICMP only, October 2026)
+
+These were measured with real VLESS (xray) traffic through each tunnel, on the same servers and in the same hours.
+
+| | 🪁 WatTunnel | GOST v3 ICMP |
+|---|---|---|
+| Download (real VLESS, 50 MB) | **~6.2 MB/s** | 1.6 – 5.4 MB/s |
+| Upload (real VLESS, 20 MB) | **~3.7 MB/s** | not measured |
+| Latency p50 / p95 at equal load | **44 / 56 ms** | 51 / 64 ms |
+| CPU per MB moved (Iran side) | **0.05 – 0.06 CPU-s** | 0.15 – 0.20 CPU-s |
+| RAM | **~40 MB** | 50 – 70 MB |
+| 120 short TLS requests, 24 parallel | **120 / 120 ok** | – |
+
+In production it carries **250 – 300 real clients** through a single process.
+
+### Against other ICMP tunnels (same route)
+
+| Tool | How it works | Throughput measured | Notes |
+|---|---|---|---|
+| **🪁 WatTunnel** | Own ICMP transport, one process, 4 lanes, AEAD | **6.2 MB/s down / 3.7 up** | Every port in one process, ~40 MB RAM |
+| GOST v3 ICMP | QUIC over ICMP | 1.6 – 5.4 MB/s | Good, but 3× the CPU per MB |
+| BackPack (tuned) | ICMP transport | ~6.1 MB/s | Latency p50 102 ms / p95 198 ms (WatTunnel: 44 / 56) |
+| Hans | IP-over-ICMP tun device | 1.1 – 3.8 MB/s | Needs a C++ build on both servers |
+| WireGuard over pingtunnel | WireGuard inside one pingtunnel UDP session | 0.25 – 2.7 MB/s | Flat ceiling of a single pingtunnel process |
+| pingtunnel | One process per port | ~0.5 MB/s under load | Each process reads every ICMP packet, so the CPU saturates |
+| ptunnel-ng | One ICMP proxy per port | ~20 KB/s | Last resort only |
+
+### Feature comparison
+
+| | WatTunnel | GOST | pingtunnel | Hans | ptunnel-ng |
+|---|:-:|:-:|:-:|:-:|:-:|
+| ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Loss-tolerant (delay-based) pacing | ✅ | ❌ | ❌ | ❌ | ❌ |
+| All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
+| Add or remove ports without restart | ✅ | ❌ | ❌ | – | ❌ |
+| UDP port forwarding | ✅ | ✅ | ⚠️ | ✅ | ❌ |
+| Built-in encryption | ✅ AEAD | ✅ | ⚠️ | ⚠️ | ❌ |
+| Adaptive FEC | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Reverse mode | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Single static binary, no dependencies | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Guided manager, token pairing, auto-heal | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+### Honest note: clean links
+
+On a clean emulated link (20 ms each way, 0.2 % loss, 100 Mbit), every tunnel reaches line rate. GOST uses a little
+less CPU there, and WatTunnel halves small-request latency (p50 **43 ms vs 83 ms**) because it sends interactive
+streams first. Full table: [bench/results-2026-10-09-final.md](bench/results-2026-10-09-final.md). WatTunnel's big
+advantage is on lossy, filtered routes.
+
+> Numbers come from one real route and one emulated setup. Your route will differ. Use **Live status** to see what
+> you actually get.
+
+## 🚀 Quick start
+
+You need two Linux servers with systemd (amd64 or arm64) and root access.
+
+**1. Install on both servers**
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/JohnWatsoon/WatTunnel/main/install.sh)
 ```
 
-If GitHub is blocked on a server, put a mirror prefix in front of every download:
+<details>
+<summary>GitHub is blocked on the server?</summary>
 
 ```bash
 WAT_PROXY=https://ghproxy.net/ bash <(curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/JohnWatsoon/WatTunnel/main/install.sh)
 ```
 
-The installer adds `/usr/local/bin/wattun`, the `wattun-manager` menu, a systemd template `wattun@.service` and
-`/etc/wattun/`. It doesn't start anything by itself.
+You can also download `wattun-linux-amd64`, `install.sh` and `wattun-manager` from the
+[releases](https://github.com/JohnWatsoon/WatTunnel/releases) page and copy them over. Put the binary in `dist/`
+next to `install.sh` and run `bash install.sh`.
+</details>
 
-## Set up a tunnel
+At the end, the installer asks which side the server is.
 
-1. On the **outside** server, run `wattun-manager` and choose **1) New server tunnel**. Pick a carrier (ICMP if only
-   ping works) and, optionally, the ports clients may reach. It prints the server address, the carrier and a
-   **key**.
-2. On the **inside** server, run `wattun-manager` and choose **2) New client tunnel**. Enter the same carrier, the
-   server address, the key, and the ports to forward (for example `443,8080,53/udp`).
-3. The menu shows `link:true` once the two sides are connected. Users can now connect to the inside server's ports.
+**2. Kharej (outside server).** Choose **Kharej**. Pick a carrier (`icmp` if only ping works) and the ports your
+service uses. You'll get a **connection token**:
 
-### Manager menu
+```
+wat1:aWNtcHwyMDMuMC4xMTMuMTB8a1E3...
+```
 
-| Option | What it does |
+**3. Iran (inside server).** Choose **Iran**, paste the token, and enter the ports users should connect to
+(for example `443,2053,53/udp`). The manager waits for the link and shows:
+
+```
+✔ Tunnel 'iran' is running.
+✔ CONNECTED (RTT 41.3 ms)
+✔ Users can now connect to this server on: 443,2053,53/udp
+```
+
+Users now connect to the Iran server's IP. Each port is delivered to the same port on Kharej (`127.0.0.1`).
+
+```
+users ──► Iran :443 ══ WatTunnel (icmp / udp / tls / wss …) ══► Kharej ──► 127.0.0.1:443 (your service)
+```
+
+## 🧭 The manager
+
+Run `wattun-manager`:
+
+```
+╔══════════════════════════════╗
+║        WatTunnel Manager     ║  wattun 1.8.0
+╚══════════════════════════════╝
+  iran         Iran   icmp  CONNECTED     rtt 41ms   streams 37   ↓12.4 GB ↑1.9 GB
+
+  1) Kharej setup  (outside server - tunnel server)
+  2) Iran setup    (inside server - tunnel client)
+  3) Manage a tunnel (status, diagnose, logs, ports, token...)
+  4) Live status monitor
+  5) Settings (auto-heal)
+  6) Update WatTunnel      7) Roll back      8) Uninstall
+```
+
+| Feature | What it does |
 |---|---|
-| New server / client tunnel | Guided setup. Writes `/etc/wattun/NAME.yml` and `NAME.key`, then starts `wattun@NAME`. |
-| Manage a tunnel | Status, live stats, logs, add or remove ports (applied live, no restart), edit the config, restart, stop, start, show the key, delete. |
-| Update | Installs the latest release and keeps the old binary for rollback. |
-| Roll back | Swaps back to the previous binary. |
-| Uninstall | Stops every tunnel and removes WatTunnel. |
+| **Kharej / Iran setup** | Guided setup. Checks for busy ports, opens the firewall (ufw or firewalld) and generates a random key. Kharej prints a token; Iran pastes it. |
+| **Status** | Each tunnel shows `CONNECTED`, `DISCONNECTED` or `STOPPED`, with RTT, streams, traffic and connected clients. |
+| **Live monitor** | A dashboard that refreshes every 2 seconds. |
+| **Diagnose** | Step-by-step checks: service running, ping or TCP reachability to Kharej, link state, listening ports, whether your service answers on Kharej, and recent errors in the log. Each failure comes with a likely cause. |
+| **Logs** | Last 100 lines, follow live, problems only, or since the last start. |
+| **Ports** | Add or remove ports live, with no restart and no dropped users. |
+| **Token and key** | Show the token again, rotate the key (Kharej), or paste a new token (Iran). |
+| **Auto-heal** | A systemd timer restarts an Iran tunnel whose link stays down for 3 minutes. Restarts are logged as `wattun-heal`. |
+| **Update and rollback** | Installs the latest release after checking its SHA-256 and keeps the previous binary for a one-step rollback. |
 
-Shortcuts: `wattun-manager list`, `wattun-manager update`, `wattun-manager rollback`.
+Command-line shortcuts:
 
-## Choosing a carrier
+```bash
+wattun-manager status          # one line per tunnel
+wattun-manager monitor         # live dashboard
+wattun-manager test NAME       # connection doctor
+wattun-manager logs NAME       # follow the log
+wattun-manager token NAME      # print the Kharej token
+wattun-manager update | rollback
+```
 
-| Carrier | Use when | Notes |
+## 🛰 Choosing a carrier
+
+| Carrier | Use it when | Notes |
 |---|---|---|
-| `icmp` | Only ping passes | Needs root on both sides. Use the default MTU (640). |
-| `udp` | UDP works | Lowest CPU use and latency. |
-| `tcp` / `tls` | TCP works / HTTPS must be seen | Uses a pool of connections. |
-| `ws` / `wss` / `h2` / `h2c` / `grpc` | Behind a CDN or reverse proxy | Set `sni` / `host` / `path` in the config file. |
+| `icmp` | **Only ping gets through.** | Needs root (the manager runs it as root). `icmp-type` can be `echo`, `timestamp`, `info` or `mask` if echo is blocked. |
+| `udp` | UDP works. | Lowest latency and CPU. |
+| `tcp` | Plain TCP works. | A pool of 8 connections. |
+| `tls` | The traffic should look like HTTPS. | TLS 1.3, self-signed certificate unless you give one. Set `tls-pin` to pin the certificate. |
+| `wss` | Behind **Cloudflare** or another CDN. | Enter your domain during Kharej setup. Turn the Cloudflare proxy (orange cloud) on and set SSL to *Full*. |
+| `ws` / `h2c` | A CDN on port 80, or a reverse proxy that handles TLS. | Cleartext to the proxy. The session itself is still encrypted. |
+| `grpc` / `h2` | CDNs or proxies that prefer gRPC or HTTP/2. | |
 
-Reverse mode (the inside server listens and the outside server dials), UDP forwarding, FEC, per-port limits, metrics
-and every config key are covered in [docs/TECHNICAL.md](docs/TECHNICAL.md).
+Not sure? Start with `icmp` on heavily filtered routes and `wss` behind Cloudflare. **Reverse mode**, bonding,
+UDP-only forwards and the other advanced options are covered in [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
-## Configuration
+## ⚙️ Configuration
 
-Each tunnel is one file at `/etc/wattun/NAME.yml`. Changes to `ports:` are picked up within 3 seconds. Any other
-change needs a restart (`systemctl restart wattun@NAME`).
+Each tunnel is one readable file at `/etc/wattun/NAME.yml`, run by systemd as `wattun@NAME`. The keys are the same as
+the command-line flags.
 
 ```yaml
+# /etc/wattun/iran.yml
 mode: client
-key-file: /etc/wattun/client.key
+key-file: /etc/wattun/iran.key
 carrier: icmp
 peer: 203.0.113.10
 metrics: 127.0.0.1:19700
 ports:
   - 443
+  - 2053
   - 53/udp
 ```
 
-Useful commands:
+- Changes to `ports:` apply within 3 seconds. Any other change needs `systemctl restart wattun@NAME`.
+- On Kharej, `ports:` is the allowlist of local ports clients may reach. Leave it out to allow any port.
+- See [docs/TECHNICAL.md](docs/TECHNICAL.md#config-file) for every key: per-port limits, FEC, pacing (`max-mbps`),
+  MTU, TLS, CDN headers, and more.
+
+## 🩺 Monitoring and troubleshooting
 
 ```bash
+wattun-manager test NAME            # run this first
 systemctl status wattun@NAME
 journalctl -u wattun@NAME -f
-curl -s 127.0.0.1:19700/stats
+curl -s 127.0.0.1:19700/stats       # alive, srtt_ms, rate_bps, loss_pct, streams, sessions, bytes...
+curl -s 127.0.0.1:19700/ports       # traffic per port
 ```
 
-## Build from source
+| Symptom | Likely cause and fix |
+|---|---|
+| `DISCONNECTED`, no errors | The key or carrier differs between the two sides. Paste the token again on Iran. For ICMP, check that `ping` works from Iran to Kharej. |
+| ICMP: small pings work but the tunnel stalls | MTU. Keep the default 640. |
+| `tcp`, `tls` or `ws` never connect | That carrier is filtered on your route, or the port is closed. Try `icmp` or `wss` behind a CDN. |
+| Connected, but users can't open sites | Nothing listens on Kharej's `127.0.0.1:PORT`. The doctor checks this. |
+| `address already in use` | Another program owns the port: `ss -ltnp | grep :PORT`. |
+| `restart needed for KEY` in the log | Only `ports:` reloads live. Restart the tunnel. |
+
+## 🔐 Security
+
+- **Pre-shared key.** It's never sent over the wire. Each session derives its own key from it, and every packet is
+  sealed with ChaCha20-Poly1305 under a nonce that's never reused.
+- **Authenticate first.** A packet that doesn't authenticate creates no state and gets no reply, so scans and
+  replays see nothing.
+- **Least reach.** Kharej only forwards to `127.0.0.1`, and only to allowed ports.
+- **Keys at rest.** `/etc/wattun` is `700` and key files are `600`. The **token contains the key**, so share it
+  privately.
+- **Scope.** WatTunnel encrypts and authenticates your traffic. It doesn't hide that a tunnel exists, or the
+  servers' addresses, and it isn't an anonymity tool.
+
+## ❓ FAQ
+
+<details><summary><b>Do I install the same thing on both servers?</b></summary>
+Yes. It's one binary. The role (Kharej server or Iran client) is chosen in the manager.
+</details>
+
+<details><summary><b>Can one Kharej serve several Iran servers?</b></summary>
+Yes. Use the same token on each Iran server. Every client gets its own session and keys.
+</details>
+
+<details><summary><b>Can I run several tunnels on one server?</b></summary>
+Yes. Each one has its own name, config file and systemd unit, for example one ICMP tunnel and one WSS tunnel as a
+backup.
+</details>
+
+<details><summary><b>Does adding a port disconnect users?</b></summary>
+No. Port changes are hot-reloaded. Only changing the carrier, address or key needs a restart.
+</details>
+
+<details><summary><b>What does it work with?</b></summary>
+Anything on TCP or UDP: Xray, V2Ray, Sing-box, OpenVPN, WireGuard (as UDP), SSH, web panels, games.
+</details>
+
+<details><summary><b>What does Kharej need open?</b></summary>
+For ICMP, it must answer ping. Don't block ICMP in the cloud firewall. For the other carriers, it needs the listen
+port you chose.
+</details>
+
+## 🛠 Building from source
 
 You need Go 1.26 or newer.
 
 ```bash
 git clone https://github.com/JohnWatsoon/WatTunnel && cd WatTunnel
-sh build.sh                 # dist/wattun-linux-amd64 and dist/wattun-linux-arm64
 go test ./...
-sudo bash install.sh        # installs the binary you just built
+sh build.sh                     # dist/wattun-linux-amd64 and -arm64, each with a .sha256
+sudo bash install.sh            # installs the binary you just built
 ```
 
-## Security
+Layout: `wat/` holds the session, congestion control, streams and carriers. `cmd/wattun` is the binary,
+`cmd/wprobe` is a path probe, and `install.sh` and `wattun-manager` are the tooling. Pushing a `v*` tag builds and
+publishes a release through GitHub Actions.
 
-- Keep the key secret. The key files are `chmod 600`.
-- Strangers' packets fail authentication and are dropped without a reply.
-- The server only forwards to `127.0.0.1`, and only to ports on its allowlist.
-- WatTunnel encrypts and authenticates traffic. It doesn't hide that a tunnel exists, and it isn't an anonymity tool.
+Issues and pull requests are welcome. A change that makes the ICMP path slower won't be merged.
 
-## License
+## 📄 License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Uses `golang.org/x/crypto`, `x/net` and `x/sys` (BSD-3-Clause). GOST, Backhaul and BackPack were
+studied for ideas and as benchmarks. No code was copied from them.
