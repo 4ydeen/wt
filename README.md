@@ -226,12 +226,12 @@ Run `wattun-manager` (version 1.9.0 and newer). The first screen is a dashboard 
    3  backup        Iran   icmp   ○ STOPPED
       -   ports 9443→443
 
+  ▸ Press 1-3 to manage a tunnel (status, ports, token, logs, restart)
   ──────────────────────────────────────────────────────────────────────────
-  [1-9]  open tunnel   [n]  new tunnel   [m]  live monitor   [s]  settings
-  [u]  update        [r]  roll back    [x]  uninstall      [q]  quit
+  [n] new tunnel   [m] live monitor   [u] update   [s] settings   [q] quit
 ```
 
-Press a tunnel's number to open it, `n` to create another one, `q` to quit. With no tunnels yet, the dashboard
+Press a tunnel's number to manage it, `n` to create another one, `q` to quit. Roll back and uninstall are under `s` settings. With no tunnels yet, the dashboard
 explains the two steps and offers `n` to create your first tunnel. Everything is single-key, and `Ctrl+C` cancels
 the wizard you are in and returns to the menu.
 
@@ -261,7 +261,7 @@ A tunnel's page groups its actions:
 | **Diagnose** | Speed test (10 MB download and upload through the tunnel), plus step-by-step checks: service running, ping or TCP reachability to Kharej, link state, listening ports, whether your service answers on Kharej, and recent errors in the log. Each failure comes with a likely cause. |
 | **Logs** | Last 100 lines, follow live, problems only, or since the last start. |
 | **Token and key** | Show the token again, rotate the key (Kharej), or paste a new token (Iran). |
-| **Advanced** | Per tunnel: speed ceiling (`max-mbps`), FEC, bind address, ICMP type. The wizards also offer name, listen port, URL path and domain/SNI behind an "Advanced options" step you can skip. |
+| **Advanced** | Per tunnel: speed ceiling (`max-mbps`), FEC, bind address, ICMP type. The wizards also offer name, listen port, URL path and domain/SNI behind a "Change advanced settings?" question. It defaults to no, so pressing Enter keeps the automatic values (name, detected public IP, ports, path). |
 | **Auto-heal** | A systemd timer restarts an Iran tunnel whose link stays down for 3 minutes. Restarts are logged as `wattun-heal`. |
 | **Update and rollback** | Installs the latest release after checking its SHA-256, with the binary and the manager taken from the same release. It then checks the new version on disk and tells you "updated X → Y" or "already up to date". Running tunnels keep the old binary until they restart, so it lists them and offers to restart them, and the dashboard flags any it missed. The previous binary is kept for a one-step rollback. |
 

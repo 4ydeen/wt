@@ -581,10 +581,14 @@ dash_table() {
   for n in "${DASH_N[@]}"; do i=$((i+1)); dash_row "$i" "$n"; done
 }
 dash_actions() {
+  local cnt=${#DASH_N[@]} range
   echo
+  if [ "$cnt" -gt 0 ]; then
+    [ "$cnt" -eq 1 ] && range=1 || range="1-$cnt"
+    printf '  %s▸ Press %s%s%s%s to manage a tunnel%s %s(status, ports, token, logs, restart)%s\n' "$BOLD" "$CYN" "$range" "$RST" "$BOLD" "$RST" "$GRY" "$RST"
+  fi
   hr
-  printf '  %s  open tunnel   %s  new tunnel   %s  live monitor   %s  settings\n' "$(key_label 1-9)" "$(key_label n)" "$(key_label m)" "$(key_label s)"
-  printf '  %s  update        %s  roll back    %s  uninstall      %s  quit\n' "$(key_label u)" "$(key_label r)" "$(key_label x)" "$(key_label q)"
+  printf '  %s new tunnel   %s live monitor   %s update   %s settings   %s quit\n' "$(key_label n)" "$(key_label m)" "$(key_label u)" "$(key_label s)" "$(key_label q)"
 }
 
 # ======================================================================================
@@ -833,7 +837,7 @@ wizard_kharej() {
   page "New tunnel" "STEP 1 · Kharej (outside server)"
   step_diagram 1
   echo
-  say "  Run this on the server where your ${BOLD}real service${RST} lives (Xray, a panel, a web site...)."
+  say "  Run this on the server where your ${BOLD}real service${RST} lives (Xray, a panel...)."
   say "  It creates a ${BOLD}token${RST}; you paste that token on the Iran server next."
   hint "Ctrl+C cancels at any time."
   echo
@@ -851,18 +855,24 @@ wizard_kharej() {
   # address Iran connects to
   page "New tunnel" "STEP 1 · Kharej (outside server)"
   spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop
+  if [ -z "$addr" ]; then
+    warn "Could not detect this server's public IP."
+    ask_ok "Public IP or domain of this server" "" v_host || return 1; addr=$REPLY_V
+  else
+    ok "Public address: $addr"
+  fi
   case "$cr" in
-    wss|grpc|h2|tls) hint "Behind a CDN? Enter the domain Iran should connect to. Otherwise keep the IP." ;;
+    wss|grpc|h2) # these usually sit behind a CDN, where Iran must use the domain
+      hint "Behind Cloudflare/a CDN? Enter your domain. Otherwise press Enter to keep the IP."
+      ask_ok "Address Iran connects to" "$addr" v_host || return 1; addr=$REPLY_V ;;
   esac
-  ask_ok "Address Iran connects to" "$addr" v_host || return 1
-  addr=$REPLY_V
-  case "$cr" in wss|grpc|h2|tls) [[ "$addr" =~ ^[0-9.]+$ ]] || sni=$addr ;; esac
 
   # advanced
   echo
-  hint "Defaults: name $name${listen:+, listen port $listen}${path:+, path $path}, no speed limit, FEC off."
-  if confirm "Advanced options (name, ICMP type, port, path, limits, FEC)?" n; then
+  hint "Automatic: name $name, address $addr${listen:+, port $listen}${path:+, path $path}, no speed limit, FEC off."
+  if confirm "Change advanced settings? (Enter = no, keep the automatic ones)" n; then
     ask_ok "Tunnel name" "$name" v_name && name=$REPLY_V || return 1
+    ask_ok "Address Iran connects to (IP or domain)" "$addr" v_host || return 1; addr=$REPLY_V
     if [ "$cr" = icmp ]; then
       hint "Keep echo unless ping echo is blocked on your route."
       ask_ok "ICMP type (echo, timestamp, info, mask)" echo v_icmp || return 1; itype=$REPLY_V
@@ -879,6 +889,7 @@ wizard_kharej() {
     ask_ok "FEC: off or auto (auto needs auto on both ends)" off v_fec || return 1; fec=$REPLY_V
   fi
   valid_name "$name" || { err "The name '$name' is not available."; return 1; }
+  case "$cr" in wss|grpc|h2|tls) [ -z "$sni" ] && ! [[ "$addr" =~ ^[0-9.]+$ ]] && sni=$addr ;; esac
 
   # summary
   page "New tunnel" "review"
@@ -990,8 +1001,8 @@ wizard_iran() {
 
   # advanced
   echo
-  hint "Defaults: name $name, listen on all addresses, no speed limit, FEC off."
-  if confirm "Advanced options (name, bind, speed limit, FEC, ICMP, SNI)?" n; then
+  hint "Automatic: name $name, listen on all addresses, no speed limit, FEC off."
+  if confirm "Change advanced settings? (Enter = no, keep the automatic ones)" n; then
     ask_ok "Tunnel name" "$name" v_name && name=$REPLY_V || return 1
     ask_ok "Bind address for the public ports" 0.0.0.0 v_bind || return 1; bind=$REPLY_V
     ask_ok "Speed ceiling in MB/s (empty = default 16)" "" v_mbps || return 1; mbps=$REPLY_V
@@ -1371,7 +1382,7 @@ tunnel_page() {
     if [ "$r" = Kharej ]; then printf '  %sConnection%s  %s show token   %s new key + token   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label k)" "$(key_label o)"
     else printf '  %sConnection%s  %s paste new token   %s change Kharej address   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label a)" "$(key_label o)"; fi
     printf '  %sService%s     %s restart  %s %s  %s start at boot on/off  %s edit file\n' "$BOLD" "$RST" "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
-    printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label X)" "$(key_label b)"
+    printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label x)" "$(key_label b)"
     key_read
     case "$KEY" in
       d) page "Diagnose" "$n"; run_flow test_tunnel "$n"; pause ;;
@@ -1394,7 +1405,7 @@ tunnel_page() {
          else systemctl enable "wattun@$n" >/dev/null 2>&1; ok "Will start at boot."; fi
          sleep 1 ;;
       c) ${EDITOR:-nano} "$CONF/$n.yml"; echo; confirm "Restart to apply? (port changes apply without restart)" n && step "Restarting wattun@$n" systemctl restart "wattun@$n" ;;
-      X) page "Delete tunnel" "$n"; echo; run_flow delete_tunnel "$n"; pause ;;
+      x|X) page "Delete tunnel" "$n"; echo; run_flow delete_tunnel "$n"; pause ;;
       b|0|q|enter|esc) return 0 ;;
       *) : ;;
     esac
@@ -1535,9 +1546,14 @@ settings_menu() {
     say "  Auto-heal   $heal_on   ${GRY}restarts an Iran tunnel whose link stays down for 3 minutes${RST}"
     say "  Animations  $anim_on   ${GRY}spinners and the intro (WAT_NO_ANIM=1 also turns them off)${RST}"
     echo
-    printf '  %s toggle auto-heal   %s restart all tunnels   %s toggle animations   %s back\n' "$(key_label h)" "$(key_label r)" "$(key_label a)" "$(key_label b)"
+    printf '  %s toggle auto-heal   %s toggle animations   %s restart all tunnels\n' "$(key_label h)" "$(key_label a)" "$(key_label r)"
+    echo
+    say "  ${BOLD}Maintenance${RST}"
+    printf '  %s roll back to the previous version   %s uninstall WatTunnel   %s back\n' "$(key_label v)" "$(key_label x)" "$(key_label b)"
     key_read
     case "$KEY" in
+      v|V) page "Roll back"; echo; run_flow rollback; pause ;;
+      x|X) page "Uninstall"; if run_flow uninstall_all; then exit 0; fi; pause ;;
       h) echo; if systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null; then heal_disable; else heal_enable; fi; sleep 1 ;;
       r) echo; if confirm "Restart all tunnels? Open connections drop." n; then restart_all; sleep 1; fi ;;
       a) if [ "$(conf_get anim 1)" = 1 ]; then conf_set anim 0; ANIM=0; else conf_set anim 1; [ "$IS_TTY" = 1 ] && [ "${WAT_NO_ANIM:-0}" != 1 ] && ANIM=1; fi ;;
@@ -1557,7 +1573,7 @@ main_menu() {
     page_full "Dashboard" "$([ -n "$VER" ] && echo "wattun $VER")"
     dash_table
     local st; st=$(stale_tunnels)
-    [ -n "$st" ] && printf '\n  %s!%s %s%s%s still run the old binary. Open it and press %s[r]%s to use wattun %s.\n' \
+    [ -n "$st" ] && printf '\n  %s!%s %s%s%s still run the old binary. Press its number, then %s[r]%s restart, to use wattun %s.\n' \
       "$YEL" "$RST" "$BOLD" "${st% }" "$RST" "$CYN" "$RST" "$VER"
     dash_actions
     while :; do
@@ -1575,11 +1591,10 @@ main_menu() {
         m|M) if [ "${#DASH_N[@]}" -gt 0 ]; then run_flow live_monitor; fi; break ;;
         s|S) settings_menu; break ;;
         u|U) page "Update"; echo; if update; then echo; hint "The manager reloads itself to show the new version."; pause; exec "$MGR"; fi; pause; break ;;
-        r|R) page "Roll back"; echo; run_flow rollback; pause; break ;;
-        x|X) page "Uninstall"; if run_flow uninstall_all; then exit 0; fi; pause; break ;;
         q|Q|esc) cur_show; echo; exit 0 ;;
         enter) break ;;
-        *) flash "Unknown key '$KEY'. Use a number, n, m, s, u, r, x or q." ;;
+        *) if [ "${#DASH_N[@]}" -gt 0 ]; then flash "Unknown key '$KEY'. Press a tunnel's number to manage it, or n, m, u, s, q."
+           else flash "Unknown key '$KEY'. Press n to create your first tunnel."; fi ;;
       esac
     done
   done
@@ -1591,7 +1606,7 @@ WatTunnel manager $VER
 
 Usage: wattun-manager [command]
 
-  (no command)          dashboard: all tunnels, open one, create, update...
+  (no command)          dashboard: all tunnels; manage one, create, update...
   new [kharej|iran]     create a tunnel (do Kharej FIRST: it makes the token)
   kharej | iran         same as new kharej / new iran
   status | list         one line per tunnel
