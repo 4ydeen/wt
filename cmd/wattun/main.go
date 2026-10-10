@@ -359,8 +359,14 @@ func main() {
 	}
 	go func() {
 		var last wat.Stats
+		var lw linkWatch
 		for range time.Tick(10 * time.Second) {
 			st := stats()
+			if !server {
+				if note := lw.tick(10*time.Second, st.PktsIn, st.PktsOut-last.PktsOut, alive()); note != "" {
+					log.Print(note)
+				}
+			}
 			if st.PktsIn == last.PktsIn && st.PktsOut == last.PktsOut && st.Streams == 0 {
 				continue
 			}
