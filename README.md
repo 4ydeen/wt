@@ -8,6 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64-lightgrey?style=flat-square)
+[![Telegram Channel](https://img.shields.io/badge/Channel-@WatxDev-26A5E4?style=flat-square&logo=telegram)](https://t.me/WatxDev)
+[![Telegram](https://img.shields.io/badge/Contact-@watxox-26A5E4?style=flat-square&logo=telegram)](https://t.me/watxox)
 
 **English** · [فارسی](README.fa.md)
 
@@ -328,6 +330,13 @@ Layout: `wat/` holds the session, congestion control, streams and carriers. `cmd
 publishes a release through GitHub Actions.
 
 Issues and pull requests are welcome. A change that makes the ICMP path slower won't be merged.
+
+## 💬 Community and contact
+
+- 📢 Telegram channel, for news, releases and updates: [@WatxDev](https://t.me/WatxDev)
+- 👤 Developer on Telegram, for questions and feedback: [@watxox](https://t.me/watxox)
+
+Found a bug? Open an [issue](https://github.com/JohnWatsoon/WatTunnel/issues), or send a message on Telegram.
 
 ## 📄 License
 

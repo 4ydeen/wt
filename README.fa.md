@@ -5,6 +5,8 @@
 [![Release](https://img.shields.io/github/v/release/JohnWatsoon/WatTunnel?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
+[![Telegram Channel](https://img.shields.io/badge/Channel-@WatxDev-26A5E4?style=flat-square&logo=telegram)](https://t.me/WatxDev)
+[![Telegram](https://img.shields.io/badge/Contact-@watxox-26A5E4?style=flat-square&logo=telegram)](https://t.me/watxox)
 
 [English](README.md) | **فارسی**
 
@@ -228,6 +230,13 @@ sh build.sh && sudo bash install.sh
 ```
 
 <div dir="rtl">
+
+## ارتباط با ما
+
+- 📢 کانال تلگرام، برای خبرها، نسخه‌های جدید و آپدیت‌ها: [@WatxDev](https://t.me/WatxDev)
+- 👤 ارتباط مستقیم با سازنده، برای سؤال و پیشنهاد: [@watxox](https://t.me/watxox)
+
+اگر به مشکلی برخوردید، در بخش [Issues](https://github.com/JohnWatsoon/WatTunnel/issues) گزارش کنید یا در تلگرام پیام بدهید.
 
 ## مشارکت و مجوز
 
