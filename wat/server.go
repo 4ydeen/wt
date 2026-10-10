@@ -40,6 +40,8 @@ type Server struct {
 	MaxSessions int
 	IdleTimeout time.Duration
 
+	lastRx atomic.Int64 // unix nanoseconds of the newest authenticated packet of any session, kept after it closes
+
 	statMu  sync.Mutex
 	seen    map[*Session]Stats // each live session's counters at the last Stats call
 	retired Stats              // counters of sessions that have closed, so the totals never go backwards
@@ -177,6 +179,32 @@ func (srv *Server) Stats() Stats {
 	return t
 }
 
+// LastRecv is when the newest authenticated packet from any client arrived, including sessions that have closed
+// since the server started (zero: none yet).
+func (srv *Server) LastRecv() time.Time {
+	srv.mu.Lock()
+	for _, ss := range srv.sessions {
+		srv.noteRecv(ss.s.LastRecv())
+	}
+	srv.mu.Unlock()
+	if n := srv.lastRx.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
+}
+
+func (srv *Server) noteRecv(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	for n := t.UnixNano(); ; {
+		old := srv.lastRx.Load()
+		if n <= old || srv.lastRx.CompareAndSwap(old, n) {
+			return
+		}
+	}
+}
+
 // addCounters adds the cumulative counters of b to a (not the rates, RTTs or live gauges).
 func addCounters(a *Stats, b Stats) {
 	a.PktsOut += b.PktsOut
@@ -260,6 +288,12 @@ func (srv *Server) run() {
 			}
 		}
 		if len(p) < hdrLen+tagLen+1 {
+			continue
+		}
+		if binary.BigEndian.Uint64(p[8:])&dirServerBit != 0 {
+			// Our own packet coming back: in reverse ICMP the client host's kernel answers every request with a copy.
+			// It carries a live session id, so counting it as traffic would keep a dead client's session from ever
+			// going idle. The session would drop it anyway (own direction).
 			continue
 		}
 		sid := binary.BigEndian.Uint64(p)
@@ -349,6 +383,7 @@ func (srv *Server) janitor() {
 			}
 			srv.mu.Unlock()
 			for _, s := range dead {
+				srv.noteRecv(s.LastRecv())
 				if srv.cfg.Logf != nil {
 					srv.cfg.Logf("client session %016x idle, closing", s.sid)
 				}

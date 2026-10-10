@@ -17,9 +17,10 @@ for a in $ARCHES; do
   case "$a" in amd64|arm64) ;; *) echo "BUILD_FAIL arch $a"; exit 1 ;; esac
   out="dist/wattun-linux-$a"
   GOOS=linux GOARCH=$a "$GO" build -trimpath -ldflags "-s -w -buildid=" -o "$out" ./cmd/wattun || { echo "BUILD_FAIL build $a"; exit 1; }
-  # sha256sum on Linux, shasum on macOS; the file holds only the hash so any tool can compare it
+  # sha256sum on Linux, shasum on macOS. The file is one standard "<hex>  <name>" line (since 2.0.1), so
+  # `sha256sum -c` works next to the binary; readers that take the first field (install.sh, the bot) are unaffected.
   if command -v sha256sum >/dev/null 2>&1; then sum=$(sha256sum "$out" | cut -d' ' -f1); else sum=$(shasum -a 256 "$out" | cut -d' ' -f1); fi
-  printf '%s\n' "$sum" > "$out.sha256"
+  printf '%s  %s\n' "$sum" "${out##*/}" > "$out.sha256"
   echo "wattun $VER linux/$a $sum"
 done
 echo "BUILD_OK $VER"

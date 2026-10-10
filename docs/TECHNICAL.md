@@ -154,10 +154,29 @@ the streams and which ports are published do not change.
   stateful firewall on either end, or on the route, sees Iran's replies as answers to requests it has seen. Without
   `peer` Kharej still answers whatever address authenticates, but nothing is knocked.
 - Iran keeps `peer` = Kharej's IP, the address its replies go to.
-- Iran must receive pings from Kharej: do not block incoming ICMP there. Linux on Iran also answers every request
-  with its own reply. That copy fails authentication on Kharej and is dropped (the same thing happens on Kharej in
-  normal mode). `net.ipv4.icmp_echo_ignore_all=1` on Iran removes the extra copies, and the tunnel still receives its
-  packets.
+- Iran must receive pings from Kharej: do not block incoming ICMP there.
+- **Kernel copies on Iran.** Linux on Iran also answers every tunnel request with its own full-size reply, so Iran
+  uploads everything twice. Measured on the real path: `OutEchoReps` = 2 x `InEchos` in `/proc/net/snmp`. Kharej
+  drops the copies (they fail authentication), and since 2.0.1 they no longer count as activity from Iran (before
+  that, a dead Iran client's session never went idle on Kharej). To stop the copies, rate-limit the kernel's own
+  replies on Iran:
+
+  ```
+  # /etc/sysctl.d/90-wattun-reverse.conf
+  net.ipv4.icmp_ratemask = 22553   # default 6168 + bit 0 (echo reply) + bit 14 (timestamp reply)
+  net.ipv4.icmp_ratelimit = 100    # kernel replies: 10 per second per sender (default 1000 ms)
+  ```
+
+  wattun's replies are raw-socket sends and are not limited. Ordinary pings to Iran are still answered. Measured
+  after the change: 15.9 – 18.2 MB/s each way. `wattun-manager` offers this when reverse is turned on for an Iran
+  tunnel and restores the old values when the last one is gone. `icmp_ratelimit` applies to every type in the
+  mask, so destination-unreachable and time-exceeded messages also go from 1 to 10 per second per destination.
+  `net.ipv4.icmp_echo_ignore_all=1` also works (the tunnel still receives its packets), but then Iran answers no
+  ping at all, which breaks monitoring that pings it.
+- **Don't judge Iran by ping from Kharej under load.** The kernel limit is per sender, and in reverse mode every
+  tunnel request comes from Kharej's IP, so a plain `ping` from Kharej competes with the tunnel for that budget and
+  loses packets while traffic flows (measured 4/6 and 1/3 received during a speed test). Use `last_rx_age_ms` from
+  `/stats` instead (see Metrics).
 - In `wattun-manager`: Kharej setup → advanced settings → reverse, or for an existing tunnel Advanced settings →
   `d` on both sides. The token carries the flag (field 8), so a fresh Iran setup picks it up.
 
@@ -430,7 +449,8 @@ localhost.
 
 | Field | Meaning |
 |---|---|
-| `alive` | Server: at least one session. Client: the session is up. |
+| `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive). |
+| `last_rx_age_ms` | Since 2.0.1. Milliseconds since the last authenticated packet from the peer (server: from any client, including sessions that have closed). `-1` = none since the process started. Monitors should use this rather than ping: it only moves on real tunnel packets. |
 | `sessions` | Server: client sessions. Client: always 1. |
 | `draining` | Server: not accepting new sessions. |
 | `streams` | Open TCP streams. The drain timer waits for 0. |

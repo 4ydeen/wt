@@ -433,6 +433,45 @@ read_token() { # token -> T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS T_R
   [ -n "$T_CARRIER" ] && [ -n "$T_PEER" ] && [ -n "$T_KEY" ]
 }
 is_reverse() { [ "$(cfg "$1" reverse)" = true ]; }
+
+# Reverse ICMP on Iran: Linux answers every tunnel request with its own full-size copy, which doubles Iran's upload.
+# Rate-limiting the kernel's echo and timestamp replies (icmp_ratemask bits 0 and 14, 10 per second per sender) drops
+# those copies and keeps ordinary pings answered. The tunnel's replies are raw-socket sends and are not limited.
+# Measured on the real path: without it OutEchoReps = 2 x InEchos. The old values are kept and restored when the
+# last reverse Iran tunnel is gone.
+KREPLY_CONF=/etc/sysctl.d/90-wattun-reverse.conf
+kreply_on() { [ -f "$KREPLY_CONF" ]; }
+kreply_apply() {
+  local mask lim
+  mask=$(sysctl -n net.ipv4.icmp_ratemask 2>/dev/null) && lim=$(sysctl -n net.ipv4.icmp_ratelimit 2>/dev/null) || return 1
+  [ -f "$CONF/.kreply.orig" ] || printf 'net.ipv4.icmp_ratemask = %s\nnet.ipv4.icmp_ratelimit = %s\n' "$mask" "$lim" >"$CONF/.kreply.orig"
+  {
+    echo "# wattun-manager: reverse ICMP on this Iran server. The kernel's ping replies are rate-limited so it stops"
+    echo "# sending a copy of every tunnel packet. Removed when no reverse Iran tunnel is left."
+    echo "net.ipv4.icmp_ratemask = $((mask | 1 | 16384))"
+    echo "net.ipv4.icmp_ratelimit = 100"
+  } >"$KREPLY_CONF"
+  sysctl -q -p "$KREPLY_CONF" >/dev/null
+}
+kreply_restore() {
+  [ -f "$KREPLY_CONF" ] || return 0
+  rm -f "$KREPLY_CONF"
+  [ -f "$CONF/.kreply.orig" ] && sysctl -q -p "$CONF/.kreply.orig" >/dev/null && rm -f "$CONF/.kreply.orig"
+  ok "Restored the kernel's normal ping replies (no reverse Iran tunnel left)."
+}
+reverse_iran_left() {
+  local n
+  for n in $(tunnels); do [ "$(role "$n")" = Iran ] && [ "$(cfg "$n" carrier)" = icmp ] && is_reverse "$n" && return 0; done
+  return 1
+}
+kreply_needed() { ! kreply_on && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" != 1 ]; }
+kreply_offer() {
+  kreply_needed || return 0
+  hint "Reverse mode: Linux here also answers every tunnel packet with a full-size copy, doubling this server's upload."
+  hint "Rate-limiting the kernel's ping replies stops that. Normal pings to this server keep working."
+  confirm "Rate-limit the kernel's ping replies (recommended)?" y && step "Limiting the kernel's ping replies" kreply_apply
+  return 0
+}
 refresh_token() { # name : keep NAME.token in step with the allowed ports in NAME.yml
   local f="$CONF/$1.token" allow
   [ -f "$f" ] && read_token "$(cat "$f")" || return 0
@@ -1076,6 +1115,7 @@ wizard_iran() {
   mkdir -p "$CONF"; chmod 700 "$CONF"
   step "Writing key and config" write_client || return 1
   start_unit "$name" || return 1
+  [ "$T_CARRIER" = icmp ] && [ "$T_REV" = 1 ] && kreply_offer
   for ((i=0; i<${#MAPS[@]}; i++)); do new_pub+=("$(spec_L "${MAPS[$i]}")/$(spec_P "${MAPS[$i]}")"); done
   echo
   if wait_link "$name" 25; then
@@ -1125,9 +1165,9 @@ new_tunnel() { # [kharej|iran]
 # counters, then say which cause fits. Uses plain ping, so it needs nothing installed on Kharej.
 # Does this server itself block ICMP? Looks at the kernel switch and the local firewall rules (iptables, nftables).
 # It cannot see a firewall in the provider's cloud panel. Prints one warning per finding; returns 0 when it found one.
-local_icmp_check() {
+local_icmp_check() { # [reverse-iran: icmp_echo_ignore_all does not stop the tunnel there]
   local found=1 rules
-  if [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
+  if [ "${1:-}" != reverse-iran ] && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
     warn "This server ignores ping: net.ipv4.icmp_echo_ignore_all=1  (fix: sysctl -w net.ipv4.icmp_echo_ignore_all=0)"; found=0
   fi
   if command -v iptables >/dev/null 2>&1; then
@@ -1225,7 +1265,7 @@ test_tunnel() {
   if [ "$r" = Iran ] && [ "$cr" = icmp ] && [ "$(jget "$s" alive)" != true ]; then
     if is_reverse "$n"; then
       echo; say "  ${BOLD}Is this server blocking ICMP itself?${RST}"
-      if local_icmp_check; then hint "Fix the finding above: in reverse mode this server must receive Kharej's pings."
+      if local_icmp_check reverse-iran; then hint "Fix the finding above: in reverse mode this server must receive Kharej's pings."
       else ok "No rule on this server blocks ICMP."; fi
     else icmp_path_report "$n" "${peer%:*}"; fi
   fi
@@ -1269,6 +1309,10 @@ test_tunnel() {
         fi
       fi
     fi
+  fi
+  if [ "$r" = Iran ] && [ "$cr" = icmp ] && is_reverse "$n" && kreply_needed; then
+    echo; warn "The kernel here answers every tunnel packet with a copy (wasted upload)."
+    if [ -t 0 ]; then kreply_offer; else hint "Fix: wattun-manager → this tunnel → o → d (or see docs: Reverse ICMP)."; fi
   fi
   while IFS= read -r it; do
     [ -n "$it" ] || continue
@@ -1475,6 +1519,7 @@ delete_tunnel() {
   systemctl disable --now "wattun@$n" >/dev/null 2>&1
   rm -f "$CONF/$n".yml "$CONF/$n".key "$CONF/$n".token "$RUN/$n.down"
   ok "Tunnel '$n' deleted."
+  reverse_iran_left || kreply_restore
   return 0
 }
 # Toggle reverse ICMP on one side. Kharej keeps Iran's IP as its peer and puts the flag in the token.
@@ -1493,6 +1538,9 @@ set_direction() { # name
       set_value "$n" peer "$ip"
     fi
     set_value "$n" reverse true
+  fi
+  if [ "$r" = Iran ]; then
+    if is_reverse "$n"; then kreply_offer; else reverse_iran_left || kreply_restore; fi
   fi
   if [ "$r" = Kharej ] && [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
     T_REV=''; is_reverse "$n" && T_REV=1

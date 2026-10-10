@@ -110,7 +110,8 @@ type Session struct {
 	rxAt      time.Time
 	ackPend   int
 	ackSince  time.Time
-	lastRecv  time.Time
+	lastRecv  time.Time // cleared after 30 s of silence (the session then counts as dead)
+	lastAuth  time.Time // same, never cleared: what LastRecv reports
 
 	streams  map[uint64]*Stream
 	tomb     map[uint64]time.Time
@@ -983,7 +984,7 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	if s.fec != nil {
 		s.fecKeep(pn, plain)
 	}
-	s.lastRecv = now
+	s.lastRecv, s.lastAuth = now, now
 	s.stats.PktsIn++
 	s.stats.BytesIn += uint64(len(raw))
 	if s.cfg.Server {
@@ -1186,10 +1187,20 @@ func (s *Session) CarrierStats() []CarrierStat {
 	return nil
 }
 
+// Alive reports whether an authenticated packet from the peer arrived in the last 10 s. The peer pings at least
+// every 2 s, so an idle but working link stays alive.
 func (s *Session) Alive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return !s.lastRecv.IsZero() && time.Since(s.lastRecv) < 10*time.Second
+}
+
+// LastRecv is when the last authenticated packet from the peer arrived (zero: none yet). Unlike Alive's clock it is
+// never reset, so a monitor can see how long the link has been silent.
+func (s *Session) LastRecv() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAuth
 }
 
 // young: the packet is small, or carries only the first bytes of its streams (handshakes, requests, replies):

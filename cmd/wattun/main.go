@@ -304,6 +304,19 @@ func main() {
 		return sess.Stats()
 	}
 	alive := func() bool { return srv != nil && srv.Sessions() > 0 || sess != nil && sess.Alive() }
+	// rxAge: ms since the last authenticated packet from the peer (server: from any client), -1 if none yet.
+	rxAge := func() int64 {
+		var t time.Time
+		if srv != nil {
+			t = srv.LastRecv()
+		} else {
+			t = sess.LastRecv()
+		}
+		if t.IsZero() {
+			return -1
+		}
+		return time.Since(t).Milliseconds()
+	}
 	carrierStats := func() []wat.CarrierStat {
 		if srv != nil {
 			return srv.CarrierStats()
@@ -345,7 +358,7 @@ func main() {
 					"fec_sent": st.FecSent, "fec_recovered": st.FecRecovered, "retrans": st.Retrans, "send_errors": st.Dropped, "rate_bps": st.RateBps,
 						"ceiling_bps": st.CeilingBps, "loss_pct": st.LossPct,
 					"srtt_ms": float64(st.SRTT) / 1e6, "min_rtt_ms": float64(st.MinRTT) / 1e6,
-					"streams": st.Streams, "inflight": st.Inflight, "alive": alive(), "version": wat.Version, "draining": srv != nil && srv.Draining(),
+					"streams": st.Streams, "inflight": st.Inflight, "alive": alive(), "last_rx_age_ms": rxAge(), "version": wat.Version, "draining": srv != nil && srv.Draining(),
 					"sessions": func() int {
 						if srv != nil {
 							return srv.Sessions()

@@ -11,10 +11,11 @@ import (
 
 // simHub is one server socket with several clients behind it, each with its own lossy up and down link.
 type simHub struct {
-	in    chan hubPkt
-	mu    sync.Mutex
-	done  chan struct{}
-	downs map[string]*simDir
+	in      chan hubPkt
+	mu      sync.Mutex
+	done    chan struct{}
+	downs   map[string]*simDir
+	reflect map[string]bool // destinations whose host bounces every packet back (a kernel echo reply)
 }
 
 type hubPkt struct {
@@ -49,9 +50,16 @@ func (h *simHub) quit() chan struct{} {
 func (h *simHub) SendTo(p []byte, lane int, dst net.Addr) error {
 	h.mu.Lock()
 	d := h.downs[dst.String()]
+	bounce := h.reflect[dst.String()]
 	h.mu.Unlock()
 	if d != nil {
 		d.send(p)
+	}
+	if bounce {
+		select {
+		case h.in <- hubPkt{append([]byte(nil), p...), strAddr(dst.String()), lane}:
+		default:
+		}
 	}
 	return nil
 }
@@ -185,6 +193,33 @@ func TestServerStatsMonotonicAfterSessionCloses(t *testing.T) {
 	after := srv.Stats()
 	if after.PktsOut < before.PktsOut || after.PktsIn < before.PktsIn || after.BytesOut < before.BytesOut || after.BytesIn < before.BytesIn {
 		t.Fatalf("totals went backwards after the session closed: before %+v after %+v", before, after)
+	}
+}
+
+// Reverse ICMP: the client host's kernel answers each of the server's requests with a copy of it. Those copies must
+// not keep a dead client's session alive (before 2.0.1 they did, so every client restart leaked a session slot), and
+// LastRecv must only move on authenticated client packets.
+func TestServerIgnoresReflections(t *testing.T) {
+	h, srv := newHub(t)
+	a, _ := NewSession(Config{Key: []byte("hub-key"), Paths: 2}, h.client("rf1", 0, 10*time.Millisecond, 10e6, 80))
+	echoOnce(t, a, 50000, 4)
+	h.mu.Lock()
+	h.reflect = map[string]bool{"rf1": true}
+	h.mu.Unlock()
+	a.Close()
+	last := srv.LastRecv()
+	if last.IsZero() || time.Since(last) > 2*time.Second {
+		t.Fatalf("LastRecv %v after live traffic", last)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.Sessions() != 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := srv.Sessions(); n != 0 {
+		t.Fatalf("reflected packets kept the dead session alive (%d left)", n)
+	}
+	if got := srv.LastRecv(); !got.Equal(last) && got.Sub(last) > 100*time.Millisecond {
+		t.Fatalf("LastRecv moved on reflections: %v -> %v", last, got)
 	}
 }
 

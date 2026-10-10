@@ -372,8 +372,11 @@ peer: 203.0.113.10      # Kharej's IP, as before
 - Iran must accept pings from Kharej. Don't block incoming ICMP in Iran's firewall or cloud panel.
 - Kharej sends a tiny keep-alive ping to Iran every 5 seconds. Stateful firewalls then see Iran's answers as replies
   to pings they have already seen.
-- Linux on Iran also answers each tunnel ping with its own reply. Kharej drops those copies, but they use some of
-  Iran's upload. `sysctl -w net.ipv4.icmp_echo_ignore_all=1` on Iran stops them, and the tunnel still works.
+- Linux on Iran also answers each tunnel ping with its own full-size reply, which doubles Iran's upload. When you
+  turn reverse on for Iran, the manager offers to rate-limit the kernel's ping replies, which stops the copies. Say
+  yes. Normal pings to Iran keep working. (By hand: see [TECHNICAL.md](docs/TECHNICAL.md#reverse-icmp).)
+- Under load, a plain `ping` from Kharej to Iran loses packets in reverse mode, because it shares the kernel's
+  per-sender reply budget with the tunnel. To check the link, look at `last_rx_age_ms` in `/stats` instead.
 - If both directions are blocked on a given day, no ICMP tunnel can work that day. Keep a second tunnel with
   another carrier (`wss`, `tcp`, `udp`) as a backup.
 
@@ -411,7 +414,7 @@ ports:
 wattun-manager test NAME            # run this first
 systemctl status wattun@NAME
 journalctl -u wattun@NAME -f
-curl -s 127.0.0.1:19700/stats       # alive, srtt_ms, rate_bps, loss_pct, streams, sessions, bytes...
+curl -s 127.0.0.1:19700/stats       # alive, last_rx_age_ms, srtt_ms, rate_bps, loss_pct, streams, sessions, bytes...
 curl -s 127.0.0.1:19700/ports       # traffic per port
 ```
 
