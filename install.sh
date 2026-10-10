@@ -135,7 +135,8 @@ fi
 # 2. The manager.
 if [ -f "$HERE/wattun-manager" ]; then cp "$HERE/wattun-manager" "$TMP/mgr"
 else fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr" || die "could not download wattun-manager"; fi
-install -m 755 "$TMP/mgr" "$MGR"
+# atomic replace: a manager that is running right now keeps reading its old file safely
+install -m 755 "$TMP/mgr" "$MGR.new" && mv -f "$MGR.new" "$MGR"
 
 # 3. The systemd template: wattun@NAME reads /etc/wattun/NAME.yml.
 mkdir -p "$CONF"; chmod 700 "$CONF"

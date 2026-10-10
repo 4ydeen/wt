@@ -54,6 +54,7 @@ cfg()     { sed -n "s/^$2:[[:space:]]*//p" "$CONF/$1.yml" 2>/dev/null | head -1 
 role()    { [ "$(cfg "$1" mode)" = server ] && echo Kharej || echo Iran; }
 cfg_ports() { sed -n '/^ports:/,/^[^ ]/s/^  - //p' "$CONF/$1.yml" | xargs; }
 stats()   { local m; m=$(cfg "$1" metrics); [ -n "$m" ] && curl -fs --max-time 2 "http://$m/stats"; }
+ms()      { printf "%.1f" "${1:-0}"; }
 jget()    { grep -o "\"$2\": *[^,}]*" <<<"$1" | head -1 | sed 's/.*: *//; s/"//g'; }
 human()   { awk -v b="${1:-0}" 'BEGIN{s="B KB MB GB TB";split(s,u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}printf "%.1f %s",b,u[i]}'; }
 public_ip() { curl -fs4 --max-time 5 https://api.ipify.org 2>/dev/null || curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
@@ -114,7 +115,7 @@ wait_link() { # name seconds
   local i s
   printf "Waiting for the link"
   for ((i=0; i<$2; i++)); do
-    s=$(stats "$1"); if [ "$(jget "$s" alive)" = true ]; then echo; ok "CONNECTED (RTT $(jget "$s" srtt_ms) ms)"; return 0; fi
+    s=$(stats "$1"); if [ "$(jget "$s" alive)" = true ]; then echo; ok "CONNECTED (RTT $(ms "$(jget "$s" srtt_ms)") ms)"; return 0; fi
     printf "."; sleep 1
   done
   echo; return 1
@@ -243,10 +244,11 @@ details() {
   local n=$1 s; s=$(stats "$n")
   say "  Service:   $(systemctl is-active "wattun@$n") ($(uptime_of "$n"))"
   say "  Carrier:   $(cfg "$n" carrier)    Peer/listen: $(cfg "$n" peer)$(cfg "$n" listen)"
-  say "  Ports:     $(cfg_ports "$n")"
+  local pl; pl=$(cfg_ports "$n"); [ -z "$pl" ] && [ "$(role "$n")" = Kharej ] && pl="any (no allow list)"
+  say "  Ports:     ${pl:--}"
   [ -z "$s" ] && { warn "No live stats (not running)."; return; }
   say "  Link:      $([ "$(jget "$s" alive)" = true ] && c 32 CONNECTED || c 31 DISCONNECTED)"
-  say "  RTT:       $(jget "$s" srtt_ms) ms (min $(jget "$s" min_rtt_ms) ms)"
+  say "  RTT:       $(ms "$(jget "$s" srtt_ms)") ms (min $(ms "$(jget "$s" min_rtt_ms)") ms)"
   say "  Rate:      $(human "$(jget "$s" rate_bps)")/s   loss $(jget "$s" loss_pct)%   retrans $(jget "$s" retrans)"
   say "  Streams:   $(jget "$s" streams)   clients: $(jget "$s" sessions)   UDP flows: $(jget "$s" dgram_flows)"
   say "  Traffic:   in $(human "$(jget "$s" bytes_in)")   out $(human "$(jget "$s" bytes_out)")"
@@ -269,7 +271,7 @@ test_tunnel() {
     fi
   fi
   s=$(stats "$n")
-  if [ "$(jget "$s" alive)" = true ]; then ok "Tunnel link is CONNECTED (RTT $(jget "$s" srtt_ms) ms)"
+  if [ "$(jget "$s" alive)" = true ]; then ok "Tunnel link is CONNECTED (RTT $(ms "$(jget "$s" srtt_ms)") ms)"
   else err "Tunnel link is DISCONNECTED"
     say "  Common causes: different key on the two sides, different carrier/icmp-type, Kharej tunnel not running,"
     say "  or the carrier is filtered on this route."
@@ -406,8 +408,9 @@ heal() { # restart Iran tunnels whose link is down 3 checks in a row
 restart_all() { local n; for n in $(tunnels); do systemctl is-enabled -q "wattun@$n" && systemctl restart "wattun@$n"; done; ok "Tunnels restarted."; }
 update() {
   local url="https://raw.githubusercontent.com/$REPO/main/install.sh"
-  bash <(curl -fsSL "${WAT_PROXY:-}$url") "$@" || { err "Update failed. If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun-manager update"; return; }
+  bash <(curl -fsSL "${WAT_PROXY:-}$url") "$@" || { err "Update failed. If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun-manager update"; return 1; }
   yes_no "Restart tunnels on the new version now? (open connections drop)" && restart_all
+  return 0
 }
 rollback() {
   [ -x "$BIN.prev" ] || { warn "No previous version saved."; return; }
@@ -478,7 +481,7 @@ menu() {
       3) manage_tunnel ;;
       4) live_monitor ;;
       5) settings_menu; pause ;;
-      6) page "Update"; update; pause ;;
+      6) page "Update"; if update; then ok "Reloading the manager..."; sleep 1; exec /usr/local/bin/wattun-manager; fi; pause ;;
       7) page "Roll back"; rollback; pause ;;
       8) page "Uninstall"; yes_no "Uninstall WatTunnel?" && { heal_disable >/dev/null; bash <(curl -fsSL "${WAT_PROXY:-}https://raw.githubusercontent.com/$REPO/main/install.sh") --uninstall; exit 0; } ;;
       0) exit 0 ;;
