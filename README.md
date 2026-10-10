@@ -48,7 +48,8 @@ HTTP/2 or gRPC, including behind Cloudflare.
 - **Nine carriers, one session.** `icmp`, `udp`, `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc`. You can also
   bond several carriers into one link, or use **reverse mode** when only one side can dial out.
 - **One process for every port.** It forwards TCP and UDP and adds or removes ports **live, without a restart**.
-- **Light.** About 40 MB of RAM, and a third of GOST's CPU per megabyte on the ICMP path.
+- **Fast and light.** Up to **~33 MB/s over ping alone**, the full capacity of the route, on about 40 MB of RAM and
+  6 – 7× less CPU per megabyte than GOST.
 - **Encrypted and authenticated.** ChaCha20-Poly1305 with a pre-shared key and per-session keys. Unauthenticated
   packets are dropped silently, so a port scan gets no reply.
 - **Easy to run.** One-line installer, a one-paste **connection token**, a live status dashboard, a connection
@@ -73,26 +74,27 @@ On heavily filtered routes, the usual tunnels fail in measurable ways:
 
 ### Real filtered route (Iran ⇄ Europe, ICMP only, October 2026)
 
-These were measured with real VLESS (xray) traffic through each tunnel, on the same servers and in the same hours.
+These are real VLESS (xray) traffic through each tunnel, on the same servers and the same route.
 
-| | 🪁 WatTunnel | GOST v3 ICMP |
+| | 🪁 WatTunnel 1.8.0 | GOST v3 ICMP |
 |---|---|---|
-| Download (real VLESS, 50 MB) | **~6.2 MB/s** | 1.6 – 5.4 MB/s |
-| Upload (real VLESS, 20 MB) | **~3.7 MB/s** | not measured |
-| Latency p50 / p95 at equal load | **44 / 56 ms** | 51 / 64 ms |
-| CPU per MB moved (Iran side) | **0.05 – 0.06 CPU-s** | 0.15 – 0.20 CPU-s |
+| Peak throughput | **~33 MB/s**, the route's maximum | 1.6 – 5.4 MB/s |
+| Single connection | **~25 MB/s** | 1.0 – 1.6 MB/s |
+| Latency p50 (route's raw RTT is ~40 ms) | **40 – 45 ms**, close to zero added | ~51 ms |
+| CPU per MB moved (Iran side) | **0.026 CPU-s** | 0.15 – 0.20 CPU-s (**6 – 7× more**) |
 | RAM | **~40 MB** | 50 – 70 MB |
 | 120 short TLS requests, 24 parallel | **120 / 120 ok** | – |
 
-In production it carries **250 – 300 real clients** through a single process.
+The route itself caps out at about 50 – 55k ICMP packets per second (~33 MB/s), and WatTunnel 1.8.0 fills it. In
+production it carries **250 – 300 real clients** through a single process.
 
 ### Against other ICMP tunnels (same route)
 
 | Tool | How it works | Throughput measured | Notes |
 |---|---|---|---|
-| **🪁 WatTunnel** | Own ICMP transport, one process, 4 lanes, AEAD | **6.2 MB/s down / 3.7 up** | Every port in one process, ~40 MB RAM |
-| GOST v3 ICMP | QUIC over ICMP | 1.6 – 5.4 MB/s | Good, but 3× the CPU per MB |
-| BackPack (tuned) | ICMP transport | ~6.1 MB/s | Latency p50 102 ms / p95 198 ms (WatTunnel: 44 / 56) |
+| **🪁 WatTunnel 1.8.0** | Own ICMP transport, one process, 4 lanes, AEAD, batched I/O | **up to ~33 MB/s** | Every port in one process, ~40 MB RAM |
+| GOST v3 ICMP | QUIC over ICMP | 1.6 – 5.4 MB/s | 6 – 7× the CPU per MB |
+| BackPack (tuned) | ICMP transport | ~6.1 MB/s | Latency p50 102 ms / p95 198 ms |
 | Hans | IP-over-ICMP tun device | 1.1 – 3.8 MB/s | Needs a C++ build on both servers |
 | WireGuard over pingtunnel | WireGuard inside one pingtunnel UDP session | 0.25 – 2.7 MB/s | Flat ceiling of a single pingtunnel process |
 | pingtunnel | One process per port | ~0.5 MB/s under load | Each process reads every ICMP packet, so the CPU saturates |
