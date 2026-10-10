@@ -54,8 +54,8 @@ HTTP/2 or gRPC, including behind Cloudflare.
   6 – 7× less CPU per megabyte than GOST.
 - **Encrypted and authenticated.** ChaCha20-Poly1305 with a pre-shared key and per-session keys. Unauthenticated
   packets are dropped silently, so a port scan gets no reply.
-- **Easy to run.** One-line installer, a one-paste **connection token**, a live status dashboard, a connection
-  doctor, auto-heal, update and rollback.
+- **Easy to run.** One-line installer, a one-paste **connection token**, a multi-tunnel dashboard, a port-mapping
+  editor (Iran port ≠ Kharej port), a connection doctor, auto-heal, update and rollback.
 - **Observable.** JSON `/stats` with RTT, rate, loss, streams and clients, plus per-port traffic counters and
   quotas.
 
@@ -133,6 +133,16 @@ advantage is on lossy, filtered routes.
 
 You need two Linux servers with systemd (amd64 or arm64) and root access.
 
+> **The order matters.** Set up **Kharej first**. It creates the **token**. Then set up **Iran** and paste that
+> token.
+
+```
+  ┌───────────────────────────┐          ┌───────────────────────────┐
+  │ STEP 1  Kharej (outside)  │ ─token─► │ STEP 2  Iran (inside)     │
+  │ do this one FIRST         │          │ paste the token here      │
+  └───────────────────────────┘          └───────────────────────────┘
+```
+
 **1. Install on both servers**
 
 ```bash
@@ -151,70 +161,126 @@ You can also download `wattun-linux-amd64`, `install.sh` and `wattun-manager` fr
 next to `install.sh` and run `bash install.sh`.
 </details>
 
-At the end, the installer asks which side the server is.
+At the end, the installer shows the two steps and asks which side this server is
+(`1) Kharej, do this first`, `2) Iran, I have the token`, `3) Later`).
 
-**2. Kharej (outside server).** Choose **Kharej**. Pick a carrier (`icmp` if only ping works) and the ports your
-service uses. You'll get a **connection token**:
+**2. STEP 1, Kharej (outside server).** Run `wattun-manager`, press `n` (new tunnel) and choose **Kharej**. Pick a
+carrier (`icmp` if only ping works) and list the ports your service uses, for example `443, 8443, 53/udp`. You get a
+**connection token**:
 
 ```
 wat1:aWNtcHwyMDMuMC4xMTMuMTB8a1E3...
 ```
 
-**3. Iran (inside server).** Choose **Iran**, paste the token, and enter the ports users should connect to
-(for example `443,2053,53/udp`). The manager waits for the link and shows:
+**3. STEP 2, Iran (inside server).** Run `wattun-manager`, press `n` and choose **Iran**. Say yes to "Do you have
+the token?" and paste it. The port table is pre-filled from the ports Kharej allows. Change the **Iran port** if
+users should connect on a different port than your service uses:
 
 ```
-✔ Tunnel 'iran' is running.
-✔ CONNECTED (RTT 41.3 ms)
-✔ Users can now connect to this server on: 443,2053,53/udp
+   #  Iran port (users)        Kharej port (service)   proto
+   1  443                 ──►  443                     tcp
+   2  8443                ──►  443                     tcp
+   3  53                  ──►  53                      udp
 ```
 
-Users now connect to the Iran server's IP. Each port is delivered to the same port on Kharej (`127.0.0.1`).
+The manager waits for the link and shows:
 
 ```
-users ──► Iran :443 ══ WatTunnel (icmp / udp / tls / wss …) ══► Kharej ──► 127.0.0.1:443 (your service)
+  ✔ Writing key and config
+  ✔ Starting wattun@iran
+  ✔ CONNECTED (RTT 41.3 ms)
+
+  Users can now connect to this server:
+  users ──► Iran :443 ══ icmp ══► Kharej ──► 127.0.0.1:443
+  users ──► Iran :8443 ══ icmp ══► Kharej ──► 127.0.0.1:443
+  users ──► Iran :53/udp ══ icmp ══► Kharej ──► 127.0.0.1:53/udp
+```
+
+Users now connect to the Iran server's IP. Each Iran port is delivered to its Kharej port on `127.0.0.1`.
+
+```
+users ──► Iran :8443 ══ WatTunnel (icmp / udp / tls / wss …) ══► Kharej ──► 127.0.0.1:443 (your service)
 ```
 
 ## 🧭 The manager
 
-Run `wattun-manager`:
+Run `wattun-manager` (version 1.9.0 and newer). The first screen is a dashboard of **all** your tunnels:
 
 ```
-╔══════════════════════════════╗
-║        WatTunnel Manager     ║  wattun 1.8.0
-╚══════════════════════════════╝
-  iran         Iran   icmp  CONNECTED     rtt 41ms   streams 37   ↓12.4 GB ↑1.9 GB
+         .
+        /|\
+       / | \       __        __    _  _____                       _
+      <--+-->      \ \      / /_ _| ||_   _|   _ _ __  _ __   ___| |
+       \ | /        \ \ /\ / / _` | __|| || | | | '_ \| '_ \ / _ \ |
+        \|/          \ V  V / (_| | |_ | || |_| | | | | | | |  __/ |
+         `.           \_/\_/ \__,_|\__||_| \__,_|_| |_|_| |_|\___|_|
+           `-.     encrypted port forwarding, even when only ping works
+  ──────────────────────────────────────────────────────────────────────────
+  Dashboard   wattun 1.9.0
 
-  1) Kharej setup  (outside server - tunnel server)
-  2) Iran setup    (inside server - tunnel client)
-  3) Manage a tunnel (status, diagnose, logs, ports, token...)
-  4) Live status monitor
-  5) Settings (auto-heal)
-  6) Update WatTunnel      7) Roll back      8) Uninstall
+   #  NAME          ROLE   CARRIER   STATE           RTT  LOAD
+   1  iran          Iran   icmp   ● CONNECTED     41 ms  37 streams
+      ↓12.4 GB ↑1.9 GB   ports 443 · 8443→443 · 53/udp
+   2  iran-wss      Iran   wss    ● CONNECTED     96 ms  4 streams
+      ↓310.2 MB ↑41.0 MB   ports 2053
+   3  backup        Iran   icmp   ○ STOPPED
+      -   ports 9443→443
+
+  ──────────────────────────────────────────────────────────────────────────
+  [1-9]  open tunnel   [n]  new tunnel   [m]  live monitor   [s]  settings
+  [u]  update        [r]  roll back    [x]  uninstall      [q]  quit
+```
+
+Press a tunnel's number to open it, `n` to create another one, `q` to quit. With no tunnels yet, the dashboard
+explains the two steps and offers `n` to create your first tunnel. Everything is single-key, and `Ctrl+C` cancels
+the wizard you are in and returns to the menu.
+
+A tunnel's page groups its actions:
+
+```
+  ┌─ iran ─────────────────────────────────────────────────────────────────┐
+  │ ● CONNECTED   Iran · icmp → 203.0.113.10                               │
+  │ rtt 41.3 ms (min 39.8)   rate 1.1 MB/s   loss 0.1%   retrans 12        │
+  │ streams 37   clients 1   udp flows 0   ↓12.4 GB ↑1.9 GB                │
+  │ Publishes: 443 · 8443→443 · 53/udp                                     │
+  └────────────────────────────────────────────────────────────────────────┘
+  Status      [d] diagnose + speed test   [v] speed test only   [l] logs
+  Ports       [p] edit port mappings
+  Connection  [t] paste new token   [a] change Kharej address   [o] advanced settings
+  Service     [r] restart  [s] stop  [e] start at boot on/off  [c] edit file
+  Danger      [X] delete this tunnel                   [b] back
 ```
 
 | Feature | What it does |
 |---|---|
-| **Kharej / Iran setup** | Guided setup. Checks for busy ports, opens the firewall (ufw or firewalld) and generates a random key. Kharej prints a token; Iran pastes it. |
-| **Status** | Each tunnel shows `CONNECTED`, `DISCONNECTED` or `STOPPED`, with RTT, streams, traffic and connected clients. |
-| **Live monitor** | A dashboard that refreshes every 2 seconds. |
+| **New tunnel** | Guided setup that shows the Kharej-first order. Checks for busy ports (including ports used by your other tunnels), opens the firewall (ufw or firewalld) and generates a random key. Kharej prints a token. Iran asks whether you have it, and explains how to get it if you do not. |
+| **Port mappings** | A table editor: `Iran port (users)  ──►  Kharej port (service)  proto`. Type `443, 8443:443, 53/udp, 5353->53/udp`, or add, edit and remove rows by number. It checks ranges, duplicates and busy ports, and warns when Kharej does not allow a target port. |
+| **Many tunnels** | Run as many as you like on one server (for example `icmp` as the main and `wss` as the backup). Each has its own name, config file, unit and metrics port, and the manager keeps them from clashing. |
+| **Status** | Each tunnel shows `CONNECTED`, `DISCONNECTED` (Iran), `WAITING` (Kharej with no Iran yet) or `STOPPED`, with RTT, streams, traffic and clients. |
+| **Live monitor** | All tunnels, refreshed every 2 seconds, with a small history graph of the rate. Any key exits. |
 | **Diagnose** | Speed test (10 MB download and upload through the tunnel), plus step-by-step checks: service running, ping or TCP reachability to Kharej, link state, listening ports, whether your service answers on Kharej, and recent errors in the log. Each failure comes with a likely cause. |
 | **Logs** | Last 100 lines, follow live, problems only, or since the last start. |
-| **Ports** | Add or remove ports live, with no restart and no dropped users. |
 | **Token and key** | Show the token again, rotate the key (Kharej), or paste a new token (Iran). |
+| **Advanced** | Per tunnel: speed ceiling (`max-mbps`), FEC, bind address, ICMP type. The wizards also offer name, listen port, URL path and domain/SNI behind an "Advanced options" step you can skip. |
 | **Auto-heal** | A systemd timer restarts an Iran tunnel whose link stays down for 3 minutes. Restarts are logged as `wattun-heal`. |
 | **Update and rollback** | Installs the latest release after checking its SHA-256 and keeps the previous binary for a one-step rollback. |
+
+Animations (spinners, the intro, progress bars) turn off by themselves when the output is not a terminal. Set
+`WAT_NO_ANIM=1` (or use **Settings**) to switch them off, and `NO_COLOR=1` for plain text.
 
 Command-line shortcuts:
 
 ```bash
+wattun-manager                 # dashboard
+wattun-manager new kharej      # new tunnel (kharej or iran); do Kharej first
 wattun-manager status          # one line per tunnel
 wattun-manager monitor         # live dashboard
+wattun-manager ports NAME      # edit the port mappings of a tunnel
 wattun-manager test NAME       # connection doctor + speed test
 wattun-manager speedtest NAME  # speed test only (10 MB each way)
 wattun-manager logs NAME       # follow the log
 wattun-manager token NAME      # print the Kharej token
-wattun-manager update | rollback
+wattun-manager update | rollback | help
 ```
 
 ## 🛰 Choosing a carrier
@@ -245,13 +311,16 @@ carrier: icmp
 peer: 203.0.113.10
 metrics: 127.0.0.1:19700
 ports:
-  - 443
-  - 2053
+  - 443          # users connect to Iran :443, delivered to Kharej 127.0.0.1:443
+  - 8443:443     # users connect to Iran :8443, delivered to Kharej 127.0.0.1:443
   - 53/udp
+  - 5353:53/udp
 ```
 
+- On Iran, `LISTEN:TARGET` publishes Iran port `LISTEN` and delivers it to port `TARGET` on Kharej (1.9.0 and
+  newer). A plain `443` means `443:443`. Add `/udp` for UDP.
 - Changes to `ports:` apply within 3 seconds. Any other change needs `systemctl restart wattun@NAME`.
-- On Kharej, `ports:` is the allowlist of local ports clients may reach. Leave it out to allow any port.
+- On Kharej, `ports:` is the allowlist of local (target) ports clients may reach. Leave it out to allow any port.
 - See [docs/TECHNICAL.md](docs/TECHNICAL.md#config-file) for every key: per-port limits, FEC, pacing (`max-mbps`),
   MTU, TLS, CDN headers, and more.
 
@@ -298,7 +367,16 @@ Yes. Use the same token on each Iran server. Every client gets its own session a
 
 <details><summary><b>Can I run several tunnels on one server?</b></summary>
 Yes. Each one has its own name, config file and systemd unit, for example one ICMP tunnel and one WSS tunnel as a
-backup.
+backup. The dashboard lists them all, and the manager stops two tunnels from claiming the same port.
+</details>
+
+<details><summary><b>Can users connect on a different port than my service uses?</b></summary>
+Yes, from 1.9.0. In the port table, set the Iran port and the Kharej port separately (<code>8443:443</code> means
+users connect to Iran 8443 and reach your service on Kharej 443).
+</details>
+
+<details><summary><b>Which server do I set up first?</b></summary>
+Kharej. It creates the token that Iran needs. The manager and the installer both remind you of the order.
 </details>
 
 <details><summary><b>Does adding a port disconnect users?</b></summary>
