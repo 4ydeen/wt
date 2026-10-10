@@ -5,6 +5,7 @@ package wat
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,22 +66,31 @@ func TestICMPFilterPerType(t *testing.T) {
 
 // Real raw sockets on loopback (needs root; skipped otherwise): a client and a server session exchange data over
 // each ICMP type pair. The packet types are checked on the sockets themselves.
+// Reverse mode (2.0.0) runs the same exchange with the server sending the requests and knocking.
 func TestICMPLoopbackPerType(t *testing.T) {
-	for _, kind := range []string{"echo", "timestamp", "info", "mask"} {
+	for _, kind := range []string{"echo", "timestamp", "info", "mask", "reverse-echo", "reverse-timestamp"} {
 		t.Run(kind, func(t *testing.T) {
 			key := []byte("icmp-type-test-" + kind)
-			sio, err := NewICMPIOType(true, "", key, kind)
+			reverse := strings.HasPrefix(kind, "reverse-")
+			kind := strings.TrimPrefix(kind, "reverse-")
+			speer := ""
+			if reverse {
+				speer = "127.0.0.1"
+			}
+			sio, err := NewICMPIOReverse(true, reverse, speer, key, kind)
 			if err != nil {
 				t.Skipf("raw socket: %v", err)
 			}
-			cio, err := NewICMPIOType(false, "127.0.0.1", key, kind)
+			cio, err := NewICMPIOReverse(false, reverse, "127.0.0.1", key, kind)
 			if err != nil {
 				sio.Close()
 				t.Skipf("raw socket: %v", err)
 			}
-			if cio.sendType() == sio.sendType() {
-				t.Fatal("client and server send the same type")
+			req, _, _ := ICMPTypes(kind)
+			if cio.sendType() == sio.sendType() || (sio.sendType() == req) != reverse {
+				t.Fatalf("reverse=%v: client sends %d, server sends %d", reverse, cio.sendType(), sio.sendType())
 			}
+			sio.Knock(4, 50*time.Millisecond)
 			srv := NewServer(Config{Key: key}, sio)
 			t.Cleanup(srv.Close)
 			go func() {

@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
@@ -22,8 +23,9 @@ import (
 type ICMPIO struct {
 	c         *net.IPConn
 	server    bool
-	reqType   uint8 // ICMP type the client sends and the server receives
-	repType   uint8 // ICMP type the server sends and the client receives
+	sendsReq  bool  // this end sends requests: the client, or the server in reverse mode
+	reqType   uint8 // ICMP type the requesting end sends
+	repType   uint8 // ICMP type the answering end sends
 	identBase uint16
 	dst       net.Addr // client: fixed peer
 	seq       [256]uint32
@@ -51,6 +53,15 @@ func NewICMPIO(server bool, peerIP string, key []byte) (*ICMPIO, error) {
 // NewICMPIOType carries datagrams in the given ICMP request/reply pair: echo, timestamp, info or mask. Both ends
 // must use the same kind. The BPF filter matches only that pair, so other ICMP software never sees our packets.
 func NewICMPIOType(server bool, peerIP string, key []byte, kind string) (*ICMPIO, error) {
+	return NewICMPIOReverse(server, false, peerIP, key, kind)
+}
+
+// NewICMPIOReverse is NewICMPIOType with the ICMP direction optionally swapped (reverse, wattun >= 2.0.0 on both
+// ends): the server sends the requests and the client answers with replies. The session roles do not change. It is
+// for routes where Iran's own requests are dropped but requests from Kharej reach Iran and Iran's replies get back.
+// In reverse mode peerIP on the server is the client's IP, used only for Knock; the server still answers whatever
+// address a session authenticates from.
+func NewICMPIOReverse(server, reverse bool, peerIP string, key []byte, kind string) (*ICMPIO, error) {
 	req, rep, ok := ICMPTypes(kind)
 	if !ok {
 		return nil, errors.New("wat: -icmp-type must be echo, timestamp, info or mask")
@@ -59,8 +70,8 @@ func NewICMPIOType(server bool, peerIP string, key []byte, kind string) (*ICMPIO
 	if err != nil {
 		return nil, err
 	}
-	io := &ICMPIO{c: c, server: server, reqType: req, repType: rep, identBase: IdentBase(key), rbuf: make([]byte, 2048)}
-	if !server {
+	io := &ICMPIO{c: c, server: server, sendsReq: server == reverse, reqType: req, repType: rep, identBase: IdentBase(key), rbuf: make([]byte, 2048)}
+	if !server || reverse && peerIP != "" {
 		ip := net.ParseIP(peerIP)
 		if ip == nil {
 			c.Close()
@@ -70,8 +81,8 @@ func NewICMPIOType(server bool, peerIP string, key []byte, kind string) (*ICMPIO
 	}
 	c.SetReadBuffer(8 << 20)
 	c.SetWriteBuffer(8 << 20)
-	want := io.repType // what we receive: the client gets replies, the server gets requests
-	if server {
+	want := io.repType // what we receive: the requesting end gets replies, the answering end gets requests
+	if !io.sendsReq {
 		want = io.reqType
 	}
 	prog, err := bpf.Assemble(icmpFilter(want, io.identBase))
@@ -158,12 +169,36 @@ func (i *ICMPIO) SendTo(p []byte, lane int, dst net.Addr) error {
 	return err
 }
 
-// sendType: the client sends requests, the server replies.
+// sendType: the requesting end (the client, or the server in reverse mode) sends requests, the other end replies.
 func (i *ICMPIO) sendType() uint8 {
-	if i.server {
-		return i.repType
+	if i.sendsReq {
+		return i.reqType
 	}
-	return i.reqType
+	return i.repType
+}
+
+// Knock sends one empty request on each of the first lanes identifiers to the fixed peer, then again every
+// interval until the socket closes. Used by a reverse-mode server: a stateful firewall on either end (or on the
+// route) then sees the client's replies as answers to requests it has seen. Conntrack keys ICMP on the identifier,
+// not the sequence, so one knock per lane is enough. An empty payload is dropped by Recv on the other end, and
+// the kernel's own echo of it comes back empty and is dropped here too.
+func (i *ICMPIO) Knock(lanes int, interval time.Duration) {
+	if i.dst == nil || !i.sendsReq {
+		return
+	}
+	if lanes < 1 || lanes > identLanes {
+		lanes = identLanes
+	}
+	go func() {
+		for {
+			for l := 0; l < lanes; l++ {
+				if err := i.SendTo(nil, l, i.dst); errors.Is(err, net.ErrClosed) {
+					return
+				}
+			}
+			time.Sleep(interval)
+		}
+	}()
 }
 
 func (i *ICMPIO) Recv() ([]byte, int, net.Addr, error) {

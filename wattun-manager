@@ -415,24 +415,30 @@ set_value() { # name key value : set or add a top-level key
 }
 unset_value() { sed -i "/^$2:/d" "$CONF/$1.yml"; }
 
-# Connection token: wat1:BASE64("carrier|peer|key|path|sni|icmp-type|allowed-ports")
+# Connection token: wat1:BASE64("carrier|peer|key|path|sni|icmp-type|allowed-ports[|reverse]")
 # Field 7 (allowed ports on Kharej, comma list, empty = any) was added in 1.9.0; 6-field tokens still parse.
-make_token() { printf 'wat1:%s' "$(printf '%s|%s|%s|%s|%s|%s|%s' "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" | base64 -w0)"; }
-T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''
-read_token() { # token -> T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS
+# Field 8 ("1" = reverse ICMP, wattun >= 2.0.0) is written only when set, so every other token stays 7 fields.
+make_token() {
+  local f; f=$(printf '%s|%s|%s|%s|%s|%s|%s' "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}")
+  [ "${8:-}" = 1 ] && f="$f|1"
+  printf 'wat1:%s' "$(printf '%s' "$f" | base64 -w0)"
+}
+T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''; T_REV=''
+read_token() { # token -> T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS T_REV
   local raw
-  T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''
+  T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''; T_REV=''
   [[ "$1" == wat1:* ]] || return 1
   raw=$(printf '%s' "${1#wat1:}" | base64 -d 2>/dev/null) || return 1
-  IFS='|' read -r T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS <<<"$raw"
+  IFS='|' read -r T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS T_REV <<<"$raw"
   [ -n "$T_CARRIER" ] && [ -n "$T_PEER" ] && [ -n "$T_KEY" ]
 }
+is_reverse() { [ "$(cfg "$1" reverse)" = true ]; }
 refresh_token() { # name : keep NAME.token in step with the allowed ports in NAME.yml
   local f="$CONF/$1.token" allow
   [ -f "$f" ] && read_token "$(cat "$f")" || return 0
   load_maps "$1"; allow=$(maps_allow_str)
   [ "$allow" = "$T_PORTS" ] && return 0
-  make_token "$T_CARRIER" "$T_PEER" "$T_KEY" "$T_PATH" "$T_SNI" "$T_ICMP" "$allow" >"$f"
+  make_token "$T_CARRIER" "$T_PEER" "$T_KEY" "$T_PATH" "$T_SNI" "$T_ICMP" "$allow" "$T_REV" >"$f"
 }
 
 # ---- cross-tunnel conflict checks ----
@@ -476,6 +482,11 @@ v_name() {
   [ ! -e "$CONF/$1.yml" ] || { err "A tunnel named '$1' already exists."; return 1; }
 }
 v_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] && return 0; err "Enter an IP address or a domain name."; return 1; }
+v_ipv4() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter the server's IPv4 address, such as 198.51.100.20."; return 1; }
+reverse_hint() {
+  hint "Reverse: Kharej sends the pings to Iran and Iran answers. Use it when Iran cannot ping Kharej but Kharej CAN"
+  hint "ping Iran (a one-way block on Iran's IP). Both sides must use it, and both need wattun 2.0.0 or newer."
+}
 v_icmp() { case "$1" in echo|timestamp|info|mask) return 0 ;; esac; err "Use echo, timestamp, info or mask."; return 1; }
 v_mbps() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && return 0; err "Enter a number of MB/s (1-9999)."; return 1; }
 v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
@@ -833,7 +844,7 @@ pick_carrier() {
 summary_line() { printf '    %s%-14s%s %s\n' "$GRY" "$1" "$RST" "$2"; }
 
 wizard_kharej() {
-  local name cr listen='' path='' sni='' itype='' mbps='' fec='' addr key m peer allow t
+  local name cr listen='' path='' sni='' itype='' mbps='' fec='' addr key m peer allow t rev='' iranip=''
   page "New tunnel" "STEP 1 · Kharej (outside server)"
   step_diagram 1
   echo
@@ -876,6 +887,10 @@ wizard_kharej() {
     if [ "$cr" = icmp ]; then
       hint "Keep echo unless ping echo is blocked on your route."
       ask_ok "ICMP type (echo, timestamp, info, mask)" echo v_icmp || return 1; itype=$REPLY_V
+      echo; reverse_hint
+      if confirm "Reverse direction (this server sends the pings to Iran)?" n; then
+        ask_ok "Iran server IPv4 address" "" v_ipv4 || return 1; iranip=$REPLY_V; rev=1
+      fi
     else
       while :; do
         ask_ok "Listen port" "$listen" v_port || return 1
@@ -897,6 +912,7 @@ wizard_kharej() {
   summary_line "Name" "$name  (Kharej, tunnel server)"
   summary_line "Carrier" "$cr${itype:+ ($itype)}${listen:+ on port $listen}${path:+ path $path}"
   summary_line "Address" "$addr"
+  [ "$rev" = 1 ] && summary_line "Direction" "reverse: this server pings Iran at $iranip"
   summary_line "Allowed ports" "${allow:-any}"
   [ -n "$mbps" ] && summary_line "Speed limit" "$mbps MB/s"
   [ "$fec" = auto ] && summary_line "FEC" auto
@@ -917,19 +933,21 @@ wizard_kharej() {
       [ -n "$listen" ] && echo "listen: \":$listen\""
       [ -n "$path" ] && echo "path: $path"
       [ -n "$itype" ] && [ "$itype" != echo ] && echo "icmp-type: $itype"
+      [ "$rev" = 1 ] && { echo "reverse: true"; echo "peer: $iranip"; }
       [ -n "$mbps" ] && echo "max-mbps: $mbps"
       [ "$fec" = auto ] && echo "fec: auto"
       echo "metrics: 127.0.0.1:$m"
       maps_yaml_block
     } >"$CONF/$name.yml"
-    make_token "$cr" "$peer" "$key" "$path" "$sni" "$itype" "$allow" >"$CONF/$name.token"
+    make_token "$cr" "$peer" "$key" "$path" "$sni" "$itype" "$allow" "$rev" >"$CONF/$name.token"
     umask "$old"
   }
   mkdir -p "$CONF"; chmod 700 "$CONF"
   step "Writing key, config and token" write_server || return 1
   start_unit "$name" || return 1
   [ -n "$listen" ] && fw_open "$listen/$([ "$cr" = udp ] && echo udp || echo tcp)"
-  [ "$cr" = icmp ] && hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."
+  if [ "$rev" = 1 ]; then hint "Reverse ICMP: Iran must answer ping from this server. Do not block ICMP in either cloud firewall."
+  elif [ "$cr" = icmp ]; then hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."; fi
 
   echo
   celebrate "Kharej tunnel '$name' is ready"
@@ -953,7 +971,7 @@ wizard_iran() {
   say "  This is the server your ${BOLD}users connect to${RST}. It needs the token made on Kharej."
   echo
   name=$(suggest_name iran)
-  T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''
+  T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''; T_REV=''
   confirm "Do you have the token from the Kharej server?" y && have=y || have=n
   if [ "$have" = n ]; then
     echo
@@ -975,6 +993,7 @@ wizard_iran() {
     summary_line "Carrier" "$T_CARRIER${T_ICMP:+ ($T_ICMP)}"
     summary_line "Kharej" "$T_PEER"
     summary_line "Kharej allows" "${T_PORTS:-any port}"
+    [ "$T_REV" = 1 ] && summary_line "Direction" "reverse: Kharej sends the pings, this server answers"
   else
     echo
     pick_carrier || return 1; T_CARRIER=$CARRIER
@@ -985,7 +1004,10 @@ wizard_iran() {
     ask_ok "Key (the same as on Kharej)" "" v_key || return 1; T_KEY=$REPLY_V
     case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" /wat v_path || return 1; T_PATH=$REPLY_V ;; esac
     case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" ""; T_SNI=$REPLY_V ;; esac
-    [ "$T_CARRIER" = icmp ] && { ask_ok "ICMP type (must match Kharej)" echo v_icmp || return 1; T_ICMP=$REPLY_V; }
+    if [ "$T_CARRIER" = icmp ]; then
+      ask_ok "ICMP type (must match Kharej)" echo v_icmp || return 1; T_ICMP=$REPLY_V
+      confirm "Reverse direction (only if Kharej is set to reverse too)?" n && T_REV=1
+    fi
   fi
   sleep 0.4
 
@@ -1019,6 +1041,7 @@ wizard_iran() {
   summary_line "Name" "$name  (Iran, tunnel client)"
   summary_line "Carrier" "$T_CARRIER${T_ICMP:+ ($T_ICMP)}"
   summary_line "Kharej" "$T_PEER"
+  [ "$T_REV" = 1 ] && summary_line "Direction" "reverse (Kharej sends the pings)"
   allow_note=''; for ((i=0; i<${#MAPS[@]}; i++)); do allow_note="$allow_note $(spec_human "${MAPS[$i]}")"; done
   summary_line "Publishes" "${allow_note# }"
   [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && summary_line "Bind" "$bind"
@@ -1041,6 +1064,7 @@ wizard_iran() {
       [ -n "$T_PATH" ] && echo "path: $T_PATH"
       [ -n "$T_SNI" ] && { echo "sni: $T_SNI"; echo "host: $T_SNI"; }
       [ -n "$T_ICMP" ] && [ "$T_ICMP" != echo ] && echo "icmp-type: $T_ICMP"
+      [ "$T_REV" = 1 ] && echo "reverse: true"
       [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && echo "bind: $bind"
       [ -n "$mbps" ] && echo "max-mbps: $mbps"
       [ "$fec" = auto ] && echo "fec: auto"
@@ -1143,6 +1167,8 @@ icmp_path_report() { # name host
     hint "Allow ICMP on Kharej's cloud firewall. If the route itself blocks ICMP right now, no ICMP tunnel can work until it opens;"
     hint "the tunnel reconnects by itself when it does (keep auto-heal on). Meanwhile, switch both sides to another carrier:"
     hint "wattun-manager → Kharej setup / Iran setup with udp, tcp or wss."
+    hint "${BOLD}One-way block?${RST}${GRY} If Kharej CAN ping this server (run Diagnose on Kharej to check), the block is only on"
+    hint "Iran's own pings. Switch BOTH sides to reverse ICMP: tunnel → Advanced settings → d (direction)."
   elif [ -n "$bad_sizes" ] && [ "$maxok" -lt 256 ]; then
     err "Only tiny packets pass: the route drops ICMP packets larger than about $maxok bytes, below the tunnel's 256-byte minimum."
     hint "An ICMP tunnel cannot work on this route. Use another carrier (udp, tcp, wss) on both sides."
@@ -1172,7 +1198,10 @@ test_tunnel() {
   else err "Service is not running"; journalctl -u "wattun@$n" -n 10 --no-pager -o cat 2>/dev/null; return; fi
   if [ "$r" = Iran ]; then
     host=${peer%:*}; port=${peer##*:}; [ "$host" = "$peer" ] && port=''
-    if [ "$cr" = icmp ]; then
+    if [ "$cr" = icmp ] && is_reverse "$n"; then
+      hint "Reverse ICMP: Kharej sends the pings and this server answers, so Iran → Kharej ping does not matter."
+      hint "Run Diagnose on Kharej: it pings this server, which is the direction this tunnel uses."
+    elif [ "$cr" = icmp ]; then
       spin_start "Pinging $host"
       ping -c 3 -W 2 -q "$host" >/dev/null 2>&1; e=$?
       spin_stop
@@ -1193,7 +1222,13 @@ test_tunnel() {
     say "  ${GRY}Common causes: different key on the two sides, different carrier/icmp-type, the other side not running,${RST}"
     say "  ${GRY}or the carrier is filtered on this route. Paste the Kharej token on Iran again to be sure.${RST}"
   fi
-  if [ "$r" = Iran ] && [ "$cr" = icmp ] && [ "$(jget "$s" alive)" != true ]; then icmp_path_report "$n" "${peer%:*}"; fi
+  if [ "$r" = Iran ] && [ "$cr" = icmp ] && [ "$(jget "$s" alive)" != true ]; then
+    if is_reverse "$n"; then
+      echo; say "  ${BOLD}Is this server blocking ICMP itself?${RST}"
+      if local_icmp_check; then hint "Fix the finding above: in reverse mode this server must receive Kharej's pings."
+      else ok "No rule on this server blocks ICMP."; fi
+    else icmp_path_report "$n" "${peer%:*}"; fi
+  fi
   if [ "$r" = Kharej ] && [ "$(jget "$s" alive)" != true ]; then
     local seen idle
     seen=$(journalctl -u "wattun@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'new client session')
@@ -1215,16 +1250,22 @@ test_tunnel() {
         ok "No rule on this server blocks ICMP (kernel switch and local firewall are fine)."
         hint "A firewall in your provider's cloud panel is outside what this check can see: make sure ICMP is allowed there."
       fi
-      if [ -t 0 ]; then
+      REPLY_V=''
+      if is_reverse "$n"; then REPLY_V=$peer
+      elif [ -t 0 ]; then echo; ask "Iran server IP, to test the direction Kharej → Iran (Enter to skip)" ""; fi
+      if [ -n "$REPLY_V" ]; then
         echo
-        ask "Iran server IP, to test the direction Kharej → Iran (Enter to skip)" ""
-        if [ -n "$REPLY_V" ]; then
-          spin_start "Pinging $REPLY_V"
-          ping -c 3 -W 2 -q "$REPLY_V" >/dev/null 2>&1; e=$?
-          spin_stop
-          if [ "$e" -eq 0 ]; then ok "Kharej → Iran ping works ($REPLY_V answers)."
-          else err "Kharej → Iran ping fails ($REPLY_V does not answer)."; fi
+        spin_start "Pinging $REPLY_V"
+        ping -c 3 -W 2 -q "$REPLY_V" >/dev/null 2>&1; e=$?
+        spin_stop
+        if [ "$e" -eq 0 ]; then ok "Kharej → Iran ping works ($REPLY_V answers)."
+        else err "Kharej → Iran ping fails ($REPLY_V does not answer)."; fi
+        if is_reverse "$n"; then
+          [ "$e" -eq 0 ] && hint "Ping works, so check that Iran has reverse: true as well, and the same key and icmp-type."
+          [ "$e" -ne 0 ] && hint "Reverse mode needs this ping to work. Check Iran's firewall, or switch both sides back to normal."
+        else
           hint "Compare with Diagnose on Iran: it tests Iran → Kharej. If one direction works and the other does not, the block is one-way."
+          [ "$e" -eq 0 ] && hint "If Iran → Kharej fails while this works, switch BOTH sides to reverse ICMP: Advanced settings → d."
         fi
       fi
     fi
@@ -1359,7 +1400,9 @@ tunnel_card() {
   tinfo "$n"; state_cell "$r" "$TI_STATE"
   box_top "$n"
   line="$SC_COL$SC_DOT $SC_TXT$RST   $r · $cr"
-  if [ "$r" = Iran ]; then line="$line → ${peer:--}"; else line="$line${lis:+ listening on $lis}"; fi
+  if [ "$cr" = icmp ] && is_reverse "$n"; then
+    if [ "$r" = Iran ]; then line="$line (reverse) ← pinged by ${peer:--}"; else line="$line (reverse) → pings Iran ${peer:--}"; fi
+  elif [ "$r" = Iran ]; then line="$line → ${peer:--}"; else line="$line${lis:+ listening on $lis}"; fi
   box_row "$line"
   box_row "${GRY}service $(systemctl is-active "wattun@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "wattun@$n" 2>/dev/null | head -1)${RST}"
   if [ "$TI_STATE" != stopped ]; then
@@ -1411,7 +1454,7 @@ change_key() {
     confirm "Generate a NEW key and token?" n || return 0
     k=$(new_key); printf '%s\n' "$k" >"$CONF/$n.key"
     if [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
-      make_token "$T_CARRIER" "$T_PEER" "$k" "$T_PATH" "$T_SNI" "$T_ICMP" "$T_PORTS" >"$CONF/$n.token"
+      make_token "$T_CARRIER" "$T_PEER" "$k" "$T_PATH" "$T_SNI" "$T_ICMP" "$T_PORTS" "$T_REV" >"$CONF/$n.token"
     fi
     step "Restarting wattun@$n" systemctl restart "wattun@$n"
     echo; ok "New token (paste it on every Iran server):"; echo
@@ -1434,7 +1477,31 @@ delete_tunnel() {
   ok "Tunnel '$n' deleted."
   return 0
 }
-adv_menu() { # name : max-mbps, fec, bind, icmp-type
+# Toggle reverse ICMP on one side. Kharej keeps Iran's IP as its peer and puts the flag in the token.
+set_direction() { # name
+  local n=$1 r ip
+  r=$(role "$n")
+  reverse_hint
+  if is_reverse "$n"; then
+    confirm "Switch '$n' back to the normal direction (Iran sends the pings)?" n || return 1
+    unset_value "$n" reverse
+    [ "$r" = Kharej ] && unset_value "$n" peer
+  else
+    confirm "Switch '$n' to reverse (Kharej sends the pings)?" n || return 1
+    if [ "$r" = Kharej ]; then
+      ask_ok "Iran server IPv4 address" "" v_ipv4 || return 1; ip=$REPLY_V
+      set_value "$n" peer "$ip"
+    fi
+    set_value "$n" reverse true
+  fi
+  if [ "$r" = Kharej ] && [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
+    T_REV=''; is_reverse "$n" && T_REV=1
+    make_token "$T_CARRIER" "$T_PEER" "$T_KEY" "$T_PATH" "$T_SNI" "$T_ICMP" "$T_PORTS" "$T_REV" >"$CONF/$n.token"
+  fi
+  warn "Change the direction on the $([ "$r" = Kharej ] && echo Iran || echo Kharej) side too (Advanced settings → d), or the link stays down."
+  return 0
+}
+adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
   local n=$1 r changed=0 v cr
   r=$(role "$n"); cr=$(cfg "$n" carrier)
   while :; do
@@ -1443,10 +1510,11 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type
     summary_line "fec" "$(cfg "$n" fec | sed 's/^$/off (default)/')"
     [ "$r" = Iran ] && summary_line "bind" "$(cfg "$n" bind | sed 's/^$/0.0.0.0 (default)/')"
     [ "$cr" = icmp ] && summary_line "icmp-type" "$(cfg "$n" icmp-type | sed 's/^$/echo (default)/')"
+    [ "$cr" = icmp ] && summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej sends the pings)" || echo "normal (Iran sends the pings)")"
     echo
     printf '  %s  speed ceiling   %s  FEC   ' "$(key_label m)" "$(key_label f)"
     [ "$r" = Iran ] && printf '%s  bind address   ' "$(key_label a)"
-    [ "$cr" = icmp ] && printf '%s  ICMP type   ' "$(key_label i)"
+    [ "$cr" = icmp ] && printf '%s  ICMP type   %s  direction   ' "$(key_label i)" "$(key_label d)"
     printf '%s  back\n' "$(key_label b)"
     key_read
     case "$KEY" in
@@ -1458,6 +1526,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type
          if [ "$REPLY_V" = 0.0.0.0 ]; then unset_value "$n" bind; else set_value "$n" bind "$REPLY_V"; fi; changed=1 ;;
       i) [ "$cr" = icmp ] || continue; echo; hint "Must match the other side."; ask_ok "ICMP type" "$(cfg "$n" icmp-type | sed 's/^$/echo/')" v_icmp || continue
          if [ "$REPLY_V" = echo ]; then unset_value "$n" icmp-type; else set_value "$n" icmp-type "$REPLY_V"; fi; changed=1 ;;
+      d) [ "$cr" = icmp ] || continue; echo; set_direction "$n" && changed=1 ;;
       b|0|q|enter|esc) break ;;
       *) : ;;
     esac

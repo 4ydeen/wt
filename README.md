@@ -338,6 +338,7 @@ curl -s 127.0.0.1:19700/ports       # traffic per port
 |---|---|
 | `DISCONNECTED`, no errors | The key or carrier differs between the two sides. Paste the token again on Iran. For ICMP, check that `ping` works from Iran to Kharej. |
 | The Iran log says `no reply from the server` or `lost contact` | The tunnel is sending but nothing comes back. Run **Diagnose** on Iran: it pings Kharej at four packet sizes and tells you which case it is (ICMP blocked, large packets dropped, wrong key or carrier, or the route blocking the answers right now). |
+| Iran can't ping Kharej, but Kharej can ping Iran (often one day blocked, the next day fine) | Iran's own pings are blocked one way. Switch **both** sides to **reverse ICMP** (2.0.0): in the manager open the tunnel → Advanced settings → `d`, on Kharej first (it asks for Iran's IP), then on Iran. Kharej then sends the pings and Iran answers. |
 | It works some days and not others | The route between the servers is being filtered on the bad days. No tunnel can carry data while its packets are blocked. WatTunnel reconnects by itself when they pass again (keep auto-heal on). For bad days, keep a second tunnel with another carrier (`wss`, `tcp`, `udp`) as a backup. |
 | ICMP: small pings work but the tunnel stalls | MTU. Keep the default 640. |
 | `tcp`, `tls` or `ws` never connect | That carrier is filtered on your route, or the port is closed. Try `icmp` or `wss` behind a CDN. |
@@ -390,7 +391,7 @@ Anything on TCP or UDP: Xray, V2Ray, Sing-box, OpenVPN, WireGuard (as UDP), SSH,
 </details>
 
 <details><summary><b>What does Kharej need open?</b></summary>
-For ICMP, it must answer ping. Don't block ICMP in the cloud firewall. For the other carriers, it needs the listen
+For ICMP, it must answer ping (with reverse ICMP it is the other way round: Iran must answer Kharej's ping). Don't block ICMP in the cloud firewall. For the other carriers, it needs the listen
 port you chose.
 </details>
 

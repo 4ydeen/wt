@@ -5,6 +5,7 @@ package wat
 import (
 	"errors"
 	"net"
+	"time"
 )
 
 // ICMPIO exists on Linux only (raw sockets + BPF). This stub lets the rest of the module build and test on a
@@ -26,3 +27,9 @@ func (*ICMPIO) Close() error                                 { return nil }
 func NewICMPIOType(server bool, peerIP string, key []byte, kind string) (*ICMPIO, error) {
 	return nil, errors.New("the icmp carrier needs Linux")
 }
+
+func NewICMPIOReverse(server, reverse bool, peerIP string, key []byte, kind string) (*ICMPIO, error) {
+	return nil, errors.New("the icmp carrier needs Linux")
+}
+
+func (*ICMPIO) Knock(int, time.Duration) {}

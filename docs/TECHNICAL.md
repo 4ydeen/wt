@@ -129,16 +129,37 @@ Normally the Kharej server listens and the Iran client dials out. Some networks 
 Kharej to Iran, or only inbound to Iran. `reverse: true` swaps who listens and who dials. Nothing else changes: Iran
 still opens the streams and listens on the public ports.
 
-Works with the pool carriers only: `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc`. Not with `icmp` or `udp`.
-Put `reverse: true` on both ends.
+Works with the pool carriers (`tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc`) and, since 2.0.0, with `icmp`.
+Not with `udp`. Put `reverse: true` on both ends.
 
-| Side | Without `reverse` | With `reverse` |
-|---|---|---|
-| Iran (client) | dials `peer` | listens on `listen` |
-| Kharej (server) | listens on `listen` | dials `peer` |
+| Side | Without `reverse` | With `reverse` (pool carriers) | With `reverse` (`icmp`, 2.0.0) |
+|---|---|---|---|
+| Iran (client) | dials `peer` | listens on `listen` | answers with ICMP replies to `peer` (Kharej's IP) |
+| Kharej (server) | listens on `listen` | dials `peer` | sends ICMP requests; `peer` is Iran's IP |
 
 Anyone who connects to the listening side can only occupy one of 64 capped slots. Their packets fail authentication
 and are dropped.
+
+### Reverse ICMP
+
+Some Iran IPs get a one-way block: Iran's own pings to Kharej are dropped (`ping KHAREJ` from Iran shows 100 % loss),
+but `ping IRAN` from Kharej works. The block often comes and goes from day to day. Normal ICMP mode cannot work then,
+because the Iran client sends the requests. With `reverse: true` on both ends the ICMP direction is swapped: Kharej
+sends the requests (`echo` type 8, or the request type of `icmp-type`) and Iran answers with replies. Which side opens
+the streams and which ports are published do not change.
+
+- Both ends need wattun 2.0.0 or newer with `reverse: true`. A 1.9 peer, or one end without `reverse`, never
+  connects: the two ends then listen for the same ICMP type.
+- On Kharej, set `peer` to Iran's IP. Kharej sends one empty request per lane every 5 s to it (the knock), so a
+  stateful firewall on either end, or on the route, sees Iran's replies as answers to requests it has seen. Without
+  `peer` Kharej still answers whatever address authenticates, but nothing is knocked.
+- Iran keeps `peer` = Kharej's IP, the address its replies go to.
+- Iran must receive pings from Kharej: do not block incoming ICMP there. Linux on Iran also answers every request
+  with its own reply. That copy fails authentication on Kharej and is dropped (the same thing happens on Kharej in
+  normal mode). `net.ipv4.icmp_echo_ignore_all=1` on Iran removes the extra copies, and the tunnel still receives its
+  packets.
+- In `wattun-manager`: Kharej setup → advanced settings → reverse, or for an existing tunnel Advanced settings →
+  `d` on both sides. The token carries the flag (field 8), so a fresh Iran setup picks it up.
 
 ## UDP forwarding
 
@@ -195,9 +216,9 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `key` | | both | Pre-shared key. Prefer `key-file`. |
 | `key-file` | | both | File with the key (whitespace trimmed). Same on both ends. |
 | `carrier` | `icmp` | both | One of the carriers above. |
-| `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. |
+| `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. Reverse icmp: Kharej sets Iran's IP, Iran keeps Kharej's. |
 | `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. |
-| `reverse` | false | both | Swap who listens and who dials. |
+| `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. |
 | `ports` | | both | List of `N`, `N/udp`, `LISTEN:TARGET` and `LISTEN:TARGET/udp`. Client listens on LISTEN, server allows TARGET. Hot-reloaded. |
 | `bind` | `0.0.0.0` | client | Address of the public listeners. |
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
@@ -332,7 +353,7 @@ Every flag can also be a config key. Flags win over the file.
 | `-carrier NAME` | `icmp` | Transport. |
 | `-peer ADDR` | | Server IP (icmp, udp) or `host:port`. |
 | `-listen ADDR` | `:4443` | Listen address of non-ICMP carriers. |
-| `-reverse` | off | Swap dial and listen. |
+| `-reverse` | off | Swap dial and listen (pool carriers), or which side sends the ICMP requests (`icmp`, 2.0.0). |
 | `-map l:s[,...]` | | Client: listen port to server port. `l:s@127.0.0.1` keeps a port private. |
 | `-udp SPEC` | | Client: UDP forwards. |
 | `-udp-idle D` | `60s` | UDP flow idle timeout. |
@@ -484,6 +505,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 | Symptom | Cause and fix |
 |---|---|
 | `alive: false` on both ends, no errors | Wrong key, or the carrier is filtered. Compare the key files (`sha256sum`). Try `ping` between the servers: ICMP must pass. |
+| Iran cannot ping Kharej, Kharej can ping Iran (often one day on, one day off) | A one-way block on Iran's own pings. Use `reverse: true` on both ends with `icmp` (see Reverse ICMP). |
 | ICMP works with small pings but the tunnel stalls | MTU. Keep ICMP at 640. Check that the route MTU is not above about 680 and that nothing drops packets over 700 bytes. |
 | tcp, tls, ws never connect | That carrier is filtered on this path. Check with `nc -vz HOST PORT` from the client. On a path where only ping passes tCP and UDP are cut: use `icmp`. |
 | tcp pool connects, then drops after a few packets | A middlebox cuts long TCP flows. Try `tls`, `wss` or `grpc`, or `reverse`. |

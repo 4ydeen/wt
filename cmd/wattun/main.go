@@ -5,7 +5,7 @@
 //
 // -map is listenPort:serverPort[,...]; the server connects each stream to 127.0.0.1:serverPort.
 // -config FILE.yml supplies flags (command-line flags win) and a hot-reloaded `ports:` list; -reverse swaps which
-// side dials the pool carriers (see config.go and wat/carrier_reverse.go).
+// side dials the pool carriers (see config.go and wat/carrier_reverse.go) and which side sends the ICMP requests.
 package main
 
 import (
@@ -72,7 +72,7 @@ func main() {
 	path := flag.String("path", "/wat", "client/server, ws|wss|h2|h2c|grpc carrier: URL path (grpc: service name, requests go to <path>/Tun)")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
-	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer")
+	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer; icmp carrier: the server sends the requests to -peer (the client's IP) and the client answers with replies (both ends need wattun >= 2.0.0 and -reverse)")
 	peerBy, listenBy := map[string]*string{}, map[string]*string{}
 	for _, c := range carrierNames {
 		peerBy[c] = flag.String("peer-"+c, "", "client, bonded carriers: server address of the "+c+" carrier (default: -peer)")
@@ -148,8 +148,8 @@ func main() {
 		seen[n] = true
 		anyPool = anyPool || poolCarriers[n]
 	}
-	if *reverse && !anyPool {
-		fmt.Fprintf(os.Stderr, "-reverse needs a connection-pool carrier (tcp|tls|ws|wss|h2|h2c|grpc), not %q\n", *carrier)
+	if *reverse && !anyPool && !seen["icmp"] {
+		fmt.Fprintf(os.Stderr, "-reverse needs icmp or a connection-pool carrier (tcp|tls|ws|wss|h2|h2c|grpc), not %q\n", *carrier)
 		os.Exit(2)
 	}
 	pick := func(by map[string]*string, def, c string) string {
@@ -167,11 +167,19 @@ func main() {
 		var err error
 		switch carrier {
 		case "icmp":
-			pio, err = wat.NewICMPIOType(server, peer, k, *icmpType)
+			var ic *wat.ICMPIO
+			if !*reverse {
+				ic, err = wat.NewICMPIOType(server, peer, k, *icmpType)
+			} else if ic, err = wat.NewICMPIOReverse(server, true, peer, k, *icmpType); err == nil && server {
+				if peer == "" {
+					log.Printf("reverse icmp: no -peer (the client's IP) set, so this server only answers; set it so the client's replies are always solicited")
+				}
+				ic.Knock(*lanes, 5*time.Second)
+			}
 			if err != nil {
 				log.Fatalf("icmp socket: %v", err)
 			}
-			raw, _ = pio.(wat.RawIO)
+			pio, raw = ic, ic
 		case "udp":
 			if server {
 				raw, err = wat.NewUDPServer(listen)
