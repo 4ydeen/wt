@@ -1099,6 +1099,27 @@ new_tunnel() { # [kharej|iran]
 # ======================================================================================
 # ICMP path check (Iran side, icmp carrier): ping the Kharej at four packet sizes and read the tunnel's own packet
 # counters, then say which cause fits. Uses plain ping, so it needs nothing installed on Kharej.
+# Does this server itself block ICMP? Looks at the kernel switch and the local firewall rules (iptables, nftables).
+# It cannot see a firewall in the provider's cloud panel. Prints one warning per finding; returns 0 when it found one.
+local_icmp_check() {
+  local found=1 rules
+  if [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
+    warn "This server ignores ping: net.ipv4.icmp_echo_ignore_all=1  (fix: sysctl -w net.ipv4.icmp_echo_ignore_all=0)"; found=0
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    rules=$(iptables -S 2>/dev/null | grep -i icmp | grep -E -- '-j (DROP|REJECT)')
+    if [ -n "$rules" ]; then warn "iptables has ICMP rules that drop or reject:"; printf '%s\n' "$rules" | sed "s/^/        $GRY/; s/\$/$RST/"; found=0; fi
+    if iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP' && ! iptables -S INPUT 2>/dev/null | grep -qi icmp; then
+      warn "iptables INPUT drops everything not allowed, and no ICMP rule exists."; found=0
+    fi
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    rules=$(nft list ruleset 2>/dev/null | grep -i icmp | grep -Ei 'drop|reject')
+    if [ -n "$rules" ]; then warn "nftables has ICMP rules that drop or reject:"; printf '%s\n' "$rules" | sed "s/^/        $GRY/; s/\$/$RST/"; found=0; fi
+  fi
+  return $found
+}
+
 icmp_path_report() { # name host
   local n=$1 host=$2 s sz loss ok_sizes='' bad_sizes='' maxok=0 pin pout ign fw
   echo
@@ -1112,13 +1133,8 @@ icmp_path_report() { # name host
     else bad_sizes="$bad_sizes $sz"; err "$sz bytes: no answer (loss ${loss}%)"; fi
   done
   s=$(stats "$n"); pin=$(jget "$s" pkts_in); pout=$(jget "$s" pkts_out); pin=${pin:-0}; pout=${pout:-0}
-  ign=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)
-  fw=''
-  if command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP' && ! iptables -S INPUT 2>/dev/null | grep -qi icmp; then
-    fw=1
-  fi
-  [ "$ign" = 1 ] && warn "This server ignores ping (net.ipv4.icmp_echo_ignore_all=1)."
-  [ -n "$fw" ] && warn "The firewall on this server drops everything not allowed, and no ICMP rule exists. Replies would be dropped here."
+  local_icmp_check >/dev/null
+  local_icmp_check
   echo
   say "  ${BOLD}What this means${RST}"
   if [ -z "$ok_sizes" ]; then
@@ -1189,6 +1205,28 @@ test_tunnel() {
     else
       warn "Iran never reached this server in the last 6 hours."
       hint "Check on Iran: the same key and carrier, and for icmp that ping to this server works. For other carriers the listen port must be open here."
+    fi
+    if [ "$cr" = icmp ]; then
+      echo
+      say "  ${BOLD}Is this server blocking ICMP itself?${RST}"
+      if local_icmp_check; then
+        hint "Fix the finding above and test again."
+      else
+        ok "No rule on this server blocks ICMP (kernel switch and local firewall are fine)."
+        hint "A firewall in your provider's cloud panel is outside what this check can see: make sure ICMP is allowed there."
+      fi
+      if [ -t 0 ]; then
+        echo
+        ask "Iran server IP, to test the direction Kharej → Iran (Enter to skip)" ""
+        if [ -n "$REPLY_V" ]; then
+          spin_start "Pinging $REPLY_V"
+          ping -c 3 -W 2 -q "$REPLY_V" >/dev/null 2>&1; e=$?
+          spin_stop
+          if [ "$e" -eq 0 ]; then ok "Kharej → Iran ping works ($REPLY_V answers)."
+          else err "Kharej → Iran ping fails ($REPLY_V does not answer)."; fi
+          hint "Compare with Diagnose on Iran: it tests Iran → Kharej. If one direction works and the other does not, the block is one-way."
+        fi
+      fi
     fi
   fi
   while IFS= read -r it; do
