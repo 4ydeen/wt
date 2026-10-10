@@ -1,0 +1,258 @@
+//go:build linux
+
+package wat
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
+
+	"golang.org/x/net/bpf"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
+)
+
+// ICMPIO carries datagrams as ICMP echo payloads. The client sends echo requests and the server sends echo
+// replies (the Iran filter does not tie replies to requests: measured with icmp_tunnel/wattun/cmd/wprobe).
+// A classic-BPF filter on the raw socket hands the process only echo packets of its own type whose identifier
+// is inside this tunnel's range, so unrelated ping traffic never reaches user space.
+type ICMPIO struct {
+	c         *net.IPConn
+	server    bool
+	reqType   uint8 // ICMP type the client sends and the server receives
+	repType   uint8 // ICMP type the server sends and the client receives
+	identBase uint16
+	dst       net.Addr // client: fixed peer
+	seq       [256]uint32
+	rbuf      []byte
+	rx        *mmsgRx // recvmmsg (nil: plain ReadFrom)
+	tx        *mmsgTx
+}
+
+const identLanes = 256
+
+// icmpBufs: packet assembly buffers for SendTo (the kernel copies the datagram, so a buffer is free again as soon as WriteTo returns).
+var icmpBufs = sync.Pool{New: func() any { b := make([]byte, 0, 2048); return &b }}
+
+// IdentBase derives the first ICMP identifier of the tunnel from the key; both ends compute the same one.
+func IdentBase(key []byte) uint16 {
+	h := sha256.Sum256(append([]byte("github.com/JohnWatsoon/WatTunnel/ident:"), key...))
+	return 0x4000 + binary.BigEndian.Uint16(h[:2])%0xA000
+}
+
+// NewICMPIO is the echo carrier (what every deployment before v1.8.0 runs).
+func NewICMPIO(server bool, peerIP string, key []byte) (*ICMPIO, error) {
+	return NewICMPIOType(server, peerIP, key, "echo")
+}
+
+// NewICMPIOType carries datagrams in the given ICMP request/reply pair: echo, timestamp, info or mask. Both ends
+// must use the same kind. The BPF filter matches only that pair, so other ICMP software never sees our packets.
+func NewICMPIOType(server bool, peerIP string, key []byte, kind string) (*ICMPIO, error) {
+	req, rep, ok := ICMPTypes(kind)
+	if !ok {
+		return nil, errors.New("wat: -icmp-type must be echo, timestamp, info or mask")
+	}
+	c, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: net.IPv4zero})
+	if err != nil {
+		return nil, err
+	}
+	io := &ICMPIO{c: c, server: server, reqType: req, repType: rep, identBase: IdentBase(key), rbuf: make([]byte, 2048)}
+	if !server {
+		ip := net.ParseIP(peerIP)
+		if ip == nil {
+			c.Close()
+			return nil, errors.New("wat: bad peer ip")
+		}
+		io.dst = &net.IPAddr{IP: ip}
+	}
+	c.SetReadBuffer(8 << 20)
+	c.SetWriteBuffer(8 << 20)
+	want := io.repType // what we receive: the client gets replies, the server gets requests
+	if server {
+		want = io.reqType
+	}
+	prog, err := bpf.Assemble(icmpFilter(want, io.identBase))
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	fl := make([]unix.SockFilter, len(prog))
+	for i, r := range prog {
+		fl[i] = unix.SockFilter{Code: r.Op, Jt: r.Jt, Jf: r.Jf, K: r.K}
+	}
+	sc, err := c.SyscallConn()
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	var serr error
+	if err := sc.Control(func(fd uintptr) {
+		serr = unix.SetsockoptSockFprog(int(fd), unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{Len: uint16(len(fl)), Filter: &fl[0]})
+	}); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if serr != nil {
+		c.Close()
+		return nil, serr
+	}
+	if !icmpBatchDisabled() {
+		pc := ipv4.NewPacketConn(c)
+		io.rx, io.tx = newMmsgRx(pc), &mmsgTx{pc: pc}
+	}
+	return io, nil
+}
+
+// icmpFilter is the classic-BPF program: ICMP type == want and identifier in [identBase, identBase+identLanes).
+func icmpFilter(want uint8, identBase uint16) []bpf.Instruction {
+	return []bpf.Instruction{
+		bpf.LoadMemShift{Off: 0},
+		bpf.LoadIndirect{Off: 0, Size: 1},
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(want), SkipTrue: 0, SkipFalse: 4},
+		bpf.LoadIndirect{Off: 4, Size: 2},
+		bpf.JumpIf{Cond: bpf.JumpLessThan, Val: uint32(identBase), SkipTrue: 2},
+		bpf.JumpIf{Cond: bpf.JumpGreaterOrEqual, Val: uint32(identBase) + identLanes, SkipTrue: 1},
+		bpf.RetConstant{Val: 0xffff},
+		bpf.RetConstant{Val: 0},
+	}
+}
+
+func csum(b []byte) uint16 {
+	var s uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		s += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	if len(b)%2 == 1 {
+		s += uint32(b[len(b)-1]) << 8
+	}
+	for s>>16 != 0 {
+		s = s&0xffff + s>>16
+	}
+	return ^uint16(s)
+}
+
+// Send is the client's path to its fixed peer.
+func (i *ICMPIO) Send(p []byte, lane int) error {
+	if i.dst == nil {
+		return errors.New("wat: no peer")
+	}
+	return i.SendTo(p, lane, i.dst)
+}
+
+// SendTo writes one datagram to dst (the server uses it for every client).
+func (i *ICMPIO) SendTo(p []byte, lane int, dst net.Addr) error {
+	lane &= identLanes - 1
+	bp := icmpBufs.Get().(*[]byte)
+	defer icmpBufs.Put(bp)
+	b := append((*bp)[:0], 0, 0, 0, 0, 0, 0, 0, 0)
+	b = append(b, p...)
+	*bp = b
+	b[0] = i.sendType()
+	binary.BigEndian.PutUint16(b[4:], i.identBase+uint16(lane))
+	binary.BigEndian.PutUint16(b[6:], uint16(atomic.AddUint32(&i.seq[lane], 1)))
+	binary.BigEndian.PutUint16(b[2:], csum(b))
+	_, err := i.c.WriteTo(b, dst)
+	return err
+}
+
+// sendType: the client sends requests, the server replies.
+func (i *ICMPIO) sendType() uint8 {
+	if i.server {
+		return i.repType
+	}
+	return i.reqType
+}
+
+func (i *ICMPIO) Recv() ([]byte, int, net.Addr, error) {
+	if i.rx != nil {
+		return i.recvBatch()
+	}
+	for {
+		n, src, err := i.c.ReadFrom(i.rbuf)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if n < 9 {
+			continue
+		}
+		id := binary.BigEndian.Uint16(i.rbuf[4:])
+		if id < i.identBase || id >= i.identBase+identLanes {
+			continue
+		}
+		return i.rbuf[8:n], int(id - i.identBase), src, nil
+	}
+}
+
+// CopiesOnSend: WriteTo hands the datagram to the kernel, which copies it.
+func (i *ICMPIO) CopiesOnSend() bool { return true }
+
+func (i *ICMPIO) SetPeer(net.Addr) {}
+
+func (i *ICMPIO) Close() error { return i.c.Close() }
+
+// recvBatch is Recv over recvmmsg. A raw socket delivers the IP header too (IPConn.ReadFrom strips it for the
+// single-datagram path), so skip it here.
+func (i *ICMPIO) recvBatch() ([]byte, int, net.Addr, error) {
+	for {
+		b, src, err := i.rx.next()
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if len(b) < 20 {
+			continue
+		}
+		ihl := int(b[0]&0x0f) * 4
+		if ihl < 20 || len(b) < ihl+9 {
+			continue
+		}
+		b = b[ihl:]
+		id := binary.BigEndian.Uint16(b[4:])
+		if id < i.identBase || id >= i.identBase+identLanes {
+			continue
+		}
+		return b[8:], int(id - i.identBase), src, nil
+	}
+}
+
+// SendBatch is the client's burst path to its fixed peer.
+func (i *ICMPIO) SendBatch(ps [][]byte, lanes []int) error {
+	if i.dst == nil {
+		return errors.New("wat: no peer")
+	}
+	return i.SendBatchTo(ps, lanes, i.dst)
+}
+
+// SendBatchTo writes a burst of echo packets to dst with one sendmmsg.
+func (i *ICMPIO) SendBatchTo(ps [][]byte, lanes []int, dst net.Addr) error {
+	if i.tx == nil {
+		var first error
+		for k, p := range ps {
+			if err := i.SendTo(p, lanes[k], dst); err != nil && first == nil {
+				first = err
+			}
+		}
+		return first
+	}
+	bufs := make([]*[]byte, len(ps)) // pooled assembly buffers, returned once the kernel has copied them
+	for k := range bufs {
+		bufs[k] = icmpBufs.Get().(*[]byte)
+	}
+	err := i.tx.write(len(ps), dst, func(k int, m *ipv4.Message) {
+		lane := lanes[k] & (identLanes - 1)
+		b := append((*bufs[k])[:0], 0, 0, 0, 0, 0, 0, 0, 0)
+		b = append(b, ps[k]...)
+		*bufs[k] = b
+		b[0] = i.sendType()
+		binary.BigEndian.PutUint16(b[4:], i.identBase+uint16(lane))
+		binary.BigEndian.PutUint16(b[6:], uint16(atomic.AddUint32(&i.seq[lane], 1)))
+		binary.BigEndian.PutUint16(b[2:], csum(b))
+		m.Buffers[0] = b
+	})
+	for _, bp := range bufs {
+		icmpBufs.Put(bp)
+	}
+	return err
+}

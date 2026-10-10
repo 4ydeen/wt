@@ -1,0 +1,375 @@
+package main
+
+// UDP port forwarding over the session's unreliable datagrams (wat.Session.SendDatagram).
+//
+//	client (Iran):   listens on UDP port P; every source address is a flow (random 64-bit id); datagrams go to the
+//	                 server tagged (flow, target port); replies by flow id go back to that source address.
+//	server (Kharej): per (session, flow) one UDP socket connected to 127.0.0.1:port; its replies are sent back.
+//
+// Both ends must run wattun >= 1.2.0 before a udp port is configured: an older peer ignores datagram frames.
+
+import (
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"log"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/JohnWatsoon/WatTunnel/wat"
+)
+
+const maxUDPFlows = 4096 // per listening port (client) / per session (server)
+
+// process-wide counters for /stats
+var (
+	udpFlowsActive atomic.Int64
+	udpRejected    atomic.Uint64 // server: datagrams for a port that is not allowed
+	udpFlowCapDrop atomic.Uint64 // flows refused because the cap was reached
+)
+
+type cflow struct {
+	id   uint64
+	src  netip.AddrPort
+	l    *udpListener
+	last atomic.Int64
+}
+
+// dgramClient is the client-side UDP forwarder for one session.
+type dgramClient struct {
+	sess *wat.Session
+	idle time.Duration
+	mu   sync.Mutex
+	byID map[uint64]*cflow
+}
+
+func newDgramClient(sess *wat.Session, idle time.Duration) *dgramClient {
+	c := &dgramClient{sess: sess, idle: idle, byID: map[uint64]*cflow{}}
+	go c.replyLoop()
+	go c.janitor()
+	return c
+}
+
+func (c *dgramClient) replyLoop() {
+	for {
+		select {
+		case d := <-c.sess.Datagrams():
+			c.mu.Lock()
+			f := c.byID[d.Flow]
+			c.mu.Unlock()
+			if f == nil {
+				continue
+			}
+			f.last.Store(time.Now().UnixNano())
+			if !f.l.stat.dgramOK(false, len(d.Data)) {
+				continue
+			}
+			f.l.stat.dgram(false, len(d.Data))
+			f.l.conn.WriteToUDPAddrPort(d.Data, f.src)
+		case <-c.sess.Done():
+			return
+		}
+	}
+}
+
+func (c *dgramClient) janitor() {
+	tk := time.NewTicker(max(c.idle/4, 20*time.Millisecond))
+	defer tk.Stop()
+	for {
+		select {
+		case <-tk.C:
+			cut := time.Now().Add(-c.idle).UnixNano()
+			c.mu.Lock()
+			for id, f := range c.byID {
+				if f.last.Load() < cut {
+					c.drop(f, id)
+				}
+			}
+			c.mu.Unlock()
+		case <-c.sess.Done():
+			return
+		}
+	}
+}
+
+// drop removes f; c.mu is held.
+func (c *dgramClient) drop(f *cflow, id uint64) {
+	delete(c.byID, id)
+	f.l.mu.Lock()
+	delete(f.l.flows, f.src)
+	f.l.mu.Unlock()
+	udpFlowsActive.Add(-1)
+	f.l.stat.udpFlows.Add(-1)
+	dbg("udp flow %016x (%s) closed", id, f.src)
+}
+
+type udpListener struct {
+	c      *dgramClient
+	conn   *net.UDPConn
+	target int
+	stat   *portStat
+	mu     sync.Mutex
+	flows  map[netip.AddrPort]*cflow
+}
+
+// listen binds addr (UDP) and forwards everything arriving there to server port target.
+func (c *dgramClient) listen(addr string, target int) (*udpListener, error) {
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp", ua)
+	if err != nil {
+		return nil, err
+	}
+	l := &udpListener{c: c, conn: conn, target: target, stat: portReg.get("c", conn.LocalAddr().(*net.UDPAddr).Port), flows: map[netip.AddrPort]*cflow{}}
+	go l.readLoop()
+	return l, nil
+}
+
+func (l *udpListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+func (l *udpListener) readLoop() {
+	buf := make([]byte, 64<<10)
+	for {
+		n, src, err := l.conn.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			if strings.Contains(err.Error(), "closed") {
+				return
+			}
+			continue // e.g. Windows "forcibly closed" after a reply to a vanished sender
+		}
+		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+		l.mu.Lock()
+		f := l.flows[src]
+		l.mu.Unlock()
+		if !l.stat.dgramOK(true, n) {
+			continue
+		}
+		if f == nil {
+			if f = l.newFlow(src); f == nil {
+				continue
+			}
+		}
+		f.last.Store(time.Now().UnixNano())
+		l.stat.dgram(true, n)
+		l.c.sess.SendDatagram(f.id, l.target, buf[:n]) // full queue / oversize: dropped and counted by the session
+	}
+}
+
+func (l *udpListener) newFlow(src netip.AddrPort) *cflow {
+	l.mu.Lock()
+	n := len(l.flows)
+	l.mu.Unlock()
+	if n >= maxUDPFlows {
+		udpFlowCapDrop.Add(1)
+		return nil
+	}
+	var b [8]byte
+	rand.Read(b[:])
+	f := &cflow{id: binary.BigEndian.Uint64(b[:]) | 1, src: src, l: l}
+	f.last.Store(time.Now().UnixNano())
+	l.c.mu.Lock()
+	for l.c.byID[f.id] != nil { // astronomically unlikely, but a clash would cross two users' replies
+		rand.Read(b[:])
+		f.id = binary.BigEndian.Uint64(b[:]) | 1
+	}
+	l.c.byID[f.id] = f
+	l.c.mu.Unlock()
+	l.mu.Lock()
+	l.flows[src] = f
+	l.mu.Unlock()
+	udpFlowsActive.Add(1)
+	l.stat.udpFlows.Add(1)
+	l.stat.connsTotal.Add(1)
+	dbg("udp flow %016x: %s -> server :%d", f.id, src, l.target)
+	return f
+}
+
+// Close stops the listener and forgets its flows.
+func (l *udpListener) Close() {
+	l.conn.Close()
+	l.c.mu.Lock()
+	for id, f := range l.c.byID {
+		if f.l == l {
+			l.c.drop(f, id)
+		}
+	}
+	l.c.mu.Unlock()
+}
+
+// udpListeners is the live set of public UDP ports (same apply semantics as listeners for tcp).
+type udpListeners struct {
+	mu     sync.Mutex
+	active map[int]*udpListener
+	open   func(port int) (*udpListener, error)
+}
+
+func newUDPListeners(open func(int) (*udpListener, error)) *udpListeners {
+	return &udpListeners{active: map[int]*udpListener{}, open: open}
+}
+
+func (u *udpListeners) apply(want []int) []error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	set := map[int]bool{}
+	var errs []error
+	for _, p := range want {
+		set[p] = true
+		if u.active[p] == nil {
+			l, err := u.open(p)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("listen udp port %d: %v", p, err))
+				continue
+			}
+			u.active[p] = l
+		}
+	}
+	for p, l := range u.active {
+		if !set[p] {
+			l.Close()
+			delete(u.active, p)
+			log.Printf("stopped listening on udp port %d", p)
+		}
+	}
+	return errs
+}
+
+func (u *udpListeners) has(p int) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.active[p] != nil
+}
+
+// ---- server side ----
+
+type sflow struct {
+	conn *net.UDPConn
+	port int
+	stat *portStat
+	last atomic.Int64
+}
+
+// serveDgrams terminates the datagram flows of one session until it ends.
+func serveDgrams(sess *wat.Session, lo, hi int, al *allow, idle time.Duration) {
+	var mu sync.Mutex
+	flows := map[uint64]*sflow{}
+	defer func() {
+		mu.Lock()
+		for id, f := range flows {
+			f.conn.Close()
+			delete(flows, id)
+			udpFlowsActive.Add(-1)
+			f.stat.udpFlows.Add(-1)
+		}
+		mu.Unlock()
+	}()
+	tk := time.NewTicker(max(idle/4, 20*time.Millisecond))
+	defer tk.Stop()
+	warned := map[int]bool{}
+	for {
+		select {
+		case <-sess.Done():
+			return
+		case <-tk.C:
+			cut := time.Now().Add(-idle).UnixNano()
+			mu.Lock()
+			for id, f := range flows {
+				if f.last.Load() < cut {
+					f.conn.Close() // its reader goroutine exits
+					delete(flows, id)
+					udpFlowsActive.Add(-1)
+					f.stat.udpFlows.Add(-1)
+					dbg("server udp flow %016x idle, closed", id)
+				}
+			}
+			mu.Unlock()
+		case d := <-sess.Datagrams():
+			mu.Lock()
+			f := flows[d.Flow]
+			full := len(flows) >= maxUDPFlows
+			mu.Unlock()
+			if f != nil && f.port != d.Port {
+				continue // a flow is bound to the port of its first datagram
+			}
+			if f == nil {
+				if !al.udpOK(d.Port, lo, hi) {
+					udpRejected.Add(1)
+					if !warned[d.Port] {
+						warned[d.Port] = true
+						log.Printf("udp port %d is not allowed, datagrams dropped", d.Port)
+					}
+					continue
+				}
+				if full {
+					udpFlowCapDrop.Add(1)
+					continue
+				}
+				conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: d.Port})
+				if err != nil {
+					continue
+				}
+				f = &sflow{conn: conn, port: d.Port, stat: portReg.get("s", d.Port)}
+				f.stat.udpFlows.Add(1)
+				f.stat.connsTotal.Add(1)
+				mu.Lock()
+				flows[d.Flow] = f
+				mu.Unlock()
+				udpFlowsActive.Add(1)
+				dbg("server udp flow %016x -> %d", d.Flow, d.Port)
+				go replyPump(sess, d.Flow, f)
+			}
+			f.last.Store(time.Now().UnixNano())
+			if !f.stat.dgramOK(true, len(d.Data)) {
+				continue
+			}
+			f.stat.dgram(true, len(d.Data))
+			if _, err := f.conn.Write(d.Data); err != nil {
+				f.stat.errs.Add(1)
+			}
+		}
+	}
+}
+
+// replyPump sends what the target answers back through the session until the flow's socket is closed.
+func replyPump(sess *wat.Session, id uint64, f *sflow) {
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := f.conn.Read(buf)
+		if err != nil {
+			// a connected UDP socket reports an earlier ICMP port-unreachable as a read error: keep going
+			if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "forcibly closed") {
+				continue
+			}
+			return
+		}
+		f.last.Store(time.Now().UnixNano())
+		if f.stat.dgramOK(false, n) {
+			f.stat.dgram(false, n)
+			sess.SendDatagram(id, f.port, buf[:n])
+		}
+	}
+}
+
+// parseUDPMap parses one -udp entry: PORT or listen:server, optionally @bindaddr; offset is -port-offset.
+func parseUDPMap(m, defBind string, offset int) (addr string, target int, err error) {
+	bind, orig := defBind, m
+	if at := strings.IndexByte(m, '@'); at >= 0 {
+		bind, m = strings.TrimSpace(m[at+1:]), m[:at]
+	}
+	lp, sp := m, m
+	if i := strings.IndexByte(m, ':'); i >= 0 {
+		lp, sp = m[:i], m[i+1:]
+	}
+	l, e1 := strconv.Atoi(strings.TrimSpace(lp))
+	t, e2 := strconv.Atoi(strings.TrimSpace(sp))
+	if e1 != nil || e2 != nil || l < 1 || l > 65535 || t < 1 || t > 65535 {
+		return "", 0, fmt.Errorf("bad -udp entry %q", orig)
+	}
+	return net.JoinHostPort(bind, strconv.Itoa(l+offset)), t, nil
+}

@@ -1,0 +1,337 @@
+package wat
+
+import (
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Bonding: one session over several carriers at once. Client side is BondIO (a PacketIO over child PacketIOs),
+// server side is MultiRaw (a RawIO over child RawIOs) plus a per-session path scheduler in the Server. Both run
+// the same pathSet: per-path delay/loss from the session's ACK feedback, health (live -> suspect -> dead), probes
+// of dead paths with backoff, and a weighted split for bulk packets with the interactive ones on the fastest path.
+// Duplicate or reordered packets across paths are harmless: the session already has a replay window and SACK.
+
+const bondRecvQueue = 4096
+
+// BondOptions configures NewBondIO. Names and Lanes are per child (Lanes: ICMP identifiers to stripe over, 1 for
+// everything else).
+type BondOptions struct {
+	Names   []string
+	Lanes   []int
+	Timings PathTimings
+}
+
+type bondPkt struct {
+	p    []byte
+	path int
+	src  net.Addr
+}
+
+// BondIO is the client PacketIO over N child PacketIOs.
+type BondIO struct {
+	kids   []PacketIO
+	lanes  []int
+	laneRR []atomic.Uint32
+	ps     *pathSet
+	prof   Profile
+	profs  []Profile
+	in     chan bondPkt
+	done   chan struct{}
+	once   sync.Once
+	prober atomic.Value // func(int)
+}
+
+func NewBondIO(kids []PacketIO, opt BondOptions) (*BondIO, error) {
+	if len(kids) == 0 {
+		return nil, errors.New("wat: bond needs at least one carrier")
+	}
+	names := make([]string, len(kids))
+	lanes := make([]int, len(kids))
+	b := &BondIO{kids: kids, lanes: lanes, laneRR: make([]atomic.Uint32, len(kids)),
+		in: make(chan bondPkt, bondRecvQueue), done: make(chan struct{})}
+	for i, k := range kids {
+		names[i] = "carrier" + string(rune('0'+i%10))
+		if i < len(opt.Names) && opt.Names[i] != "" {
+			names[i] = opt.Names[i]
+		}
+		lanes[i] = 1
+		if i < len(opt.Lanes) && opt.Lanes[i] > 0 {
+			lanes[i] = opt.Lanes[i]
+		}
+		b.profs = append(b.profs, profileOf(k))
+	}
+	b.prof = mergeProfiles(b.profs)
+	b.ps = newPathSet(names, true, opt.Timings)
+	for i := range kids {
+		go b.recvKid(i)
+	}
+	go b.tickLoop()
+	return b, nil
+}
+
+func (b *BondIO) recvKid(i int) {
+	backoff := time.Millisecond
+	for {
+		p, _, src, err := b.kids[i].Recv()
+		if err != nil {
+			select {
+			case <-b.done:
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, time.Second)
+			continue
+		}
+		backoff = time.Millisecond
+		select {
+		case b.in <- bondPkt{append([]byte(nil), p...), i, src}:
+		default: // overloaded: a dropped datagram is just loss
+		}
+	}
+}
+
+func (b *BondIO) tickLoop() {
+	tk := time.NewTicker(50 * time.Millisecond)
+	defer tk.Stop()
+	for {
+		select {
+		case <-b.done:
+			return
+		case <-tk.C:
+		}
+		list := b.ps.tick()
+		if f, _ := b.prober.Load().(func(int)); f != nil {
+			for _, i := range list {
+				f(i)
+			}
+		}
+	}
+}
+
+func (b *BondIO) Send(p []byte, path int) error {
+	if path < 0 || path >= len(b.kids) {
+		path = 0
+	}
+	b.ps.onSend(path)
+	lane := 0
+	if n := b.lanes[path]; n > 1 {
+		lane = int(b.laneRR[path].Add(1) % uint32(n))
+	}
+	return b.kids[path].Send(p, lane)
+}
+
+func (b *BondIO) Recv() ([]byte, int, net.Addr, error) {
+	select {
+	case r := <-b.in:
+		return r.p, r.path, r.src, nil
+	case <-b.done:
+		return nil, 0, nil, net.ErrClosed
+	}
+}
+
+func (b *BondIO) SetPeer(net.Addr) {}
+
+func (b *BondIO) Close() error {
+	b.once.Do(func() {
+		close(b.done)
+		for _, k := range b.kids {
+			k.Close()
+		}
+	})
+	return nil
+}
+
+func (b *BondIO) Profile() Profile                         { return b.prof }
+func (b *BondIO) NumPaths() int                            { return len(b.kids) }
+func (b *BondIO) PathProfile(i int) Profile                { return b.profs[i] }
+func (b *BondIO) ChoosePath(_ int, inter bool) int         { return b.ps.choose(inter) }
+func (b *BondIO) OnAck(path int, rtt time.Duration, _ int) { b.ps.onAck(path, rtt) }
+func (b *BondIO) OnLoss(path int)                          { b.ps.onLoss(path) }
+func (b *BondIO) SetProber(f func(int))                    { b.prober.Store(f) }
+func (b *BondIO) PathStats() []CarrierStat                 { return b.ps.stats() }
+
+// ---- server side
+
+// TaggedAddr is the source address MultiRaw reports: which child raw the packet came in on, plus the child's own
+// address and lane.
+type TaggedAddr struct {
+	Idx  int
+	Addr net.Addr
+	Lane int
+}
+
+func (a *TaggedAddr) Network() string { return "multi" }
+func (a *TaggedAddr) String() string {
+	return string(rune('a'+a.Idx%26)) + ":" + a.Addr.String()
+}
+
+type multiPkt struct {
+	p    []byte
+	lane int
+	src  net.Addr
+}
+
+// MultiRaw is the server RawIO over several RawIOs (one per carrier). The Server detects it and gives every
+// client session a path scheduler over the carriers that client has been heard on.
+type MultiRaw struct {
+	raws  []RawIO
+	names []string
+	in    chan multiPkt
+	done  chan struct{}
+	once  sync.Once
+}
+
+func NewMultiRaw(names []string, raws []RawIO) *MultiRaw {
+	m := &MultiRaw{raws: raws, names: names, in: make(chan multiPkt, bondRecvQueue), done: make(chan struct{})}
+	for len(m.names) < len(raws) {
+		m.names = append(m.names, "carrier")
+	}
+	for i := range raws {
+		go m.readLoop(i)
+	}
+	return m
+}
+
+func (m *MultiRaw) readLoop(i int) {
+	backoff := time.Millisecond
+	for {
+		p, lane, src, err := m.raws[i].Recv()
+		if err != nil {
+			select {
+			case <-m.done:
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, time.Second)
+			continue
+		}
+		backoff = time.Millisecond
+		select {
+		case m.in <- multiPkt{append([]byte(nil), p...), lane, &TaggedAddr{i, src, lane}}:
+		default:
+		}
+	}
+}
+
+func (m *MultiRaw) Recv() ([]byte, int, net.Addr, error) {
+	select {
+	case r := <-m.in:
+		return r.p, r.lane, r.src, nil
+	case <-m.done:
+		return nil, 0, nil, net.ErrClosed
+	}
+}
+
+func (m *MultiRaw) SendTo(p []byte, lane int, dst net.Addr) error {
+	t, ok := dst.(*TaggedAddr)
+	if !ok || t.Idx < 0 || t.Idx >= len(m.raws) {
+		return net.ErrClosed
+	}
+	return m.raws[t.Idx].SendTo(p, lane, t.Addr)
+}
+
+func (m *MultiRaw) Close() error {
+	m.once.Do(func() {
+		close(m.done)
+		for _, r := range m.raws {
+			r.Close()
+		}
+	})
+	return nil
+}
+
+func (m *MultiRaw) Profile() Profile {
+	ps := make([]Profile, len(m.raws))
+	for i, r := range m.raws {
+		ps[i] = profileOf(r)
+	}
+	return mergeProfiles(ps)
+}
+
+// multiSubIO is a server session's PacketIO when the Server runs on a MultiRaw: it remembers where the client was
+// last heard on each carrier and replies on the best live one, so when the client's carrier dies and it carries on
+// over another, the replies follow it (live migration) without any signalling.
+type multiSubIO struct {
+	*subIO
+	mr     *MultiRaw
+	ps     *pathSet
+	mu     sync.Mutex
+	slots  []peerSlot
+	prober atomic.Value // func(int)
+}
+
+type peerSlot struct {
+	dst   *TaggedAddr // last authenticated source on this carrier
+	lanes []int       // lanes (ICMP identifiers) the client used on it
+	rr    int
+}
+
+func newMultiSubIO(base *subIO, mr *MultiRaw, tm PathTimings) *multiSubIO {
+	m := &multiSubIO{subIO: base, mr: mr, slots: make([]peerSlot, len(mr.raws))}
+	m.ps = newPathSet(mr.names, false, tm)
+	go func() {
+		tk := time.NewTicker(50 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-base.done:
+				return
+			case <-tk.C:
+			}
+			list := m.ps.tick()
+			if f, _ := m.prober.Load().(func(int)); f != nil {
+				for _, i := range list {
+					f(i)
+				}
+			}
+		}
+	}()
+	return m
+}
+
+func (m *multiSubIO) SetPeer(a net.Addr) {
+	t, ok := a.(*TaggedAddr)
+	if !ok || t.Idx < 0 || t.Idx >= len(m.slots) {
+		return
+	}
+	m.mu.Lock()
+	s := &m.slots[t.Idx]
+	s.dst = t
+	have := false
+	for _, l := range s.lanes {
+		have = have || l == t.Lane
+	}
+	if !have && len(s.lanes) < 8 {
+		s.lanes = append(s.lanes, t.Lane)
+	}
+	m.mu.Unlock()
+	m.ps.markPresent(t.Idx)
+}
+
+func (m *multiSubIO) Send(p []byte, path int) error {
+	m.mu.Lock()
+	if path < 0 || path >= len(m.slots) || m.slots[path].dst == nil {
+		m.mu.Unlock()
+		return errors.New("wat: no peer yet")
+	}
+	s := &m.slots[path]
+	dst, lane := s.dst, 0
+	if len(s.lanes) > 0 {
+		s.rr++
+		lane = s.lanes[s.rr%len(s.lanes)]
+	}
+	m.mu.Unlock()
+	m.ps.onSend(path)
+	return m.mr.raws[path].SendTo(p, lane, dst.Addr)
+}
+
+func (m *multiSubIO) NumPaths() int                            { return len(m.slots) }
+func (m *multiSubIO) PathProfile(i int) Profile                { return profileOf(m.mr.raws[i]) }
+func (m *multiSubIO) ChoosePath(_ int, inter bool) int         { return m.ps.choose(inter) }
+func (m *multiSubIO) OnAck(path int, rtt time.Duration, _ int) { m.ps.onAck(path, rtt) }
+func (m *multiSubIO) OnLoss(path int)                          { m.ps.onLoss(path) }
+func (m *multiSubIO) SetProber(f func(int))                    { m.prober.Store(f) }
+func (m *multiSubIO) PathStats() []CarrierStat                 { return m.ps.stats() }

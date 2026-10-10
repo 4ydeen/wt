@@ -1,0 +1,25 @@
+#!/bin/sh
+# Reproducible WatTunnel build: static linux/amd64 and linux/arm64 binaries in dist/ with a .sha256 next to each.
+# Usage: build.sh [amd64|arm64 ...]   (default: both)
+# Go: `go` on PATH (or $GO).
+# Prints one line per binary and "BUILD_OK <version>" at the end, or "BUILD_FAIL <step>".
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+cd "$HERE"
+GO=${GO:-$(command -v go || true)}
+[ -n "$GO" ] || { echo "BUILD_FAIL no-go (install Go 1.26+)"; exit 1; }
+VER=$(sed -n 's/^const Version = "\([0-9A-Za-z.+-]*\)".*/\1/p' wat/version.go)
+[ -n "$VER" ] || { echo "BUILD_FAIL version (wat/version.go)"; exit 1; }
+ARCHES=${*:-"amd64 arm64"}
+export CGO_ENABLED=0 GOFLAGS=-mod=mod
+mkdir -p dist
+for a in $ARCHES; do
+  case "$a" in amd64|arm64) ;; *) echo "BUILD_FAIL arch $a"; exit 1 ;; esac
+  out="dist/wattun-linux-$a"
+  GOOS=linux GOARCH=$a "$GO" build -trimpath -ldflags "-s -w -buildid=" -o "$out" ./cmd/wattun || { echo "BUILD_FAIL build $a"; exit 1; }
+  # sha256sum on Linux, shasum on macOS; the file holds only the hash so any tool can compare it
+  if command -v sha256sum >/dev/null 2>&1; then sum=$(sha256sum "$out" | cut -d' ' -f1); else sum=$(shasum -a 256 "$out" | cut -d' ' -f1); fi
+  printf '%s\n' "$sum" > "$out.sha256"
+  echo "wattun $VER linux/$a $sum"
+done
+echo "BUILD_OK $VER"
