@@ -39,6 +39,10 @@ type Server struct {
 
 	MaxSessions int
 	IdleTimeout time.Duration
+
+	statMu  sync.Mutex
+	seen    map[*Session]Stats // each live session's counters at the last Stats call
+	retired Stats              // counters of sessions that have closed, so the totals never go backwards
 }
 
 type srvSess struct {
@@ -132,6 +136,9 @@ func (srv *Server) Stats() Stats {
 		list = append(list, ss.s)
 	}
 	srv.mu.Unlock()
+	srv.statMu.Lock()
+	defer srv.statMu.Unlock()
+	now := make(map[*Session]Stats, len(list))
 	var t Stats
 	for _, s := range list {
 		st := s.Stats()
@@ -156,8 +163,30 @@ func (srv *Server) Stats() Stats {
 		if t.MinRTT == 0 || (st.MinRTT > 0 && st.MinRTT < t.MinRTT) {
 			t.MinRTT = st.MinRTT
 		}
+		now[s] = st
 	}
+	// A closed session leaves the map; keep its last counters so the cumulative totals stay monotonic (callers
+	// subtract the previous total, and a smaller total wrapped to ~1.8e19 in the stats log).
+	for s, st := range srv.seen {
+		if _, live := now[s]; !live {
+			addCounters(&srv.retired, st)
+		}
+	}
+	srv.seen = now
+	addCounters(&t, srv.retired)
 	return t
+}
+
+// addCounters adds the cumulative counters of b to a (not the rates, RTTs or live gauges).
+func addCounters(a *Stats, b Stats) {
+	a.PktsOut += b.PktsOut
+	a.PktsIn += b.PktsIn
+	a.BytesOut += b.BytesOut
+	a.BytesIn += b.BytesIn
+	a.Retrans += b.Retrans
+	a.Dropped += b.Dropped
+	a.FecSent += b.FecSent
+	a.FecRecovered += b.FecRecovered
 }
 
 // CarrierStats sums the per-carrier numbers of every client session (nil unless the server runs on a MultiRaw).
