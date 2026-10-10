@@ -417,6 +417,14 @@ localhost.
 
 The process also logs a stats line every 10 seconds when something moves (it includes `ceiling=` and `loss=`).
 
+### Speed test (1.8.1)
+
+On a client, `GET /speedtest?dir=down|up&mb=N` (on the `metrics` address, N 1 to 256, default 10) moves N MB through
+the live session and returns `{"dir","bytes","seconds","mb_per_s","mbit_per_s","ok","error"}`. The stream asks the
+server for target port 0, which the server answers itself (it sends or absorbs the bytes), so no test service or
+extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or newer.
+`wattun-manager test NAME` runs it 10 MB each way.
+
 ## ICMP path limits and pacing
 
 Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):

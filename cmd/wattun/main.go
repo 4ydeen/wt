@@ -327,6 +327,9 @@ func main() {
 				json.NewEncoder(w).Encode(portReg.snapshot(side))
 			})
 			mux.HandleFunc("/quota/reset", quotaResetHandler)
+			if sess != nil {
+				mux.HandleFunc("/speedtest", speedTestHandler(sess))
+			}
 			mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 				st := stats()
 				out := map[string]any{
@@ -600,6 +603,10 @@ func serve(sess *wat.Session, lo, hi int, al *allow) {
 				return
 			}
 			port := int(binary.BigEndian.Uint16(hdr[:]))
+			if port == speedTestPort { // built-in speed test, never a local service
+				serveSpeedTest(st)
+				return
+			}
 			if !al.ok(port, lo, hi) {
 				st.Reset()
 				return

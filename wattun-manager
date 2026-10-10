@@ -3,7 +3,7 @@
 #   Kharej = the outside server (runs the real service, the tunnel SERVER)
 #   Iran   = the inside server users connect to (the tunnel CLIENT)
 # Each tunnel is /etc/wattun/NAME.yml + NAME.key (+ NAME.token on Kharej), run by systemd as wattun@NAME.
-# Commands: wattun-manager [kharej|iran|status|test NAME|logs NAME|token NAME|update|rollback|heal]
+# Commands: wattun-manager [kharej|iran|status|test NAME|speedtest NAME [MB]|logs NAME|token NAME|update|rollback|heal]
 set -uo pipefail
 
 CONF=/etc/wattun
@@ -284,8 +284,40 @@ test_tunnel() {
       timeout 2 bash -c "</dev/tcp/127.0.0.1/$p" 2>/dev/null && ok "Target 127.0.0.1:$p answers" || warn "No service on 127.0.0.1:$p (start your panel/service)"
     done
   fi
+  if [ "$(role "$n")" = Iran ] && [ "$(jget "$s" alive)" = true ]; then speed_test "$n"
+  elif [ "$(role "$n")" = Kharej ]; then say "  Speed test: run Diagnose on the Iran side (it tests both directions)."; fi
   local e; e=$(journalctl -u "wattun@$n" -n 200 --no-pager -o cat | grep -iE "error|fail|denied|refused|restart needed" | tail -5)
   [ -n "$e" ] && { warn "Recent problems in the log:"; say "$e"; }
+}
+
+# Speed test: 10 MB each way through the live tunnel (wattun >= 1.8.1 on both sides; uses /speedtest on the
+# local metrics address, so no test service or open port is needed on either server).
+speed_test() { # name [mb]
+  local n=$1 mb=${2:-10} m d r label secs mbs mbit err
+  m=$(cfg "$n" metrics); [ -n "$m" ] || { warn "Speed test needs a metrics address in $n.yml."; return; }
+  say "
+  $(c 1 "Speed test") - ${mb} MB each way through the tunnel"
+  for d in down up; do
+    [ "$d" = down ] && label="Download (Kharej → Iran)" || label="Upload   (Iran → Kharej)"
+    printf "  %s ... " "$label"
+    r=$(curl -fs --max-time 200 "http://$m/speedtest?dir=$d&mb=$mb")
+    if [ -z "$r" ]; then
+      echo
+      if [ -z "$(stats "$n")" ]; then err "Tunnel '$n' is not running."
+      else warn "Speed test not available: this tunnel runs wattun older than 1.8.1. Update and restart both sides."; fi
+      return
+    fi
+    if [ "$(jget "$r" ok)" = true ]; then
+      secs=$(jget "$r" seconds); mbs=$(jget "$r" mb_per_s); mbit=$(jget "$r" mbit_per_s)
+      printf '[32m%.1f MB/s[0m  (%.0f Mbit/s, %s MB in %.1f s)
+' "$mbs" "$mbit" "$mb" "$secs"
+    else
+      err=$(grep -o '"error":"[^"]*"' <<<"$r" | cut -d'"' -f4)
+      printf '[31mfailed[0m  %s
+' "${err:-unknown error}"
+      [[ "$err" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it (wattun-manager update) and restart its tunnel."
+    fi
+  done
 }
 
 # ---------- logs ----------
@@ -402,7 +434,7 @@ manage_tunnel() {
   while true; do
     page "Tunnel: $n" "$(role "$n") · $(cfg "$n" carrier)"
     details "$n"
-    say "\n  1) Diagnose connection   2) Logs              3) Add ports        4) Remove ports"
+    say "\n  1) Diagnose + speed test 2) Logs              3) Add ports        4) Remove ports"
     if [ "$(role "$n")" = Kharej ]; then say "  5) Show token            6) New key/token"
     else say "  5) Change Kharej address 6) Paste new token"; fi
     say "  7) Restart               8) Stop              9) Start           10) Edit config file"
@@ -461,10 +493,11 @@ case "${1:-}" in
   status|list) status_all ;;
   monitor) live_monitor ;;
   test) test_tunnel "${2:?name}" ;;
+  speedtest) speed_test "${2:?name}" "${3:-10}" ;;
   logs) journalctl -u "wattun@${2:?name}" -f -o short-iso ;;
   token) show_token "${2:?name}" ;;
   heal) heal ;;
   update) shift; update "$@" ;;
   rollback) rollback ;;
-  *) echo "Usage: wattun-manager [kharej|iran|status|monitor|test NAME|logs NAME|token NAME|update|rollback|heal]"; exit 1 ;;
+  *) echo "Usage: wattun-manager [kharej|iran|status|monitor|test NAME|speedtest NAME [MB]|logs NAME|token NAME|update|rollback|heal]"; exit 1 ;;
 esac

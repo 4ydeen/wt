@@ -196,7 +196,7 @@ Run `wattun-manager`:
 | **Kharej / Iran setup** | Guided setup. Checks for busy ports, opens the firewall (ufw or firewalld) and generates a random key. Kharej prints a token; Iran pastes it. |
 | **Status** | Each tunnel shows `CONNECTED`, `DISCONNECTED` or `STOPPED`, with RTT, streams, traffic and connected clients. |
 | **Live monitor** | A dashboard that refreshes every 2 seconds. |
-| **Diagnose** | Step-by-step checks: service running, ping or TCP reachability to Kharej, link state, listening ports, whether your service answers on Kharej, and recent errors in the log. Each failure comes with a likely cause. |
+| **Diagnose** | Speed test (10 MB download and upload through the tunnel), plus step-by-step checks: service running, ping or TCP reachability to Kharej, link state, listening ports, whether your service answers on Kharej, and recent errors in the log. Each failure comes with a likely cause. |
 | **Logs** | Last 100 lines, follow live, problems only, or since the last start. |
 | **Ports** | Add or remove ports live, with no restart and no dropped users. |
 | **Token and key** | Show the token again, rotate the key (Kharej), or paste a new token (Iran). |
@@ -208,7 +208,8 @@ Command-line shortcuts:
 ```bash
 wattun-manager status          # one line per tunnel
 wattun-manager monitor         # live dashboard
-wattun-manager test NAME       # connection doctor
+wattun-manager test NAME       # connection doctor + speed test
+wattun-manager speedtest NAME  # speed test only (10 MB each way)
 wattun-manager logs NAME       # follow the log
 wattun-manager token NAME      # print the Kharej token
 wattun-manager update | rollback
