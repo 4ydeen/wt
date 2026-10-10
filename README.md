@@ -263,7 +263,7 @@ A tunnel's page groups its actions:
 | **Token and key** | Show the token again, rotate the key (Kharej), or paste a new token (Iran). |
 | **Advanced** | Per tunnel: speed ceiling (`max-mbps`), FEC, bind address, ICMP type. The wizards also offer name, listen port, URL path and domain/SNI behind an "Advanced options" step you can skip. |
 | **Auto-heal** | A systemd timer restarts an Iran tunnel whose link stays down for 3 minutes. Restarts are logged as `wattun-heal`. |
-| **Update and rollback** | Installs the latest release after checking its SHA-256 and keeps the previous binary for a one-step rollback. |
+| **Update and rollback** | Installs the latest release after checking its SHA-256, with the binary and the manager taken from the same release. It then checks the new version on disk and tells you "updated X → Y" or "already up to date". Running tunnels keep the old binary until they restart, so it lists them and offers to restart them, and the dashboard flags any it missed. The previous binary is kept for a one-step rollback. |
 
 Animations (spinners, the intro, progress bars) turn off by themselves when the output is not a terminal. Set
 `WAT_NO_ANIM=1` (or use **Settings**) to switch them off, and `NO_COLOR=1` for plain text.

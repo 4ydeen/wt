@@ -24,6 +24,10 @@ VERSION=latest
 FORCE=0
 MODE=install
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo /nonexistent)
+# Local files (dist/ build, wattun-manager) are used only when this script sits in a real checkout or unpacked
+# release. The manager's update runs a downloaded copy from a temp dir: there a stale /tmp/dist/ must not be
+# picked up and "installed" again, so it always downloads.
+if [ "${WAT_FROM_MANAGER:-0}" = 1 ] || [ ! -f "$HERE/install.sh" ]; then HERE=/nonexistent; fi
 
 case "$(locale charmap 2>/dev/null)" in UTF-8) ;; *) export LC_ALL=C.UTF-8 ;; esac
 
@@ -253,6 +257,18 @@ fetch() { # url dest
   elif command -v wget >/dev/null; then wget -q -T 20 -t 3 -O "$2" "$PROXY$1"
   else return 127; fi
 }
+# resolve_tag: the tag that releases/latest points to, so the binary and the manager come from the SAME release
+# (the manager used to come from main while the binary came from the latest release, and the two could disagree).
+resolve_tag() {
+  local u
+  [ "$VERSION" = latest ] || { TAG=$VERSION; return 0; }
+  command -v curl >/dev/null || return 1
+  u=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 15 --max-time 30 "${PROXY}https://github.com/$REPO/releases/latest" 2>/dev/null) || return 1
+  u=${u%/}; u=${u##*/}
+  [[ "$u" =~ ^v[0-9]+\.[0-9]+ ]] || return 1
+  TAG=$u
+}
+TAG=''
 human_size() { awk -v b="$1" 'BEGIN{printf "%.1f MB", b/1048576}'; }
 
 step_check() {
@@ -267,11 +283,12 @@ step_get() {
     [ -f "$HERE/dist/$NAME.sha256" ] && cp "$HERE/dist/$NAME.sha256" "$TMP/sum"
     DETAIL="local build (dist/)"; return 0
   fi
-  if [ "$VERSION" = latest ]; then base="https://github.com/$REPO/releases/latest/download"
-  else base="https://github.com/$REPO/releases/download/$VERSION"; fi
+  resolve_tag || TAG=''
+  if [ -n "$TAG" ]; then base="https://github.com/$REPO/releases/download/$TAG"
+  else base="https://github.com/$REPO/releases/latest/download"; fi
   if fetch "$base/$NAME" "$TMP/wattun"; then
     fetch "$base/$NAME.sha256" "$TMP/sum" || { ERRMSG="could not download the checksum file"; return 1; }
-    DETAIL="$VERSION, $(human_size "$(stat -c %s "$TMP/wattun")")"
+    DETAIL="release ${TAG:-latest}, $(human_size "$(stat -c %s "$TMP/wattun")")"
   elif [ -f "$HERE/go.mod" ] && command -v go >/dev/null; then
     (cd "$HERE" && timeout 900 sh build.sh "$ARCH") >"$TMP/build.log" 2>&1 || { ERRMSG="download failed and the source build failed too (see: sh build.sh)"; return 1; }
     cp "$HERE/dist/$NAME" "$TMP/wattun"; cp "$HERE/dist/$NAME.sha256" "$TMP/sum"
@@ -296,15 +313,19 @@ step_install_bin() {
   if [ "$OLD" = "$NEW" ] && [ "$FORCE" = 0 ]; then DETAIL="$NEW already installed (--force reinstalls)"; return 2; fi
   [ -x "$BIN" ] && cp -f "$BIN" "$BIN.prev"
   install -m 755 "$TMP/wattun" "$BIN.new" && mv -f "$BIN.new" "$BIN" || { ERRMSG="cannot write $BIN"; return 1; }
+  # prove it: the file on disk must now report the new version
+  local now; now=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
+  [ "$now" = "$NEW" ] || { ERRMSG="$BIN still reports ${now:-nothing} after installing $NEW"; return 1; }
   DETAIL="$NEW${OLD:+ (was $OLD)}"
 }
 step_install_mgr() {
   if [ -f "$HERE/wattun-manager" ]; then cp "$HERE/wattun-manager" "$TMP/mgr"
+  elif [ -n "$TAG" ] && fetch "https://raw.githubusercontent.com/$REPO/$TAG/wattun-manager" "$TMP/mgr"; then :
   else fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr" || { ERRMSG="could not download wattun-manager"; return 1; }; fi
   head -c 2 "$TMP/mgr" | grep -q '#!' || { ERRMSG="wattun-manager looks corrupt"; return 1; }
   # atomic replace: a manager that is running right now keeps reading its old file safely
   install -m 755 "$TMP/mgr" "$MGR.new" && mv -f "$MGR.new" "$MGR" || { ERRMSG="cannot write $MGR"; return 1; }
-  DETAIL="${MGR##*/} command"
+  DETAIL="${MGR##*/} command${TAG:+ ($TAG)}"
 }
 step_systemd() {
   mkdir -p "$CONF" && chmod 700 "$CONF"
@@ -335,7 +356,7 @@ EOF
 # ======================================================================================
 TMP=$(mktemp -d)
 page "Installer" "WatTunnel for linux/$ARCH"
-cl_init "Check system" "Get wattun ($VERSION)" "Verify checksum and binary" "Install wattun" "Install wattun-manager" "Set up systemd"
+cl_init "Check system" "Get wattun (${VERSION/latest/latest release})" "Verify checksum and binary" "Install wattun" "Install wattun-manager" "Set up systemd"
 run_step 0 step_check
 run_step 1 step_get
 run_step 2 step_verify
@@ -345,22 +366,28 @@ run_step 5 step_systemd
 echo
 
 # ---- summary ----
-total=0; running=0; running_names=''
+total=0; running=0; stale_names=''
+# A running tunnel keeps executing the binary it started with; after the file is replaced /proc/PID/exe reads
+# "... (deleted)". Those tunnels still run the OLD version until they are restarted.
+is_stale() { local pid; pid=$(systemctl show -p MainPID --value "wattun@$1" 2>/dev/null); [ -n "$pid" ] && [ "$pid" != 0 ] && [[ "$(readlink "/proc/$pid/exe" 2>/dev/null)" == *"(deleted)"* ]]; }
 while IFS= read -r n; do
   [ -n "$n" ] || continue
   total=$((total+1))
-  if systemctl is-active -q "wattun@$n" 2>/dev/null; then running=$((running+1)); running_names="$running_names $n"; fi
+  if systemctl is-active -q "wattun@$n" 2>/dev/null; then running=$((running+1)); is_stale "$n" && stale_names="$stale_names $n"; fi
 done < <(tunnel_list)
 prev=''; [ -x "$BIN.prev" ] && prev=$("$BIN.prev" -version 2>/dev/null | awk '{print $2; exit}')
-box "WatTunnel $NEW is installed" \
+if [ -n "$OLD" ] && [ "$OLD" = "$NEW" ] && [ "$FORCE" = 0 ]; then title="Already up to date: WatTunnel $NEW"
+elif [ -n "$OLD" ]; then title="Updated WatTunnel $OLD -> $NEW"
+else title="WatTunnel $NEW is installed"; fi
+box "$title" \
   "${BOLD}wattun${RST}          $BIN" \
   "${BOLD}manager${RST}         $MGR" \
   "${BOLD}tunnels${RST}         $total configured, $running running" \
   "${BOLD}previous${RST}        ${prev:-none}${prev:+   (roll back from the manager)}"
-if [ "$running" -gt 0 ] && [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+if [ -n "$stale_names" ]; then
   echo
-  warn "Running tunnels still use $OLD:${running_names}"
-  hint "Restart them from wattun-manager when convenient (a restart drops open connections)."
+  warn "These tunnels are still running the OLD binary:${stale_names}"
+  hint "They switch to $NEW only after a restart (wattun-manager -> Settings -> restart all; open connections drop)."
 fi
 echo
 

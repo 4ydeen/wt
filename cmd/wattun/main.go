@@ -337,7 +337,7 @@ func main() {
 					"fec_sent": st.FecSent, "fec_recovered": st.FecRecovered, "retrans": st.Retrans, "send_errors": st.Dropped, "rate_bps": st.RateBps,
 						"ceiling_bps": st.CeilingBps, "loss_pct": st.LossPct,
 					"srtt_ms": float64(st.SRTT) / 1e6, "min_rtt_ms": float64(st.MinRTT) / 1e6,
-					"streams": st.Streams, "inflight": st.Inflight, "alive": alive(), "draining": srv != nil && srv.Draining(),
+					"streams": st.Streams, "inflight": st.Inflight, "alive": alive(), "version": wat.Version, "draining": srv != nil && srv.Draining(),
 					"sessions": func() int {
 						if srv != nil {
 							return srv.Sessions()

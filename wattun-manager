@@ -1439,6 +1439,28 @@ heal() { # restart Iran tunnels whose link is down 3 checks in a row
     fi
   done
 }
+# A running tunnel keeps executing the binary it was started with. Once update/rollback replaces the file,
+# /proc/PID/exe reads "... (deleted)": that tunnel still runs the OLD version until it is restarted.
+bin_ver() { "${1:-$BIN}" -version 2>/dev/null | awk '{print $2; exit}'; }
+is_stale() {
+  local pid
+  pid=$(systemctl show -p MainPID --value "wattun@$1" 2>/dev/null)
+  [ -n "$pid" ] && [ "$pid" != 0 ] && [[ "$(readlink "/proc/$pid/exe" 2>/dev/null)" == *"(deleted)"* ]]
+}
+stale_tunnels() { local n; for n in $(tunnels); do systemctl is-active -q "wattun@$n" 2>/dev/null && is_stale "$n" && printf '%s ' "$n"; done; }
+restart_stale() { # offer to restart tunnels that still run the old binary, then prove they switched
+  local st n bad=''
+  st=$(stale_tunnels)
+  [ -n "$st" ] || { ok "All running tunnels use wattun $(bin_ver)."; return 0; }
+  warn "Still running the OLD binary: ${BOLD}${st% }${RST}"
+  hint "They switch to $(bin_ver) only after a restart. A restart drops open connections for a few seconds."
+  confirm "Restart them now?" y || { hint "Later: open the tunnel and press [r], or Settings -> restart all."; return 0; }
+  for n in $st; do step "Restarting wattun@$n" systemctl restart "wattun@$n"; done
+  sleep 1
+  for n in $st; do is_stale "$n" && bad="$bad $n"; done
+  if [ -n "$bad" ]; then err "Still on the old binary:$bad (see: journalctl -u wattun@NAME)"; return 1; fi
+  ok "Tunnels now run wattun $(bin_ver)."
+}
 restart_all() {
   local n c=0
   for n in $(tunnels); do
@@ -1449,7 +1471,8 @@ restart_all() {
   [ "$c" -gt 0 ] || warn "No tunnels to restart."
 }
 update() { # [installer args...]
-  local url="https://raw.githubusercontent.com/$REPO/main/install.sh" tmp
+  local url="https://raw.githubusercontent.com/$REPO/main/install.sh" tmp before after mbefore
+  before=$(bin_ver); mbefore=$(cksum <"$MGR" 2>/dev/null)
   tmp=$(mktemp /tmp/wattun-install.XXXXXX)
   spin_start "Downloading the installer"
   curl -fsSL --max-time 60 --retry 2 -o "$tmp" "${WAT_PROXY:-}$url"; local rc=$?
@@ -1460,9 +1483,14 @@ update() { # [installer args...]
   ok "Installer downloaded"
   WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
   rm -f "$tmp"
-  [ "$rc" -eq 0 ] || { err "The installer reported an error."; return 1; }
+  [ "$rc" -eq 0 ] || { err "The installer reported an error. Nothing was changed: still wattun ${before:-?}."; return 1; }
+  after=$(bin_ver)
   echo
-  confirm "Restart tunnels on the new version now? (open connections drop)" n && restart_all
+  if [ -z "$after" ]; then err "$BIN does not run after the update. Roll back from the dashboard ([r])."; return 1
+  elif [ "$after" != "$before" ]; then ok "wattun updated: ${BOLD}${before:-none} -> $after${RST}"
+  else ok "wattun is already the latest release (${BOLD}$after${RST})."; fi
+  [ "$(cksum <"$MGR" 2>/dev/null)" != "$mbefore" ] && ok "Manager updated."
+  restart_stale
   return 0
 }
 rollback() {
@@ -1471,8 +1499,8 @@ rollback() {
   echo
   confirm "Roll back to the previous version?" n || return 0
   cp -f "$BIN" "$BIN.rb" && mv -f "$BIN.prev" "$BIN" && mv -f "$BIN.rb" "$BIN.prev"
-  ok "Rolled back."
-  confirm "Restart tunnels now?" n && restart_all
+  ok "Rolled back: wattun is now ${BOLD}$(bin_ver)${RST}."
+  restart_stale
   return 0
 }
 uninstall_all() {
@@ -1528,6 +1556,9 @@ main_menu() {
   while :; do
     page_full "Dashboard" "$([ -n "$VER" ] && echo "wattun $VER")"
     dash_table
+    local st; st=$(stale_tunnels)
+    [ -n "$st" ] && printf '\n  %s!%s %s%s%s still run the old binary. Open it and press %s[r]%s to use wattun %s.\n' \
+      "$YEL" "$RST" "$BOLD" "${st% }" "$RST" "$CYN" "$RST" "$VER"
     dash_actions
     while :; do
       printf '\r%s  %s▸%s %s%s%s' "$EL" "$CYN" "$RST" "$YEL" "$PMSG" "$RST"; PMSG=''
@@ -1543,7 +1574,7 @@ main_menu() {
         n|N) new_tunnel; break ;;
         m|M) if [ "${#DASH_N[@]}" -gt 0 ]; then run_flow live_monitor; fi; break ;;
         s|S) settings_menu; break ;;
-        u|U) page "Update"; echo; if update; then ok "Reloading the manager..."; sleep 1; exec "$MGR"; fi; pause; break ;;
+        u|U) page "Update"; echo; if update; then echo; hint "The manager reloads itself to show the new version."; pause; exec "$MGR"; fi; pause; break ;;
         r|R) page "Roll back"; echo; run_flow rollback; pause; break ;;
         x|X) page "Uninstall"; if run_flow uninstall_all; then exit 0; fi; pause; break ;;
         q|Q|esc) cur_show; echo; exit 0 ;;
