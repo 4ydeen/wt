@@ -448,39 +448,39 @@ func main() {
 			log.Printf("forwarding udp %s -> server :%d", addr, target)
 		}
 		if *cfgPath != "" { // config ports: public port N -> server port N, added and removed live
-			uls := newUDPListeners(func(p int) (*udpListener, error) {
+			uls := newUDPListeners(func(p, t int) (*udpListener, error) {
 				addr := net.JoinHostPort(*bind, strconv.Itoa(p+*offset))
-				l, err := dc.listen(addr, p)
+				l, err := dc.listen(addr, t)
 				if err == nil {
-					log.Printf("forwarding udp %s -> server :%d", addr, p)
+					log.Printf("forwarding udp %s -> server :%d", addr, t)
 				}
 				return l, err
 			})
-			ls := newListeners(func(p int) (net.Listener, error) {
+			ls := newListeners(func(p, t int) (net.Listener, error) {
 				addr := net.JoinHostPort(*bind, strconv.Itoa(p+*offset))
 				ln, err := net.Listen("tcp", addr)
 				if err == nil {
-					log.Printf("forwarding %s -> server :%d", addr, p)
+					log.Printf("forwarding %s -> server :%d", addr, t)
 					ps := portReg.get("c", p+*offset)
-					go acceptLoop(ln, func(c net.Conn) { forward(sess, c, p, ps) })
+					go acceptLoop(ln, func(c net.Conn) { forward(sess, c, t, ps) })
 				}
 				return ln, err
 			})
 			if cfgPorts {
-				if errs := ls.apply(fileCfg.tcpPorts()); len(errs) > 0 {
+				if errs := ls.apply(fileCfg.tcpMaps()); len(errs) > 0 {
 					log.Fatal(errs[0])
 				}
-				if errs := uls.apply(fileCfg.udpPorts()); len(errs) > 0 {
+				if errs := uls.apply(fileCfg.udpMaps()); len(errs) > 0 {
 					log.Fatal(errs[0])
 				}
 			}
 			w := &cfgWatcher{path: *cfgPath, known: known, skip: func(k string) bool { return explicit[k] }, interval: 3 * time.Second,
 				onLimits: func(c *fileConfig) { portReg.applyLimits(c.Limits) },
 				onPorts: func(c *fileConfig) {
-					for _, e := range ls.apply(c.tcpPorts()) {
+					for _, e := range ls.apply(c.tcpMaps()) {
 						log.Print(e)
 					}
-					for _, e := range uls.apply(c.udpPorts()) {
+					for _, e := range uls.apply(c.udpMaps()) {
 						log.Print(e)
 					}
 				}}
@@ -549,45 +549,66 @@ func forward(sess *wat.Session, c net.Conn, target int, ps *portStat) {
 // new connections only; connections already bridged keep running.
 type listeners struct {
 	mu     sync.Mutex
-	active map[int]net.Listener
-	open   func(port int) (net.Listener, error)
+	active map[portMap]net.Listener
+	open   func(listen, target int) (net.Listener, error)
 }
 
-func newListeners(open func(int) (net.Listener, error)) *listeners {
-	return &listeners{active: map[int]net.Listener{}, open: open}
+func newListeners(open func(listen, target int) (net.Listener, error)) *listeners {
+	return &listeners{active: map[portMap]net.Listener{}, open: open}
 }
 
-// apply makes the open ports equal to want; failures are returned and retried by the next apply.
-func (l *listeners) apply(want []int) []error {
+// apply makes the open listeners equal to want; a changed target for the same listen port is a close + reopen.
+// Failures are returned and retried by the next apply.
+func (l *listeners) apply(want []portMap) []error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	set := map[int]bool{}
-	var errs []error
-	for _, p := range want {
-		set[p] = true
-		if l.active[p] == nil {
-			ln, err := l.open(p)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("listen port %d: %v", p, err))
-				continue
-			}
-			l.active[p] = ln
+	set := map[portMap]bool{}
+	for _, m := range want {
+		set[m] = true
+	}
+	for m, ln := range l.active { // close first so a re-targeted listen port can be rebound
+		if !set[m] {
+			ln.Close()
+			delete(l.active, m)
+			log.Printf("stopped listening on port %d (-> %d)", m.Listen, m.Target)
 		}
 	}
-	for p, ln := range l.active {
-		if !set[p] {
-			ln.Close()
-			delete(l.active, p)
-			log.Printf("stopped listening on port %d", p)
+	var errs []error
+	for _, m := range want {
+		if l.active[m] == nil {
+			ln, err := l.open(m.Listen, m.Target)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("listen port %d: %v", m.Listen, err))
+				continue
+			}
+			l.active[m] = ln
 		}
 	}
 	return errs
 }
 
+// has reports whether listen port p is open.
 func (l *listeners) has(p int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.active[p] != nil
+	for m := range l.active {
+		if m.Listen == p {
+			return true
+		}
+	}
+	return false
+}
+
+// target returns the target of the open listener on listen port p (0 if none).
+func (l *listeners) target(p int) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for m := range l.active {
+		if m.Listen == p {
+			return m.Target
+		}
+	}
+	return 0
 }
 
 func serve(sess *wat.Session, lo, hi int, al *allow) {

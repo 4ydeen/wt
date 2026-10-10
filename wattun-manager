@@ -1,384 +1,1418 @@
 #!/usr/bin/env bash
 # wattun-manager: set up and run WatTunnel tunnels.
-#   Kharej = the outside server (runs the real service, the tunnel SERVER)
-#   Iran   = the inside server users connect to (the tunnel CLIENT)
+#   Kharej = the outside server (runs the real service, the tunnel SERVER)  -> set it up FIRST, it makes the token
+#   Iran   = the inside server users connect to (the tunnel CLIENT)          -> paste the token there
 # Each tunnel is /etc/wattun/NAME.yml + NAME.key (+ NAME.token on Kharej), run by systemd as wattun@NAME.
-# Commands: wattun-manager [kharej|iran|status|test NAME|speedtest NAME [MB]|logs NAME|token NAME|update|rollback|heal]
+# Run it without arguments for the dashboard. Commands:
+#   wattun-manager [new [kharej|iran]|kharej|iran|status|list|monitor|ports NAME|test NAME|
+#                   speedtest NAME [MB]|logs NAME|token NAME|heal|update|rollback|help]
+# Environment: WAT_NO_ANIM=1 (no animations), NO_COLOR=1 (no colours), WAT_REPO, WAT_PROXY.
 set -uo pipefail
+shopt -s extglob
 
-CONF=/etc/wattun
-BIN=/usr/local/bin/wattun
+CONF=${WAT_CONF:-/etc/wattun}
+BIN=${WAT_BIN:-/usr/local/bin/wattun}
+MGR=/usr/local/bin/wattun-manager
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
-RUN=/run/wattun
+RUN=${WAT_RUN:-/run/wattun}
 HEAL_UNIT=wattun-heal
+MCONF=$CONF/.manager.conf
+LIB=${WAT_MANAGER_LIB:-0}
 
-c()    { printf '\033[%sm%s\033[0m' "$1" "$2"; }
-say()  { echo -e "$*"; }
-ok()   { say "$(c 32 "✔ $*")"; }
-warn() { say "$(c 33 "! $*")"; }
-err()  { say "$(c 31 "✘ $*")"; }
-hdr()  { say "\n$(c '1;36' "── $* ──")"; }
-ask()  { local v; read -rp "$1${2:+ [$2]}: " v; echo "${v:-${2:-}}"; }
-pause() { read -rp "Press Enter to continue..." _; }
-yes_no() { local a; read -rp "$1 [y/N] " a; [[ "$a" =~ ^[Yy]$ ]]; }
-yes_def() { local a; read -rp "$1 [Y/n] " a; [[ ! "$a" =~ ^[Nn]$ ]]; }
+case "$(locale charmap 2>/dev/null)" in UTF-8) ;; *) export LC_ALL=C.UTF-8 ;; esac
 
-[ "$(id -u)" -eq 0 ] || { err "Run as root."; exit 1; }
-[ -x "$BIN" ] || { err "wattun is not installed. Run install.sh first."; exit 1; }
-mkdir -p "$CONF" "$RUN"; chmod 700 "$CONF"
+# ======================================================================================
+#  Terminal UI core: colours, cursor, animations, prompts
+# ======================================================================================
+IS_TTY=0; [ -t 1 ] && IS_TTY=1
+USE_COLOR=0
+if [ "${WAT_FORCE_COLOR:-0}" = 1 ] || { [ "$IS_TTY" = 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; }; then USE_COLOR=1; fi
+NCOL=8
+if [ "$USE_COLOR" = 1 ]; then
+  NCOL=$(tput colors 2>/dev/null || echo 8)
+  case "${TERM:-}" in *256color*) NCOL=256 ;; esac
+  case "$NCOL" in ''|*[!0-9]*) NCOL=8 ;; esac
+fi
+if [ "$USE_COLOR" = 1 ]; then
+  RST=$'\e[0m'; BOLD=$'\e[1m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'
+  CYN=$'\e[36m'; GRY=$'\e[90m'
+else
+  RST=''; BOLD=''; RED=''; GRN=''; YEL=''; CYN=''; GRY=''
+fi
 
-# ---------- pages: every screen starts with the WatsonTUN banner ----------
-ART=(
-  ' ▄▄▄  ▄▄▄  ▄▄▄                                    | ▄▄▄▄▄▄▄ ▄▄▄ ▄▄▄  ▄▄▄  ▄▄'
-  ' ███  ███  ███        ███                         | ▀▀███▀▀ ███ ███  ███  ██'
-  '  ██▄ ███ ███ ▄█████▄ ████ ▄█████▄ ▄█████▄ ███▄██▄|   ███   ███ ███  ████ ██'
-  '  ███ █ █ ███ ███ ███ ███  ███ ▀▀▀ ███ ███ ███ ███|   ███   ███ ███  ████▄██'
-  '  ███ █ █ ███ ▄▄█████ ███   ▀███▄▄ ███ ███ ███ ███|   ███   ███ ███  ██ ████'
-  '   ██▄█ █▄██  ███ ███ ███  ▄▄▄ ███ ███ ███ ███ ███|   ███   ███ ███  ██ ▀███'
-  '   ███   ███  ▀██▀███ ████ ▀█████▀ ▀█████▀ ███ ███|   ███   ▀▀████▀  ██  ███'
+conf_get() { local v; v=$(sed -n "s/^$1=//p" "$MCONF" 2>/dev/null | tail -1); echo "${v:-$2}"; }
+conf_set() {
+  mkdir -p "$CONF"; touch "$MCONF"; chmod 600 "$MCONF"
+  sed -i "/^$1=/d" "$MCONF"; echo "$1=$2" >>"$MCONF"
+}
+ANIM=0
+if [ "$IS_TTY" = 1 ] && [ "${WAT_NO_ANIM:-0}" != 1 ] && [ "$(conf_get anim 1)" = 1 ]; then ANIM=1; fi
+
+SPIN_PID=''
+LOGF=''
+LINK_RTT=''
+IN_FLOW=0
+INTRO_DONE=0
+KEY=''
+REPLY_V=''
+
+cur_hide() { [ "$IS_TTY" = 1 ] && printf '\e[?25l'; return 0; }
+cur_show() { [ "$IS_TTY" = 1 ] && printf '\e[?25h'; return 0; }
+kill_spin() {
+  if [ -n "$SPIN_PID" ]; then kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null; SPIN_PID=''; fi
+  return 0
+}
+cleanup() { kill_spin; cur_show; [ -n "$LOGF" ] && rm -f "$LOGF"; return 0; }
+on_int() { [ "$IN_FLOW" = 1 ] && return 0; cleanup; printf '\n'; exit 130; }
+eof_exit() { cleanup; echo; exit 0; }
+
+rep() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }
+VLEN=0
+vlen() { local s=${1//$'\e'\[*([0-9;?])[a-zA-Z]/}; VLEN=${#s}; }
+strip_ansi() { printf '%s' "${1//$'\e'\[*([0-9;?])[a-zA-Z]/}"; }
+
+# ---- plain messages ----
+say()  { printf '%b\n' "$*"; }
+ok()   { printf '  %s✔%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YEL" "$RST" "$*"; }
+err()  { printf '  %s✘%s %s\n' "$RED" "$RST" "$*"; }
+hint() { printf '  %s%s%s\n' "$GRY" "$*" "$RST"; }
+hr()   { printf '  %s%s%s\n' "$GRY" "$(rep ─ 74)" "$RST"; }
+key_label() { printf '%s[%s]%s' "$CYN" "$1" "$RST"; }
+
+# ---- gradient banner (cyan -> blue -> magenta), kite on the left ----
+GR_N=(51 45 39 33 63 99 135 171)
+GR_F=(36 36 36 34 34 35 35 35)
+GFG=''
+gfg() { # index -> GFG escape
+  GFG=''; [ "$USE_COLOR" = 1 ] || return 0
+  local i=$(( $1 % 8 ))
+  if [ "$NCOL" -ge 256 ]; then printf -v GFG '\e[1;38;5;%sm' "${GR_N[$i]}"; else printf -v GFG '\e[1;%sm' "${GR_F[$i]}"; fi
+}
+KITE=(
+  '       .'
+  '      /|\'
+  '     / | \'
+  '    <--+-->'
+  '     \ | /'
+  '      \|/'
+  '       `.'
+  '         `-.'
 )
-banner() {
-  [ -t 1 ] && printf '\033[H\033[2J\033[3J'
-  local l; echo
-  for l in "${ART[@]}"; do printf '\033[1;36m%s\033[1;33m%s\033[0m\n' "${l%%|*}" "${l#*|}"; done
+mapfile -t TXT <<'EOF'
+__        __    _  _____                       _
+\ \      / /_ _| ||_   _|   _ _ __  _ __   ___| |
+ \ \ /\ / / _` | __|| || | | | '_ \| '_ \ / _ \ |
+  \ V  V / (_| | |_ | || |_| | | | | | | |  __/ |
+   \_/\_/ \__,_|\__||_| \__,_|_| |_|_| |_|\___|_|
+EOF
+TAGLINE='encrypted port forwarding, even when only ping works'
+B_K=(); B_T=()
+banner_build() {
+  local i k
+  for i in 0 1 2 3 4 5 6 7; do
+    printf -v k '%-17s' "${KITE[$i]}"; B_K[i]=$k
+    if [ "$i" -ge 2 ] && [ "$i" -le 6 ]; then B_T[i]=${TXT[$((i-2))]}; elif [ "$i" -eq 7 ]; then B_T[i]=$TAGLINE; else B_T[i]=''; fi
+  done
 }
-page() { # title [subtitle]
-  banner
-  printf '\033[90m  %s\033[0m\n' "─────────────────────────────────────────────────────────────────────────"
-  printf '  \033[1;37m%s\033[0m%s\n\n' "$1" "${2:+   $(printf '\033[90m%s\033[0m' "$2")}"
+banner_build
+banner_plain() { local i; for i in 0 1 2 3 4 5 6 7; do printf '  %s%s\n' "${B_K[$i]}" "${B_T[$i]}"; done; }
+banner() { # [1 = animated reveal]
+  local i kc
+  for i in 0 1 2 3 4 5 6 7; do
+    kc=''
+    if [ "$USE_COLOR" = 1 ]; then
+      if [ "$NCOL" -ge 256 ]; then [ "$i" -le 5 ] && kc=$'\e[1;38;5;221m' || kc=$'\e[1;38;5;213m'
+      else [ "$i" -le 5 ] && kc=$'\e[1;33m' || kc=$'\e[1;35m'; fi
+    fi
+    gfg "$i"
+    if [ "$i" -eq 7 ]; then GFG=$GRY; fi
+    printf '  %s%s%s%s%s%s\n' "$kc" "${B_K[$i]}" "$RST" "$GFG" "${B_T[$i]}" "$RST"
+    [ "${1:-0}" = 1 ] && sleep 0.035
+  done
+  return 0
 }
 
-# ---------- helpers ----------
-tunnels() { ls "$CONF"/*.yml 2>/dev/null | xargs -rn1 basename | sed 's/\.yml$//'; }
+VER=''
+LOGO=''
+make_logo() {
+  local w=WatTunnel i
+  LOGO=''
+  for ((i=0; i<${#w}; i++)); do gfg $((i*8/${#w})); LOGO+="$GFG${w:i:1}"; done
+  LOGO+=$RST
+}
+make_logo
+
+EL=''; [ "$IS_TTY" = 1 ] && EL=$'\e[K'
+clear_screen() { [ "$IS_TTY" = 1 ] && printf '\e[H\e[2J\e[3J'; return 0; }
+page_full() { # title [subtitle] : big banner (dashboard, first screens)
+  clear_screen; echo
+  if [ "$ANIM" = 1 ] && [ "$INTRO_DONE" = 0 ]; then banner 1; else banner 0; fi
+  INTRO_DONE=1
+  hr
+  printf '  %s%s%s%s\n\n' "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
+}
+page() { # title [subtitle] : compact header with breadcrumb
+  clear_screen
+  printf '\n  %s◆%s %s%s%s %s›%s %s%s%s%s\n' "$CYN" "$RST" "$LOGO" "${VER:+ $GRY$VER$RST}" "" "$GRY" "$RST" "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
+  hr; echo
+}
+
+# ---- boxes ----
+BOXW=72
+box_top() { printf '  %s┌─ %s%s%s%s %s┐%s\n' "$GRY" "$RST" "$BOLD$1" "$RST" "$GRY" "$(rep ─ $((BOXW-${#1}-3)))" "$RST"; }
+box_row() { vlen "$1"; local pad=$((BOXW-2-VLEN)); [ "$pad" -lt 0 ] && pad=0; printf '  %s│%s %s%*s %s│%s\n' "$GRY" "$RST" "$1" "$pad" '' "$GRY" "$RST"; }
+box_bot() { printf '  %s└%s┘%s\n' "$GRY" "$(rep ─ "$BOXW")" "$RST"; }
+
+# ---- spinner / progress ----
+SPIN_FR=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+spin_start() { # label : animate a spinner on the current line until spin_stop (foreground work continues)
+  [ "$ANIM" = 1 ] || return 0
+  cur_hide
+  (
+    local i=0 t0=$SECONDS
+    while :; do
+      printf '\r\e[K  %s%s%s %s %s(%ds)%s' "$CYN" "${SPIN_FR[$i]}" "$RST" "$1" "$GRY" $((SECONDS-t0)) "$RST"
+      i=$(( (i+1) % 10 )); sleep 0.1
+    done
+  ) &
+  SPIN_PID=$!
+}
+spin_stop() { kill_spin; [ "$ANIM" = 1 ] && { printf '\r\e[K'; cur_show; }; return 0; }
+step() { # label cmd... : run silently under a spinner, print a done/failed line
+  local label=$1 rc; shift
+  [ -n "$LOGF" ] || LOGF=$(mktemp /tmp/wattun-manager.XXXXXX)
+  : >"$LOGF"
+  spin_start "$label"
+  "$@" >>"$LOGF" 2>&1; rc=$?
+  spin_stop
+  if [ "$rc" -eq 0 ]; then ok "$label"; else err "$label"; tail -n 3 "$LOGF" 2>/dev/null | sed "s/^/      $GRY/; s/\$/$RST/"; fi
+  return "$rc"
+}
+bar() { # cur max width -> [████░░░░]
+  local c=$1 m=$2 w=${3:-20} f
+  [ "$m" -gt 0 ] || m=1; [ "$c" -gt "$m" ] && c=$m
+  f=$(( c * w / m ))
+  printf '%s%s%s' "$(rep █ "$f")" "$GRY" "$(rep ░ $((w-f)))$RST"
+}
+
+celebrate() { # text : short success flourish
+  local t=$1 i col
+  if [ "$ANIM" != 1 ]; then ok "$t"; return 0; fi
+  cur_hide
+  for i in 0 1 2 3 4 5 6 7; do
+    gfg "$i"; col=$GFG
+    if [ $((i%2)) -eq 0 ]; then printf '\r\e[K  %s✦ ˚ %s ˚ ✧%s' "$col" "$t" "$RST"; else printf '\r\e[K  %s✧ · %s · ✦%s' "$col" "$t" "$RST"; fi
+    sleep 0.06
+  done
+  printf '\r\e[K'; cur_show; ok "$t"
+}
+
+# ---- input ----
+# shellcheck disable=SC2120
+key_read() { # [timeout] -> KEY ; rc 0 key, 2 timeout ; EOF exits
+  local rc; KEY=''
+  if [ -n "${1:-}" ]; then IFS= read -rsn1 -t "$1" KEY; rc=$?; else IFS= read -rsn1 KEY; rc=$?; fi
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -gt 128 ] && { KEY=''; return 2; }
+    eof_exit
+  fi
+  if [ "$KEY" = $'\e' ]; then IFS= read -rsn2 -t 0.02 _; KEY=esc; fi
+  [ -z "$KEY" ] && KEY=enter
+  return 0
+}
+ask() { # prompt [default] -> REPLY_V (free text). Enter keeps the default.
+  local d=${2:-} v
+  printf '  %s?%s %s%s %s›%s ' "$CYN" "$RST" "$1" "${d:+ ${GRY}[$d]${RST}}" "$GRY" "$RST"
+  IFS= read -r v || eof_exit
+  v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+  REPLY_V=${v:-$d}
+}
+ask_ok() { # prompt default validator : up to 3 tries, validator prints its own error
+  local t
+  for t in 1 2 3; do
+    ask "$1" "$2"
+    if "$3" "$REPLY_V"; then return 0; fi
+  done
+  err "Too many invalid answers, going back."; return 1
+}
+confirm() { # prompt [y|n default]
+  local def=${2:-y} t lab='Y/n'
+  [ "$def" = n ] && lab='y/N'
+  for t in 1 2 3; do
+    printf '  %s?%s %s %s[%s]%s ' "$CYN" "$RST" "$1" "$GRY" "$lab" "$RST"
+    key_read
+    case "$KEY" in
+      y|Y) echo yes; return 0 ;;
+      n|N) echo no; return 1 ;;
+      enter) echo; [ "$def" = y ]; return ;;
+      esc) echo; return 1 ;;
+    esac
+    echo
+  done
+  return 1
+}
+pause() { printf '\n  %sPress any key to go back...%s' "$GRY" "$RST"; key_read; echo; }
+PMSG=''
+flash() { PMSG=$*; } # shown after the next prompt caret
+
+run_flow() { # fn args... : run in a subshell; Ctrl+C cancels just this flow
+  local rc
+  IN_FLOW=1
+  ( trap 'kill_spin; cur_show; exit 130' INT; trap 'kill_spin; cur_show' EXIT; "$@" )
+  rc=$?
+  IN_FLOW=0
+  [ "$rc" -eq 130 ] && { echo; warn "Cancelled."; [ "$IS_TTY" = 1 ] && sleep 0.8; }
+  return "$rc"
+}
+
+# ======================================================================================
+#  Pure helpers: config, tokens, port specs
+# ======================================================================================
+tunnels() { local f b; for f in "$CONF"/*.yml; do [ -e "$f" ] || continue; b=${f##*/}; echo "${b%.yml}"; done; }
 cfg()     { sed -n "s/^$2:[[:space:]]*//p" "$CONF/$1.yml" 2>/dev/null | head -1 | tr -d "\"'"; }
 role()    { [ "$(cfg "$1" mode)" = server ] && echo Kharej || echo Iran; }
-cfg_ports() { sed -n '/^ports:/,/^[^ ]/s/^  - //p' "$CONF/$1.yml" | xargs; }
-stats()   { local m; m=$(cfg "$1" metrics); [ -n "$m" ] && curl -fs --max-time 2 "http://$m/stats"; }
+stats()   { local m; m=$(cfg "$1" metrics); [ -n "$m" ] && curl -fs --noproxy '*' --max-time 2 "http://$m/stats"; }
 ms()      { printf "%.1f" "${1:-0}"; }
 jget()    { grep -o "\"$2\": *[^,}]*" <<<"$1" | head -1 | sed 's/.*: *//; s/"//g'; }
 human()   { awk -v b="${1:-0}" 'BEGIN{s="B KB MB GB TB";split(s,u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}printf "%.1f %s",b,u[i]}'; }
-public_ip() { curl -fs4 --max-time 5 https://api.ipify.org 2>/dev/null || curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
-free_metrics_port() { local p=19700; while ss -ltn | grep -q ":$p " || grep -qs "127.0.0.1:$p" "$CONF"/*.yml; do p=$((p+1)); done; echo "$p"; }
-valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] && [ ! -e "$CONF/$1.yml" ]; }
-valid_ports() { local p; [ -n "$1" ] || return 1; for p in ${1//,/ }; do [[ "$p" =~ ^[0-9]{1,5}(/(tcp|udp))?$ ]] && [ "${p%%/*}" -ge 1 ] && [ "${p%%/*}" -le 65535 ] || return 1; done; }
-ports_yaml() { local p; echo "ports:"; for p in ${1//,/ }; do echo "  - $p"; done; }
+public_ip() { curl -fs4 --max-time 5 https://api.ipify.org 2>/dev/null || curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'; }
 new_key() { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40; }
-uptime_of() { local t; t=$(systemctl show "wattun@$1" -p ActiveEnterTimestamp --value); [ -n "$t" ] && echo "since $t" || echo "-"; }
-port_busy() { ss -Hltnu "( sport = :$1 )" 2>/dev/null | grep -q .; }
+uptime_of() { local t; t=$(systemctl show "wattun@$1" -p ActiveEnterTimestamp --value 2>/dev/null); [ -n "$t" ] && echo "since $t" || echo "-"; }
 
-# Connection token: wat1:BASE64("carrier|peer|key|path|sni|icmp-type")
-make_token() { printf 'wat1:%s' "$(printf '%s|%s|%s|%s|%s|%s' "$@" | base64 -w0)"; }
-read_token() { # token -> sets T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP
-  local raw; [[ "$1" == wat1:* ]] || return 1
+free_metrics_port() {
+  local p=19700
+  while [ "$p" -lt 20400 ] && { port_busy "$p" tcp || grep -qhE "^metrics:.*:$p\"?[[:space:]]*\$" "$CONF"/*.yml 2>/dev/null; }; do p=$((p+1)); done
+  echo "$p"
+}
+valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] && [ ! -e "$CONF/$1.yml" ]; }
+suggest_name() { # kharej|iran -> kharej, kharej-2, kharej-3 ...
+  local base=$1 n=1 c=$1
+  while [ -e "$CONF/$c.yml" ] && [ "$n" -lt 99 ]; do n=$((n+1)); c="$base-$n"; done
+  echo "$c"
+}
+
+# ---- port busy / ownership ----
+port_busy() { # port [tcp|udp|any] : is something listening on it on this server?
+  local pr=${2:-any} f fl=-Hltnu hex files=()
+  if command -v ss >/dev/null 2>&1; then
+    case "$pr" in tcp) fl=-Hltn ;; udp) fl=-Hlun ;; esac
+    ss "$fl" "( sport = :$1 )" 2>/dev/null | grep -q .; return
+  fi
+  printf -v hex '%04X' "$1"   # no ss on this system: read /proc/net directly
+  case "$pr" in tcp) files=(tcp tcp6) ;; udp) files=(udp udp6) ;; *) files=(tcp tcp6 udp udp6) ;; esac
+  for f in "${files[@]}"; do
+    awk -v h=":$hex" -v u="${f:0:3}" 'NR>1 && substr($2, length($2)-4) == h && (u=="udp" || $4=="0A") {found=1} END{exit !found}' "/proc/net/$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+port_user() { # port proto -> process name or empty
+  local f=-Hltnp; [ "${2:-tcp}" = udp ] && f=-Hlunp
+  ss "$f" "( sport = :$1 )" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -1 | cut -d'"' -f2
+}
+
+# ---- port specs. Canonical form: LISTEN:TARGET/proto (proto = tcp|udp) ----
+NS_OUT=(); NS_ERR=''
+norm_spec() { # "8443->443/udp" "443" "53/both" -> NS_OUT=(canonical...) ; rc 1 + NS_ERR on bad input
+  NS_OUT=(); NS_ERR=''
+  local s=$1 body proto=tcp L T
+  s=${s//->/:}; s=${s//→/:}; s=${s//=>/:}; s=${s//=/:}; s=${s//[[:space:]]/}
+  [ -n "$s" ] || { NS_ERR='empty entry'; return 1; }
+  body=$s
+  if [[ $s == */* ]]; then body=${s%%/*}; proto=${s#*/}; fi
+  proto=${proto,,}
+  case $proto in
+    tcp|udp|both) ;;
+    tcp+udp|udp+tcp|tcpudp|udptcp) proto=both ;;
+    *) NS_ERR="unknown protocol '$proto' (use tcp, udp or both)"; return 1 ;;
+  esac
+  if [[ $body == *:*:* ]]; then NS_ERR="'$1' has too many ':'"; return 1; fi
+  if [[ $body == *:* ]]; then L=${body%%:*}; T=${body##*:}; else L=$body; T=$body; fi
+  if ! [[ $L =~ ^[0-9]{1,5}$ && $T =~ ^[0-9]{1,5}$ ]]; then NS_ERR="'$1' is not a port"; return 1; fi
+  L=$((10#$L)); T=$((10#$T))
+  if [ "$L" -lt 1 ] || [ "$L" -gt 65535 ] || [ "$T" -lt 1 ] || [ "$T" -gt 65535 ]; then NS_ERR="'$1': ports must be 1-65535"; return 1; fi
+  case $proto in both) NS_OUT=("$L:$T/tcp" "$L:$T/udp") ;; *) NS_OUT=("$L:$T/$proto") ;; esac
+}
+spec_L() { local x=${1%%/*}; echo "${x%%:*}"; }
+spec_T() { local x=${1%%/*}; echo "${x##*:}"; }
+spec_P() { echo "${1##*/}"; }
+spec_yaml() { # canonical -> YAML list item text (L:T only when they differ)
+  local L T P out
+  L=$(spec_L "$1"); T=$(spec_T "$1"); P=$(spec_P "$1")
+  if [ "$L" = "$T" ]; then out=$L; else out="$L:$T"; fi
+  [ "$P" = udp ] && out="$out/udp"
+  echo "$out"
+}
+spec_human() { # canonical -> "443" / "8443→443" / "53/udp"
+  local L T P out
+  L=$(spec_L "$1"); T=$(spec_T "$1"); P=$(spec_P "$1")
+  if [ "$L" = "$T" ]; then out=$L; else out="$L→$T"; fi
+  [ "$P" = udp ] && out="$out/udp"
+  echo "$out"
+}
+maps_yaml_block() { # prints the ports: block for the array MAPS (nothing when empty)
+  local i
+  [ "${#MAPS[@]}" -gt 0 ] || return 0
+  echo "ports:"
+  for ((i=0; i<${#MAPS[@]}; i++)); do echo "  - $(spec_yaml "${MAPS[$i]}")"; done
+}
+maps_allow_str() { # MAPS -> "443,53/udp" (target ports only, as embedded in the token)
+  local i out='' t p
+  for ((i=0; i<${#MAPS[@]}; i++)); do
+    t=$(spec_T "${MAPS[$i]}"); p=$(spec_P "${MAPS[$i]}")
+    [ "$p" = udp ] && t="$t/udp"
+    case ",$out," in *",$t,"*) continue ;; esac
+    out="${out:+$out,}$t"
+  done
+  echo "$out"
+}
+allow_to_array() { # "443,53/udp" -> PE_ALLOW=(443:443/tcp 53:53/udp)
+  local it; PE_ALLOW=()
+  for it in ${1//,/ }; do norm_spec "$it" && PE_ALLOW+=("${NS_OUT[@]}"); done
+  return 0
+}
+allowed_has() { # target proto : 0 if allowed or the allow list is unknown/empty
+  local i
+  [ "${#PE_ALLOW[@]}" -gt 0 ] || return 0
+  for ((i=0; i<${#PE_ALLOW[@]}; i++)); do
+    [ "$(spec_T "${PE_ALLOW[$i]}")" = "$1" ] && [ "$(spec_P "${PE_ALLOW[$i]}")" = "$2" ] && return 0
+  done
+  return 1
+}
+yml_ports_raw() { # name -> one raw ports: item per line
+  sed -n '/^ports:/,/^[^ #\t-]/{/^[[:space:]]*-[[:space:]]/{s/^[[:space:]]*-[[:space:]]*//;s/[[:space:]]*#.*//;s/["'"'"']//g;p}}' "$CONF/$1.yml" 2>/dev/null
+}
+yml_maps() { # name -> canonical items, one per line
+  local it
+  while IFS= read -r it; do [ -n "$it" ] && norm_spec "$it" && printf '%s\n' "${NS_OUT[@]}"; done < <(yml_ports_raw "$1")
+}
+load_maps() { # name -> MAPS
+  MAPS=()
+  local it
+  while IFS= read -r it; do [ -n "$it" ] && MAPS+=("$it"); done < <(yml_maps "$1")
+}
+cfg_ports() { # legacy one-line list: "443 8443→443 53/udp"
+  local it out=''
+  while IFS= read -r it; do [ -n "$it" ] && out="$out $(spec_human "$it")"; done < <(yml_maps "$1")
+  echo "${out# }"
+}
+write_ports() { # name : replace the ports: block of NAME.yml with the array MAPS
+  local f="$CONF/$1.yml" tmp
+  tmp=$(mktemp "$CONF/.tmp.XXXXXX") || return 1
+  awk '
+    /^ports:/ {skip=1; next}
+    skip && /^[[:space:]]+(-|#)/ {next}
+    skip && /^[[:space:]]*$/ {next}
+    {skip=0; print}' "$f" >"$tmp"
+  maps_yaml_block >>"$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+}
+set_value() { # name key value : set or add a top-level key
+  local f="$CONF/$1.yml" tmp
+  tmp=$(mktemp "$CONF/.tmp.XXXXXX") || return 1
+  grep -v "^$2:" "$f" | awk -v k="$2" -v v="$3" '/^(metrics|ports):/ && !d {print k ": " v; d=1} {print} END{if(!d) print k ": " v}' >"$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+}
+unset_value() { sed -i "/^$2:/d" "$CONF/$1.yml"; }
+
+# Connection token: wat1:BASE64("carrier|peer|key|path|sni|icmp-type|allowed-ports")
+# Field 7 (allowed ports on Kharej, comma list, empty = any) was added in 1.9.0; 6-field tokens still parse.
+make_token() { printf 'wat1:%s' "$(printf '%s|%s|%s|%s|%s|%s|%s' "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" | base64 -w0)"; }
+T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''
+read_token() { # token -> T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS
+  local raw
+  T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''
+  [[ "$1" == wat1:* ]] || return 1
   raw=$(printf '%s' "${1#wat1:}" | base64 -d 2>/dev/null) || return 1
-  IFS='|' read -r T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP <<<"$raw"
+  IFS='|' read -r T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS <<<"$raw"
   [ -n "$T_CARRIER" ] && [ -n "$T_PEER" ] && [ -n "$T_KEY" ]
 }
+refresh_token() { # name : keep NAME.token in step with the allowed ports in NAME.yml
+  local f="$CONF/$1.token" allow
+  [ -f "$f" ] && read_token "$(cat "$f")" || return 0
+  load_maps "$1"; allow=$(maps_allow_str)
+  [ "$allow" = "$T_PORTS" ] && return 0
+  make_token "$T_CARRIER" "$T_PEER" "$T_KEY" "$T_PATH" "$T_SNI" "$T_ICMP" "$allow" >"$f"
+}
 
-pick_carrier() {
-  {
-    say "Carrier (how the two servers talk):"
-    say "  1) icmp  - only ping gets through (the usual case for filtered links)"
-    say "  2) udp   - UDP works; lowest latency"
-    say "  3) tcp   - plain TCP works"
-    say "  4) tls   - looks like HTTPS"
-    say "  5) wss   - WebSocket over TLS, works behind Cloudflare/CDN"
-    say "  6) ws    - WebSocket without TLS (CDN on port 80, or a proxy that does TLS)"
-    say "  7) grpc  - gRPC, for CDNs that allow it"
-    say "  8) h2    - HTTP/2"
-  } >&2
-  case "$(ask Choice 1)" in
-    1|icmp) echo icmp ;; 2|udp) echo udp ;; 3|tcp) echo tcp ;; 4|tls) echo tls ;;
-    5|wss) echo wss ;; 6|ws) echo ws ;; 7|grpc) echo grpc ;; 8|h2) echo h2 ;;
-    *) err "Unknown choice" >&2; return 1 ;;
+# ---- cross-tunnel conflict checks ----
+tunnel_using_public() { # port proto [exclude] -> name of another Iran tunnel publishing it
+  local n it
+  for n in $(tunnels); do
+    [ "$n" = "${3:-}" ] && continue
+    [ "$(role "$n")" = Iran ] || continue
+    while IFS= read -r it; do
+      [ -n "$it" ] && [ "$(spec_L "$it")" = "$1" ] && [ "$(spec_P "$it")" = "$2" ] && { echo "$n"; return 0; }
+    done < <(yml_maps "$n")
+  done
+  return 1
+}
+tunnel_using_listen() { # port [exclude] -> name of a Kharej tunnel listening on it
+  local n
+  for n in $(tunnels); do
+    [ "$n" = "${2:-}" ] && continue
+    [ "$(role "$n")" = Kharej ] || continue
+    [[ "$(cfg "$n" listen)" == *:"$1" ]] && { echo "$n"; return 0; }
+  done
+  return 1
+}
+listen_blocked() { # proto port
+  port_busy "$2" "$1" || tunnel_using_listen "$2" >/dev/null
+}
+default_listen() { # carrier -> a free listen port
+  local base proto=tcp c
+  case "$1" in ws|h2c) base=8080 ;; wss|tls|grpc|h2) base=443 ;; *) base=4443 ;; esac
+  [ "$1" = udp ] && proto=udp
+  for c in "$base" 8443 2053 2083 2087 2096 $((base+1)) $((base+2)) $((base+3)); do
+    listen_blocked "$proto" "$c" || { echo "$c"; return; }
+  done
+  echo "$base"
+}
+
+# ---- validators (print their own error, rc 1 when bad) ----
+v_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ] && return 0; err "Enter a port between 1 and 65535."; return 1; }
+v_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || { err "Use 1-32 letters, digits, - or _."; return 1; }
+  [ ! -e "$CONF/$1.yml" ] || { err "A tunnel named '$1' already exists."; return 1; }
+}
+v_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] && return 0; err "Enter an IP address or a domain name."; return 1; }
+v_icmp() { case "$1" in echo|timestamp|info|mask) return 0 ;; esac; err "Use echo, timestamp, info or mask."; return 1; }
+v_mbps() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && return 0; err "Enter a number of MB/s (1-9999)."; return 1; }
+v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
+v_fec() { case "$1" in off|auto) return 0 ;; esac; err "Use off or auto."; return 1; }
+v_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]*$ ]] && return 0; err "The path must start with / (example: /wat)."; return 1; }
+v_token() {
+  if read_token "$1"; then return 0; fi
+  err "That is not a valid token. It starts with wat1: and is one long line."; return 1
+}
+v_key() { [ "${#1}" -ge 8 ] && [[ "$1" =~ ^[^[:space:]]+$ ]] && return 0; err "The key is at least 8 characters, no spaces."; return 1; }
+v_nonempty() { [ -n "$1" ] && return 0; err "This value is required."; return 1; }
+
+# ======================================================================================
+#  Diagrams
+# ======================================================================================
+step_diagram() { # [1|2 highlight]
+  local hl=${1:-0} c1=$BOLD c2=$BOLD e=$RST
+  [ "$hl" = 2 ] && c1=$GRY; [ "$hl" = 1 ] && c2=$GRY
+  [ "$hl" = 1 ] && c1=$BOLD$CYN; [ "$hl" = 2 ] && c2=$BOLD$CYN
+  local top bot; top=$(rep ─ 27); bot=$top
+  printf '  %s┌%s┐%s          %s┌%s┐%s\n' "$c1" "$top" "$e" "$c2" "$top" "$e"
+  printf '  %s│ %-25s │%s %s─token─►%s %s│ %-25s │%s\n' "$c1" "STEP 1  Kharej (outside)" "$e" "$GRY" "$e" "$c2" "STEP 2  Iran (inside)" "$e"
+  printf '  %s│ %-25s │%s          %s│ %-25s │%s\n' "$c1" "do this one FIRST" "$e" "$c2" "paste the token here" "$e"
+  printf '  %s└%s┘%s          %s└%s┘%s\n' "$c1" "$bot" "$e" "$c2" "$bot" "$e"
+}
+conn_diagram() { # carrier canonical... : users ──► Iran :8443 ══ icmp ══► Kharej ──► 127.0.0.1:443
+  local cr=$1 it n=0 L T P sfx; shift
+  for it in "$@"; do
+    n=$((n+1)); [ "$n" -gt 4 ] && continue
+    L=$(spec_L "$it"); T=$(spec_T "$it"); P=$(spec_P "$it"); sfx=''; [ "$P" = udp ] && sfx=/udp
+    printf '  users %s──►%s Iran :%s%s %s══ %s ══►%s Kharej %s──►%s 127.0.0.1:%s%s\n' "$GRY" "$RST" "$L" "$sfx" "$CYN" "$cr" "$RST" "$GRY" "$RST" "$T" "$sfx"
+  done
+  [ "$n" -gt 4 ] && hint "  ... and $((n-4)) more"
+  return 0
+}
+
+# ======================================================================================
+#  Tunnel info
+# ======================================================================================
+TI_STATE=stopped; TI_RTT=0; TI_STREAMS=0; TI_SESS=0; TI_IN=0; TI_OUT=0; TI_RATE=0; TI_RAW=''
+tinfo() { # name -> TI_*  (state: up | down | stopped)
+  TI_STATE=stopped; TI_RTT=0; TI_STREAMS=0; TI_SESS=0; TI_IN=0; TI_OUT=0; TI_RATE=0; TI_RAW=''
+  systemctl is-active -q "wattun@$1" 2>/dev/null || return 0
+  TI_RAW=$(stats "$1")
+  if [ "$(jget "$TI_RAW" alive)" = true ]; then TI_STATE=up; else TI_STATE=down; fi
+  TI_RTT=$(jget "$TI_RAW" srtt_ms); TI_STREAMS=$(jget "$TI_RAW" streams); TI_SESS=$(jget "$TI_RAW" sessions)
+  TI_IN=$(jget "$TI_RAW" bytes_in); TI_OUT=$(jget "$TI_RAW" bytes_out); TI_RATE=$(jget "$TI_RAW" rate_bps)
+  : "${TI_RTT:=0}" "${TI_STREAMS:=0}" "${TI_SESS:=0}" "${TI_IN:=0}" "${TI_OUT:=0}" "${TI_RATE:=0}"
+}
+SC_COL=''; SC_TXT=''; SC_DOT='●'
+state_cell() { # role state
+  SC_DOT='●'
+  case "$2" in
+    up) SC_COL=$GRN; SC_TXT=CONNECTED ;;
+    down) if [ "$1" = Kharej ]; then SC_COL=$YEL; SC_TXT='WAITING'; else SC_COL=$RED; SC_TXT=DISCONNECTED; fi ;;
+    *) SC_COL=$GRY; SC_TXT=STOPPED; SC_DOT='○' ;;
   esac
 }
-
-start_unit() {
-  systemctl enable --now "wattun@$1" >/dev/null 2>&1
-  sleep 2
-  if systemctl is-active -q "wattun@$1"; then ok "Tunnel '$1' is running."
-  else err "Tunnel '$1' failed to start. Last log lines:"; journalctl -u "wattun@$1" -n 15 --no-pager -o cat; return 1; fi
+ports_summary() { # name [maxlen] -> "443 · 8443→443 · 53/udp"
+  local n=$1 max=${2:-50} out='' piece it cnt=0 total=0
+  while IFS= read -r it; do
+    [ -n "$it" ] || continue
+    total=$((total+1))
+    piece=$(spec_human "$it")
+    [ "$(role "$n")" = Kharej ] && { piece=$(spec_T "$it"); [ "$(spec_P "$it")" = udp ] && piece="$piece/udp"; }
+    if [ $(( ${#out} + ${#piece} + 5 )) -gt "$max" ]; then continue; fi
+    out="${out:+$out · }$piece"; cnt=$((cnt+1))
+  done < <(yml_maps "$n")
+  if [ "$total" -eq 0 ]; then [ "$(role "$n")" = Kharej ] && echo "any port" || echo "no ports yet"; return; fi
+  [ "$cnt" -lt "$total" ] && out="$out +$((total-cnt))"
+  echo "$out"
 }
 
-open_firewall() { # port proto
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    yes_def "ufw is active. Allow $1/$2?" && ufw allow "$1/$2" >/dev/null && ok "ufw: allowed $1/$2"
-  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-    yes_def "firewalld is active. Allow $1/$2?" && firewall-cmd -q --permanent --add-port="$1/$2" && firewall-cmd -q --reload && ok "firewalld: allowed $1/$2"
-  else
-    warn "Make sure $1/$2 is open in any firewall in front of this server (cloud panel, etc.)."
+# ---- dashboard ----
+DASH_N=()
+dash_row() { # idx name
+  local i=$1 n=$2 r cr load rtt tr pl
+  r=$(role "$n"); cr=$(cfg "$n" carrier)
+  tinfo "$n"; state_cell "$r" "$TI_STATE"
+  load=''; rtt=''
+  if [ "$TI_STATE" != stopped ]; then
+    if [ "$r" = Kharej ]; then load="$TI_SESS clients"; else load="$TI_STREAMS streams"; fi
+    [ "$TI_STATE" = up ] && rtt="$(printf '%.0f' "$TI_RTT") ms"
   fi
+  tr='-'; [ "$TI_STATE" != stopped ] && tr="↓$(human "$TI_IN") ↑$(human "$TI_OUT")"
+  [ "$r" = Kharej ] && pl="allows $(ports_summary "$n" 40)" || pl="ports $(ports_summary "$n" 42)"
+  printf ' %s%2s%s  %-13s %-6s %-6s %s%s%s %s%-12s%s %6s  %s\n' "$BOLD$CYN" "$i" "$RST" "${n:0:13}" "$r" "${cr:0:6}" \
+    "$SC_COL" "$SC_DOT" "$RST" "$SC_COL" "$SC_TXT" "$RST" "$rtt" "$load"
+  printf '     %s%s   %s%s\n' "$GRY" "$tr" "$pl" "$RST"
+}
+dash_table() {
+  local n i=0; DASH_N=()
+  for n in $(tunnels); do DASH_N+=("$n"); done
+  if [ "${#DASH_N[@]}" -eq 0 ]; then
+    printf '  %sWelcome! No tunnels yet. A tunnel needs two servers, set up in this order:%s\n\n' "$BOLD" "$RST"
+    step_diagram
+    printf '\n  %sStep 1%s  on Kharej: run %swattun-manager%s, press %s[n]%s, choose Kharej.\n' "$BOLD" "$RST" "$CYN" "$RST" "$CYN" "$RST"
+    printf '  %sStep 2%s  on Iran: press %s[n]%s, choose Iran, paste the token from step 1.\n\n' "$BOLD" "$RST" "$CYN" "$RST"
+    printf '  Press %s[n]%s to create your first tunnel.\n' "$CYN$BOLD" "$RST"
+    return 0
+  fi
+  printf ' %s%2s  %-13s %-6s %-6s   %-12s %6s  %s%s\n' "$GRY" '#' NAME ROLE CARRIER STATE RTT LOAD "$RST"
+  for n in "${DASH_N[@]}"; do i=$((i+1)); dash_row "$i" "$n"; done
+}
+dash_actions() {
+  echo
+  hr
+  printf '  %s  open tunnel   %s  new tunnel   %s  live monitor   %s  settings\n' "$(key_label 1-9)" "$(key_label n)" "$(key_label m)" "$(key_label s)"
+  printf '  %s  update        %s  roll back    %s  uninstall      %s  quit\n' "$(key_label u)" "$(key_label r)" "$(key_label x)" "$(key_label q)"
 }
 
-wait_link() { # name seconds
-  local i s
-  printf "Waiting for the link"
-  for ((i=0; i<$2; i++)); do
-    s=$(stats "$1"); if [ "$(jget "$s" alive)" = true ]; then echo; ok "CONNECTED (RTT $(ms "$(jget "$s" srtt_ms)") ms)"; return 0; fi
-    printf "."; sleep 1
+# ======================================================================================
+#  Firewall, service helpers
+# ======================================================================================
+fw_open() { # "443/tcp 53/udp" ...
+  local list=$* fw='' p
+  [ -n "$list" ] || return 0
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then fw=ufw
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then fw=firewalld; fi
+  if [ -z "$fw" ]; then
+    warn "No active ufw/firewalld found on this server."
+    hint "If a cloud firewall is in front, open: $list"; return 0
+  fi
+  confirm "$fw is active. Open $list?" y || { warn "Skipped. Open them yourself: $list"; return 0; }
+  for p in $list; do
+    if [ "$fw" = ufw ]; then ufw allow "$p" >/dev/null && ok "ufw: allowed $p"
+    else firewall-cmd -q --permanent --add-port="$p" && ok "firewalld: allowed $p"; fi
   done
-  echo; return 1
+  [ "$fw" = firewalld ] && firewall-cmd -q --reload
+  return 0
+}
+unit_up() { # name : enable + start, wait up to 10 s for "active"
+  local i
+  systemctl enable --now "wattun@$1" || return 1
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    systemctl is-active -q "wattun@$1" && { sleep 1; systemctl is-active -q "wattun@$1" && return 0; }
+    sleep 0.5
+  done
+  return 1
+}
+start_unit() { # name : with feedback
+  if step "Starting wattun@$1" unit_up "$1"; then return 0; fi
+  err "Tunnel '$1' failed to start. Last log lines:"; journalctl -u "wattun@$1" -n 15 --no-pager -o cat 2>/dev/null; return 1
+}
+link_alive() { [ "$(jget "$(stats "$1")" alive)" = true ]; }
+wait_link() { # name seconds : spinner + progress bar while waiting for the link
+  local n=$1 max=${2:-25} t0=$SECONDS el i=0 f
+  [ "$ANIM" = 1 ] && cur_hide || printf '  Waiting for the link (up to %ss)...\n' "$max"
+  while :; do
+    if link_alive "$n"; then
+      [ "$ANIM" = 1 ] && { printf '\r\e[K'; cur_show; }
+      LINK_RTT=$(ms "$(jget "$(stats "$n")" srtt_ms)"); return 0
+    fi
+    el=$((SECONDS-t0))
+    if [ "$el" -ge "$max" ] || ! systemctl is-active -q "wattun@$n" 2>/dev/null; then break; fi
+    if [ "$ANIM" = 1 ]; then
+      for f in 1 2 3 4; do
+        printf '\r\e[K  %s%s%s Waiting for the link  [%s]  %ds / %ds' "$CYN" "${SPIN_FR[$((i%10))]}" "$RST" "$(bar "$el" "$max" 20)" "$el" "$max"
+        i=$((i+1)); sleep 0.12
+      done
+    else sleep 1; fi
+  done
+  [ "$ANIM" = 1 ] && { printf '\r\e[K'; cur_show; }
+  return 1
 }
 
-# ---------- Kharej (server) ----------
-setup_kharej() {
-  page "Kharej setup" "outside server · tunnel server"
-  say "Run this on the server where your real service (VPN panel, web server...) listens."
-  local name cr listen="" ports key m addr path="" sni="" itype=""
-  name=$(ask "Tunnel name" kharej); valid_name "$name" || { err "Name is invalid or already used."; return; }
-  cr=$(pick_carrier) || return
-  if [ "$cr" != icmp ]; then
-    case "$cr" in ws) listen=$(ask "Listen port" 8080) ;; wss|tls|grpc|h2) listen=$(ask "Listen port" 443) ;; *) listen=$(ask "Listen port" 4443) ;; esac
-    [[ "$listen" =~ ^[0-9]+$ ]] || { err "Bad port."; return; }
-    port_busy "$listen" && { err "Port $listen is already in use on this server."; return; }
-    case "$cr" in ws|wss|grpc|h2) path=$(ask "URL path" /wat) ;; esac
-  else
-    itype=$(ask "ICMP type: echo, timestamp, info, mask (keep echo unless echo is blocked)" echo)
+# ======================================================================================
+#  Port mapping editor
+#    uses: MAPS (canonical items), PE_ROLE (Iran|Kharej), PE_TUNNEL (name or ''),
+#          PE_ALLOW (Kharej's allow list from the token, may be empty), PE_OWNED (ports this tunnel already owns)
+# ======================================================================================
+MAPS=(); PE_ROLE=Iran; PE_TUNNEL=''; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
+pe_owned_has() { local o; for o in ${PE_OWNED[@]+"${PE_OWNED[@]}"}; do [ "$o" = "$1" ] && return 0; done; return 1; }
+pe_msg() { PE_MSG+="$1"$'\n'; }
+pe_try_add() { # canonical [replace-index] : validate and add/replace ; rc 1 + message when rejected
+  local item=$1 idx=${2:--1} i L T P who u
+  L=$(spec_L "$item"); T=$(spec_T "$item"); P=$(spec_P "$item")
+  if [ "$PE_ROLE" = Kharej ] && [ "$L" != "$T" ]; then
+    pe_msg "${RED}✘${RST} $(spec_human "$item"): on Kharej list only the port your service uses (like 443 or 53/udp)."; return 1
   fi
-  say "Which local ports may Iran reach on this server? (e.g. 443,2053,53/udp)"
-  ports=$(ask "Allowed ports (empty = any)" "")
-  [ -z "$ports" ] || valid_ports "$ports" || { err "Bad port list."; return; }
-  addr=$(public_ip)
-  case "$cr" in wss|grpc|h2|tls)
-    say "Behind a CDN? Enter the domain Iran should connect to. Otherwise keep the IP."
-    addr=$(ask "Address Iran connects to" "$addr")
-    [[ "$addr" =~ ^[0-9.]+$ ]] || sni=$addr ;;
-  *) addr=$(ask "Public address of this server" "$addr") ;; esac
+  for ((i=0; i<${#MAPS[@]}; i++)); do
+    [ "$i" = "$idx" ] && continue
+    if [ "$PE_ROLE" = Iran ]; then
+      [ "$(spec_L "${MAPS[$i]}")" = "$L" ] && [ "$(spec_P "${MAPS[$i]}")" = "$P" ] && { pe_msg "${RED}✘${RST} Iran port $L/$P is already mapped (row $((i+1)))."; return 1; }
+    else
+      [ "$(spec_T "${MAPS[$i]}")" = "$T" ] && [ "$(spec_P "${MAPS[$i]}")" = "$P" ] && { pe_msg "${RED}✘${RST} Port $T/$P is already in the list (row $((i+1)))."; return 1; }
+    fi
+  done
+  if [ "$PE_ROLE" = Iran ]; then
+    if ! pe_owned_has "$L/$P" && port_busy "$L" "$P"; then
+      u=$(port_user "$L" "$P"); pe_msg "${RED}✘${RST} Port $L/$P is already in use on this server${u:+ by $u}. Pick another Iran port."; return 1
+    fi
+    who=$(tunnel_using_public "$L" "$P" "$PE_TUNNEL") && { pe_msg "${RED}✘${RST} Port $L/$P is already published by tunnel '$who'."; return 1; }
+    allowed_has "$T" "$P" || pe_msg "${YEL}!${RST} Kharej does not allow $T/$P. Add it to Kharej's ports or it will be refused."
+  else
+    if [ "$P" = tcp ] && ! timeout 1 bash -c "</dev/tcp/127.0.0.1/$T" 2>/dev/null; then
+      pe_msg "${YEL}!${RST} Nothing answers on 127.0.0.1:$T yet. Fine if you start your service later."
+    fi
+  fi
+  if [ "$idx" -ge 0 ]; then MAPS[idx]=$item; else MAPS+=("$item"); fi
+  return 0
+}
+pe_draw() {
+  local i it L T P mark warned=0 bad
+  page "Port mappings" "${PE_TUNNEL:-new tunnel} · $PE_ROLE"
+  if [ "$PE_ROLE" = Iran ]; then
+    printf '  %s%3s  %-19s      %-23s %s%s\n' "$GRY" '#' 'Iran port (users)' 'Kharej port (service)' proto "$RST"
+  else
+    printf '  %s%3s  %-31s %s%s\n' "$GRY" '#' 'Port on this server (service)' proto "$RST"
+  fi
+  if [ "${#MAPS[@]}" -eq 0 ]; then
+    printf '  %s  (empty)%s\n' "$GRY" "$RST"
+    [ "$PE_ROLE" = Kharej ] && printf '  %s  An empty list means Iran may reach ANY port on this server.%s\n' "$GRY" "$RST"
+  fi
+  for ((i=0; i<${#MAPS[@]}; i++)); do
+    it=${MAPS[$i]}; L=$(spec_L "$it"); T=$(spec_T "$it"); P=$(spec_P "$it"); mark=' '
+    if [ "$PE_ROLE" = Iran ]; then
+      allowed_has "$T" "$P" || { mark="${YEL}!${RST}"; warned=1; }
+      printf '  %s%3s%s  %-19s ──►  %-23s %-5s %s\n' "$BOLD$CYN" $((i+1)) "$RST" "$L" "$T" "$P" "$mark"
+    else
+      printf '  %s%3s%s  %-31s %s\n' "$BOLD$CYN" $((i+1)) "$RST" "$T" "$P"
+    fi
+  done
+  [ "$warned" = 1 ] && hint "  ! = this target is not in Kharej's allowed ports (from the token)"
+  if [ "$PE_ROLE" = Iran ] && [ "${#PE_ALLOW[@]}" -gt 0 ]; then
+    bad=''; for it in "${PE_ALLOW[@]}"; do bad="$bad $(spec_T "$it")/$(spec_P "$it")"; done
+    hint "  Kharej allows:${bad//\/tcp/}"
+  fi
+  echo
+  if [ -n "$PE_MSG" ]; then printf '%b' "${PE_MSG}" | sed 's/^/  /'; echo; PE_MSG=''; fi
+  if [ "$PE_ROLE" = Iran ]; then
+    hint "Type ports to add:  443, 8443:443, 53/udp, 5353->53/udp   (users:service)"
+  else
+    hint "Type ports to add:  443, 8443, 53/udp   (empty list = any port)"
+  fi
+  printf '  %s add  %s edit #  %s remove #  %s clear  %s done  %s cancel\n' "$(key_label a)" "$(key_label e)" "$(key_label r)" "$(key_label c)" "$(key_label Enter)" "$(key_label q)"
+}
+pe_bulk() {
+  local line=$1 tok toks=() before=${#MAPS[@]} it
+  read -ra toks <<<"${line//[,;]/ }"
+  for tok in "${toks[@]}"; do
+    if norm_spec "$tok"; then for it in "${NS_OUT[@]}"; do pe_try_add "$it"; done
+    else pe_msg "${RED}✘${RST} $NS_ERR"; fi
+  done
+  [ "${#MAPS[@]}" -gt "$before" ] && pe_msg "${GRN}✔${RST} Added $((${#MAPS[@]}-before))."
+  return 0
+}
+pe_guided_add() {
+  local l t p it
+  if [ "$PE_ROLE" = Iran ]; then
+    echo; ask_ok "Iran port (users connect here)" "" v_port || { pe_msg "Cancelled."; return; }; l=$((10#$REPLY_V))
+    ask_ok "Kharej port (where your service listens)" "$l" v_port || { pe_msg "Cancelled."; return; }; t=$((10#$REPLY_V))
+  else
+    echo; ask_ok "Port of your service on this server" "" v_port || { pe_msg "Cancelled."; return; }; t=$((10#$REPLY_V)); l=$t
+  fi
+  ask "Protocol: tcp, udp or both" tcp; p=${REPLY_V,,}
+  if norm_spec "$l:$t/$p"; then for it in "${NS_OUT[@]}"; do pe_try_add "$it"; done; else pe_msg "${RED}✘${RST} $NS_ERR"; fi
+}
+pe_pick_index() { # arg -> PE_IDX (0-based) ; asks when missing
+  local a=$1
+  if [ -z "$a" ]; then ask "Row number" ""; a=$REPLY_V; fi
+  if [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le "${#MAPS[@]}" ]; then PE_IDX=$((a-1)); return 0; fi
+  pe_msg "${RED}✘${RST} No such row '$a'."; return 1
+}
+PE_IDX=0
+pe_edit() {
+  local l t p it cur
+  pe_pick_index "$1" || return 0
+  cur=${MAPS[$PE_IDX]}; p=$(spec_P "$cur")
+  echo
+  if [ "$PE_ROLE" = Iran ]; then
+    ask_ok "Iran port" "$(spec_L "$cur")" v_port || return 0; l=$((10#$REPLY_V))
+    ask_ok "Kharej port" "$(spec_T "$cur")" v_port || return 0; t=$((10#$REPLY_V))
+  else
+    ask_ok "Port" "$(spec_T "$cur")" v_port || return 0; t=$((10#$REPLY_V)); l=$t
+  fi
+  ask "Protocol: tcp or udp" "$p"; p=${REPLY_V,,}
+  case $p in tcp|udp) ;; *) pe_msg "${RED}✘${RST} Protocol must be tcp or udp here (to get both, add a second row)."; return 0 ;; esac
+  norm_spec "$l:$t/$p" && { pe_try_add "${NS_OUT[0]}" "$PE_IDX" && pe_msg "${GRN}✔${RST} Row $((PE_IDX+1)) updated."; }
+  return 0
+}
+pe_remove() {
+  local a=$1 x out=() i keep drop=()
+  if [ -z "$a" ]; then ask "Row number(s) to remove (e.g. 2 or 1,3)" ""; a=$REPLY_V; fi
+  [ -n "$a" ] || return 0
+  for x in ${a//,/ }; do
+    if [[ "$x" =~ ^[0-9]+$ ]] && [ "$x" -ge 1 ] && [ "$x" -le "${#MAPS[@]}" ]; then drop+=("$x"); else pe_msg "${RED}✘${RST} No such row '$x'."; fi
+  done
+  [ "${#drop[@]}" -gt 0 ] || return 0
+  for ((i=0; i<${#MAPS[@]}; i++)); do
+    keep=1; for x in "${drop[@]}"; do [ "$x" = $((i+1)) ] && keep=0; done
+    [ "$keep" = 1 ] && out+=("${MAPS[$i]}")
+  done
+  MAPS=("${out[@]+"${out[@]}"}")
+  pe_msg "${GRN}✔${RST} Removed."
+}
+port_editor() { # rc 0 = done (MAPS ready), 1 = cancelled
+  local line cmd arg
+  while :; do
+    pe_draw
+    printf '  %s▸%s ' "$CYN" "$RST"
+    IFS= read -r line || eof_exit
+    line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+    cmd=${line%% *}; arg=''; [[ "$line" == *" "* ]] && arg=${line#* }
+    case "${cmd,,}" in
+      ''|d|done|ok)
+        if [ "$PE_ROLE" = Iran ] && [ "${#MAPS[@]}" -eq 0 ]; then pe_msg "${YEL}!${RST} Add at least one port first (example: 443)."; continue; fi
+        if [ "$PE_ROLE" = Kharej ] && [ "${#MAPS[@]}" -eq 0 ]; then
+          if ! confirm "The list is empty: Iran can reach ANY port on this server. Continue?" n; then continue; fi
+        fi
+        return 0 ;;
+      q|quit|cancel|esc|b|back) return 1 ;;
+      a|add) pe_guided_add ;;
+      e|edit) pe_edit "$arg" ;;
+      r|rm|remove|del|delete) pe_remove "$arg" ;;
+      c|clear) MAPS=(); pe_msg "Cleared." ;;
+      '?'|h|help) pe_msg "Examples: 443   8443:443   8443->443/udp   53/both   (several at once: 443, 8443:443, 53/udp)"; pe_msg "Iran port = what users connect to on this server. Kharej port = your service." ;;
+      *) if [[ "$line" == *[0-9]* ]]; then pe_bulk "$line"; else pe_msg "${YEL}!${RST} Not understood: '$line'. Type ports like 443 or 8443:443, or ? for help."; fi ;;
+    esac
+  done
+}
+
+# ======================================================================================
+#  Wizards
+# ======================================================================================
+CARRIER=''
+pick_carrier() {
+  local t
+  say "  ${BOLD}Carrier${RST}: how the two servers talk to each other"
+  say "    ${CYN}1${RST} icmp  only ping gets through (the usual case on filtered routes)"
+  say "    ${CYN}2${RST} udp   UDP works; lowest latency"
+  say "    ${CYN}3${RST} tcp   plain TCP works"
+  say "    ${CYN}4${RST} tls   looks like HTTPS"
+  say "    ${CYN}5${RST} wss   WebSocket over TLS; works behind Cloudflare or a CDN"
+  say "    ${CYN}6${RST} ws    WebSocket without TLS (CDN on port 80, or a proxy that does TLS)"
+  say "    ${CYN}7${RST} grpc  gRPC, for CDNs that allow it"
+  say "    ${CYN}8${RST} h2    HTTP/2"
+  for t in 1 2 3; do
+    printf '  %s?%s Press a number %s[1 = icmp]%s ' "$CYN" "$RST" "$GRY" "$RST"
+    key_read
+    case "$KEY" in
+      1|enter) CARRIER=icmp ;; 2) CARRIER=udp ;; 3) CARRIER=tcp ;; 4) CARRIER=tls ;;
+      5) CARRIER=wss ;; 6) CARRIER=ws ;; 7) CARRIER=grpc ;; 8) CARRIER=h2 ;;
+      esc|q) echo; return 1 ;;
+      *) echo; warn "Press a number from 1 to 8."; continue ;;
+    esac
+    echo "$CARRIER"; return 0
+  done
+  return 1
+}
+summary_line() { printf '    %s%-14s%s %s\n' "$GRY" "$1" "$RST" "$2"; }
+
+wizard_kharej() {
+  local name cr listen='' path='' sni='' itype='' mbps='' fec='' addr key m peer allow t
+  page "New tunnel" "STEP 1 · Kharej (outside server)"
+  step_diagram 1
+  echo
+  say "  Run this on the server where your ${BOLD}real service${RST} lives (Xray, a panel, a web site...)."
+  say "  It creates a ${BOLD}token${RST}; you paste that token on the Iran server next."
+  hint "Ctrl+C cancels at any time."
+  echo
+  name=$(suggest_name kharej)
+  pick_carrier || return 1
+  cr=$CARRIER
+  [ "$cr" != icmp ] && listen=$(default_listen "$cr")
+  case "$cr" in ws|wss|grpc|h2|h2c) path=/wat ;; esac
+
+  # allowed ports
+  MAPS=(); PE_ROLE=Kharej; PE_TUNNEL=$name; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
+  port_editor || { warn "Cancelled."; return 1; }
+  allow=$(maps_allow_str)
+
+  # address Iran connects to
+  page "New tunnel" "STEP 1 · Kharej (outside server)"
+  spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop
+  case "$cr" in
+    wss|grpc|h2|tls) hint "Behind a CDN? Enter the domain Iran should connect to. Otherwise keep the IP." ;;
+  esac
+  ask_ok "Address Iran connects to" "$addr" v_host || return 1
+  addr=$REPLY_V
+  case "$cr" in wss|grpc|h2|tls) [[ "$addr" =~ ^[0-9.]+$ ]] || sni=$addr ;; esac
+
+  # advanced
+  echo
+  hint "Defaults: name $name${listen:+, listen port $listen}${path:+, path $path}, no speed limit, FEC off."
+  if confirm "Advanced options (name, ICMP type, port, path, limits, FEC)?" n; then
+    ask_ok "Tunnel name" "$name" v_name && name=$REPLY_V || return 1
+    if [ "$cr" = icmp ]; then
+      hint "Keep echo unless ping echo is blocked on your route."
+      ask_ok "ICMP type (echo, timestamp, info, mask)" echo v_icmp || return 1; itype=$REPLY_V
+    else
+      while :; do
+        ask_ok "Listen port" "$listen" v_port || return 1
+        if listen_blocked "$([ "$cr" = udp ] && echo udp || echo tcp)" "$REPLY_V"; then err "Port $REPLY_V is already used (by this server or another tunnel)."; else listen=$((10#$REPLY_V)); break; fi
+        t=$((${t:-0}+1)); [ "$t" -ge 3 ] && { err "Too many tries, going back."; return 1; }
+      done
+    fi
+    case "$cr" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "$path" v_path || return 1; path=$REPLY_V ;; esac
+    case "$cr" in wss|tls|grpc|h2) ask "Domain / SNI sent by Iran (empty = none)" "$sni"; sni=$REPLY_V ;; esac
+    ask_ok "Speed ceiling in MB/s (empty = default 16)" "" v_mbps || return 1; mbps=$REPLY_V
+    ask_ok "FEC: off or auto (auto needs auto on both ends)" off v_fec || return 1; fec=$REPLY_V
+  fi
+  valid_name "$name" || { err "The name '$name' is not available."; return 1; }
+
+  # summary
+  page "New tunnel" "review"
+  say "  ${BOLD}Ready to create${RST}"
+  summary_line "Name" "$name  (Kharej, tunnel server)"
+  summary_line "Carrier" "$cr${itype:+ ($itype)}${listen:+ on port $listen}${path:+ path $path}"
+  summary_line "Address" "$addr"
+  summary_line "Allowed ports" "${allow:-any}"
+  [ -n "$mbps" ] && summary_line "Speed limit" "$mbps MB/s"
+  [ "$fec" = auto ] && summary_line "FEC" auto
+  echo
+  confirm "Create this tunnel?" y || { warn "Nothing was created."; return 1; }
+  echo
+
   key=$(new_key); m=$(free_metrics_port)
-  umask 077
-  printf '%s\n' "$key" > "$CONF/$name.key"
-  {
-    echo "# WatTunnel - Kharej (server). Created by wattun-manager."
-    echo "mode: server"
-    echo "key-file: $CONF/$name.key"
-    echo "carrier: $cr"
-    [ -n "$listen" ] && echo "listen: \":$listen\""
-    [ -n "$path" ] && echo "path: $path"
-    [ -n "$itype" ] && [ "$itype" != echo ] && echo "icmp-type: $itype"
-    echo "metrics: 127.0.0.1:$m"
-    [ -n "$ports" ] && ports_yaml "$ports"
-  } > "$CONF/$name.yml"
-  local peer=$addr; [ -n "$listen" ] && peer="$addr:$listen"
-  make_token "$cr" "$peer" "$key" "$path" "$sni" "$itype" > "$CONF/$name.token"
-  start_unit "$name" || return
-  [ -n "$listen" ] && { [ "$cr" = udp ] && open_firewall "$listen" udp || open_firewall "$listen" tcp; }
-  say "\n$(c 1 'Connection token') - paste it on the Iran server (wattun-manager → Iran setup):\n"
-  say "$(c '1;33' "$(cat "$CONF/$name.token")")\n"
-  say "Show it again any time: $(c 1 "wattun-manager token $name")"
+  peer=$addr; [ -n "$listen" ] && peer="$addr:$listen"
+  write_server() {
+    local old; old=$(umask); umask 077
+    printf '%s\n' "$key" >"$CONF/$name.key" || return 1
+    {
+      echo "# WatTunnel - Kharej (server). Created by wattun-manager."
+      echo "mode: server"
+      echo "key-file: $CONF/$name.key"
+      echo "carrier: $cr"
+      [ -n "$listen" ] && echo "listen: \":$listen\""
+      [ -n "$path" ] && echo "path: $path"
+      [ -n "$itype" ] && [ "$itype" != echo ] && echo "icmp-type: $itype"
+      [ -n "$mbps" ] && echo "max-mbps: $mbps"
+      [ "$fec" = auto ] && echo "fec: auto"
+      echo "metrics: 127.0.0.1:$m"
+      maps_yaml_block
+    } >"$CONF/$name.yml"
+    make_token "$cr" "$peer" "$key" "$path" "$sni" "$itype" "$allow" >"$CONF/$name.token"
+    umask "$old"
+  }
+  mkdir -p "$CONF"; chmod 700 "$CONF"
+  step "Writing key, config and token" write_server || return 1
+  start_unit "$name" || return 1
+  [ -n "$listen" ] && fw_open "$listen/$([ "$cr" = udp ] && echo udp || echo tcp)"
+  [ "$cr" = icmp ] && hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."
+
+  echo
+  celebrate "Kharej tunnel '$name' is ready"
+  echo
+  say "  ${BOLD}Your connection token${RST} (copy the whole line):"
+  echo
+  printf '%s%s%s\n\n' "$BOLD$YEL" "$(cat "$CONF/$name.token")" "$RST"
+  step_diagram 2
+  echo
+  say "  ${BOLD}Now, STEP 2${RST}: on the ${BOLD}Iran${RST} server run ${CYN}wattun-manager${RST}, press ${CYN}[n]${RST},"
+  say "  choose Iran and paste the token."
+  hint "Show it again any time: wattun-manager token $name"
   warn "The token contains the key. Share it only over a private channel."
 }
 
-# ---------- Iran (client) ----------
-setup_iran() {
-  page "Iran setup" "inside server · tunnel client"
-  say "Users will connect to this server. Set up Kharej first and copy its token."
-  local name tok ports m p bad=""
-  name=$(ask "Tunnel name" iran); valid_name "$name" || { err "Name is invalid or already used."; return; }
-  tok=$(ask "Paste the connection token (or leave empty to enter details by hand)" "")
-  if [ -n "$tok" ]; then
-    read_token "$tok" || { err "Invalid token."; return; }
-  else
-    T_CARRIER=$(pick_carrier) || return
-    T_PEER=$(ask "Kharej address (IP or domain)" "")
-    [ "$T_CARRIER" != icmp ] && T_PEER="$T_PEER:$(ask "Kharej port" 4443)"
-    T_KEY=$(ask "Key" ""); T_PATH=""; T_SNI=""; T_ICMP=""
-    case "$T_CARRIER" in ws|wss|grpc|h2) T_PATH=$(ask "URL path" /wat) ;; esac
-    [ -n "$T_PEER" ] && [ -n "$T_KEY" ] || { err "Address and key are required."; return; }
+wizard_iran() {
+  local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0
+  page "New tunnel" "STEP 2 · Iran (inside server)"
+  step_diagram 2
+  echo
+  say "  This is the server your ${BOLD}users connect to${RST}. It needs the token made on Kharej."
+  echo
+  name=$(suggest_name iran)
+  T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''
+  confirm "Do you have the token from the Kharej server?" y && have=y || have=n
+  if [ "$have" = n ]; then
+    echo
+    say "  ${BOLD}Get the token first${RST}"
+    say "    1. Log in to the ${BOLD}Kharej${RST} (outside) server"
+    say "    2. Run  ${CYN}wattun-manager${RST}  then press ${CYN}[n]${RST} and choose ${BOLD}Kharej${RST}"
+    say "    3. Copy the token it prints (one long line starting with ${BOLD}wat1:${RST})"
+    echo
+    printf '  %s[Enter]%s I have it now   %s[m]%s enter the details by hand (advanced)   %s[q]%s go back\n  ' "$CYN" "$RST" "$CYN" "$RST" "$CYN" "$RST"
+    key_read; echo
+    case "$KEY" in m|M) manual=1 ;; enter) ;; *) return 1 ;; esac
   fi
-  say "Carrier: $(c 1 "$T_CARRIER")   Kharej: $(c 1 "$T_PEER")"
-  say "Which ports should users connect to on this server? Each one is sent to the same port on Kharej."
-  ports=$(ask "Ports (e.g. 443,2053,53/udp)" "")
-  valid_ports "$ports" || { err "Bad port list."; return; }
-  for p in ${ports//,/ }; do port_busy "${p%%/*}" && bad="$bad ${p%%/*}"; done
-  [ -n "$bad" ] && { err "Already in use on this server:$bad. Free them or pick others."; return; }
+  if [ "$manual" = 0 ]; then
+    echo
+    ask_ok "Paste the connection token" "" v_token || return 1
+    tok=$REPLY_V; read_token "$tok"
+    echo
+    ok "Token accepted"
+    summary_line "Carrier" "$T_CARRIER${T_ICMP:+ ($T_ICMP)}"
+    summary_line "Kharej" "$T_PEER"
+    summary_line "Kharej allows" "${T_PORTS:-any port}"
+  else
+    echo
+    pick_carrier || return 1; T_CARRIER=$CARRIER
+    ask_ok "Kharej address (IP or domain)" "" v_host || return 1; T_PEER=$REPLY_V
+    if [ "$T_CARRIER" != icmp ]; then
+      ask_ok "Kharej listen port" "$(default_listen "$T_CARRIER")" v_port || return 1; T_PEER="$T_PEER:$((10#$REPLY_V))"
+    fi
+    ask_ok "Key (the same as on Kharej)" "" v_key || return 1; T_KEY=$REPLY_V
+    case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" /wat v_path || return 1; T_PATH=$REPLY_V ;; esac
+    case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" ""; T_SNI=$REPLY_V ;; esac
+    [ "$T_CARRIER" = icmp ] && { ask_ok "ICMP type (must match Kharej)" echo v_icmp || return 1; T_ICMP=$REPLY_V; }
+  fi
+  sleep 0.4
+
+  # port mappings
+  MAPS=(); PE_ROLE=Iran; PE_TUNNEL=$name; PE_OWNED=()
+  allow_to_array "$T_PORTS"
+  if [ "${#PE_ALLOW[@]}" -gt 0 ]; then
+    for it in "${PE_ALLOW[@]}"; do MAPS+=("$(spec_T "$it"):$(spec_T "$it")/$(spec_P "$it")"); done
+    PE_MSG="${GRN}✔${RST} Pre-filled from the token: every port Kharej allows is published on the same port here."$'\n'
+    PE_MSG+="  Edit a row to publish it on another Iran port (e.g. users on 8443, service on 443)."$'\n'
+  fi
+  port_editor || { warn "Cancelled."; return 1; }
+
+  # advanced
+  echo
+  hint "Defaults: name $name, listen on all addresses, no speed limit, FEC off."
+  if confirm "Advanced options (name, bind, speed limit, FEC, ICMP, SNI)?" n; then
+    ask_ok "Tunnel name" "$name" v_name && name=$REPLY_V || return 1
+    ask_ok "Bind address for the public ports" 0.0.0.0 v_bind || return 1; bind=$REPLY_V
+    ask_ok "Speed ceiling in MB/s (empty = default 16)" "" v_mbps || return 1; mbps=$REPLY_V
+    ask_ok "FEC: off or auto (auto needs auto on both ends)" off v_fec || return 1; fec=$REPLY_V
+    if [ "$T_CARRIER" = icmp ]; then ask_ok "ICMP type (must match Kharej)" "${T_ICMP:-echo}" v_icmp || return 1; T_ICMP=$REPLY_V; fi
+    case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
+    case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "${T_PATH:-/wat}" v_path || return 1; T_PATH=$REPLY_V ;; esac
+  fi
+  valid_name "$name" || { err "The name '$name' is not available."; return 1; }
+
+  # summary
+  page "New tunnel" "review"
+  say "  ${BOLD}Ready to create${RST}"
+  summary_line "Name" "$name  (Iran, tunnel client)"
+  summary_line "Carrier" "$T_CARRIER${T_ICMP:+ ($T_ICMP)}"
+  summary_line "Kharej" "$T_PEER"
+  allow_note=''; for ((i=0; i<${#MAPS[@]}; i++)); do allow_note="$allow_note $(spec_human "${MAPS[$i]}")"; done
+  summary_line "Publishes" "${allow_note# }"
+  [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && summary_line "Bind" "$bind"
+  [ -n "$mbps" ] && summary_line "Speed limit" "$mbps MB/s"
+  [ "$fec" = auto ] && summary_line "FEC" auto
+  echo
+  confirm "Create this tunnel?" y || { warn "Nothing was created."; return 1; }
+  echo
+
   m=$(free_metrics_port)
-  umask 077
-  printf '%s\n' "$T_KEY" > "$CONF/$name.key"
-  {
-    echo "# WatTunnel - Iran (client). Created by wattun-manager."
-    echo "mode: client"
-    echo "key-file: $CONF/$name.key"
-    echo "carrier: $T_CARRIER"
-    echo "peer: $T_PEER"
-    [ -n "$T_PATH" ] && echo "path: $T_PATH"
-    [ -n "$T_SNI" ] && { echo "sni: $T_SNI"; echo "host: $T_SNI"; }
-    [ -n "$T_ICMP" ] && [ "$T_ICMP" != echo ] && echo "icmp-type: $T_ICMP"
-    echo "metrics: 127.0.0.1:$m"
-    ports_yaml "$ports"
-  } > "$CONF/$name.yml"
-  start_unit "$name" || return
-  if wait_link "$name" 20; then
-    ok "Users can now connect to this server on: $ports"
+  write_client() {
+    local old; old=$(umask); umask 077
+    printf '%s\n' "$T_KEY" >"$CONF/$name.key" || return 1
+    {
+      echo "# WatTunnel - Iran (client). Created by wattun-manager."
+      echo "mode: client"
+      echo "key-file: $CONF/$name.key"
+      echo "carrier: $T_CARRIER"
+      echo "peer: $T_PEER"
+      [ -n "$T_PATH" ] && echo "path: $T_PATH"
+      [ -n "$T_SNI" ] && { echo "sni: $T_SNI"; echo "host: $T_SNI"; }
+      [ -n "$T_ICMP" ] && [ "$T_ICMP" != echo ] && echo "icmp-type: $T_ICMP"
+      [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && echo "bind: $bind"
+      [ -n "$mbps" ] && echo "max-mbps: $mbps"
+      [ "$fec" = auto ] && echo "fec: auto"
+      echo "metrics: 127.0.0.1:$m"
+      maps_yaml_block
+    } >"$CONF/$name.yml"
+    umask "$old"
+  }
+  mkdir -p "$CONF"; chmod 700 "$CONF"
+  step "Writing key and config" write_client || return 1
+  start_unit "$name" || return 1
+  for ((i=0; i<${#MAPS[@]}; i++)); do new_pub+=("$(spec_L "${MAPS[$i]}")/$(spec_P "${MAPS[$i]}")"); done
+  echo
+  if wait_link "$name" 25; then
+    celebrate "CONNECTED (RTT ${LINK_RTT} ms)"
+    echo
+    say "  ${BOLD}Users can now connect to this server${RST}:"
+    conn_diagram "$T_CARRIER" "${MAPS[@]}"
   else
-    err "Not connected yet. Running a diagnosis..."; test_tunnel "$name"
+    err "Not connected yet. Running a diagnosis..."
+    test_tunnel "$name"
   fi
-  if ! systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && yes_def "Enable auto-heal (restart the tunnel if the link stays down for 3 minutes)?"; then heal_enable; fi
+  echo
+  fw_open "${new_pub[*]}"
+  if ! systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && confirm "Enable auto-heal (restart if the link is down for 3 min)?" y; then heal_enable; fi
+  echo
+  hint "Manage this tunnel any time: wattun-manager"
 }
 
-# ---------- status ----------
-status_row() {
-  local n=$1 st s link rtt rate tr sess
-  st=$(systemctl is-active "wattun@$n" 2>/dev/null); s=""
-  [ "$st" = active ] && s=$(stats "$n")
-  if [ "$st" != active ]; then link=$(c 90 "STOPPED     ")
-  elif [ "$(jget "$s" alive)" = true ]; then link=$(c 32 "CONNECTED   ")
-  else link=$(c 31 "DISCONNECTED"); fi
-  rtt=$(jget "$s" srtt_ms); rate=$(jget "$s" rate_bps); sess=$(jget "$s" sessions)
-  tr="↓$(human "$(jget "$s" bytes_in)") ↑$(human "$(jget "$s" bytes_out)")"
-  printf "  %-12s %-6s %-5s %b  rtt %-6s streams %-4s %s%s\n" "$n" "$(role "$n")" "$(cfg "$n" carrier)" "$link" \
-    "${rtt%%.*}ms" "$(jget "$s" streams)" "$tr" "$([ "$(role "$n")" = Kharej ] && echo "  clients ${sess:-0}")"
-}
-status_all() {
-  local t; t=$(tunnels)
-  [ -n "$t" ] || { warn "No tunnels yet. Start with Kharej setup on the outside server."; return 1; }
-  for n in $t; do status_row "$n"; done
-}
-live_monitor() {
-  while true; do
-    page "Live status" "$(date '+%H:%M:%S') · refreshes every 2 s · any key to go back"; status_all
-    read -rsn1 -t 2 && break
-  done
-}
-details() {
-  local n=$1 s; s=$(stats "$n")
-  say "  Service:   $(systemctl is-active "wattun@$n") ($(uptime_of "$n"))"
-  say "  Carrier:   $(cfg "$n" carrier)    Peer/listen: $(cfg "$n" peer)$(cfg "$n" listen)"
-  local pl; pl=$(cfg_ports "$n"); [ -z "$pl" ] && [ "$(role "$n")" = Kharej ] && pl="any (no allow list)"
-  say "  Ports:     ${pl:--}"
-  [ -z "$s" ] && { warn "No live stats (not running)."; return; }
-  say "  Link:      $([ "$(jget "$s" alive)" = true ] && c 32 CONNECTED || c 31 DISCONNECTED)"
-  say "  RTT:       $(ms "$(jget "$s" srtt_ms)") ms (min $(ms "$(jget "$s" min_rtt_ms)") ms)"
-  say "  Rate:      $(human "$(jget "$s" rate_bps)")/s   loss $(jget "$s" loss_pct)%   retrans $(jget "$s" retrans)"
-  say "  Streams:   $(jget "$s" streams)   clients: $(jget "$s" sessions)   UDP flows: $(jget "$s" dgram_flows)"
-  say "  Traffic:   in $(human "$(jget "$s" bytes_in)")   out $(human "$(jget "$s" bytes_out)")"
+new_tunnel() { # [kharej|iran]
+  local pick=${1:-}
+  if [ -z "$pick" ]; then
+    page "New tunnel" "which server is this?"
+    step_diagram
+    echo
+    say "  A tunnel needs ${BOLD}two${RST} servers, set up in this order:"
+    say "    ${CYN}1${RST}  ${BOLD}Kharej${RST}  outside server, where your service runs  ${YEL}<- do this FIRST${RST}"
+    say "    ${CYN}2${RST}  ${BOLD}Iran${RST}    inside server that users connect to      (needs the token from 1)"
+    echo
+    printf '  %s?%s Which one is THIS server? %s[1/2, b = back]%s ' "$CYN" "$RST" "$GRY" "$RST"
+    key_read; echo
+    case "$KEY" in 1|k|K) pick=kharej ;; 2|i|I) pick=iran ;; *) return 0 ;; esac
+  fi
+  local rc=0
+  case "$pick" in
+    kharej) run_flow wizard_kharej; rc=$? ;;
+    iran) run_flow wizard_iran; rc=$? ;;
+    *) err "Unknown role '$pick' (use kharej or iran)."; return 1 ;;
+  esac
+  [ "$rc" -eq 130 ] || pause
+  return 0
 }
 
-# ---------- diagnosis ----------
+# ======================================================================================
+#  Diagnosis, speed test, logs
+# ======================================================================================
 test_tunnel() {
-  local n=$1 cr peer host port s p
-  cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer)
+  local n=$1 cr peer host port s p r it e
+  cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer); r=$(role "$n")
+  echo
+  say "  ${BOLD}Diagnosing '$n'${RST} ($r · $cr)"
+  echo
   if systemctl is-active -q "wattun@$n"; then ok "Service is running"
-  else err "Service is not running"; journalctl -u "wattun@$n" -n 10 --no-pager -o cat; return; fi
-  if [ "$(role "$n")" = Iran ]; then
-    host=${peer%:*}; port=${peer##*:}; [ "$host" = "$peer" ] && port=""
+  else err "Service is not running"; journalctl -u "wattun@$n" -n 10 --no-pager -o cat 2>/dev/null; return; fi
+  if [ "$r" = Iran ]; then
+    host=${peer%:*}; port=${peer##*:}; [ "$host" = "$peer" ] && port=''
     if [ "$cr" = icmp ]; then
-      if ping -c 3 -W 2 -q "$host" >/dev/null 2>&1; then ok "Ping to $host works"
+      spin_start "Pinging $host"
+      ping -c 3 -W 2 -q "$host" >/dev/null 2>&1; e=$?
+      spin_stop
+      if [ "$e" -eq 0 ]; then ok "Ping to $host works"
       else err "Ping to $host fails: ICMP is blocked or Kharej drops ping (check its firewall / cloud panel)."; fi
     elif [ "$cr" != udp ] && [ -n "$port" ]; then
-      if timeout 4 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then ok "TCP $host:$port is reachable"
+      spin_start "Connecting to $host:$port"
+      timeout 4 bash -c "</dev/tcp/$host/$port" 2>/dev/null; e=$?
+      spin_stop
+      if [ "$e" -eq 0 ]; then ok "TCP $host:$port is reachable"
       else err "Cannot open TCP $host:$port: port closed, firewall, or this carrier is filtered. Try another carrier."; fi
     fi
   fi
   s=$(stats "$n")
   if [ "$(jget "$s" alive)" = true ]; then ok "Tunnel link is CONNECTED (RTT $(ms "$(jget "$s" srtt_ms)") ms)"
-  else err "Tunnel link is DISCONNECTED"
-    say "  Common causes: different key on the two sides, different carrier/icmp-type, Kharej tunnel not running,"
-    say "  or the carrier is filtered on this route."
+  else
+    if [ "$r" = Kharej ]; then err "No Iran server is connected yet"; else err "Tunnel link is DISCONNECTED"; fi
+    say "  ${GRY}Common causes: different key on the two sides, different carrier/icmp-type, the other side not running,${RST}"
+    say "  ${GRY}or the carrier is filtered on this route. Paste the Kharej token on Iran again to be sure.${RST}"
   fi
-  for p in $(cfg_ports "$n"); do
-    p=${p%%/*}
-    if ss -Hltnu "( sport = :$p )" | grep -q .; then ok "Port $p is listening"; else warn "Nothing listens on port $p"; fi
-  done
-  if [ "$(role "$n")" = Kharej ]; then
-    for p in $(cfg_ports "$n"); do
-      [[ "$p" == */udp ]] && continue
-      timeout 2 bash -c "</dev/tcp/127.0.0.1/$p" 2>/dev/null && ok "Target 127.0.0.1:$p answers" || warn "No service on 127.0.0.1:$p (start your panel/service)"
-    done
-  fi
-  if [ "$(role "$n")" = Iran ] && [ "$(jget "$s" alive)" = true ]; then speed_test "$n"
-  elif [ "$(role "$n")" = Kharej ]; then say "  Speed test: run Diagnose on the Iran side (it tests both directions)."; fi
-  local e; e=$(journalctl -u "wattun@$n" -n 200 --no-pager -o cat | grep -iE "error|fail|denied|refused|restart needed" | tail -5)
-  [ -n "$e" ] && { warn "Recent problems in the log:"; say "$e"; }
+  while IFS= read -r it; do
+    [ -n "$it" ] || continue
+    if [ "$r" = Iran ]; then
+      p=$(spec_L "$it")
+      if port_busy "$p" "$(spec_P "$it")"; then ok "Iran port $p/$(spec_P "$it") is listening"; else warn "Nothing listens on Iran port $p/$(spec_P "$it")"; fi
+    else
+      p=$(spec_T "$it"); [ "$(spec_P "$it")" = udp ] && continue
+      if timeout 2 bash -c "</dev/tcp/127.0.0.1/$p" 2>/dev/null; then ok "Target 127.0.0.1:$p answers"; else warn "No service on 127.0.0.1:$p (start your panel/service)"; fi
+    fi
+  done < <(yml_maps "$n")
+  if [ "$r" = Iran ] && [ "$(jget "$s" alive)" = true ]; then speed_test "$n"
+  elif [ "$r" = Kharej ]; then echo; hint "Speed test: run Diagnose on the Iran side (it tests both directions)."; fi
+  e=$(journalctl -u "wattun@$n" -n 200 --no-pager -o cat 2>/dev/null | grep -iE "error|fail|denied|refused|restart needed" | tail -5)
+  [ -n "$e" ] && { echo; warn "Recent problems in the log:"; printf '%s\n' "$e" | sed "s/^/      $GRY/; s/\$/$RST/"; }
+  return 0
 }
 
-# Speed test: 10 MB each way through the live tunnel (wattun >= 1.8.1 on both sides; uses /speedtest on the
-# local metrics address, so no test service or open port is needed on either server).
+# 10 MB each way through the live tunnel (wattun >= 1.8.1 on both sides; uses /speedtest on the local metrics address).
 speed_test() { # name [mb]
-  local n=$1 mb=${2:-10} m d r label secs mbs mbit err
+  local n=$1 mb=${2:-10} m d r label secs mbs mbit er
   m=$(cfg "$n" metrics); [ -n "$m" ] || { warn "Speed test needs a metrics address in $n.yml."; return; }
-  say "
-  $(c 1 "Speed test") - ${mb} MB each way through the tunnel"
+  echo
+  say "  ${BOLD}Speed test${RST}: ${mb} MB each way through the tunnel"
   for d in down up; do
     [ "$d" = down ] && label="Download (Kharej → Iran)" || label="Upload   (Iran → Kharej)"
-    printf "  %s ... " "$label"
-    r=$(curl -fs --max-time 200 "http://$m/speedtest?dir=$d&mb=$mb")
+    spin_start "$label"
+    r=$(curl -fs --noproxy '*' --max-time 200 "http://$m/speedtest?dir=$d&mb=$mb")
+    spin_stop
     if [ -z "$r" ]; then
-      echo
-      if [ -z "$(stats "$n")" ]; then err "Tunnel '$n' is not running."
+      if [ -z "$(stats "$n")" ]; then err "$label: tunnel '$n' is not running."
       else warn "Speed test not available: this tunnel runs wattun older than 1.8.1. Update and restart both sides."; fi
       return
     fi
     if [ "$(jget "$r" ok)" = true ]; then
       secs=$(jget "$r" seconds); mbs=$(jget "$r" mb_per_s); mbit=$(jget "$r" mbit_per_s)
-      printf '[32m%.1f MB/s[0m  (%.0f Mbit/s, %s MB in %.1f s)
-' "$mbs" "$mbit" "$mb" "$secs"
+      printf '  %s✔%s %s  %s%5.1f MB/s%s  (%.0f Mbit/s, %s MB in %.1f s)\n' "$GRN" "$RST" "$label" "$GRN$BOLD" "$mbs" "$RST" "$mbit" "$mb" "$secs"
     else
-      err=$(grep -o '"error":"[^"]*"' <<<"$r" | cut -d'"' -f4)
-      printf '[31mfailed[0m  %s
-' "${err:-unknown error}"
-      [[ "$err" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it (wattun-manager update) and restart its tunnel."
+      er=$(grep -o '"error":"[^"]*"' <<<"$r" | cut -d'"' -f4)
+      printf '  %s✘%s %s  %sfailed%s  %s\n' "$RED" "$RST" "$label" "$RED" "$RST" "${er:-unknown error}"
+      [[ "$er" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it (wattun-manager update) and restart its tunnel."
     fi
   done
 }
 
-# ---------- logs ----------
 logs_menu() {
   local n=$1
-  say "  1) Last 100 lines   2) Follow live (Ctrl+C to stop)   3) Problems only   4) Since last start"
-  case "$(ask Choice 1)" in
-    1) journalctl -u "wattun@$n" -n 100 --no-pager -o short-iso ;;
+  echo
+  printf '  %s last 100 lines  %s follow live (Ctrl+C stops)\n' "$(key_label 1)" "$(key_label 2)"
+  printf '  %s problems only   %s since last start\n' "$(key_label 3)" "$(key_label 4)"
+  printf '  %s?%s Choice %s[1]%s ' "$CYN" "$RST" "$GRY" "$RST"
+  key_read; echo; echo
+  case "$KEY" in
+    1|enter) journalctl -u "wattun@$n" -n 100 --no-pager -o short-iso ;;
     2) journalctl -u "wattun@$n" -f -o short-iso ;;
     3) journalctl -u "wattun@$n" -n 2000 --no-pager -o short-iso | grep -iE "error|fail|denied|refused|lost|restart" | tail -50 ;;
     4) journalctl -u "wattun@$n" -b --no-pager -o short-iso | tail -200 ;;
+    *) return 0 ;;
   esac
 }
 
-# ---------- edits ----------
-edit_ports() { # name add|remove
-  local f="$CONF/$1.yml" p list
-  say "Current ports: $(cfg_ports "$1")"
-  list=$(ask "Ports to $2 (e.g. 443,53/udp)" ""); valid_ports "$list" || { err "Bad port list."; return; }
-  grep -q '^ports:' "$f" || echo "ports:" >> "$f"
-  for p in ${list//,/ }; do
-    if [ "$2" = add ]; then grep -qE "^  - $p\$" "$f" || sed -i "/^ports:/a\\  - $p" "$f"
-    else sed -i "\#^  - $p\$#d" "$f"; fi
+# ======================================================================================
+#  Live monitor (all tunnels, 2 s refresh, sparkline of the rate)
+# ======================================================================================
+declare -A HIST
+hist_push() { # name value
+  local arr v=${2%%.*}; [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  read -ra arr <<<"${HIST[$1]:-}"
+  arr+=("$v")
+  [ "${#arr[@]}" -gt 16 ] && arr=("${arr[@]:1}")
+  HIST[$1]="${arr[*]}"
+}
+spark() { # "v1 v2 ..." -> ▁▂▃▅▇
+  local -a vals chars=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+  local max=0 v res=''
+  read -ra vals <<<"$1"
+  for v in "${vals[@]}"; do [ "$v" -gt "$max" ] && max=$v; done
+  for v in "${vals[@]}"; do
+    if [ "$max" -eq 0 ]; then res+=${chars[0]}; else res+=${chars[$((v*7/max))]}; fi
   done
-  ok "Saved: $(cfg_ports "$1"). Applied within 3 seconds, no restart."
-  [ "$(role "$1")" = Iran ] && warn "On Kharej, make sure these ports are allowed (or its allowed list is empty)."
+  printf '%s' "$res"
 }
-set_value() { # name key value
-  local f="$CONF/$1.yml"
-  if grep -q "^$2:" "$f"; then sed -i "s#^$2:.*#$2: $3#" "$f"; else sed -i "/^metrics:/i $2: $3" "$f"; fi
+mon_frame() {
+  local n r any=0 sp rate pad
+  printf '\n  %s◆%s %s %s›%s %sLive monitor%s   %s%s · every 2 s · any key = back%s\e[K\n' "$CYN" "$RST" "$LOGO" "$GRY" "$RST" "$BOLD" "$RST" "$GRY" "$(date '+%H:%M:%S')" "$RST"
+  printf '  %s%s%s\e[K\n' "$GRY" "$(rep ─ 74)" "$RST"
+  printf '  %sNAME        STATE         RTT     RATE         HISTORY             LOAD%s\e[K\n' "$GRY" "$RST"
+  for n in $(tunnels); do
+    any=1; r=$(role "$n"); tinfo "$n"; state_cell "$r" "$TI_STATE"
+    hist_push "$n" "$TI_RATE"; sp=$(spark "${HIST[$n]}")
+    rate=$(human "$TI_RATE"); pad=$((16-${#sp}))
+    printf '  %-11s %s%s %-12s%s %5s   %-10s  %s%s%*s%s  %s\e[K\n' "${n:0:11}" "$SC_COL" "$SC_DOT" "$SC_TXT" "$RST" \
+      "$([ "$TI_STATE" = up ] && printf '%.0f ms' "$TI_RTT")" "$([ "$TI_STATE" != stopped ] && echo "$rate/s")" "$CYN" "$sp" "$pad" '' "$RST" \
+      "$([ "$TI_STATE" = stopped ] || { [ "$r" = Kharej ] && echo "$TI_SESS clients" || echo "$TI_STREAMS streams"; })"
+  done
+  [ "$any" = 0 ] && printf '  %sNo tunnels yet. Press any key, then n to create one.%s\e[K\n' "$GRY" "$RST"
+  printf '\e[K\n'
 }
-change_peer() { local v; v=$(ask "New Kharej address (host or host:port)" "$(cfg "$1" peer)"); set_value "$1" peer "$v"; systemctl restart "wattun@$1"; wait_link "$1" 15 || warn "Not connected yet."; }
-change_key() {
-  if [ "$(role "$1")" = Kharej ]; then
-    yes_no "Generate a NEW key? Every Iran client must then use the new token." || return
-    local k; k=$(new_key); printf '%s\n' "$k" > "$CONF/$1.key"
-    [ -f "$CONF/$1.token" ] && { read_token "$(cat "$CONF/$1.token")" && make_token "$T_CARRIER" "$T_PEER" "$k" "$T_PATH" "$T_SNI" "$T_ICMP" > "$CONF/$1.token"; }
-    systemctl restart "wattun@$1"; ok "New token:"; cat "$CONF/$1.token"; echo
-  else
-    local t; t=$(ask "Paste the new token from Kharej" ""); read_token "$t" || { err "Invalid token."; return; }
-    printf '%s\n' "$T_KEY" > "$CONF/$1.key"; set_value "$1" peer "$T_PEER"
-    systemctl restart "wattun@$1"; wait_link "$1" 15 || warn "Not connected yet."
-  fi
-}
-show_token() {
-  if [ -f "$CONF/$1.token" ]; then say "$(c '1;33' "$(cat "$CONF/$1.token")")"
-  else err "No token stored for '$1' (tokens exist only on Kharej tunnels)."; fi
+live_monitor() {
+  local rc
+  if [ "$IS_TTY" != 1 ]; then mon_frame | sed 's/\x1b\[K//g'; return 0; fi
+  cur_hide; printf '\e[2J'
+  while :; do
+    printf '\e[H'; mon_frame; printf '\e[J'
+    IFS= read -rsn1 -t 2 KEY; rc=$?
+    [ "$rc" -le 128 ] && break
+  done
+  cur_show
 }
 
-# ---------- auto-heal ----------
+# ======================================================================================
+#  Tunnel actions
+# ======================================================================================
+status_all() { # plain, scriptable list
+  local n any=0
+  for n in $(tunnels); do any=1; status_row "$n"; done
+  [ "$any" = 1 ] || { warn "No tunnels yet. Start with Kharej: run wattun-manager and press n."; return 1; }
+}
+status_row() {
+  local n=$1 r cr load
+  r=$(role "$n"); cr=$(cfg "$n" carrier); tinfo "$n"; state_cell "$r" "$TI_STATE"
+  load=''; [ "$TI_STATE" != stopped ] && { [ "$r" = Kharej ] && load="clients $TI_SESS" || load="streams $TI_STREAMS"; }
+  printf '  %-12s %-6s %-5s %s%s %-12s%s %-6s %-11s %s\n' "${n:0:12}" "$r" "$cr" "$SC_COL" "$SC_DOT" "$SC_TXT" "$RST" \
+    "$([ "$TI_STATE" = up ] && printf '%.0fms' "$TI_RTT" || echo -)" "$load" "$(ports_summary "$n" 17)"
+}
+tunnel_card() {
+  local n=$1 r cr peer lis line
+  r=$(role "$n"); cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer); lis=$(cfg "$n" listen)
+  tinfo "$n"; state_cell "$r" "$TI_STATE"
+  box_top "$n"
+  line="$SC_COL$SC_DOT $SC_TXT$RST   $r · $cr"
+  if [ "$r" = Iran ]; then line="$line → ${peer:--}"; else line="$line${lis:+ listening on $lis}"; fi
+  box_row "$line"
+  box_row "${GRY}service $(systemctl is-active "wattun@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "wattun@$n" 2>/dev/null | head -1)${RST}"
+  if [ "$TI_STATE" != stopped ]; then
+    box_row "rtt $(ms "$TI_RTT") ms (min $(ms "$(jget "$TI_RAW" min_rtt_ms)"))   rate $(human "$TI_RATE")/s   loss $(jget "$TI_RAW" loss_pct)%   retrans $(jget "$TI_RAW" retrans)"
+    box_row "streams $TI_STREAMS   clients $TI_SESS   udp flows $(jget "$TI_RAW" dgram_flows)   ↓$(human "$TI_IN") ↑$(human "$TI_OUT")"
+  fi
+  if [ "$r" = Kharej ]; then box_row "Iran may reach: $(ports_summary "$n" 48)"; else box_row "Publishes: $(ports_summary "$n" 56)"; fi
+  box_bot
+}
+show_token() {
+  if [ -f "$CONF/$1.token" ]; then refresh_token "$1"; printf '%s%s%s\n' "$BOLD$YEL" "$(cat "$CONF/$1.token")" "$RST"
+  else err "No token stored for '$1' (tokens exist only on Kharej tunnels)."; return 1; fi
+}
+edit_ports() { # name
+  local n=$1 r old=() it i pub=() before
+  r=$(role "$n")
+  load_maps "$n"; old=("${MAPS[@]+"${MAPS[@]}"}")
+  PE_ROLE=$r; PE_TUNNEL=$n; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
+  for it in ${old[@]+"${old[@]}"}; do PE_OWNED+=("$(spec_L "$it")/$(spec_P "$it")"); done
+  systemctl is-active -q "wattun@$n" 2>/dev/null || PE_OWNED=()
+  port_editor || { warn "No changes saved."; return 0; }
+  write_ports "$n" || { err "Could not write the config."; return 1; }
+  [ "$r" = Kharej ] && refresh_token "$n"
+  ok "Saved: $(ports_summary "$n" 60)"
+  hint "Applied within 3 seconds, no restart, no dropped users."
+  if [ "$r" = Iran ]; then
+    before=" ${PE_OWNED[*]-} "
+    for ((i=0; i<${#MAPS[@]}; i++)); do
+      it="$(spec_L "${MAPS[$i]}")/$(spec_P "${MAPS[$i]}")"
+      case "$before" in *" $it "*) ;; *) pub+=("$it") ;; esac
+    done
+    [ "${#pub[@]}" -gt 0 ] && fw_open "${pub[*]}"
+    hint "On Kharej, make sure the target ports are allowed (or its allowed list is empty)."
+  else
+    warn "The token was updated with the new allowed ports. Iran servers already connected keep working."
+  fi
+}
+change_peer() {
+  local n=$1
+  ask_ok "New Kharej address (host or host:port)" "$(cfg "$n" peer)" v_host || return 1
+  set_value "$n" peer "$REPLY_V"
+  step "Restarting wattun@$n" systemctl restart "wattun@$n" || return 1
+  wait_link "$n" 20 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
+}
+change_key() {
+  local n=$1 k t
+  if [ "$(role "$n")" = Kharej ]; then
+    warn "A new key disconnects every Iran server until it gets the new token."
+    confirm "Generate a NEW key and token?" n || return 0
+    k=$(new_key); printf '%s\n' "$k" >"$CONF/$n.key"
+    if [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
+      make_token "$T_CARRIER" "$T_PEER" "$k" "$T_PATH" "$T_SNI" "$T_ICMP" "$T_PORTS" >"$CONF/$n.token"
+    fi
+    step "Restarting wattun@$n" systemctl restart "wattun@$n"
+    echo; ok "New token (paste it on every Iran server):"; echo
+    show_token "$n"
+  else
+    ask_ok "Paste the new token from Kharej" "" v_token || return 1
+    t=$REPLY_V; read_token "$t"
+    printf '%s\n' "$T_KEY" >"$CONF/$n.key"; set_value "$n" peer "$T_PEER"
+    step "Restarting wattun@$n" systemctl restart "wattun@$n" || return 1
+    wait_link "$n" 20 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
+  fi
+}
+delete_tunnel() {
+  local n=$1
+  warn "This stops '$n' and deletes its config, key and token."
+  ask "Type the tunnel name to confirm (empty = cancel)" ""
+  [ "$REPLY_V" = "$n" ] || { warn "Not deleted."; return 1; }
+  systemctl disable --now "wattun@$n" >/dev/null 2>&1
+  rm -f "$CONF/$n".yml "$CONF/$n".key "$CONF/$n".token "$RUN/$n.down"
+  ok "Tunnel '$n' deleted."
+  return 0
+}
+adv_menu() { # name : max-mbps, fec, bind, icmp-type
+  local n=$1 r changed=0 v cr
+  r=$(role "$n"); cr=$(cfg "$n" carrier)
+  while :; do
+    page "Advanced settings" "$n"
+    summary_line "max-mbps" "$(cfg "$n" max-mbps | sed 's/^$/16 (default)/')"
+    summary_line "fec" "$(cfg "$n" fec | sed 's/^$/off (default)/')"
+    [ "$r" = Iran ] && summary_line "bind" "$(cfg "$n" bind | sed 's/^$/0.0.0.0 (default)/')"
+    [ "$cr" = icmp ] && summary_line "icmp-type" "$(cfg "$n" icmp-type | sed 's/^$/echo (default)/')"
+    echo
+    printf '  %s  speed ceiling   %s  FEC   ' "$(key_label m)" "$(key_label f)"
+    [ "$r" = Iran ] && printf '%s  bind address   ' "$(key_label a)"
+    [ "$cr" = icmp ] && printf '%s  ICMP type   ' "$(key_label i)"
+    printf '%s  back\n' "$(key_label b)"
+    key_read
+    case "$KEY" in
+      m) echo; ask_ok "Speed ceiling in MB/s (empty = default)" "$(cfg "$n" max-mbps)" v_mbps || continue
+         if [ -z "$REPLY_V" ]; then unset_value "$n" max-mbps; else set_value "$n" max-mbps "$REPLY_V"; fi; changed=1 ;;
+      f) echo; ask_ok "FEC: off or auto" "$(cfg "$n" fec | sed 's/^$/off/')" v_fec || continue
+         if [ "$REPLY_V" = off ]; then unset_value "$n" fec; else set_value "$n" fec "$REPLY_V"; fi; changed=1 ;;
+      a) [ "$r" = Iran ] || continue; echo; ask_ok "Bind address" "$(cfg "$n" bind | sed 's/^$/0.0.0.0/')" v_bind || continue
+         if [ "$REPLY_V" = 0.0.0.0 ]; then unset_value "$n" bind; else set_value "$n" bind "$REPLY_V"; fi; changed=1 ;;
+      i) [ "$cr" = icmp ] || continue; echo; hint "Must match the other side."; ask_ok "ICMP type" "$(cfg "$n" icmp-type | sed 's/^$/echo/')" v_icmp || continue
+         if [ "$REPLY_V" = echo ]; then unset_value "$n" icmp-type; else set_value "$n" icmp-type "$REPLY_V"; fi; changed=1 ;;
+      b|0|q|enter|esc) break ;;
+      *) : ;;
+    esac
+  done
+  if [ "$changed" = 1 ]; then
+    v=$(confirm "Restart '$n' to apply? (open connections drop)" y && echo y)
+    [ "$v" = y ] && step "Restarting wattun@$n" systemctl restart "wattun@$n"
+  fi
+  return 0
+}
+
+tunnel_page() {
+  local n=$1 r run
+  while :; do
+    [ -f "$CONF/$n.yml" ] || return 0
+    r=$(role "$n")
+    page "Tunnel $n" "$r"
+    tunnel_card "$n"
+    run=$(systemctl is-active "wattun@$n" 2>/dev/null)
+    echo
+    printf '  %sStatus%s      %s diagnose + speed test   %s speed test only   %s logs\n' "$BOLD" "$RST" "$(key_label d)" "$(key_label v)" "$(key_label l)"
+    printf '  %sPorts%s       %s edit port mappings\n' "$BOLD" "$RST" "$(key_label p)"
+    if [ "$r" = Kharej ]; then printf '  %sConnection%s  %s show token   %s new key + token   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label k)" "$(key_label o)"
+    else printf '  %sConnection%s  %s paste new token   %s change Kharej address   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label a)" "$(key_label o)"; fi
+    printf '  %sService%s     %s restart  %s %s  %s start at boot on/off  %s edit file\n' "$BOLD" "$RST" "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
+    printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label X)" "$(key_label b)"
+    key_read
+    case "$KEY" in
+      d) page "Diagnose" "$n"; run_flow test_tunnel "$n"; pause ;;
+      v) page "Speed test" "$n"; run_flow speed_test "$n"; pause ;;
+      l) page "Logs" "$n"; run_flow logs_menu "$n"; pause ;;
+      p) run_flow edit_ports "$n"; pause ;;
+      t) if [ "$r" = Kharej ]; then
+           page "Token" "$n"; echo; say "  Paste this on the Iran server (wattun-manager → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
+         else page "New token" "$n"; echo; run_flow change_key "$n"; fi
+         pause ;;
+      k) [ "$r" = Kharej ] && { page "New key" "$n"; run_flow change_key "$n"; pause; } ;;
+      a) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
+      o) run_flow adv_menu "$n" ;;
+      r) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting wattun@$n" systemctl restart "wattun@$n"; sleep 1; fi ;;
+      s) echo
+         if [ "$run" = active ]; then systemctl stop "wattun@$n" 2>/dev/null; ok "Stopped (it still starts at boot if enabled)."; sleep 1
+         else start_unit "$n"; sleep 1; fi ;;
+      e) echo
+         if systemctl is-enabled -q "wattun@$n" 2>/dev/null; then systemctl disable "wattun@$n" >/dev/null 2>&1; ok "Will NOT start at boot."
+         else systemctl enable "wattun@$n" >/dev/null 2>&1; ok "Will start at boot."; fi
+         sleep 1 ;;
+      c) ${EDITOR:-nano} "$CONF/$n.yml"; echo; confirm "Restart to apply? (port changes apply without restart)" n && step "Restarting wattun@$n" systemctl restart "wattun@$n" ;;
+      X) page "Delete tunnel" "$n"; echo; run_flow delete_tunnel "$n"; pause ;;
+      b|0|q|enter|esc) return 0 ;;
+      *) : ;;
+    esac
+  done
+}
+
+# ======================================================================================
+#  Auto-heal, update, rollback, uninstall, settings
+# ======================================================================================
 heal_enable() {
-  cat > /etc/systemd/system/$HEAL_UNIT.service <<EOF
+  cat >"/etc/systemd/system/$HEAL_UNIT.service" <<EOF
 [Unit]
 Description=WatTunnel auto-heal
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/wattun-manager heal
 EOF
-  cat > /etc/systemd/system/$HEAL_UNIT.timer <<EOF
+  cat >"/etc/systemd/system/$HEAL_UNIT.timer" <<EOF
 [Unit]
 Description=WatTunnel auto-heal every minute
 [Timer]
@@ -387,120 +1421,189 @@ OnUnitActiveSec=1min
 [Install]
 WantedBy=timers.target
 EOF
+  chmod 644 "/etc/systemd/system/$HEAL_UNIT.service" "/etc/systemd/system/$HEAL_UNIT.timer"
   systemctl daemon-reload && systemctl enable --now "$HEAL_UNIT.timer" >/dev/null 2>&1 && ok "Auto-heal enabled."
 }
 heal_disable() { systemctl disable --now "$HEAL_UNIT.timer" >/dev/null 2>&1; ok "Auto-heal disabled."; }
 heal() { # restart Iran tunnels whose link is down 3 checks in a row
   local n cnt f
+  mkdir -p "$RUN"
   for n in $(tunnels); do
     [ "$(role "$n")" = Iran ] && systemctl is-enabled -q "wattun@$n" || continue
     f="$RUN/$n.down"
     if [ "$(jget "$(stats "$n")" alive)" = true ]; then rm -f "$f"; continue; fi
-    cnt=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$cnt" > "$f"
+    cnt=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$cnt" >"$f"
     if [ "$cnt" -ge 3 ]; then
       logger -t wattun-heal "tunnel $n down for $cnt checks, restarting"
       systemctl restart "wattun@$n"; rm -f "$f"
     fi
   done
 }
-
-# ---------- update / rollback ----------
-restart_all() { local n; for n in $(tunnels); do systemctl is-enabled -q "wattun@$n" && systemctl restart "wattun@$n"; done; ok "Tunnels restarted."; }
-update() {
-  local url="https://raw.githubusercontent.com/$REPO/main/install.sh"
-  bash <(curl -fsSL "${WAT_PROXY:-}$url") "$@" || { err "Update failed. If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun-manager update"; return 1; }
-  yes_no "Restart tunnels on the new version now? (open connections drop)" && restart_all
+restart_all() {
+  local n c=0
+  for n in $(tunnels); do
+    if systemctl is-enabled -q "wattun@$n" 2>/dev/null || systemctl is-active -q "wattun@$n" 2>/dev/null; then
+      step "Restarting wattun@$n" systemctl restart "wattun@$n"; c=$((c+1))
+    fi
+  done
+  [ "$c" -gt 0 ] || warn "No tunnels to restart."
+}
+update() { # [installer args...]
+  local url="https://raw.githubusercontent.com/$REPO/main/install.sh" tmp
+  tmp=$(mktemp /tmp/wattun-install.XXXXXX)
+  spin_start "Downloading the installer"
+  curl -fsSL --max-time 60 --retry 2 -o "$tmp" "${WAT_PROXY:-}$url"; local rc=$?
+  spin_stop
+  if [ "$rc" -ne 0 ] || ! head -c 2 "$tmp" | grep -q '#!'; then
+    rm -f "$tmp"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun-manager update"; return 1
+  fi
+  ok "Installer downloaded"
+  WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
+  rm -f "$tmp"
+  [ "$rc" -eq 0 ] || { err "The installer reported an error."; return 1; }
+  echo
+  confirm "Restart tunnels on the new version now? (open connections drop)" n && restart_all
   return 0
 }
 rollback() {
-  [ -x "$BIN.prev" ] || { warn "No previous version saved."; return; }
-  say "Current: $($BIN -version)   Previous: $($BIN.prev -version)"
-  yes_no "Roll back?" || return
+  [ -x "$BIN.prev" ] || { warn "No previous version saved."; return 0; }
+  say "  Current: ${BOLD}$($BIN -version 2>&1)${RST}    Previous: ${BOLD}$($BIN.prev -version 2>&1)${RST}"
+  echo
+  confirm "Roll back to the previous version?" n || return 0
   cp -f "$BIN" "$BIN.rb" && mv -f "$BIN.prev" "$BIN" && mv -f "$BIN.rb" "$BIN.prev"
-  ok "Rolled back."; yes_no "Restart tunnels now?" && restart_all
+  ok "Rolled back."
+  confirm "Restart tunnels now?" n && restart_all
+  return 0
 }
-
-# ---------- menus ----------
-choose_tunnel() {
-  local i=1 n arr=()
-  for n in $(tunnels); do arr+=("$n"); say "  $i) $n ($(role "$n"))" >&2; i=$((i+1)); done
-  [ ${#arr[@]} -gt 0 ] || { warn "No tunnels yet." >&2; return 1; }
-  [ ${#arr[@]} -eq 1 ] && { echo "${arr[0]}"; return; }
-  local s; s=$(ask "Tunnel" 1)
-  [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le ${#arr[@]} ] || return 1
-  echo "${arr[$((s-1))]}"
-}
-manage_tunnel() {
-  local n
-  page "Manage a tunnel"
-  n=$(choose_tunnel) || { pause; return; }
-  while true; do
-    page "Tunnel: $n" "$(role "$n") · $(cfg "$n" carrier)"
-    details "$n"
-    say "\n  1) Diagnose + speed test 2) Logs              3) Add ports        4) Remove ports"
-    if [ "$(role "$n")" = Kharej ]; then say "  5) Show token            6) New key/token"
-    else say "  5) Change Kharej address 6) Paste new token"; fi
-    say "  7) Restart               8) Stop              9) Start           10) Edit config file"
-    say "  11) Delete tunnel        0) Back"
-    case "$(ask Choice)" in
-      1) page "Diagnose: $n"; test_tunnel "$n"; pause ;;
-      2) page "Logs: $n"; logs_menu "$n"; pause ;;
-      3) page "Add ports: $n"; edit_ports "$n" add; pause ;;
-      4) page "Remove ports: $n"; edit_ports "$n" remove; pause ;;
-      5) page "Tunnel: $n"; if [ "$(role "$n")" = Kharej ]; then show_token "$n"; else change_peer "$n"; fi; pause ;;
-      6) page "Key and token: $n"; change_key "$n"; pause ;;
-      7) yes_no "Restart drops open connections. Continue?" && systemctl restart "wattun@$n" && ok "Restarted." ;;
-      8) systemctl disable --now "wattun@$n" >/dev/null 2>&1; ok "Stopped (won't start at boot)." ;;
-      9) start_unit "$n" ;;
-      10) ${EDITOR:-nano} "$CONF/$n.yml"; yes_no "Restart to apply? (ports apply without restart)" && systemctl restart "wattun@$n" ;;
-      11) yes_no "Delete tunnel '$n' and its key?" && { systemctl disable --now "wattun@$n" >/dev/null 2>&1; rm -f "$CONF/$n".{yml,key,token}; ok "Deleted."; return; } ;;
-      0) return ;;
-    esac
+uninstall_all() {
+  local n list=() u
+  for n in $(tunnels); do list+=("$n"); done
+  echo
+  if [ "${#list[@]}" -gt 0 ]; then
+    warn "These tunnels will be stopped:"
+    for n in "${list[@]}"; do printf '      %s%-14s%s %s · %s\n' "$BOLD" "$n" "$RST" "$(role "$n")" "$(cfg "$n" carrier)"; done
+  else hint "No tunnels are configured."; fi
+  echo
+  ask "Type 'uninstall' to remove WatTunnel (empty = cancel)" ""
+  [ "$REPLY_V" = uninstall ] || { warn "Cancelled."; return 1; }
+  heal_disable >/dev/null 2>&1; rm -f "/etc/systemd/system/$HEAL_UNIT.service" "/etc/systemd/system/$HEAL_UNIT.timer"
+  for u in $(systemctl list-units --all --plain --no-legend 'wattun@*' 2>/dev/null | awk '{print $1}'); do
+    systemctl disable --now "$u" >/dev/null 2>&1
   done
+  rm -f /etc/systemd/system/wattun@.service "$BIN" "$BIN.prev"
+  systemctl daemon-reload
+  ok "Services and binaries removed."
+  if [ -d "$CONF" ] && confirm "Also delete $CONF (tunnel configs, keys, tokens)?" n; then rm -rf "$CONF"; ok "Configuration deleted."; fi
+  ok "WatTunnel removed."
+  rm -f "$MGR"
+  return 0
 }
 settings_menu() {
-  page "Settings"
-  say "  Auto-heal: $(systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && c 32 on || c 90 off)"
-  say "  1) Turn auto-heal on   2) Turn auto-heal off   3) Restart all tunnels   0) Back"
-  case "$(ask Choice)" in 1) heal_enable ;; 2) heal_disable ;; 3) yes_no "Restart all?" && restart_all ;; esac
-}
-menu() {
-  while true; do
-    page "Main menu" "$($BIN -version 2>/dev/null)"
-    status_all 2>/dev/null || say "  $(c 90 'No tunnels yet.')"
-    say "\n  1) Kharej setup  (outside server - tunnel server)"
-    say "  2) Iran setup    (inside server - tunnel client)"
-    say "  3) Manage a tunnel (status, diagnose, logs, ports, token...)"
-    say "  4) Live status monitor"
-    say "  5) Settings (auto-heal)"
-    say "  6) Update WatTunnel      7) Roll back      8) Uninstall"
-    say "  0) Exit"
-    case "$(ask Choice)" in
-      1) setup_kharej; pause ;;
-      2) setup_iran; pause ;;
-      3) manage_tunnel ;;
-      4) live_monitor ;;
-      5) settings_menu; pause ;;
-      6) page "Update"; if update; then ok "Reloading the manager..."; sleep 1; exec /usr/local/bin/wattun-manager; fi; pause ;;
-      7) page "Roll back"; rollback; pause ;;
-      8) page "Uninstall"; yes_no "Uninstall WatTunnel?" && { heal_disable >/dev/null; bash <(curl -fsSL "${WAT_PROXY:-}https://raw.githubusercontent.com/$REPO/main/install.sh") --uninstall; exit 0; } ;;
-      0) exit 0 ;;
+  local heal_on anim_on
+  while :; do
+    systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && heal_on="${GRN}on${RST}" || heal_on="${GRY}off${RST}"
+    [ "$(conf_get anim 1)" = 1 ] && anim_on="${GRN}on${RST}" || anim_on="${GRY}off${RST}"
+    page "Settings"
+    say "  Auto-heal   $heal_on   ${GRY}restarts an Iran tunnel whose link stays down for 3 minutes${RST}"
+    say "  Animations  $anim_on   ${GRY}spinners and the intro (WAT_NO_ANIM=1 also turns them off)${RST}"
+    echo
+    printf '  %s toggle auto-heal   %s restart all tunnels   %s toggle animations   %s back\n' "$(key_label h)" "$(key_label r)" "$(key_label a)" "$(key_label b)"
+    key_read
+    case "$KEY" in
+      h) echo; if systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null; then heal_disable; else heal_enable; fi; sleep 1 ;;
+      r) echo; if confirm "Restart all tunnels? Open connections drop." n; then restart_all; sleep 1; fi ;;
+      a) if [ "$(conf_get anim 1)" = 1 ]; then conf_set anim 0; ANIM=0; else conf_set anim 1; [ "$IS_TTY" = 1 ] && [ "${WAT_NO_ANIM:-0}" != 1 ] && ANIM=1; fi ;;
+      b|0|q|enter|esc) return 0 ;;
+      *) : ;;
     esac
   done
 }
 
-case "${1:-}" in
-  "") menu ;;
-  kharej) setup_kharej ;;
-  iran) setup_iran ;;
-  status|list) status_all ;;
-  monitor) live_monitor ;;
-  test) test_tunnel "${2:?name}" ;;
-  speedtest) speed_test "${2:?name}" "${3:-10}" ;;
-  logs) journalctl -u "wattun@${2:?name}" -f -o short-iso ;;
-  token) show_token "${2:?name}" ;;
-  heal) heal ;;
-  update) shift; update "$@" ;;
-  rollback) rollback ;;
-  *) echo "Usage: wattun-manager [kharej|iran|status|monitor|test NAME|speedtest NAME [MB]|logs NAME|token NAME|update|rollback|heal]"; exit 1 ;;
-esac
+# ======================================================================================
+#  Main dashboard
+# ======================================================================================
+need_tunnel() { [ -f "$CONF/$1.yml" ] || { err "No tunnel named '$1'. See: wattun-manager status"; return 1; }; }
+main_menu() {
+  local num d rest
+  while :; do
+    page_full "Dashboard" "$([ -n "$VER" ] && echo "wattun $VER")"
+    dash_table
+    dash_actions
+    while :; do
+      printf '\r%s  %s▸%s %s%s%s' "$EL" "$CYN" "$RST" "$YEL" "$PMSG" "$RST"; PMSG=''
+      key_read
+      printf '\r%s' "$EL"
+      [ "$IS_TTY" = 1 ] || echo
+      case "$KEY" in
+        [1-9])
+          num=$KEY
+          if [ "${#DASH_N[@]}" -gt 9 ]; then printf '%s' "$KEY"; IFS= read -r -t 5 rest || true; num="$KEY$rest"; fi
+          if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#DASH_N[@]}" ]; then tunnel_page "${DASH_N[$((num-1))]}"; break
+          else flash "No tunnel number $num."; fi ;;
+        n|N) new_tunnel; break ;;
+        m|M) if [ "${#DASH_N[@]}" -gt 0 ]; then run_flow live_monitor; fi; break ;;
+        s|S) settings_menu; break ;;
+        u|U) page "Update"; echo; if update; then ok "Reloading the manager..."; sleep 1; exec "$MGR"; fi; pause; break ;;
+        r|R) page "Roll back"; echo; run_flow rollback; pause; break ;;
+        x|X) page "Uninstall"; if run_flow uninstall_all; then exit 0; fi; pause; break ;;
+        q|Q|esc) cur_show; echo; exit 0 ;;
+        enter) break ;;
+        *) flash "Unknown key '$KEY'. Use a number, n, m, s, u, r, x or q." ;;
+      esac
+    done
+  done
+}
+
+usage() {
+  cat <<EOF
+WatTunnel manager $VER
+
+Usage: wattun-manager [command]
+
+  (no command)          dashboard: all tunnels, open one, create, update...
+  new [kharej|iran]     create a tunnel (do Kharej FIRST: it makes the token)
+  kharej | iran         same as new kharej / new iran
+  status | list         one line per tunnel
+  monitor               live dashboard (any key exits)
+  ports NAME            edit the port mappings of a tunnel
+  test NAME             connection doctor + speed test
+  speedtest NAME [MB]   speed test only (default 10 MB each way)
+  logs NAME             follow the log
+  token NAME            print the Kharej token again
+  heal                  restart Iran tunnels whose link is down (used by the timer)
+  update | rollback     install the latest release / go back one version
+  help                  this text
+
+Environment: WAT_NO_ANIM=1 (no animations)  NO_COLOR=1 (no colours)  WAT_PROXY=https://ghproxy.net/
+EOF
+}
+
+main() {
+  [ -x "$BIN" ] && VER=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
+  case "${1:-}" in help|-h|--help) usage; return 0 ;; esac
+  [ "$(id -u)" -eq 0 ] || { err "Run as root."; exit 1; }
+  [ -x "$BIN" ] || { err "wattun is not installed. Run install.sh first."; exit 1; }
+  mkdir -p "$CONF" "$RUN"; chmod 700 "$CONF"
+  trap on_int INT
+  trap cleanup EXIT
+  trap 'cleanup; exit 143' TERM HUP
+  case "${1:-}" in
+    "") main_menu ;;
+    new) new_tunnel "${2:-}" ;;
+    kharej) run_flow wizard_kharej ;;
+    iran) run_flow wizard_iran ;;
+    status|list) status_all ;;
+    monitor) live_monitor ;;
+    ports) need_tunnel "${2:?name}" && run_flow edit_ports "$2" ;;
+    test) need_tunnel "${2:?name}" && test_tunnel "$2" ;;
+    speedtest) need_tunnel "${2:?name}" && speed_test "$2" "${3:-10}" ;;
+    logs) need_tunnel "${2:?name}" && journalctl -u "wattun@$2" -f -o short-iso ;;
+    token) need_tunnel "${2:?name}" && show_token "$2" ;;
+    heal) heal ;;
+    update) shift; update "$@" ;;
+    rollback) rollback ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+if [ "$LIB" != 1 ]; then main "$@"; fi

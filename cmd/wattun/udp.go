@@ -206,35 +206,37 @@ func (l *udpListener) Close() {
 // udpListeners is the live set of public UDP ports (same apply semantics as listeners for tcp).
 type udpListeners struct {
 	mu     sync.Mutex
-	active map[int]*udpListener
-	open   func(port int) (*udpListener, error)
+	active map[portMap]*udpListener
+	open   func(listen, target int) (*udpListener, error)
 }
 
-func newUDPListeners(open func(int) (*udpListener, error)) *udpListeners {
-	return &udpListeners{active: map[int]*udpListener{}, open: open}
+func newUDPListeners(open func(listen, target int) (*udpListener, error)) *udpListeners {
+	return &udpListeners{active: map[portMap]*udpListener{}, open: open}
 }
 
-func (u *udpListeners) apply(want []int) []error {
+func (u *udpListeners) apply(want []portMap) []error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	set := map[int]bool{}
-	var errs []error
-	for _, p := range want {
-		set[p] = true
-		if u.active[p] == nil {
-			l, err := u.open(p)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("listen udp port %d: %v", p, err))
-				continue
-			}
-			u.active[p] = l
+	set := map[portMap]bool{}
+	for _, m := range want {
+		set[m] = true
+	}
+	for m, l := range u.active {
+		if !set[m] {
+			l.Close()
+			delete(u.active, m)
+			log.Printf("stopped listening on udp port %d (-> %d)", m.Listen, m.Target)
 		}
 	}
-	for p, l := range u.active {
-		if !set[p] {
-			l.Close()
-			delete(u.active, p)
-			log.Printf("stopped listening on udp port %d", p)
+	var errs []error
+	for _, m := range want {
+		if u.active[m] == nil {
+			l, err := u.open(m.Listen, m.Target)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("listen udp port %d: %v", m.Listen, err))
+				continue
+			}
+			u.active[m] = l
 		}
 	}
 	return errs
@@ -243,7 +245,12 @@ func (u *udpListeners) apply(want []int) []error {
 func (u *udpListeners) has(p int) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return u.active[p] != nil
+	for m := range u.active {
+		if m.Listen == p {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- server side ----

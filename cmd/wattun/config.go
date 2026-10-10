@@ -16,13 +16,20 @@ import (
 //	ports:
 //	  - 10001
 //	  - 10001/udp
+//	  - 8443:443       (client listens on 8443, forwards to server port 443; also 5353:53/udp)
+//
+// A plain N means listen N -> target N. The server's allowlist is the TARGET ports; the client opens the LISTEN ports.
 //
 // A second list `limits:` holds `- PORT rate=5MB quota=100GB` items (see ports.go). The lists are hot-reloaded (see cfgWatcher); every other key needs a restart.
 
 type portSpec struct {
-	Port int
-	UDP  bool
+	Port   int // public (client listen) port
+	Target int // server port it forwards to (== Port for a plain `N` item)
+	UDP    bool
 }
+
+// portMap is one client listener: public port Listen forwards to server port Target.
+type portMap struct{ Listen, Target int }
 
 type kv struct{ Key, Val string }
 
@@ -33,22 +40,39 @@ type fileConfig struct {
 	Limits   []limitSpec // `limits:` list: per-port rate / quota (hot-reloaded)
 }
 
-func (c *fileConfig) tcpPorts() []int {
+// tcpPorts / udpPorts are the server-side (target) ports, i.e. the allowlist.
+func (c *fileConfig) tcpPorts() []int { return c.targets(false) }
+func (c *fileConfig) udpPorts() []int { return c.targets(true) }
+
+func (c *fileConfig) targets(udp bool) []int {
 	var out []int
 	for _, p := range c.Ports {
-		if !p.UDP {
-			out = append(out, p.Port)
+		if p.UDP == udp {
+			out = append(out, p.Target)
 		}
 	}
 	return out
 }
 
-func (c *fileConfig) udpPorts() []int {
-	var out []int
+// tcpMaps / udpMaps are the client-side listen->target mappings.
+func (c *fileConfig) tcpMaps() []portMap { return c.maps(false) }
+func (c *fileConfig) udpMaps() []portMap { return c.maps(true) }
+
+func (c *fileConfig) maps(udp bool) []portMap {
+	var out []portMap
 	for _, p := range c.Ports {
-		if p.UDP {
-			out = append(out, p.Port)
+		if p.UDP == udp {
+			out = append(out, portMap{p.Port, p.Target})
 		}
+	}
+	return out
+}
+
+// plainMaps maps each port to itself.
+func plainMaps(ports []int) []portMap {
+	out := make([]portMap, len(ports))
+	for i, p := range ports {
+		out[i] = portMap{p, p}
 	}
 	return out
 }
@@ -82,6 +106,15 @@ func parseConfig(txt string, known func(string) bool) (*fileConfig, error) {
 				ps, err := parsePortItem(item)
 				if err != nil {
 					return nil, fmt.Errorf("line %d: %v", ln, err)
+				}
+				for _, o := range cfg.Ports {
+					if o.Port == ps.Port && o.UDP == ps.UDP {
+						proto := "tcp"
+						if ps.UDP {
+							proto = "udp"
+						}
+						return nil, fmt.Errorf("line %d: duplicate listen port %d/%s", ln, ps.Port, proto)
+					}
 				}
 				cfg.Ports = append(cfg.Ports, ps)
 			case "limits":
@@ -172,11 +205,24 @@ func parsePortItem(s string) (portSpec, error) {
 	} else if p, ok := strings.CutSuffix(s, "/tcp"); ok {
 		s = p
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil || n < 1 || n > 65535 {
-		return ps, fmt.Errorf("bad port %q", s)
+	l, t, mapped := strings.Cut(s, ":")
+	port := func(x string) (int, error) {
+		n, err := strconv.Atoi(strings.TrimSpace(x))
+		if err != nil || n < 1 || n > 65535 {
+			return 0, fmt.Errorf("bad port %q", x)
+		}
+		return n, nil
 	}
-	ps.Port = n
+	var err error
+	if ps.Port, err = port(l); err != nil {
+		return ps, err
+	}
+	ps.Target = ps.Port
+	if mapped {
+		if ps.Target, err = port(t); err != nil {
+			return ps, err
+		}
+	}
 	return ps, nil
 }
 
@@ -214,7 +260,7 @@ func portsKey(c *fileConfig) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%v", c.PortsSet)
 	for _, p := range c.Ports {
-		fmt.Fprintf(&b, ",%d/%v", p.Port, p.UDP)
+		fmt.Fprintf(&b, ",%d:%d/%v", p.Port, p.Target, p.UDP)
 	}
 	return b.String()
 }
