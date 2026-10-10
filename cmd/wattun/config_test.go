@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -33,7 +34,7 @@ func TestParseConfig(t *testing.T) {
 	if got["header"] != "A: 1\x00B: 2" {
 		t.Errorf("header = %q", got["header"])
 	}
-	if !c.PortsSet || len(c.Ports) != 3 || c.Ports[2] != (portSpec{10003, true}) || c.Ports[1].Port != 10002 {
+	if !c.PortsSet || len(c.Ports) != 3 || c.Ports[2] != (portSpec{10003, 10003, true}) || c.Ports[1].Port != 10002 {
 		t.Errorf("ports = %+v", c.Ports)
 	}
 	if tp := c.tcpPorts(); len(tp) != 2 || tp[0] != 10001 || tp[1] != 10002 {
@@ -150,7 +151,7 @@ func TestHotReloadClientListeners(t *testing.T) {
 	}
 	writeCfg(t, path, cfgOf(p1, p2), 1)
 	held := make(chan net.Conn, 4)
-	ls := newListeners(func(p int) (net.Listener, error) {
+	ls := newListeners(func(p, _ int) (net.Listener, error) {
 		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p)))
 		if err == nil {
 			go acceptLoop(ln, func(c net.Conn) { held <- c })
@@ -159,12 +160,12 @@ func TestHotReloadClientListeners(t *testing.T) {
 	})
 	t.Cleanup(func() { ls.apply(nil) })
 	c, _ := parseConfig(mustRead(t, path), knownKeys)
-	if errs := ls.apply(c.tcpPorts()); len(errs) > 0 {
+	if errs := ls.apply(c.tcpMaps()); len(errs) > 0 {
 		t.Fatal(errs)
 	}
 	w := &cfgWatcher{path: path, known: knownKeys, interval: 20 * time.Millisecond,
 		onPorts: func(c *fileConfig) {
-			for _, e := range ls.apply(c.tcpPorts()) {
+			for _, e := range ls.apply(c.tcpMaps()) {
 				t.Log(e)
 			}
 		}}
@@ -219,5 +220,65 @@ func TestParseConfigIcmpType(t *testing.T) {
 	}
 	if got := flatten(c); got["icmp-type"] != "timestamp" {
 		t.Errorf("icmp-type = %q", got["icmp-type"])
+	}
+}
+
+func TestPortMappingSyntax(t *testing.T) {
+	c, err := parseConfig("ports:\n  - 443\n  - 443/udp\n  - 8443:443\n  - 9000:9001/tcp\n  - 5353:53/udp\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []portSpec{{443, 443, false}, {443, 443, true}, {8443, 443, false}, {9000, 9001, false}, {5353, 53, true}}
+	if len(c.Ports) != len(want) {
+		t.Fatalf("ports = %v", c.Ports)
+	}
+	for i, w := range want {
+		if c.Ports[i] != w {
+			t.Errorf("item %d = %v, want %v", i, c.Ports[i], w)
+		}
+	}
+	if tp := c.tcpPorts(); len(tp) != 3 || tp[0] != 443 || tp[1] != 443 || tp[2] != 9001 {
+		t.Errorf("tcpPorts (targets) = %v", tp)
+	}
+	if up := c.udpPorts(); len(up) != 2 || up[1] != 53 {
+		t.Errorf("udpPorts = %v", up)
+	}
+	if m := c.tcpMaps(); len(m) != 3 || m[1] != (portMap{8443, 443}) {
+		t.Errorf("tcpMaps = %v", m)
+	}
+	c2, _ := parseConfig("ports:\n  - 443\n  - 8443:444\n", nil)
+	c3, _ := parseConfig("ports:\n  - 443\n  - 8443:443\n", nil)
+	if portsKey(c2) == portsKey(c3) {
+		t.Error("portsKey ignores the target")
+	}
+}
+
+func TestPortMappingRejects(t *testing.T) {
+	for _, it := range []string{"0:443", "443:", ":443", "a:b", "70000:1", "1:70000", "1:2:3", "x"} {
+		if _, err := parseConfig("ports:\n  - "+it+"\n", nil); err == nil {
+			t.Errorf("%q accepted", it)
+		}
+	}
+	for _, txt := range []string{"ports:\n  - 443\n  - 443:80\n", "ports:\n  - 53/udp\n  - 53:1/udp\n"} {
+		if _, err := parseConfig(txt, nil); err == nil || !strings.Contains(err.Error(), "duplicate") {
+			t.Errorf("duplicate not rejected: %v", err)
+		}
+	}
+	if _, err := parseConfig("ports:\n  - 443\n  - 443/udp\n  - 80:443\n", nil); err != nil {
+		t.Errorf("same port on tcp and udp / shared target rejected: %v", err)
+	}
+}
+
+func TestListenersRetarget(t *testing.T) {
+	p := freePort(t)
+	ls := newListeners(func(l, _ int) (net.Listener, error) {
+		return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(l)))
+	})
+	t.Cleanup(func() { ls.apply(nil) })
+	if errs := ls.apply([]portMap{{p, 1}}); len(errs) > 0 || ls.target(p) != 1 {
+		t.Fatal(errs)
+	}
+	if errs := ls.apply([]portMap{{p, 2}}); len(errs) > 0 || ls.target(p) != 2 {
+		t.Fatalf("retarget: %v target=%d", errs, ls.target(p))
 	}
 }

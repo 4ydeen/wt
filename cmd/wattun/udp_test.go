@@ -250,14 +250,14 @@ func TestUDPListenersApplyAddsAndRemoves(t *testing.T) {
 	port := echoUDP(t)
 	r := newUDPRig(t, allowUDP(port), time.Minute)
 	var addr net.Addr
-	ul := newUDPListeners(func(p int) (*udpListener, error) {
+	ul := newUDPListeners(func(p, _ int) (*udpListener, error) {
 		l, err := r.dc.listen("127.0.0.1:0", p)
 		if err == nil {
 			addr = l.Addr()
 		}
 		return l, err
 	})
-	if errs := ul.apply([]int{port}); len(errs) > 0 || !ul.has(port) {
+	if errs := ul.apply(plainMaps([]int{port})); len(errs) > 0 || !ul.has(port) {
 		t.Fatalf("apply add: %v", errs)
 	}
 	if got, _ := sender(t, addr, 'H', 10); got != 10 {

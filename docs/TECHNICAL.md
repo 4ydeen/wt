@@ -163,7 +163,7 @@ ports:
 
 - `key: value` per line. The keys are the flag names.
 - `#` starts a comment. Values may be in "double" or 'single' quotes.
-- One list, `ports:`, with `- PORT` or `- PORT/udp` items.
+- One list, `ports:`, with `- PORT`, `- PORT/udp`, `- LISTEN:TARGET` or `- LISTEN:TARGET/udp` items.
 - Unknown keys, duplicate keys and bad values stop the start with a line number. Only `header` may repeat.
 - Command-line flags win over the file.
 - The `ports:` list is **hot-reloaded** every 3 seconds. On the client it opens and closes listeners. On the server it
@@ -171,8 +171,21 @@ ports:
   `restart needed for KEY`.
 - With a `ports:` key on the server, the file replaces `allow-ports` and `allow-file`.
 
-On the client, port N in `ports:` means: listen on `bind:(N + port-offset)` and forward to server port N. For a
-different target port use `-map listenPort:serverPort` on the command line.
+On the client, a plain `N` in `ports:` means: listen on `bind:(N + port-offset)` and forward to server port N. Since
+1.9.0 an item `LISTEN:TARGET` listens on `LISTEN` and forwards to server port `TARGET`. Both are 1-65535 and may be
+followed by `/tcp` or `/udp`. A listen port may appear only once per protocol. Changing only the target of a listen port
+in the file closes and reopens that listener (connections already open keep running).
+
+```yaml
+# Iran (client)
+ports:
+  - 443         # listen 443 -> server 443
+  - 8443:443    # listen 8443 -> server 443
+  - 5353:53/udp # listen udp 5353 -> server udp 53
+```
+
+The server allowlist is the **target** ports, so Kharej's list contains `443` and `53/udp` for the example above (not
+`8443` or `5353`). `-map` and `-udp listenPort:serverPort` on the command line behave as before.
 
 ### Keys
 
@@ -185,7 +198,7 @@ different target port use `-map listenPort:serverPort` on the command line.
 | `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. |
 | `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. |
 | `reverse` | false | both | Swap who listens and who dials. |
-| `ports` | | both | List of `N` and `N/udp`. Hot-reloaded. |
+| `ports` | | both | List of `N`, `N/udp`, `LISTEN:TARGET` and `LISTEN:TARGET/udp`. Client listens on LISTEN, server allows TARGET. Hot-reloaded. |
 | `bind` | `0.0.0.0` | client | Address of the public listeners. |
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
