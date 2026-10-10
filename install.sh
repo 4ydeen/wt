@@ -21,6 +21,26 @@ VERSION=latest
 FORCE=0
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo /nonexistent)
 
+ART=(
+  ' ▄▄▄  ▄▄▄  ▄▄▄                                    | ▄▄▄▄▄▄▄ ▄▄▄ ▄▄▄  ▄▄▄  ▄▄'
+  ' ███  ███  ███        ███                         | ▀▀███▀▀ ███ ███  ███  ██'
+  '  ██▄ ███ ███ ▄█████▄ ████ ▄█████▄ ▄█████▄ ███▄██▄|   ███   ███ ███  ████ ██'
+  '  ███ █ █ ███ ███ ███ ███  ███ ▀▀▀ ███ ███ ███ ███|   ███   ███ ███  ████▄██'
+  '  ███ █ █ ███ ▄▄█████ ███   ▀███▄▄ ███ ███ ███ ███|   ███   ███ ███  ██ ████'
+  '   ██▄█ █▄██  ███ ███ ███  ▄▄▄ ███ ███ ███ ███ ███|   ███   ███ ███  ██ ▀███'
+  '   ███   ███  ▀██▀███ ████ ▀█████▀ ▀█████▀ ███ ███|   ███   ▀▀████▀  ██  ███'
+)
+banner() {
+  [ -t 1 ] && printf '\033[H\033[2J\033[3J'
+  local l; echo
+  for l in "${ART[@]}"; do printf '\033[1;36m%s\033[1;33m%s\033[0m\n' "${l%%|*}" "${l#*|}"; done
+}
+page() { # title [subtitle]
+  banner
+  printf '\033[90m  %s\033[0m\n' "─────────────────────────────────────────────────────────────────────────"
+  printf '  \033[1;37m%s\033[0m%s\n\n' "$1" "${2:+   $(printf '\033[90m%s\033[0m' "$2")}"
+}
+
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 die()   { red "ERROR: $*"; exit 1; }
@@ -50,7 +70,7 @@ uninstall() {
   fi
   green "WatTunnel removed."
 }
-[ "${MODE:-}" = uninstall ] && { uninstall; exit 0; }
+[ "${MODE:-}" = uninstall ] && { page "Uninstall"; uninstall; exit 0; }
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -62,6 +82,14 @@ fetch() { # url dest
   if command -v curl >/dev/null; then curl -fsSL --retry 3 --connect-timeout 15 -o "$2" "$PROXY$1"
   else wget -q -T 15 -t 3 -O "$2" "$PROXY$1"; fi
 }
+
+page "Installer" "WatTunnel for linux/$ARCH"
+echo "  This will install:"
+echo "    /usr/local/bin/wattun           the tunnel"
+echo "    /usr/local/bin/wattun-manager   the menu to set up and manage tunnels"
+echo "    wattun@.service                 systemd template, one unit per tunnel"
+echo
+if [ -t 0 ]; then read -rp "  Press Enter to start, or Ctrl+C to cancel " _; page "Installing" "WatTunnel for linux/$ARCH"; fi
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 NAME=wattun-linux-$ARCH
@@ -136,9 +164,8 @@ if [ -n "$running" ] && [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
   echo "Running tunnels still use the old version: $running"
   echo "Restart them from wattun-manager when convenient (a restart drops open connections)."
 fi
-green "Done."
 if [ -t 0 ] && [ -z "$running" ]; then
-  echo
+  page "Installed" "wattun $NEW"
   echo "Which side is this server?"
   echo "  1) Kharej - outside server, where your service runs (set this up first)"
   echo "  2) Iran   - inside server that users connect to (needs the token from Kharej)"
@@ -146,4 +173,4 @@ if [ -t 0 ] && [ -z "$running" ]; then
   read -rp "Choice [3]: " side
   case "$side" in 1) exec "$MGR" kharej ;; 2) exec "$MGR" iran ;; esac
 fi
-echo "Manage tunnels any time with: wattun-manager"
+green "Done. Manage tunnels any time with: wattun-manager"

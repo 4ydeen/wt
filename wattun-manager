@@ -27,6 +27,27 @@ yes_def() { local a; read -rp "$1 [Y/n] " a; [[ ! "$a" =~ ^[Nn]$ ]]; }
 [ -x "$BIN" ] || { err "wattun is not installed. Run install.sh first."; exit 1; }
 mkdir -p "$CONF" "$RUN"; chmod 700 "$CONF"
 
+# ---------- pages: every screen starts with the WatsonTUN banner ----------
+ART=(
+  ' ▄▄▄  ▄▄▄  ▄▄▄                                    | ▄▄▄▄▄▄▄ ▄▄▄ ▄▄▄  ▄▄▄  ▄▄'
+  ' ███  ███  ███        ███                         | ▀▀███▀▀ ███ ███  ███  ██'
+  '  ██▄ ███ ███ ▄█████▄ ████ ▄█████▄ ▄█████▄ ███▄██▄|   ███   ███ ███  ████ ██'
+  '  ███ █ █ ███ ███ ███ ███  ███ ▀▀▀ ███ ███ ███ ███|   ███   ███ ███  ████▄██'
+  '  ███ █ █ ███ ▄▄█████ ███   ▀███▄▄ ███ ███ ███ ███|   ███   ███ ███  ██ ████'
+  '   ██▄█ █▄██  ███ ███ ███  ▄▄▄ ███ ███ ███ ███ ███|   ███   ███ ███  ██ ▀███'
+  '   ███   ███  ▀██▀███ ████ ▀█████▀ ▀█████▀ ███ ███|   ███   ▀▀████▀  ██  ███'
+)
+banner() {
+  [ -t 1 ] && printf '\033[H\033[2J\033[3J'
+  local l; echo
+  for l in "${ART[@]}"; do printf '\033[1;36m%s\033[1;33m%s\033[0m\n' "${l%%|*}" "${l#*|}"; done
+}
+page() { # title [subtitle]
+  banner
+  printf '\033[90m  %s\033[0m\n' "─────────────────────────────────────────────────────────────────────────"
+  printf '  \033[1;37m%s\033[0m%s\n\n' "$1" "${2:+   $(printf '\033[90m%s\033[0m' "$2")}"
+}
+
 # ---------- helpers ----------
 tunnels() { ls "$CONF"/*.yml 2>/dev/null | xargs -rn1 basename | sed 's/\.yml$//'; }
 cfg()     { sed -n "s/^$2:[[:space:]]*//p" "$CONF/$1.yml" 2>/dev/null | head -1 | tr -d "\"'"; }
@@ -101,7 +122,7 @@ wait_link() { # name seconds
 
 # ---------- Kharej (server) ----------
 setup_kharej() {
-  hdr "Kharej setup (outside server, tunnel SERVER)"
+  page "Kharej setup" "outside server · tunnel server"
   say "Run this on the server where your real service (VPN panel, web server...) listens."
   local name cr listen="" ports key m addr path="" sni="" itype=""
   name=$(ask "Tunnel name" kharej); valid_name "$name" || { err "Name is invalid or already used."; return; }
@@ -149,7 +170,7 @@ setup_kharej() {
 
 # ---------- Iran (client) ----------
 setup_iran() {
-  hdr "Iran setup (inside server, tunnel CLIENT)"
+  page "Iran setup" "inside server · tunnel client"
   say "Users will connect to this server. Set up Kharej first and copy its token."
   local name tok ports m p bad=""
   name=$(ask "Tunnel name" iran); valid_name "$name" || { err "Name is invalid or already used."; return; }
@@ -213,15 +234,13 @@ status_all() {
   for n in $t; do status_row "$n"; done
 }
 live_monitor() {
-  say "Refreshing every 2 s. Press any key to stop."
   while true; do
-    clear; say "$(c '1;36' "WatTunnel live status") - $(date '+%H:%M:%S')\n"; status_all
+    page "Live status" "$(date '+%H:%M:%S') · refreshes every 2 s · any key to go back"; status_all
     read -rsn1 -t 2 && break
   done
 }
 details() {
   local n=$1 s; s=$(stats "$n")
-  hdr "$n ($(role "$n"))"
   say "  Service:   $(systemctl is-active "wattun@$n") ($(uptime_of "$n"))"
   say "  Carrier:   $(cfg "$n" carrier)    Peer/listen: $(cfg "$n" peer)$(cfg "$n" listen)"
   say "  Ports:     $(cfg_ports "$n")"
@@ -236,7 +255,6 @@ details() {
 # ---------- diagnosis ----------
 test_tunnel() {
   local n=$1 cr peer host port s p
-  hdr "Diagnosis: $n"
   cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer)
   if systemctl is-active -q "wattun@$n"; then ok "Service is running"
   else err "Service is not running"; journalctl -u "wattun@$n" -n 10 --no-pager -o cat; return; fi
@@ -378,8 +396,11 @@ choose_tunnel() {
   echo "${arr[$((s-1))]}"
 }
 manage_tunnel() {
-  local n; n=$(choose_tunnel) || return
+  local n
+  page "Manage a tunnel"
+  n=$(choose_tunnel) || { pause; return; }
   while true; do
+    page "Tunnel: $n" "$(role "$n") · $(cfg "$n" carrier)"
     details "$n"
     say "\n  1) Diagnose connection   2) Logs              3) Add ports        4) Remove ports"
     if [ "$(role "$n")" = Kharej ]; then say "  5) Show token            6) New key/token"
@@ -387,12 +408,12 @@ manage_tunnel() {
     say "  7) Restart               8) Stop              9) Start           10) Edit config file"
     say "  11) Delete tunnel        0) Back"
     case "$(ask Choice)" in
-      1) test_tunnel "$n"; pause ;;
-      2) logs_menu "$n"; pause ;;
-      3) edit_ports "$n" add; pause ;;
-      4) edit_ports "$n" remove; pause ;;
-      5) if [ "$(role "$n")" = Kharej ]; then show_token "$n"; else change_peer "$n"; fi; pause ;;
-      6) change_key "$n"; pause ;;
+      1) page "Diagnose: $n"; test_tunnel "$n"; pause ;;
+      2) page "Logs: $n"; logs_menu "$n"; pause ;;
+      3) page "Add ports: $n"; edit_ports "$n" add; pause ;;
+      4) page "Remove ports: $n"; edit_ports "$n" remove; pause ;;
+      5) page "Tunnel: $n"; if [ "$(role "$n")" = Kharej ]; then show_token "$n"; else change_peer "$n"; fi; pause ;;
+      6) page "Key and token: $n"; change_key "$n"; pause ;;
       7) yes_no "Restart drops open connections. Continue?" && systemctl restart "wattun@$n" && ok "Restarted." ;;
       8) systemctl disable --now "wattun@$n" >/dev/null 2>&1; ok "Stopped (won't start at boot)." ;;
       9) start_unit "$n" ;;
@@ -403,17 +424,14 @@ manage_tunnel() {
   done
 }
 settings_menu() {
-  hdr "Settings"
+  page "Settings"
   say "  Auto-heal: $(systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && c 32 on || c 90 off)"
   say "  1) Turn auto-heal on   2) Turn auto-heal off   3) Restart all tunnels   0) Back"
   case "$(ask Choice)" in 1) heal_enable ;; 2) heal_disable ;; 3) yes_no "Restart all?" && restart_all ;; esac
 }
 menu() {
   while true; do
-    clear
-    say "$(c '1;36' "╔══════════════════════════════╗")"
-    say "$(c '1;36' "║        WatTunnel Manager     ║")  $($BIN -version 2>/dev/null)"
-    say "$(c '1;36' "╚══════════════════════════════╝")"
+    page "Main menu" "$($BIN -version 2>/dev/null)"
     status_all 2>/dev/null || say "  $(c 90 'No tunnels yet.')"
     say "\n  1) Kharej setup  (outside server - tunnel server)"
     say "  2) Iran setup    (inside server - tunnel client)"
@@ -428,9 +446,9 @@ menu() {
       3) manage_tunnel ;;
       4) live_monitor ;;
       5) settings_menu; pause ;;
-      6) update; pause ;;
-      7) rollback; pause ;;
-      8) yes_no "Uninstall WatTunnel?" && { heal_disable >/dev/null; bash <(curl -fsSL "${WAT_PROXY:-}https://raw.githubusercontent.com/$REPO/main/install.sh") --uninstall; exit 0; } ;;
+      6) page "Update"; update; pause ;;
+      7) page "Roll back"; rollback; pause ;;
+      8) page "Uninstall"; yes_no "Uninstall WatTunnel?" && { heal_disable >/dev/null; bash <(curl -fsSL "${WAT_PROXY:-}https://raw.githubusercontent.com/$REPO/main/install.sh") --uninstall; exit 0; } ;;
       0) exit 0 ;;
     esac
   done
