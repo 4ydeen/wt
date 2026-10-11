@@ -3187,7 +3187,7 @@ update() { # [installer args...]
   fi
   before=$(bin_ver); mbefore=$(cksum <"${imgr:-$MGR}" 2>/dev/null)
   tmp=$(mktemp /tmp/wattun-install.XXXXXX)
-  [ "$SANDBOX" = 1 ] && ienv=(WAT_BIN="$BIN" WAT_MGR="$imgr" WAT_CONF="$CONF" WAT_UNIT="$tmp.unit") # the installer's unit file goes to a throwaway path
+  [ "$SANDBOX" = 1 ] && ienv=(WAT_BIN="$BIN" WAT_MGR="$imgr" WAT_CONF="$CONF" WAT_UNIT="$tmp.unit" WAT_REQUIRE_SANDBOX=1) # the installer's unit file goes to a throwaway path
   spin_start "Downloading the installer"
   curl -fsSL --max-time 60 --retry 2 -o "$tmp" "${WAT_PROXY:-}$url"; local rc=$?
   spin_stop

@@ -327,9 +327,16 @@ step_install_bin() {
 }
 step_install_mgr() {
   if [ -f "$HERE/wattun-manager" ]; then cp "$HERE/wattun-manager" "$TMP/mgr"
+  # the manager is served from main (it checks the binary's version before using newer features); the release
+  # tag's copy is only a fallback, since a tag's manager can be older than main's fixes
+  elif fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr"; then MGR_FALLBACK=1
   elif [ -n "$TAG" ] && fetch "https://raw.githubusercontent.com/$REPO/$TAG/wattun-manager" "$TMP/mgr"; then :
-  else MGR_FALLBACK=1; fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr" || { ERRMSG="could not download wattun-manager"; return 1; }; fi
+  else ERRMSG="could not download wattun-manager"; return 1; fi
   head -c 2 "$TMP/mgr" | grep -q '#!' || { ERRMSG="wattun-manager looks corrupt"; return 1; }
+  # a sandboxed manager (WAT_PREFIX) must never be replaced by one that would ignore the prefix and use /etc/wattun
+  if [ "${WAT_REQUIRE_SANDBOX:-0}" = 1 ] && ! grep -q 'WAT_PREFIX' "$TMP/mgr"; then
+    ERRMSG="the downloaded wattun-manager has no sandbox (WAT_PREFIX) support; keeping the current one"; return 1
+  fi
   bash -n "$TMP/mgr" 2>/dev/null || { ERRMSG="the downloaded wattun-manager fails a syntax check (bash -n); not installing it"; return 1; }
   # atomic replace: a manager that is running right now keeps reading its old file safely
   install -m 755 "$TMP/mgr" "$MGR.new" && mv -f "$MGR.new" "$MGR" || { ERRMSG="cannot write $MGR"; return 1; }
@@ -375,10 +382,6 @@ run_step 3 step_install_bin
 run_step 4 step_install_mgr
 run_step 5 step_systemd
 echo
-if [ "$MGR_FALLBACK" = 1 ]; then
-  warn "Could not resolve the release tag, so the manager came from the main branch."
-  hint "The binary and the manager may not match. Re-run the installer later to get a matching pair."
-fi
 if [ "$PREV_WARN" = 1 ]; then
   warn "Could not save the previous binary as $BIN.prev (disk full?). Rollback keeps the older copy, if any."
 fi
