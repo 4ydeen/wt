@@ -33,7 +33,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
   ahead of bulk downloads.
 - **Survives SNI filtering.** Through Cloudflare with ECH, and the manager finds working edges by itself.
 - **One process, every port.** TCP and UDP, ports added or removed live without a restart, per-port stats and quotas.
-- **Light and secure.** About 40 MB of RAM. ChaCha20-Poly1305 with a pre-shared key, and unauthenticated packets get
+- **Light and secure.** About 40 MB of RAM for an ICMP tunnel. ChaCha20-Poly1305 with a pre-shared key, and unauthenticated packets get
   no reply.
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
@@ -56,7 +56,7 @@ On a heavily filtered route the usual tunnels fail in measurable ways:
 | Problem on a filtered route | What usual tools do | What WatTunnel does |
 |---|---|---|
 | TCP and UDP are cut after a few packets | Tunnel dies or flaps | Rides ICMP, which isn't cut |
-| 0.2 - 2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
+| 0.2–2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
 | Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default |
 | SNI filtering of CDN domains | Blocked right after the handshake | Cloudflare with ECH; edges and TLS settings are found automatically |
 | One process per port | Server CPU saturates | One process for all ports, batched syscalls |
@@ -113,9 +113,9 @@ We did not measure competitors' CDN speeds on this route, so there is no speed c
 | ECH against SNI filtering, config fetched automatically | ✅ | ❌ by hand |
 | Automatic scan for working Cloudflare IPs | ✅ | ❌ by hand |
 | Automatic choice of TLS fingerprint / ECH / fragmentation by speed test | ✅ | ❌ by hand |
-| Several sessions per tunnel (multi-core) | ✅ | ❌ |
-| All ports in one process, hot-reload | ✅ | ❌ |
-| Auto-heal re-tests and replaces dead edges | ✅ | ❌ |
+| Several sessions per tunnel, spread over several Cloudflare IPs | ✅ (default 4) | ❌ by hand |
+| Ports added or removed without a restart | ✅ | depends on the tool |
+| Auto-heal re-tests and replaces dead Cloudflare IPs | ✅ | ❌ |
 
 ### Feature comparison
 
@@ -258,7 +258,7 @@ on Kharej. Auto-heal can switch to another working carrier by itself. Kharej nee
 For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI.
 
 1. Put a domain on Cloudflare, with the proxy (orange cloud) on and SSL mode **Full**. For `grpc`, turn on gRPC in
-   Cloudflare's Network settings.
+   Cloudflare's Network settings if your plan shows that switch.
 2. In the Kharej wizard choose `wss` (or `grpc`) and enter the domain. `h2` does not work through Cloudflare, and
    plain `ws` on HTTP ports can hang at the upgrade.
 3. On Iran, the manager finds the ECH config by itself and scans Cloudflare edge IPs for ones that really work for
@@ -302,7 +302,7 @@ mode: client
 key-file: /etc/wattun/iran.key
 carrier: icmp
 peer: 203.0.113.10
-metrics: 127.0.0.1:19700
+metrics: 127.0.0.1:19750
 ports:
   - 443          # users connect to Iran :443, delivered to Kharej 127.0.0.1:443
   - 8443:443     # users connect to Iran :8443, delivered to Kharej 127.0.0.1:443
@@ -321,9 +321,9 @@ turned on for Iran tunnels automatically (off: `wattun` → `s` → `h`) and doe
 Each tunnel serves a small HTTP API on `127.0.0.1` only (never expose it):
 
 ```bash
-curl -s 127.0.0.1:19700/stats       # alive, last_rx_age_ms, srtt_ms, rate_bps, loss_pct, streams, sessions, bytes...
-curl -s 127.0.0.1:19700/ports       # traffic per port
-curl -s '127.0.0.1:19700/speedtest?dir=down&mb=10'   # built-in speed test (client side)
+curl -s 127.0.0.1:19750/stats       # alive, last_rx_age_ms, srtt_ms, rate_bps, loss_pct, streams, sessions, bytes...
+curl -s 127.0.0.1:19750/ports       # traffic per port
+curl -s '127.0.0.1:19750/speedtest?dir=down&mb=10'   # built-in speed test (client side)
 ```
 
 Use `last_rx_age_ms` rather than ping to judge a link's health. Field reference:
