@@ -152,7 +152,16 @@ func (c *cc) tick(now time.Time) {
 		if s := c.minRTT / 8; s > slack {
 			slack = s
 		}
-		if avg > c.minRTT+slack {
+		// reliable (TCP pool, e.g. through a CDN): delay spread across edges and TCP buffering inflates the RTT
+		// without any queue of ours, and real congestion is already handled by TCP. Allow a third of the RTT and cut
+		// only while we fill the window ourselves: in production (2.4.0, ~500 bursty web streams) the old rule cut
+		// app-limited sessions down to the 0.2 MB/s floor and they never climbed back.
+		if c.reliable {
+			if s := c.minRTT / 3; s > slack {
+				slack = s
+			}
+		}
+		if avg > c.minRTT+slack && (!c.reliable || c.limited) {
 			c.rate *= 0.93
 			if c.rate < c.minRate {
 				c.rate = c.minRate

@@ -232,6 +232,9 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		winSlack: uint64(hi - overhead),
 	}
 	s.cc.reliable = prof.Reliable
+	if prof.Reliable && cfg.MinBps == 2e5 && cfg.InitBps > s.cc.minRate { // default floor: never pace a TCP pool below its start rate
+		s.cc.minRate = min(cfg.InitBps, cfg.MaxBps)
+	}
 	s.replayWin, s.ackMax, s.rxKeep = replayWin, 20, 64
 	if prof.Reliable { // pool reordering leaves a hole per stalled connection's packets: track and report more of them
 		s.replayWin, s.ackMax, s.rxKeep = reliableReplayWin, 64, 512
