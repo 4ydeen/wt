@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/img/banner.jpg" alt="WatTunnel: stay connected, even when only ping gets through" width="100%">
+
 # 🪁 WatTunnel
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**

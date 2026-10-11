@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/img/banner.jpg" alt="WatTunnel: stay connected, even when only ping gets through" width="100%">
+
 # 🪁 WatTunnel
 
 [![Release](https://img.shields.io/github/v/release/JohnWatsoon/WatTunnel?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
