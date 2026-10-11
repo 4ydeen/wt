@@ -375,7 +375,7 @@ WantedBy=multi-user.target
 EOF
   if ! cmp -s "$TMP/unit" "$UNIT" 2>/dev/null; then install -m 644 "$TMP/unit" "$UNIT" || { ERRMSG="cannot write $UNIT"; return 1; }; fi
   systemctl daemon-reload || { ERRMSG="systemctl daemon-reload failed"; return 1; }
-  DETAIL="wattun@.service (one unit per tunnel)"
+  DETAIL="${UNIT##*/} (one unit per tunnel)"
 }
 
 # ======================================================================================

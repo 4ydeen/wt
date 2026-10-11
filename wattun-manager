@@ -1427,6 +1427,10 @@ sessions_check() { # --sessions N: only when the installed wattun knows the key 
   return 0
 }
 sessions_line() { # the engine refuses sessions with icmp, bonded carriers, reverse, or more than 16
+  if [ -z "$SESS_USE" ] && [ "$T_REV" != 1 ] && ver_ge "$(bin_ver || true)" 2.3.0 2>/dev/null; then
+    # default for pool carriers: 4 sessions (field, Iran-CF-Kharej wss: 1 = 19, 4 = 52 MB/s down at 91% of 2 cores)
+    case "$T_CARRIER" in tcp|tls|ws|wss|h2|h2c|grpc) SESS_USE=4 ;; esac
+  fi
   [ -n "$SESS_USE" ] || return 0
   case "$T_CARRIER" in icmp|*,*) warn "--sessions ignored: not supported with carrier '$T_CARRIER'" >&2; return 0 ;; esac
   [ "$T_REV" = 1 ] && { warn "--sessions ignored: not supported in reverse mode" >&2; return 0; }
@@ -2483,6 +2487,14 @@ cdn_tune_cmd() { # name [full] : re-run the CDN tuning for an Iran CDN tunnel, s
   cdn_take
   new=$T_PEER/$(sed -n 's/^fp: //p' <<<"$AT_EXTRA")/$(sed -n 's/^ech: //p' <<<"$AT_EXTRA")/$(sed -n 's/^tls-frag: //p' <<<"$AT_EXTRA")
   if [ "$new" = "$cur" ]; then ok "'$n' already uses these settings."; return 0; fi
+  # same TLS settings and only the edge list differs: keep the running tunnel if every edge it uses is still up
+  # (a restart drops every open connection; edge order varies between scans)
+  if [ "${new#*/}" = "${cur#*/}" ]; then
+    local st; st=$(stats "$n" 2>/dev/null)
+    if grep -q '"edges"' <<<"$st" && ! grep -q '"up": *false' <<<"$st"; then
+      ok "'$n' already uses these settings and all its Cloudflare edges are up; not restarting."; return 0
+    fi
+  fi
   confirm "Apply to '$n'? (restarts the tunnel, open connections drop)" y || { warn "No change."; return 0; }
   cdn_apply "$n"
 }
