@@ -19,6 +19,7 @@ type poolRig struct {
 	tap  *sizeTap
 	key  []byte
 	mtu  int
+	tlsOpt TLSClientOptions
 	tls  bool
 }
 
@@ -55,12 +56,19 @@ func newPoolRig(t *testing.T, mtu int, useTLS bool) *poolRig {
 	return r
 }
 
+// tlsOptions are the tls carrier's client options; tlsOpt (when set by a test) adds the 2.2.0 tuning.
+func (r *poolRig) tlsOptions() TLSClientOptions {
+	o := r.tlsOpt
+	o.ServerName = "example.com"
+	return o
+}
+
 func (r *poolRig) pio(t *testing.T) *TCPPoolClient {
 	t.Helper()
 	var c *TCPPoolClient
 	var err error
 	if r.tls {
-		c, err = NewTLSPoolClient(r.addr, 8, TLSClientOptions{ServerName: "example.com"})
+		c, err = NewTLSPoolClient(r.addr, 8, r.tlsOptions())
 	} else {
 		c, err = NewTCPPoolClient(r.addr, 8)
 	}

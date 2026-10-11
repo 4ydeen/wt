@@ -17,6 +17,7 @@ Version: see `wat/version.go` (`wattun -version`).
 5. [Bonding](#bonding)
 6. [Reverse mode](#reverse-mode)
    - [Auto mode](#auto-mode)
+   - [CDN tuning](#cdn-tuning)
 7. [UDP forwarding](#udp-forwarding)
 8. [Config file](#config-file)
 9. [Command-line flags](#command-line-flags)
@@ -352,6 +353,53 @@ once per 30 minutes). It switches to another working variant only when the curre
 2.1.0 or newer (the `clients` field and the reverse dial backoff). The wire format did not change, so 2.1.0 peers work
 with 2.0.x ones for normal tunnels.
 
+## CDN tuning
+
+Since 2.2.0, client (Iran) side only. Kharej and the wire format are unchanged, so any 2.x Kharej works.
+
+**Why.** Field findings from a real Iran server (October 2026): the filter lets the TLS handshake through and then
+black-holes the flow by the SNI of the user's own domain. The edges DNS returns for the Cloudflare zone were
+degraded while other edges (for example 162.159.140.220) worked. Domain fronting (another SNI, your Host) gets a 403
+from Cloudflare. Plain `ws` on HTTP ports through Cloudflare hung at the Upgrade. So the tuning picks edges and
+TLS behaviour, and does not rely on fronting.
+
+**Client keys.**
+
+- `peer: A,B,C` accepts several comma-separated addresses for the pool carriers. Slots spread over them, and a dead
+  address fails over at once. `/stats` shows them in `edges`.
+- `fp` sets the ClientHello fingerprint (utls). `ech: auto` hides the domain with Encrypted Client Hello and falls
+  back to no ECH if the record is missing. `tls-frag: N` splits the ClientHello.
+- ALPN: `ws` and `wss` force `http/1.1`; `h2` and `grpc` require `h2`.
+
+**What the manager does.** When Iran sets up a CDN tunnel (`wss`, `h2`, `grpc`, `ws`, `h2c` through a Cloudflare
+domain) it runs, without questions:
+
+1. Scan about 22 Cloudflare edge IPs. An edge counts only if it returns a real HTTP response. IPv6 edges are tried
+   only when the server has an IPv6 route.
+2. If no edge answers for the domain (SNI filtering), rank the edges with `speed.cloudflare.com` instead and make
+   sure ECH is tried.
+3. Keep the best 3 as `peer`.
+4. Speed-test, in this order: Chrome fingerprint, ECH, plain, and last fragmentation.
+5. Write the winner (`fp`, `ech`, `tls-frag`, `peer`) into the config and restart.
+
+In Auto mode this is part of the CDN phase; the table labels look like `wss · chrome · 3 edges`.
+`wattun cdn-tune NAME [full]` repeats the tuning at any time. Auto-heal refreshes dead edges.
+
+**Cloudflare settings.** Use `wss`, `grpc` or `h2` on a Cloudflare HTTPS port (443, 2053, 2083, 2087, 2096, 8443),
+SSL mode Full, ECH on, and enable gRPC in the Cloudflare Network settings for `grpc`. Avoid plain `ws` on HTTP ports.
+
+**Troubleshooting.**
+
+| Symptom | Cause and fix |
+|---|---|
+| Connects, then stalls with no data | SNI black-holing. Set `ech: auto`, or try `fp: chrome` and `tls-frag`. Run `wattun cdn-tune NAME full`. |
+| All edges fail the scan | The domain is blocked by SNI. The manager falls back to ranking by `speed.cloudflare.com` and tries ECH. Check `ech` and `tls_mode` in `/stats`. |
+| `ech: false` although `ech: auto` is set | The domain has no HTTPS DNS record (the zone is not on Cloudflare's ECH), or DoH is blocked. The tunnel runs without ECH. |
+| `grpc` never connects | gRPC is off in Cloudflare Network settings. |
+| `ws` hangs at the Upgrade | Plain ws on an HTTP port. Move to `wss` on an HTTPS port. |
+| 403 from Cloudflare | A fronted SNI/Host mismatch. Keep `sni` and `host` the same domain. |
+| One entry in `edges` has `up: false` | That edge is dead. Auto-heal replaces it, or run `wattun cdn-tune NAME`. |
+
 ## UDP forwarding
 
 Since 1.2.0 WatTunnel also forwards UDP ports (WireGuard, DNS, QUIC, game servers) as unreliable datagrams inside the
@@ -435,6 +483,9 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `host` | = `peer` | client (server with `reverse`) | Host header / authority, set on whichever side dials. |
 | `plain` | false | both (dialer with `reverse`) | grpc without TLS. |
 | `header` | | client (server with `reverse`) | Extra request header `Name: value`. Repeatable. |
+| `fp` | `go` | client (server with `reverse`) | TLS ClientHello fingerprint (utls): `go`, `chrome`, `firefox`, `safari`, `edge` or `random`. Since 2.2.0. |
+| `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. Since 2.2.0. |
+| `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
 
@@ -568,6 +619,9 @@ Every flag can also be a config key. Flags win over the file.
 | `-tls-cert`, `-tls-key` | | Server: certificate files. |
 | `-sni`, `-tls-pin` | | Client: TLS name, certificate fingerprint. |
 | `-path`, `-host`, `-header`, `-plain` | `/wat` | HTTP carrier options. |
+| `-fp NAME` | `go` | Dialer: TLS fingerprint `go`, `chrome`, `firefox`, `safari`, `edge`, `random` (2.2.0). |
+| `-ech MODE` | `off` | Dialer: `off`, `auto` or a base64 ECHConfigList (2.2.0). |
+| `-tls-frag N` | 0 | Dialer: split the ClientHello into N-byte pieces (2.2.0). |
 | `-metrics ADDR` | off | Serve `/stats` and pprof. |
 | `-debug` | off | Log every stream. |
 | `-version` | | Print `wattun X.Y.Z` and exit. |
@@ -636,6 +690,10 @@ metrics port, even if the port is in the allowlist.
 | `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive). |
 | `last_rx_age_ms` | Since 2.0.1. Milliseconds since the last authenticated packet from the peer (server: from any client, including sessions that have closed). `-1` = none since the process started. Monitors should use this rather than ping: it only moves on real tunnel packets. |
 | `clients` | Since 2.1.0, servers only. One entry per live client session: `[{"ip":"203.0.113.5","carrier":"tcp","age_ms":1234}]`. Behind a CDN carrier (`ws`, `wss`, `h2`, `h2c`, `grpc`) `ip` is the proxy's address. Auto mode uses it to learn Iran's IP. |
+| `tls_fp` | Since 2.2.0, pool carriers. The TLS fingerprint in use (`go`, `chrome`, ...). |
+| `tls_mode` | Since 2.2.0. Fingerprint plus ECH state, for example `chrome+ech`, `go`. |
+| `ech` | Since 2.2.0. `true` when Encrypted Client Hello is active on the dialed connections. |
+| `edges` | Since 2.2.0, when `peer` lists several addresses: `[{"addr":"162.159.140.220:443","up":true}]`, one entry per address. |
 | `sessions` | Server: client sessions. Client: always 1. |
 | `draining` | Server: not accepting new sessions. |
 | `streams` | Open TCP streams. The drain timer waits for 0. |

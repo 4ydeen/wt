@@ -66,6 +66,14 @@ HTTP/2 or gRPC, including behind Cloudflare.
 
 ## 🆕 What's new
 
+**2.2.0: CDN tuning (Iran side only).** Some Iran filters let the TLS handshake through and then black-hole the flow
+by the SNI of your domain, or the edges DNS gives you for a zone are degraded while other Cloudflare edges work. When
+Iran sets up a CDN tunnel (`wss`, `h2`, `grpc`, `ws`, `h2c` through a Cloudflare domain), the manager now scans about
+22 Cloudflare edge IPs, keeps the best 3, then speed-tests a Chrome TLS fingerprint, Encrypted Client Hello (ECH),
+plain TLS and ClientHello fragmentation, and writes the winner into the config. No questions. New client keys:
+`fp`, `ech`, `tls-frag`, and `peer` accepts several comma-separated addresses. `wattun cdn-tune NAME` re-tunes, and
+auto-heal refreshes dead edges. Kharej and the wire format are unchanged. See [CDN tuning](docs/TECHNICAL.md#cdn-tuning).
+
 **2.1.1: just type `wattun`.** The manager now opens with `wattun` (no flags), and `wattun auto-test NAME`,
 `wattun token NAME`, `wattun update`, `wattun status` and `wattun auto-ip NAME IP` work too. `wattun-manager` still
 works. Fewer questions: Kharej no longer asks which ports Iran may reach (all are allowed; restrict them later in the
@@ -378,6 +386,11 @@ Good to know: several ports are open on Kharej at once, and Kharej must run 2.1.
 | `wss` | Behind **Cloudflare** or another CDN. | Enter your domain during Kharej setup. Turn the Cloudflare proxy (orange cloud) on and set SSL to *Full*. |
 | `ws` / `h2c` | A CDN on port 80, or a reverse proxy that handles TLS. | Cleartext to the proxy. The session itself is still encrypted. |
 | `grpc` / `h2` | CDNs or proxies that prefer gRPC or HTTP/2. | |
+
+**Behind Cloudflare (2.2.0).** Prefer `wss`, `grpc` or `h2` on a Cloudflare HTTPS port, SSL mode *Full*, and turn on
+gRPC in Cloudflare's Network settings for `grpc`. Plain `ws` on HTTP ports can hang at the Upgrade. The Iran side
+picks the edge IPs, the TLS fingerprint, ECH and fragmentation by itself (`wattun cdn-tune NAME` repeats it); details
+and the manual keys are in [docs/TECHNICAL.md](docs/TECHNICAL.md#cdn-tuning).
 
 Not sure? Start with `icmp` on heavily filtered routes and `wss` behind Cloudflare. If Iran can't ping Kharej but
 Kharej can ping Iran, use `icmp` with [Reverse ICMP](#-reverse-mode). If Iran can't reach Kharej's TCP port

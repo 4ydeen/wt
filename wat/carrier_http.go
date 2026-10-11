@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // CDN-compatible carriers: ws/wss (WebSocket), h2/h2c (one full-duplex HTTP/2 POST per pool connection) and grpc
@@ -56,47 +58,56 @@ func (o HTTPClientOptions) host(peer string) string {
 	return peer
 }
 
-func (o HTTPClientOptions) tlsConfig(proto string) *tls.Config {
+// engine is the TLS client for this carrier: SNI from -sni, else the Host name, ALPN fixed per carrier.
+func (o HTTPClientOptions) engine(alpn string) (*tlsEngine, error) {
 	t := o.TLS
 	if t.ServerName == "" && o.Host != "" {
 		t.ServerName, _, _ = strings.Cut(o.Host, ":")
 	}
-	cfg := t.config()
-	cfg.NextProtos = []string{proto}
-	return cfg
+	return newTLSEngine(t, alpn)
 }
 
 // ---------------------------------------------------------------- websocket
 
-// NewWSPoolClient is the ws (o.Secure false) or wss pool client.
+// NewWSPoolClient is the ws (o.Secure false) or wss pool client. The TLS side asks for http/1.1 only: a CDN that
+// picked h2 could not upgrade the connection to a WebSocket.
 func NewWSPoolClient(peer string, conns int, o HTTPClientOptions) (*TCPPoolClient, error) {
-	if _, _, err := net.SplitHostPort(peer); err != nil {
+	addrs, err := SplitPeers(peer)
+	if err != nil {
 		return nil, err
 	}
-	path, host := normPath(o.Path), o.host(peer)
+	path := normPath(o.Path)
 	d := net.Dialer{Timeout: 5 * time.Second}
-	return newPoolClient(func(ctx context.Context) (net.Conn, error) {
+	var eng *tlsEngine
+	if o.Secure {
+		if eng, err = o.engine("http/1.1"); err != nil {
+			return nil, err
+		}
+	}
+	c, err := newSlotClient(addrs, conns, func(ctx context.Context, addr string) (net.Conn, error) {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		c, err := d.DialContext(ctx, "tcp", peer)
+		var c net.Conn
+		var err error
+		if eng != nil {
+			c, err = eng.dial(ctx, addr)
+		} else {
+			c, err = d.DialContext(ctx, "tcp", addr)
+		}
 		if err != nil {
 			return nil, err
 		}
-		if o.Secure {
-			tc := tls.Client(c, o.tlsConfig("http/1.1"))
-			if err = tc.HandshakeContext(ctx); err != nil {
-				c.Close()
-				return nil, err
-			}
-			c = tc
-		}
-		w, err := wsClientHandshake(ctx, c, host, path, o.Headers)
+		w, err := wsClientHandshake(ctx, c, o.host(addr), path, o.Headers)
 		if err != nil {
 			c.Close()
 			return nil, err
 		}
 		return w, nil
-	}, conns)
+	})
+	if c != nil && eng != nil {
+		c.tlsFn = eng.info
+	}
+	return c, err
 }
 
 // NewWSPoolServer serves the pool over WebSocket on o.Path; any other request gets a plain 404.
@@ -292,7 +303,8 @@ func (c *h2Conn) wait(ctx context.Context) {
 // ---------------------------------------------------------------- h2 client / server
 
 func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPoolClient, error) {
-	if _, _, err := net.SplitHostPort(peer); err != nil {
+	addrs, err := SplitPeers(peer)
+	if err != nil {
 		return nil, err
 	}
 	path := normPath(o.Path)
@@ -300,18 +312,44 @@ func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPo
 		path += "/Tun"
 	}
 	scheme := "http"
+	var eng *tlsEngine
 	if o.Secure {
 		scheme = "https"
+		if eng, err = o.engine("h2"); err != nil {
+			return nil, err
+		}
 	}
-	url, host := scheme+"://"+peer+path, o.host(peer)
-	return newPoolClient(func(ctx context.Context) (net.Conn, error) {
-		var protos http.Protocols
-		protos.SetHTTP2(o.Secure)
-		protos.SetUnencryptedHTTP2(!o.Secure)
-		tr := &http.Transport{Protocols: &protos, DisableKeepAlives: true, ForceAttemptHTTP2: true,
-			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second}
-		if o.Secure {
-			tr.TLSClientConfig = o.tlsConfig("h2")
+	c, err := newSlotClient(addrs, conns, func(ctx context.Context, addr string) (net.Conn, error) {
+		url, host := scheme+"://"+addr+path, o.host(addr)
+		var rt http.RoundTripper
+		var closeTr func()
+		var tcpConn atomic.Pointer[net.Conn]
+		if eng != nil && eng.useUTLS() {
+			// utls connections are not *tls.Conn, which net/http needs to see to speak h2 over them; the x/net
+			// HTTP/2 transport has no such limit. The engine has already insisted on ALPN h2.
+			tr := &http2.Transport{DialTLSContext: func(ctx context.Context, _, a string, _ *tls.Config) (net.Conn, error) {
+				c, err := eng.dial(ctx, a)
+				if err == nil {
+					tcpConn.Store(&c)
+				}
+				return c, err
+			}}
+			rt, closeTr = tr, func() {
+				tr.CloseIdleConnections()
+				if cp := tcpConn.Load(); cp != nil {
+					(*cp).Close()
+				}
+			}
+		} else {
+			var protos http.Protocols
+			protos.SetHTTP2(o.Secure)
+			protos.SetUnencryptedHTTP2(!o.Secure)
+			tr := &http.Transport{Protocols: &protos, DisableKeepAlives: true, ForceAttemptHTTP2: true,
+				DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
+			if eng != nil {
+				tr.DialTLSContext = func(ctx context.Context, _, a string) (net.Conn, error) { return eng.dial(ctx, a) }
+			}
+			rt, closeTr = tr, tr.CloseIdleConnections
 		}
 		rctx, cancel := context.WithCancel(ctx)
 		pr, pw := io.Pipe()
@@ -331,7 +369,7 @@ func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPo
 			req.Header.Set("Content-Type", "application/octet-stream")
 		}
 		t := time.AfterFunc(10*time.Second, cancel) // bounds the connect; headers arrive as soon as the server accepts
-		resp, err := (&http.Client{Transport: tr}).Do(req)
+		resp, err := (&http.Client{Transport: rt}).Do(req)
 		if !t.Stop() && err == nil {
 			err = context.DeadlineExceeded
 		}
@@ -342,7 +380,7 @@ func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPo
 		if err != nil {
 			cancel()
 			pw.Close()
-			tr.CloseIdleConnections()
+			closeTr()
 			return nil, err
 		}
 		var rd io.Reader = resp.Body
@@ -351,13 +389,17 @@ func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPo
 			pw.CloseWithError(io.EOF)
 			cancel()
 			resp.Body.Close()
-			tr.CloseIdleConnections()
-		}, h2Addr{"client"}, h2Addr{peer})
+			closeTr()
+		}, h2Addr{"client"}, h2Addr{addr})
 		if grpc {
 			return newGRPCConn(c), nil
 		}
 		return c, nil
-	}, conns)
+	})
+	if c != nil && eng != nil {
+		c.tlsFn = eng.info
+	}
+	return c, err
 }
 
 // NewH2PoolClient is the h2 (o.Secure) or h2c pool client: every pool connection is one POST on its own TCP connection.

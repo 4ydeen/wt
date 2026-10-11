@@ -24,7 +24,7 @@ import (
 // admits sids whose packets authenticate, so all a stranger can do here is occupy capped slots for a few seconds.
 
 const (
-	poolQueue     = 256 // packets queued per connection
+	poolQueue     = 256      // packets queued per connection
 	poolMaxFrame  = 32 << 10 // receive bound; datagrams are at most poolMaxMTU
 	poolBufSize   = 64 << 10
 	poolHelloWait = 5 * time.Second
@@ -181,7 +181,9 @@ type PoolDialFunc func(ctx context.Context) (net.Conn, error)
 
 // TCPPoolClient is the client PacketIO over a pool of framed connections. The lane is ignored.
 type TCPPoolClient struct {
-	dial   PoolDialFunc
+	dial   func(ctx context.Context, slot int) (net.Conn, error)
+	tlsFn  func() (string, string, bool) // TLS fingerprint, mode and ECH state, nil for non-TLS carriers
+	ps     *peerSet
 	peer   poolAddr
 	remIP  atomic.Value // string: remote IP of the newest connection
 	id     [8]byte
@@ -194,8 +196,8 @@ type TCPPoolClient struct {
 	rr     atomic.Uint32
 	once   sync.Once
 
-	maxBackoff atomic.Int64                  // cap of the redial backoff in ns (0: poolBackoffMax)
-	logf       atomic.Pointer[dialLogger]   // optional, see SetDialLog
+	maxBackoff atomic.Int64               // cap of the redial backoff in ns (0: poolBackoffMax)
+	logf       atomic.Pointer[dialLogger] // optional, see SetDialLog
 	logMu      sync.Mutex
 	lastLog    time.Time // last failure line
 	failing    bool      // a failure was logged and no connection came up since
@@ -203,15 +205,69 @@ type TCPPoolClient struct {
 
 // NewTCPPoolClient dials conns (0 = DefaultPoolConns) TCP connections to host:port in the background; Send drops
 // until the first one is up, which the session treats as loss.
+//
+// peer may hold several comma-separated addresses: slot i dials address i%n (see peerSet).
 func NewTCPPoolClient(peer string, conns int) (*TCPPoolClient, error) {
-	if _, _, err := net.SplitHostPort(peer); err != nil {
+	addrs, err := SplitPeers(peer)
+	if err != nil {
 		return nil, err
 	}
 	d := net.Dialer{Timeout: 5 * time.Second}
-	return newPoolClient(func(ctx context.Context) (net.Conn, error) { return d.DialContext(ctx, "tcp", peer) }, conns)
+	return newSlotClient(addrs, conns, func(ctx context.Context, addr string) (net.Conn, error) {
+		return d.DialContext(ctx, "tcp", addr)
+	})
+}
+
+// newSlotClient is a pool client whose slots spread over addrs; dial opens one connection to one address. A slot
+// tries its home address first, then the others at once, and the pool's redial backoff only applies when all failed.
+func newSlotClient(addrs []string, conns int, dial func(ctx context.Context, addr string) (net.Conn, error)) (*TCPPoolClient, error) {
+	ps := newPeerSet(addrs)
+	c, err := newSlotPoolClient(func(ctx context.Context, slot int) (net.Conn, error) {
+		var last error
+		for _, i := range ps.order(slot) {
+			if ctx.Err() != nil {
+				break
+			}
+			conn, err := dial(ctx, addrs[i])
+			ps.mark(i, err == nil)
+			if err == nil {
+				return conn, nil
+			}
+			last = err
+		}
+		if last == nil {
+			last = ctx.Err()
+		}
+		return nil, last
+	}, conns)
+	if c != nil {
+		c.ps = ps
+	}
+	return c, err
 }
 
 func newPoolClient(dial PoolDialFunc, conns int) (*TCPPoolClient, error) {
+	return newSlotPoolClient(func(ctx context.Context, _ int) (net.Conn, error) { return dial(ctx) }, conns)
+}
+
+// TLSInfo reports the TLS fingerprint in use and whether the newest connection used ECH (ok false: not a TLS carrier).
+func (c *TCPPoolClient) TLSInfo() (fp, mode string, ech bool, ok bool) {
+	if c.tlsFn == nil {
+		return "", "", false, false
+	}
+	fp, mode, ech = c.tlsFn()
+	return fp, mode, ech, true
+}
+
+// Edges reports the health of each peer address (nil for a client built without addresses).
+func (c *TCPPoolClient) Edges() []EdgeStat {
+	if c.ps == nil {
+		return nil
+	}
+	return c.ps.edges()
+}
+
+func newSlotPoolClient(dial func(ctx context.Context, slot int) (net.Conn, error), conns int) (*TCPPoolClient, error) {
 	if conns <= 0 {
 		conns = DefaultPoolConns
 	}
@@ -324,7 +380,7 @@ func (c *TCPPoolClient) slotLoop(i int) {
 			return
 		default:
 		}
-		conn, err := c.dial(c.ctx)
+		conn, err := c.dial(c.ctx, i)
 		if err == nil {
 			conn.SetWriteDeadline(time.Now().Add(poolHelloWait))
 			_, err = conn.Write(c.id[:])
@@ -434,7 +490,7 @@ type TCPPoolServer struct {
 	mu    sync.Mutex
 	pools map[string]map[*poolConn]struct{}
 	all   map[net.Conn]struct{} // every accepted conn, so Close also reaches ones still in their hello
-	merge atomic.Bool          // reverse mode: every conn joins one pool whatever its hello id says
+	merge atomic.Bool           // reverse mode: every conn joins one pool whatever its hello id says
 }
 
 // NewTCPPoolServer listens on addr (":4443").

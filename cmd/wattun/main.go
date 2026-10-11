@@ -43,7 +43,7 @@ func main() {
 	mode := flag.String("mode", "", "client|server")
 	key := flag.String("key", "", "pre-shared key")
 	keyFile := flag.String("key-file", "", "read the key from a file")
-	peer := flag.String("peer", "", "client: server IP")
+	peer := flag.String("peer", "", "client: server IP; the pool carriers (tcp|tls|ws|wss|h2|h2c|grpc) take host:port and may list several, comma separated, which the pool connections spread over (client only, 2.2.0)")
 	maps := flag.String("map", "", "client: listenPort:serverPort[,...]")
 	udpMaps := flag.String("udp", "", "client: UDP forwarding, PORT or listenPort:serverPort[@bind][,...] (both ends need wattun >= 1.2.0)")
 	udpIdle := flag.Duration("udp-idle", 60*time.Second, "UDP flows with no traffic for this long are closed")
@@ -72,6 +72,9 @@ func main() {
 	tlsPin := flag.String("tls-pin", "", "client, tls carrier: hex sha256 of the server certificate to require")
 	mtu := flag.Int("mtu", 0, "datagram size cap incl. header/tag, 256-1400 (tcp|tls|ws|wss|h2|h2c|grpc: up to 16384) (0 = the carrier default: 640 icmp, 1400 udp, 4096 tcp-based)")
 	path := flag.String("path", "/wat", "client/server, ws|wss|h2|h2c|grpc carrier: URL path (grpc: service name, requests go to <path>/Tun)")
+	tlsFP := flag.String("fp", "go", "client (also a -reverse server), tls|wss|h2|grpc carriers: TLS ClientHello fingerprint go|chrome|firefox|safari|edge|random; go is the standard library's (client only, 2.2.0; server unchanged)")
+	echMode := flag.String("ech", "off", "client, tls|wss|h2|grpc carriers: Encrypted Client Hello: off|auto|<base64 ECHConfigList>; auto reads the HTTPS DNS record of the SNI/host name over DNS-over-HTTPS (1.1.1.1, 8.8.8.8) (client only, 2.2.0; server unchanged)")
+	tlsFrag := flag.Int("tls-frag", 0, "client, tls|wss|h2|grpc carriers: split the TLS ClientHello into N-byte TCP segments, 0 = off (client only, 2.2.0; server unchanged)")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
 	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer; icmp carrier: the server sends the requests to -peer (the client's IP) and the client answers with replies (both ends need wattun >= 2.0.0 and -reverse)")
@@ -154,15 +157,28 @@ func main() {
 		fmt.Fprintf(os.Stderr, "-reverse needs icmp or a connection-pool carrier (tcp|tls|ws|wss|h2|h2c|grpc), not %q\n", *carrier)
 		os.Exit(2)
 	}
+	if _, err := wat.NormFingerprint(*tlsFP); err != nil {
+		log.Fatal(err)
+	}
+	if _, _, err := wat.ParseECHFlag(*echMode); err != nil {
+		log.Fatal(err)
+	}
+	if *tlsFrag < 0 || *tlsFrag > 1<<14 {
+		log.Fatalf("-tls-frag must be 0..16384, got %d", *tlsFrag)
+	}
 	pick := func(by map[string]*string, def, c string) string {
 		if v := by[c]; v != nil && *v != "" {
 			return *v
 		}
 		return def
 	}
+	var tlsPools []*wat.TCPPoolClient // dialing pool clients, for the tls_fp / ech stats
 	// build opens one carrier; the single-carrier case is exactly the old code path.
 	build := func(carrier string) (pio wat.PacketIO, raw wat.RawIO) {
 		peer, listen := pick(peerBy, *peer, carrier), pick(listenBy, *udpListen, carrier)
+		if (carrier == "icmp" || carrier == "udp") && strings.Contains(peer, ",") {
+			log.Fatalf("%s carrier: -peer takes exactly one address, got %q (several comma separated addresses work with tcp|tls|ws|wss|h2|h2c|grpc)", carrier, peer)
+		}
 		lis := server != (*reverse && poolCarriers[carrier]) // which side listens: the server, or the client when -reverse
 		var ps *wat.TCPPoolServer
 		var pc *wat.TCPPoolClient
@@ -210,7 +226,8 @@ func main() {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
 					}
 				}
-				pc, err = wat.NewTLSPoolClient(peer, *conns, wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin})
+				pc, err = wat.NewTLSPoolClient(peer, *conns, wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin,
+					Fingerprint: *tlsFP, ECH: *echMode, Frag: *tlsFrag, Logf: log.Printf})
 			}
 			if err != nil {
 				log.Fatalf("tls carrier: %v", err)
@@ -230,6 +247,7 @@ func main() {
 			} else {
 				co := wat.HTTPClientOptions{Path: *path, Host: *host, Secure: secure, Headers: map[string]string{}}
 				co.TLS.ServerName = *sni
+				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				if *tlsPin != "" {
 					if co.TLS.PinSHA256, err = hex.DecodeString(strings.ReplaceAll(*tlsPin, ":", "")); err != nil || len(co.TLS.PinSHA256) != 32 {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
@@ -251,6 +269,9 @@ func main() {
 			if err != nil {
 				log.Fatalf("%s carrier: %v", carrier, err)
 			}
+		}
+		if pc != nil {
+			tlsPools = append(tlsPools, pc)
 		}
 		switch { // pool carriers: who listens and who dials is independent of the session role
 		case ps != nil && server:
@@ -384,6 +405,19 @@ func main() {
 					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(),
 				}
 				out["ports"] = portReg.snapshot(side)
+				var edges []wat.EdgeStat
+				for _, p := range tlsPools { // dialing pools: per-address health, and the client-side TLS state
+					edges = append(edges, p.Edges()...)
+					if _, ok := out["tls_mode"]; ok {
+						continue
+					}
+					if fp, mode, ech, ok := p.TLSInfo(); ok {
+						out["tls_fp"], out["tls_mode"], out["ech"] = fp, mode, ech
+					}
+				}
+				if len(edges) > 0 {
+					out["edges"] = edges
+				}
 				if len(names) > 1 {
 					out["carriers"] = carrierStats()
 				}

@@ -14,6 +14,7 @@ type httpRig struct {
 	flavor string
 	path   string
 	stop   chan struct{}
+	tlsOpt TLSClientOptions // client TLS tuning under test
 }
 
 // shut closes the server and the rig's accept goroutine (srv.New is never closed).
@@ -80,7 +81,7 @@ func newHTTPRig(t *testing.T, flavor string) *httpRig {
 func (r *httpRig) pio(t *testing.T) *TCPPoolClient {
 	t.Helper()
 	o := HTTPClientOptions{Path: r.path, Host: "cdn.example.com", Headers: map[string]string{"X-Test": "1"},
-		Secure: r.flavor == "wss" || r.flavor == "h2" || r.flavor == "grpc"}
+		Secure: r.flavor == "wss" || r.flavor == "h2" || r.flavor == "grpc", TLS: r.tlsOpt}
 	var c *TCPPoolClient
 	var err error
 	switch r.flavor {

@@ -1,16 +1,13 @@
 package wat
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crand "crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"errors"
 	"math/big"
 	"net"
 	"time"
@@ -25,37 +22,42 @@ type TLSClientOptions struct {
 	ServerName string // SNI sent in the ClientHello
 	Verify     bool   // verify the server certificate chain (default: off, the PSK authenticates the peer)
 	PinSHA256  []byte // if set, the server's leaf certificate DER must hash to this
+
+	// Client-side tuning, engine 2.2.0 (the server and the wire format are unchanged); see tlsfp.go and ech.go.
+	Fingerprint string                // go (default), chrome, firefox, safari, edge, random
+	ECH         string                // off (default), auto, or a base64 ECHConfigList
+	Frag        int                   // split the ClientHello into this many bytes per TCP segment (0 = off)
+	Logf        func(string, ...any) // optional: one-time notes (ECH lookups, fallbacks)
 }
 
 func (o TLSClientOptions) config() *tls.Config {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: o.ServerName, InsecureSkipVerify: !o.Verify}
 	if len(o.PinSHA256) > 0 {
-		pin := o.PinSHA256
-		cfg.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
-			if len(raw) == 0 {
-				return errors.New("tls: no server certificate")
-			}
-			sum := sha256.Sum256(raw[0])
-			if !bytes.Equal(sum[:], pin) {
-				return errors.New("tls: server certificate does not match the pinned fingerprint")
-			}
-			return nil
-		}
+		cfg.VerifyPeerCertificate = pinVerifier(o.PinSHA256)
 	}
 	return cfg
 }
 
 // NewTLSPoolClient is NewTCPPoolClient with TLS 1.3 on every connection.
 func NewTLSPoolClient(peer string, conns int, o TLSClientOptions) (*TCPPoolClient, error) {
-	if _, _, err := net.SplitHostPort(peer); err != nil {
+	addrs, err := SplitPeers(peer)
+	if err != nil {
 		return nil, err
 	}
-	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: o.config()}
-	return newPoolClient(func(ctx context.Context) (net.Conn, error) {
+	// No ALPN of our own: the tls carrier's server has none, so a fingerprint keeps the browser's offer.
+	eng, err := newTLSEngine(o, "")
+	if err != nil {
+		return nil, err
+	}
+	c, err := newSlotClient(addrs, conns, func(ctx context.Context, addr string) (net.Conn, error) {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		return d.DialContext(ctx, "tcp", peer)
-	}, conns)
+		return eng.dial(ctx, addr)
+	})
+	if c != nil {
+		c.tlsFn = eng.info
+	}
+	return c, err
 }
 
 // NewTLSPoolServer listens on addr with the given certificate and key files; empty files mean a fresh in-memory
