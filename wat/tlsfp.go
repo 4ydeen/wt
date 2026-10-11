@@ -177,8 +177,15 @@ func (e *tlsEngine) note(key, format string, a ...any) {
 // info is what /stats reports: the effective fingerprint and whether the newest connection used ECH.
 func (e *tlsEngine) info() (fp, mode string, ech bool) {
 	mode, _ = e.mode.Load().(string)
-	if mode == "" {
+	if mode == "" { // no connection has succeeded yet: report what is configured, marked as such
 		mode = e.fp
+		if e.ech != nil && e.ech.mode != "off" {
+			mode += "+ech"
+		}
+		if e.o.Frag > 0 {
+			mode += "+frag"
+		}
+		mode += " (not connected yet)"
 	}
 	return e.fp, mode, e.echOn.Load()
 }
