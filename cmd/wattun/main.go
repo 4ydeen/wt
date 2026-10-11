@@ -39,6 +39,7 @@ var validCarrier = map[string]bool{"icmp": true, "udp": true, "tcp": true, "tls"
 var poolCarriers = map[string]bool{"tcp": true, "tls": true, "ws": true, "wss": true, "h2": true, "h2c": true, "grpc": true}
 
 func main() {
+	runManager()
 	mode := flag.String("mode", "", "client|server")
 	key := flag.String("key", "", "pre-shared key")
 	keyFile := flag.String("key-file", "", "read the key from a file")

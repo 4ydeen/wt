@@ -72,7 +72,10 @@ proven on loopback and simulated links only.
 
 ## Install
 
-Use the installer and the `wattun-manager` menu described in the main [README](../README.md).
+Use the installer and the `wattun` menu described in the main [README](../README.md). Running `wattun` with no
+flags (or with a first argument that does not start with `-`, such as `wattun auto-test NAME`, `token NAME`, `update`,
+`status` or `auto-ip NAME IP`) hands over to `/usr/local/bin/wattun-manager`, which still works by its own name.
+Engine usage (flags starting with `-`) is unchanged.
 
 ## Quick start
 
@@ -204,7 +207,7 @@ the streams and which ports are published do not change.
   ```
 
   wattun's replies are raw-socket sends and are not limited. Ordinary pings to Iran are still answered. Measured
-  after the change: 15.9 – 18.2 MB/s each way. `wattun-manager` offers this when reverse is turned on for an Iran
+  after the change: 15.9 – 18.2 MB/s each way. Since 2.1.1 the manager applies this by itself, without a question, when reverse is turned on for an Iran
   tunnel and restores the old values when the last one is gone. `icmp_ratelimit` applies to every type in the
   mask, so destination-unreachable and time-exceeded messages also go from 1 to 10 per second per destination.
   `net.ipv4.icmp_echo_ignore_all=1` also works (the tunnel still receives its packets), but then Iran answers no
@@ -213,7 +216,7 @@ the streams and which ports are published do not change.
   tunnel request comes from Kharej's IP, so a plain `ping` from Kharej competes with the tunnel for that budget and
   loses packets while traffic flows (measured 4/6 and 1/3 received during a speed test). Use `last_rx_age_ms` from
   `/stats` instead (see Metrics).
-- In `wattun-manager`: Kharej setup → advanced settings → reverse, or for an existing tunnel Advanced settings →
+- In `wattun`: Kharej setup → advanced settings → reverse, or for an existing tunnel Advanced settings →
   `d` on both sides. The token carries the flag (field 8), so a fresh Iran setup picks it up.
 
 ### Reverse pool carriers
@@ -269,7 +272,7 @@ ports:
   - 443
 ```
 
-In `wattun-manager`:
+In `wattun`:
 
 - New tunnel: Kharej setup → advanced settings → reverse. It asks for Iran's IPv4, and the carrier port P you chose
   becomes the port Iran listens on. The token carries the flag, so Iran picks it up when you paste it.
@@ -300,7 +303,7 @@ have had them too; this table says 1.8.0 because that is the oldest one that can
 
 ## Auto mode
 
-`wattun-manager` only (no engine flag). It needs `wattun` 2.1.0 on Kharej and `systemd-run`. It finds the carrier that
+The manager only (`wattun`, no engine flag). It needs `wattun` 2.1.0 on Kharej and `systemd-run`. It finds the carrier that
 works on a route by testing all of them, so the operator does not have to guess.
 
 **Kharej.** In the new-tunnel wizard the first carrier option is `auto`. It asks for an optional Cloudflare-proxied
@@ -329,13 +332,16 @@ managers, non-auto tunnels) still work.
 `/stats` `clients` list. When Iran's first test client connects, it learns Iran's IP and writes and starts a companion
 tunnel `NAME-r`: a reverse server with reverse ICMP and reverse dials to Iran's `r` ports. With a CDN domain set, the IP
 is taken only from `icmp`, `udp`, `tcp` and `tls` clients, because CDN clients show the proxy's IP. Manual fallback on
-Kharej: `wattun-manager auto-ip NAME IRAN_IP`. `NAME-r` appears on the dashboard as the reverse side of `NAME`, follows
+Kharej: `wattun auto-ip NAME IRAN_IP`. `NAME-r` appears on the dashboard as the reverse side of `NAME`, follows
 its ports and key, and is deleted with it.
 
-**Iran test.** Pasting an auto token runs the test (re-run later with `wattun-manager auto-test NAME`). Phases: direct,
+**Iran test.** Pasting an auto token runs the test (re-run later with `wattun auto-test NAME`). Phases: direct,
 then CDN (if a domain was given), then reverse. Each variant is a throw-away client with its own `/speedtest`
-(2 MB down + up). Nothing is published; temp files are in `/run/wattun-auto`. Reverse test ports are opened in the
-firewall only during their probe. The ranked table accepts Enter (best), `b` (bond the working carriers), `1`-`N`
+(2 MB down + up). Since 2.1.1 the reverse variants are started all at once and get up to 45 s to connect (Kharej's
+reverse dialer backoff made most of them fail with "no link in 8 s" before). Nothing is published; temp files are in `/run/wattun-auto`. Reverse test ports are opened in the
+firewall only during their probe. Since 2.1.1 the manager opens ufw/firewalld ports without a confirm, Kharej does not
+ask which ports Iran may reach (all are allowed; restrict later in the port editor), and Iran enables auto-heal by
+itself (off: `wattun` → `s` → `h`). The table is ranked by download plus upload (ties: lower RTT) and accepts Enter (best), `b` (bond the working carriers), `1`-`N`
 (one variant) and `q`. The normal wizard continues at port mapping. The token is saved in `/etc/wattun/NAME.auto`.
 
 **Auto-heal.** After two failed restart cycles on an auto tunnel, `wattun-manager heal` starts a re-test (1 MB, at most
@@ -656,7 +662,7 @@ On a client, `GET /speedtest?dir=down|up&mb=N` (on the `metrics` address, N 1 to
 the live session and returns `{"dir","bytes","seconds","mb_per_s","mbit_per_s","ok","error"}`. The stream asks the
 server for target port 0, which the server answers itself (it sends or absorbs the bytes), so no test service or
 extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or newer.
-`wattun-manager test NAME` runs it 10 MB each way.
+`wattun test NAME` runs it 10 MB each way.
 
 ## ICMP path limits and pacing
 
@@ -698,7 +704,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
   the NAT redirect from the old slot to the new one, then let the old slot drain.
   If the proof fails, the live slot is not touched.
 - **Drain.** `SIGUSR1` to a server stops new sessions. It exits when the last session ends. Stop an old client slot once its `/stats` shows `streams` 0.
-- **Rollback.** Every install keeps the previous binary as `wattun.prev`. `wattun-manager` can roll back to it.
+- **Rollback.** Every install keeps the previous binary as `wattun.prev`. `wattun` (the manager) can roll back to it.
 
 ## Troubleshooting
 

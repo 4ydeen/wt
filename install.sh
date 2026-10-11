@@ -405,7 +405,7 @@ box "$title" \
 if [ -n "$stale_names" ]; then
   echo
   warn "These tunnels are still running the OLD binary:${stale_names}"
-  hint "They switch to $NEW only after a restart (wattun-manager -> Settings -> restart all; open connections drop)."
+  hint "They switch to $NEW only after a restart (wattun -> Settings -> restart all; open connections drop)."
 fi
 echo
 
@@ -420,7 +420,7 @@ if [ -t 0 ] && [ -t 1 ]; then
     echo "  Which side is THIS server?"
     echo "    ${CYN}1${RST}  ${BOLD}Kharej${RST}  outside server, where your service runs   ${YEL}<- do this FIRST${RST}"
     echo "    ${CYN}2${RST}  ${BOLD}Iran${RST}    inside server, I already have the token"
-    echo "    ${CYN}3${RST}  Later (run ${BOLD}wattun-manager${RST} any time)"
+    echo "    ${CYN}3${RST}  Later (run ${BOLD}wattun${RST} any time)"
     echo
     for t in 1 2 3; do
       printf '  %s?%s Press 1, 2 or 3 %s[3]%s ' "$CYN" "$RST" "$GRY" "$RST"
@@ -440,5 +440,5 @@ if [ -t 0 ] && [ -t 1 ]; then
     case "$a" in n|N) ;; *) cleanup; exec "$MGR" ;; esac
   fi
 fi
-echo "  Done. Manage tunnels any time with: ${BOLD}wattun-manager${RST}"
+echo "  Done. Manage tunnels any time with: ${BOLD}wattun${RST}"
 if [ "$total" -eq 0 ]; then hint "Remember the order: Kharej first (it makes the token), then Iran."; fi

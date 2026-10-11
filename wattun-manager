@@ -515,8 +515,8 @@ kreply_needed() { ! kreply_on && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>
 kreply_offer() {
   kreply_needed || return 0
   hint "Reverse mode: Linux here also answers every tunnel packet with a full-size copy, doubling this server's upload."
-  hint "Rate-limiting the kernel's ping replies stops that. Normal pings to this server keep working."
-  confirm "Rate-limit the kernel's ping replies (recommended)?" y && step "Limiting the kernel's ping replies" kreply_apply
+  step "Limiting the kernel's ping replies (normal pings keep working)" kreply_apply \
+    && hint "Undo: remove $KREPLY_CONF and run: sysctl --system (it is also undone when the last reverse Iran tunnel is deleted)."
   return 0
 }
 refresh_token() { # name : keep NAME.token in step with the allowed ports in NAME.yml
@@ -683,7 +683,7 @@ dash_table() {
   if [ "${#DASH_N[@]}" -eq 0 ]; then
     printf '  %sWelcome! No tunnels yet. A tunnel needs two servers, set up in this order:%s\n\n' "$BOLD" "$RST"
     step_diagram
-    printf '\n  %sStep 1%s  on Kharej: run %swattun-manager%s, press %s[n]%s, choose Kharej.\n' "$BOLD" "$RST" "$CYN" "$RST" "$CYN" "$RST"
+    printf '\n  %sStep 1%s  on Kharej: run %swattun%s, press %s[n]%s, choose Kharej.\n' "$BOLD" "$RST" "$CYN" "$RST" "$CYN" "$RST"
     printf '  %sStep 2%s  on Iran: press %s[n]%s, choose Iran, paste the token from step 1.\n\n' "$BOLD" "$RST" "$CYN" "$RST"
     printf '  Press %s[n]%s to create your first tunnel.\n' "$CYN$BOLD" "$RST"
     return 0
@@ -713,9 +713,6 @@ fw_open() { # "443/tcp 53/udp" ...
   if [ -z "$fw" ]; then
     warn "No active ufw/firewalld found on this server."
     hint "If a cloud firewall is in front, open: $list"; return 0
-  fi
-  if [ "${AT_QUIET:-0}" != 1 ]; then
-    confirm "$fw is active. Open $list?" y || { warn "Skipped. Open them yourself: $list"; return 0; }
   fi
   for p in $list; do
     if [ "$fw" = ufw ]; then ufw allow "$p" >/dev/null && ok "ufw: allowed $p"
@@ -975,10 +972,9 @@ wizard_kharej() {
   [ "$cr" != icmp ] && listen=$(default_listen "$cr")
   case "$cr" in ws|wss|grpc|h2|h2c) path=/wat ;; esac
 
-  # allowed ports
+  # allowed ports: all (no question; the port editor stays in the tunnel menu)
   MAPS=(); PE_ROLE=Kharej; PE_TUNNEL=$name; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
-  port_editor || { warn "Cancelled."; return 1; }
-  allow=$(maps_allow_str)
+  allow=''
 
   # address Iran connects to
   page "New tunnel" "STEP 1 · Kharej (outside server)"
@@ -1096,9 +1092,9 @@ wizard_kharej() {
   printf '%s%s%s\n\n' "$BOLD$YEL" "$(cat "$CONF/$name.token")" "$RST"
   step_diagram 2
   echo
-  say "  ${BOLD}Now, STEP 2${RST}: on the ${BOLD}Iran${RST} server run ${CYN}wattun-manager${RST}, press ${CYN}[n]${RST},"
+  say "  ${BOLD}Now, STEP 2${RST}: on the ${BOLD}Iran${RST} server run ${CYN}wattun${RST}, press ${CYN}[n]${RST},"
   say "  choose Iran and paste the token."
-  hint "Show it again any time: wattun-manager token $name"
+  hint "Show it again any time: wattun token $name"
   warn "The token contains the key. Share it only over a private channel."
 }
 
@@ -1117,7 +1113,7 @@ wizard_iran() {
     echo
     say "  ${BOLD}Get the token first${RST}"
     say "    1. Log in to the ${BOLD}Kharej${RST} (outside) server"
-    say "    2. Run  ${CYN}wattun-manager${RST}  then press ${CYN}[n]${RST} and choose ${BOLD}Kharej${RST}"
+    say "    2. Run  ${CYN}wattun${RST}  then press ${CYN}[n]${RST} and choose ${BOLD}Kharej${RST}"
     say "    3. Copy the token it prints (one long line starting with ${BOLD}wat1:${RST})"
     echo
     printf '  %s[Enter]%s I have it now   %s[m]%s enter the details by hand (advanced)   %s[q]%s go back\n  ' "$CYN" "$RST" "$CYN" "$RST" "$CYN" "$RST"
@@ -1271,9 +1267,11 @@ wizard_iran() {
   fi
   echo
   fw_open "${new_pub[*]}"
-  if ! systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && confirm "Enable auto-heal (restart if the link is down for 3 min)?" y; then heal_enable; fi
+  if ! systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null; then
+    heal_enable >/dev/null && ok "Auto-heal enabled (turn off: wattun → s settings → h)"
+  fi
   echo
-  hint "Manage this tunnel any time: wattun-manager"
+  hint "Manage this tunnel any time: wattun"
 }
 
 # ======================================================================================
@@ -1371,7 +1369,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   local name=$1 n=1 cdn='' key m allow plan c p cars='' fwl='' ver line
   ver=$(bin_ver)
   if ! ver_ge "${ver:-0}" 2.1.0; then
-    err "Auto needs wattun 2.1.0 or newer on this server (found ${ver:-none})."; hint "Update first: wattun-manager update"; return 1
+    err "Auto needs wattun 2.1.0 or newer on this server (found ${ver:-none})."; hint "Update first: wattun update"; return 1
   fi
   command -v systemd-run >/dev/null 2>&1 || { err "Auto needs systemd (systemd-run) on this server."; return 1; }
   while { [ -e "$CONF/$name.yml" ] || [ -e "$CONF/$name-r.yml" ]; } && [ "$n" -lt 99 ]; do n=$((n+1)); name="kharej-$n"; done
@@ -1385,10 +1383,8 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   auto_pick_ports || { err "Could not find free ports for all carriers on this server."; return 1; }
 
   MAPS=(); PE_ROLE=Kharej; PE_TUNNEL=$name; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
-  port_editor || { warn "Cancelled."; return 1; }
-  allow=$(maps_allow_str)
+  allow='' # all ports allowed; edit later from the tunnel menu
 
-  page "New tunnel" "STEP 1 · Kharej (outside server)"
   ask_public_addr || return 1
   plan="d=$AUTO_D;r=$AUTO_RPLAN"
 
@@ -1432,7 +1428,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   fw_open "${fwl# }"
   hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."
   start_watcher "$name" && ok "Watching for Iran (creates ${name}-r by itself, no action needed)" \
-    || warn "Could not start the watcher. After Iran connects run: wattun-manager auto-ip $name IRAN_IP"
+    || warn "Could not start the watcher. After Iran connects run: wattun auto-ip $name IRAN_IP"
 
   echo
   celebrate "Kharej auto tunnel '$name' is ready"
@@ -1443,8 +1439,8 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   step_diagram 2
   echo
   say "  ${BOLD}Now paste this token on Iran.${RST} It tests every connection type by itself (about 2-3 minutes)."
-  hint "Show it again any time: wattun-manager token $name"
-  hint "If the reverse tests fail because this server never learned Iran's IP: wattun-manager auto-ip $name IRAN_IP"
+  hint "Show it again any time: wattun token $name"
+  hint "If the reverse tests fail because this server never learned Iran's IP: wattun auto-ip $name IRAN_IP"
   warn "The token contains the key. Share it only over a private channel."
 }
 
@@ -1504,7 +1500,7 @@ auto_watch() { # name : run by systemd-run; poll /stats clients, write the compa
 auto_ip() { # name ip : the manual fallback of auto_watch
   local n=$1 ip=${2:-}
   is_auto_kharej "$n" || { err "'$n' is not an auto Kharej tunnel."; return 1; }
-  ipv4_ok "$ip" || { err "Usage: wattun-manager auto-ip $n IRAN_IPV4"; return 1; }
+  ipv4_ok "$ip" || { err "Usage: wattun auto-ip $n IRAN_IPV4"; return 1; }
   companion_create "$n" "$ip" || return 1
   systemctl stop "wattun-autowatch-$n.service" >/dev/null 2>&1
   ok "Reverse side ${n}-r is set for Iran $ip. Run the test again on Iran."
@@ -1550,8 +1546,13 @@ at_wait() { # metrics-port seconds : wait for the link
     sleep 0.5
   done
 }
-at_kill() {
+AT_PIDS=(); AT_MPS=()
+at_kill() { # the single probe client and every client of the reverse batch
+  local p
   if [ -n "$AT_PID" ]; then kill "$AT_PID" 2>/dev/null; { wait "$AT_PID"; } 2>/dev/null; AT_PID=''; fi
+  for p in "${AT_PIDS[@]}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  for p in "${AT_PIDS[@]}"; do [ -n "$p" ] && { wait "$p"; } 2>/dev/null; done
+  AT_PIDS=(); AT_MPS=()
   return 0
 }
 at_fw_open() { # port/tcp : temporary rule for a reverse test port (firewalld: runtime only)
@@ -1589,7 +1590,7 @@ at_start() { # i metrics-port : start a throw-away client for variant i (no -map
     a+=(-reverse)
     if is_pool "$car"; then a+=(-listen ":${AV_PORT[$i]}"); fi
   fi
-  timeout -k 2 "$AT_LIM" "$BIN" "${a[@]}" >"$AT_DIR/client.log" 2>&1 &
+  timeout -k 2 "$AT_LIM" "$BIN" "${a[@]}" >"$AT_DIR/client.$i.log" 2>&1 &
   AT_PID=$!
 }
 at_curl() { curl -fs --noproxy '*' --max-time 20 "http://127.0.0.1:$1/speedtest?dir=$2&mb=$AT_MB" 2>/dev/null; }
@@ -1608,19 +1609,72 @@ at_probe() { # i wait-seconds : fills AR_*[i]
     AR_WHY[$i]="no link in $w s"
   else
     [ "${AV_KIND[$i]}" = r ] || AT_DLINK=$((AT_DLINK+1))
-    r=$(at_curl "$mp" down)
-    if [ "$(jget "$r" ok)" = true ]; then
-      AR_DOWN[$i]=$(jget "$r" mb_per_s)
-      r=$(at_curl "$mp" up)
-      if [ "$(jget "$r" ok)" = true ]; then
-        AR_UP[$i]=$(jget "$r" mb_per_s)
-        AR_RTT[$i]=$(jget "$(curl -fs --noproxy '*' --max-time 2 "http://127.0.0.1:$mp/stats" 2>/dev/null)" srtt_ms)
-        : "${AR_RTT[$i]:=0}"
-        AR_OK[$i]=1
-      fi
-    fi
-    [ "${AR_OK[$i]}" = 1 ] || AR_WHY[$i]='speed test failed/stalled'
+    at_measure "$i" "$mp"
   fi
+  at_kill; at_fw_close
+  return 0
+}
+at_measure() { # i metrics-port : speed test on a running client, fills AR_*[i]
+  local i=$1 mp=$2 r
+  r=$(at_curl "$mp" down)
+  if [ "$(jget "$r" ok)" = true ]; then
+    AR_DOWN[$i]=$(jget "$r" mb_per_s)
+    r=$(at_curl "$mp" up)
+    if [ "$(jget "$r" ok)" = true ]; then
+      AR_UP[$i]=$(jget "$r" mb_per_s)
+      AR_RTT[$i]=$(jget "$(curl -fs --noproxy '*' --max-time 2 "http://127.0.0.1:$mp/stats" 2>/dev/null)" srtt_ms)
+      : "${AR_DOWN[$i]:=0}" "${AR_UP[$i]:=0}" "${AR_RTT[$i]:=0}"
+      AR_OK[$i]=1
+    fi
+  fi
+  [ "${AR_OK[$i]}" = 1 ] || AR_WHY[$i]='speed test failed/stalled'
+  return 0
+}
+# Reverse pool carriers: Kharej's NAME-r companion starts dialing Iran's r-ports as soon as it knows Iran's IP, and its
+# redial backoff grows while nothing listens. So all reverse clients (and their temporary firewall rules) are started at
+# once, we wait for all of them together, then the speed tests run one at a time on the already-running clients.
+at_pool_batch() { # indices... : probe every reverse pool variant given
+  local i mp base=20500 end pend started=() up=()
+  for i in "$@"; do
+    AR_OK[$i]=0; AR_DOWN[$i]=0; AR_UP[$i]=0; AR_RTT[$i]=0; AR_WHY[$i]=''
+    case " $AT_SKIP " in *" $(av_key "$i") "*) AR_WHY[$i]='in use by this tunnel'; continue ;; esac
+    if listen_blocked tcp "${AV_PORT[$i]}"; then AR_WHY[$i]="port ${AV_PORT[$i]}/tcp is busy here"; continue; fi
+    at_fw_open "${AV_PORT[$i]}/tcp"
+  done
+  AT_LIM=$((45 + $# * 50 + 30))
+  for i in "$@"; do
+    [ -z "${AR_WHY[$i]}" ] || continue
+    mp=$(at_free_port "$base"); base=$((mp + 3))
+    at_start "$i" "$mp"
+    AT_PIDS[$i]=$AT_PID; AT_PID=''; AT_MPS[$i]=$mp
+    started+=("$i")
+  done
+  if [ "${#started[@]}" -gt 0 ]; then
+    [ "$AT_QUIET" = 1 ] || at_busy "reverse links (all at once, up to 45 s)"
+    end=$((SECONDS + 45))
+    while :; do
+      pend=0
+      for i in "${started[@]}"; do
+        [ "${up[$i]:-0}" = 1 ] && continue
+        if at_alive "${AT_MPS[$i]}"; then up[$i]=1
+        elif kill -0 "${AT_PIDS[$i]}" 2>/dev/null; then pend=1; fi
+      done
+      [ "$pend" = 0 ] && break
+      [ "$SECONDS" -ge "$end" ] && break
+      sleep 0.5
+    done
+    [ "$AT_QUIET" = 1 ] || at_idle
+  fi
+  for i in "$@"; do
+    if [ -z "${AR_WHY[$i]}" ]; then
+      if [ "${up[$i]:-0}" = 1 ]; then
+        [ "$AT_QUIET" = 1 ] || at_busy "${AV_LABEL[$i]}"
+        at_measure "$i" "${AT_MPS[$i]}"
+        [ "$AT_QUIET" = 1 ] || at_idle
+      else AR_WHY[$i]='no link in 45 s'; fi
+    fi
+    [ "$AT_QUIET" = 1 ] || at_print "$i"
+  done
   at_kill; at_fw_close
   return 0
 }
@@ -1629,13 +1683,13 @@ at_idle() { if [ "$ANIM" = 1 ]; then spin_stop; elif [ "$IS_TTY" = 1 ]; then pri
 at_print() {
   local i=$1
   if [ "${AR_OK[$i]}" = 1 ]; then
-    printf '  %s✔%s %-16s %s%6.1f MB/s down%s  %6.1f MB/s up  %4.0f ms\n' "$GRN" "$RST" "${AV_LABEL[$i]}" "$BOLD" "$RST" "${AR_DOWN[$i]}" "${AR_UP[$i]}" "${AR_RTT[$i]:-0}"
+    printf '  %s✔%s %-16s %s%6.1f%s MB/s down  %6.1f MB/s up  %4.0f ms\n' "$GRN" "$RST" "${AV_LABEL[$i]}" "$BOLD" "${AR_DOWN[$i]:-0}" "$RST" "${AR_UP[$i]:-0}" "${AR_RTT[$i]:-0}"
   else
     printf '  %s✘%s %-16s %s%s%s\n' "$RED" "$RST" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"
   fi
 }
 auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKIP ; fills AR_*, AT_SECS
-  local i n t0=$SECONDS kind last='' w
+  local i n t0=$SECONDS kind last='' w pool=() j
   AT_DIR=$AUTO_RUN/t.$$
   mkdir -p "$AUTO_RUN" && chmod 700 "$AUTO_RUN" && rm -rf "$AT_DIR" && mkdir -p "$AT_DIR" || return 1
   ( umask 077; printf '%s\n' "$T_KEY" >"$AT_DIR/key" )
@@ -1651,6 +1705,11 @@ auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKI
       esac
     fi
     last=$kind
+    if [ "$kind" = r ] && is_pool "${AV_CAR[$i]}"; then
+      pool=(); for ((j=i; j<n; j++)); do [ "${AV_KIND[$j]}" = r ] && is_pool "${AV_CAR[$j]}" && pool+=("$j"); done
+      at_pool_batch "${pool[@]}"
+      break
+    fi
     w=8; [ "$kind" = r ] && [ "${AV_CAR[$i]}" = icmp ] && w=30 # Kharej's companion needs a few seconds to start
     [ "$AT_QUIET" = 1 ] || at_busy "${AV_LABEL[$i]}"
     at_probe "$i" "$w"
@@ -1660,12 +1719,12 @@ auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKI
   AT_SECS=$((SECONDS-t0))
   return 0
 }
-at_rank() { # -> AT_RANK (working variants, best first: download, then upload, then rtt)
+at_rank() { # -> AT_RANK (working variants, best first: down+up, then lower rtt)
   local i; AT_RANK=()
-  while read -r _ _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
+  while read -r _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
     for ((i=0; i<${#AV_LABEL[@]}; i++)); do
-      [ "${AR_OK[$i]}" = 1 ] && echo "${AR_DOWN[$i]} ${AR_UP[$i]} ${AR_RTT[$i]:-0} $i"
-    done | sort -k1,1gr -k2,2gr -k3,3g)
+      [ "${AR_OK[$i]}" = 1 ] && awk -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%.6f %.3f %d\n", d+u, r, i}'
+    done | sort -k1,1gr -k2,2g)
 }
 at_table() {
   local i k=0
@@ -1673,7 +1732,7 @@ at_table() {
   printf '  %s%3s  %-16s %12s %12s %7s%s\n' "$GRY" '#' variant down up rtt "$RST"
   for i in "${AT_RANK[@]}"; do
     k=$((k+1))
-    printf '  %s%3s%s  %-16s %7.1f MB/s %7.1f MB/s %4.0f ms\n' "$BOLD$CYN" "$k" "$RST" "${AV_LABEL[$i]}" "${AR_DOWN[$i]}" "${AR_UP[$i]}" "${AR_RTT[$i]:-0}"
+    printf '  %s%3s%s  %-16s %7.1f MB/s %7.1f MB/s %4.0f ms\n' "$BOLD$CYN" "$k" "$RST" "${AV_LABEL[$i]}" "${AR_DOWN[$i]:-0}" "${AR_UP[$i]:-0}" "${AR_RTT[$i]:-0}"
   done
   for ((i=0; i<${#AV_LABEL[@]}; i++)); do
     [ "${AR_OK[$i]}" = 1 ] || printf '  %s  ✘  %-16s %s%s%s\n' "$RED" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"
@@ -1700,11 +1759,12 @@ at_to_t() { # AT_SEL (one index, or several = bond) -> T_CARRIER T_PEER T_PATH T
   AT_SEL_LABEL=${AV_LABEL[$i]}; AT_SEL_KEY=$(av_key "$i")
 }
 at_choose() { # rc 0 = chosen (T_* ready), 1 = cancelled
-  local n=${#AT_RANK[@]} best=${AT_RANK[0]} bond=() i t num rest bd
+  local n=${#AT_RANK[@]} best=${AT_RANK[0]} bond=() i t num rest bd bu
   for i in "${AT_RANK[@]}"; do [ "${AV_KIND[$i]}" = d ] && bond+=("$i"); done
-  printf -v bd '%.1f' "${AR_DOWN[$best]}"
+  printf -v bd '%.1f' "${AR_DOWN[$best]:-0}"
+  printf -v bu '%.1f' "${AR_UP[$best]:-0}"
   echo
-  printf '  %s use the best (%s%s%s, %s MB/s)\n' "$(key_label Enter)" "$BOLD" "${AV_LABEL[$best]}" "$RST" "$bd"
+  printf '  %s use the best (%s%s%s, %s/%s MB/s)\n' "$(key_label Enter)" "$BOLD" "${AV_LABEL[$best]}" "$RST" "$bd" "$bu"
   [ "${#bond[@]}" -ge 2 ] && printf '  %s bond all working direct carriers (%d: survives any one being blocked)\n' "$(key_label b)" "${#bond[@]}"
   [ "$n" -gt 1 ] && printf '  %s pick another from the table   ' "$(key_label "1-$n")"
   printf '%s cancel\n' "$(key_label q)"
@@ -1735,7 +1795,7 @@ at_none() { # nothing worked
   if [ "$AT_DLINK" = 0 ]; then
     echo
     warn "Kharej may not know this server's IP yet, so the reverse side may never have started."
-    hint "On Kharej run:  wattun-manager auto-ip <kharej tunnel name> $(public_ip)"
+    hint "On Kharej run:  wattun auto-ip <kharej tunnel name> $(public_ip)"
     hint "then run the test again: ${AT_AGAIN:-paste the token again on this server}"
   fi
   hint "Also check: the Kharej tunnel is running, the key is current (paste the token again), and Kharej's cloud firewall."
@@ -1797,7 +1857,7 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   fi
   if ! { read_token "$(cat "$CONF/$n.auto")" && [ -n "$T_AUTO" ]; }; then err "$CONF/$n.auto is not a valid auto token."; return 1; fi
   cur=$(auto_current_key "$n")
-  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN="wattun-manager auto-test $n"
+  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN="wattun auto-test $n"
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac # its own port / ICMP are in use by the running tunnel
   page "Auto test" "$n"
   hint "Current: $cur. The running tunnel is not touched until you choose."
@@ -1938,7 +1998,7 @@ icmp_path_report() { # name host
     hint "Either ICMP is blocked on the route, or Kharej drops it (cloud firewall, or net.ipv4.icmp_echo_ignore_all=1 there)."
     hint "Allow ICMP on Kharej's cloud firewall. If the route itself blocks ICMP right now, no ICMP tunnel can work until it opens;"
     hint "the tunnel reconnects by itself when it does (keep auto-heal on). Meanwhile, switch both sides to another carrier:"
-    hint "wattun-manager → Kharej setup / Iran setup with udp, tcp or wss."
+    hint "wattun → Kharej setup / Iran setup with udp, tcp or wss."
     hint "${BOLD}One-way block?${RST}${GRY} If Kharej CAN ping this server (run Diagnose on Kharej to check), the block is only on"
     hint "Iran's own pings. Switch BOTH sides to reverse ICMP: tunnel → Advanced settings → d (direction)."
   elif [ -n "$bad_sizes" ] && [ "$maxok" -lt 256 ]; then
@@ -1950,7 +2010,7 @@ icmp_path_report() { # name host
   elif [ "$pout" -gt 0 ] && [ "$pin" -eq 0 ]; then
     err "Ping works at every size, but the tunnel's own packets get no answer."
     hint "Check, in this order: 1) both sides have the SAME key (paste the Kharej token on Iran again), 2) the same carrier and icmp-type,"
-    hint "3) the Kharej tunnel is running ('wattun-manager status' there), 4) try icmp-type: timestamp on BOTH sides (some filters only"
+    hint "3) the Kharej tunnel is running ('wattun status' there), 4) try icmp-type: timestamp on BOTH sides (some filters only"
     hint "pass plain echo, others only pass other ICMP types), 5) otherwise use another carrier (udp, tcp, wss)."
   elif [ "$pin" -gt 0 ]; then
     warn "Ping works and the tunnel did receive packets earlier, but it is silent now."
@@ -2063,7 +2123,7 @@ test_tunnel() {
   fi
   if [ "$r" = Iran ] && [ "$cr" = icmp ] && is_reverse "$n" && kreply_needed; then
     echo; warn "The kernel here answers every tunnel packet with a copy (wasted upload)."
-    if [ -t 0 ]; then kreply_offer; else hint "Fix: wattun-manager → this tunnel → o → d (or see docs: Reverse ICMP)."; fi
+    if [ -t 0 ]; then kreply_offer; else hint "Fix: wattun → this tunnel → o → d (or see docs: Reverse ICMP)."; fi
   fi
   while IFS= read -r it; do
     [ -n "$it" ] || continue
@@ -2104,7 +2164,7 @@ speed_test() { # name [mb]
     else
       er=$(grep -o '"error":"[^"]*"' <<<"$r" | cut -d'"' -f4)
       printf '  %s✘%s %s  %sfailed%s  %s\n' "$RED" "$RST" "$label" "$RED" "$RST" "${er:-unknown error}"
-      [[ "$er" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it (wattun-manager update) and restart its tunnel."
+      [[ "$er" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it (wattun update) and restart its tunnel."
     fi
   done
 }
@@ -2180,7 +2240,7 @@ live_monitor() {
 status_all() { # plain, scriptable list
   local n any=0
   for n in $(tunnels); do any=1; status_row "$n"; done
-  [ "$any" = 1 ] || { warn "No tunnels yet. Start with Kharej: run wattun-manager and press n."; return 1; }
+  [ "$any" = 1 ] || { warn "No tunnels yet. Start with Kharej: run wattun and press n."; return 1; }
 }
 status_row() {
   local n=$1 r cr load
@@ -2201,7 +2261,7 @@ tunnel_card() {
     line="$SC_COL$SC_DOT $SC_TXT$RST   $r · auto (every carrier at once)"
     if [ -f "$CONF/$n-r.yml" ]; then sub="reverse side: $n-r (Iran $(cfg "$n-r" peer-icmp))"
     elif systemctl is-active -q "wattun-autowatch-$n.service" 2>/dev/null; then sub="watching for Iran's first connection (then $n-r is created)"
-    else sub="Iran's IP not learned yet: wattun-manager auto-ip $n IRAN_IP"; fi
+    else sub="Iran's IP not learned yet: wattun auto-ip $n IRAN_IP"; fi
   elif [ "$cr" = icmp ] && is_reverse "$n"; then
     if [ "$r" = Iran ]; then line="$line (reverse) ← pinged by ${peer:--}"; else line="$line (reverse) → pings Iran ${peer:--}"; fi
   elif is_pool "$cr" && is_reverse "$n"; then
@@ -2292,7 +2352,7 @@ change_key() {
       printf '%s\n' "$T_KEY" >"$CONF/$n.key"
       ( umask 077; printf '%s\n' "$t" >"$CONF/$n.auto" ); chmod 600 "$CONF/$n.auto"
       step "Restarting wattun@$n" systemctl restart "wattun@$n"
-      hint "This is an auto token. Test again and pick the best connection: wattun-manager auto-test $n"
+      hint "This is an auto token. Test again and pick the best connection: wattun auto-test $n"
       return 0
     fi
     printf '%s\n' "$T_KEY" >"$CONF/$n.key"; set_value "$n" peer "$T_PEER"
@@ -2446,7 +2506,7 @@ tunnel_page() {
       l) page "Logs" "$n"; run_flow logs_menu "$n"; pause ;;
       p) run_flow edit_ports "$n"; pause ;;
       t) if [ "$r" = Kharej ]; then
-           page "Token" "$n"; echo; say "  Paste this on the Iran server (wattun-manager → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
+           page "Token" "$n"; echo; say "  Paste this on the Iran server (wattun → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
          else page "New token" "$n"; echo; run_flow change_key "$n"; fi
          pause ;;
       k) [ "$r" = Kharej ] && { page "New key" "$n"; run_flow change_key "$n"; pause; } ;;
@@ -2550,7 +2610,7 @@ update() { # [installer args...]
   curl -fsSL --max-time 60 --retry 2 -o "$tmp" "${WAT_PROXY:-}$url"; local rc=$?
   spin_stop
   if [ "$rc" -ne 0 ] || ! head -c 2 "$tmp" | grep -q '#!'; then
-    rm -f "$tmp"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun-manager update"; return 1
+    rm -f "$tmp"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun update"; return 1
   fi
   ok "Installer downloaded"
   WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
@@ -2631,7 +2691,7 @@ settings_menu() {
 # ======================================================================================
 #  Main dashboard
 # ======================================================================================
-need_tunnel() { [ -f "$CONF/$1.yml" ] || { err "No tunnel named '$1'. See: wattun-manager status"; return 1; }; }
+need_tunnel() { [ -f "$CONF/$1.yml" ] || { err "No tunnel named '$1'. See: wattun status"; return 1; }; }
 main_menu() {
   local num d rest
   while :; do
@@ -2669,7 +2729,7 @@ usage() {
   cat <<EOF
 WatTunnel manager $VER
 
-Usage: wattun-manager [command]
+Usage: wattun [command]
 
   (no command)          dashboard: all tunnels; manage one, create, update...
   new [kharej|iran]     create a tunnel (do Kharej FIRST: it makes the token)
