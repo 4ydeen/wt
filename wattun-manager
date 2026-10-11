@@ -36,6 +36,7 @@ else
   MGR=/usr/local/bin/wattun-manager
 fi
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
+MGR_VERSION=2026101101   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
 HEAL_UNIT=$WAT_PREFIX-heal
 MCONF=$CONF/.manager.conf
 self_cmd() { # the command to type to start this manager (user-facing hints)
@@ -344,9 +345,11 @@ ask_ok() { # prompt default validator : up to 3 tries, validator prints its own 
 }
 confirm() { # prompt [y|n default]
   local def=${2:-y} t lab='Y/n'
+  [ "$def" = y ] || def=n # anything but y is "no"
   [ "$def" = n ] && lab='y/N'
   if [ "$NONINTERACTIVE" = 1 ]; then
-    if [ "$def" = y ]; then echo "  ? $1 -> yes"; return 0; else echo "  ? $1 -> no"; return 1; fi
+    echo "  ? $1 -> $([ "$def" = y ] && echo yes || echo no)" # the answer actually used
+    [ "$def" = y ]; return
   fi
   for t in 1 2 3; do
     printf '  %s?%s %s %s[%s]%s ' "$CYN" "$RST" "$1" "$GRY" "$lab" "$RST"
@@ -415,9 +418,14 @@ public_ip() { # prints a valid IPv4 or nothing
 new_key() { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40; }
 uptime_of() { local t; t=$(systemctl show "${WAT_PREFIX}@$1" -p ActiveEnterTimestamp --value 2>/dev/null); [ -n "$t" ] && echo "since $t" || echo "-"; }
 
-free_metrics_port() {
-  local p=19700
-  while [ "$p" -lt 20400 ] && { port_busy "$p" tcp || grep -qhE "^metrics:.*:$p\"?[[:space:]]*\$" "$CONF"/*.yml 2>/dev/null; }; do p=$((p+1)); done
+free_metrics_port() { # first free port from WAT_METRICS_BASE (default 19750, sandbox 19850); never 19700-19709 or 18990-18999
+  local p=${WAT_METRICS_BASE:-}
+  [[ "$p" =~ ^[0-9]{4,5}$ ]] || { p=19750; [ "$SANDBOX" = 1 ] && p=19850; }
+  while [ "$p" -lt 20400 ]; do
+    if { [ "$p" -ge 19700 ] && [ "$p" -le 19709 ]; } || { [ "$p" -ge 18990 ] && [ "$p" -le 18999 ]; }; then p=$((p+1)); continue; fi
+    port_busy "$p" tcp || grep -qhE "^metrics:.*:$p\"?[[:space:]]*\$" "$CONF"/*.yml 2>/dev/null || break
+    p=$((p+1))
+  done
   echo "$p"
 }
 valid_name() { [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] && [ ! -e "$CONF/$1.yml" ]; }
@@ -1771,7 +1779,7 @@ at_start() { # i metrics-port : start a throw-away client for variant i (no -map
   timeout -k 2 "$AT_LIM" "$BIN" "${a[@]}" >"$AT_DIR/client.$i.log" 2>&1 &
   AT_PID=$!
 }
-at_curl() { curl -fs --noproxy '*' --max-time 20 "http://127.0.0.1:$1/speedtest?dir=$2&mb=$AT_MB" 2>/dev/null; }
+at_curl() { curl -fs --noproxy '*' --max-time $((AT_MB * 2 > 20 ? AT_MB * 2 : 20)) "http://127.0.0.1:$1/speedtest?dir=$2&mb=$AT_MB" 2>/dev/null; }
 at_probe() { # i wait-seconds : fills AR_*[i]
   local i=$1 w=${2:-8} mp r
   AR_OK[$i]=0; AR_DOWN[$i]=0; AR_UP[$i]=0; AR_RTT[$i]=0; AR_WHY[$i]=''
@@ -1781,7 +1789,7 @@ at_probe() { # i wait-seconds : fills AR_*[i]
     at_fw_open "${AV_PORT[$i]}/tcp"
   fi
   mp=$(at_free_port)
-  AT_LIM=$((w + 55))
+  AT_LIM=$((w + 55 + AT_MB * 4))
   at_start "$i" "$mp"
   if ! at_wait "$mp" "$w"; then
     AR_WHY[$i]="no link in $w s"
@@ -1819,7 +1827,7 @@ at_pool_batch() { # indices... : probe every reverse pool variant given
     if listen_blocked tcp "${AV_PORT[$i]}"; then AR_WHY[$i]="port ${AV_PORT[$i]}/tcp is busy here"; continue; fi
     at_fw_open "${AV_PORT[$i]}/tcp"
   done
-  AT_LIM=$((45 + $# * 50 + 30))
+  AT_LIM=$((45 + $# * (50 + AT_MB * 4) + 30))
   for i in "$@"; do
     [ -z "${AR_WHY[$i]}" ] || continue
     mp=$(at_free_port "$base"); base=$((mp + 3))
@@ -1865,6 +1873,33 @@ at_print() {
   else
     printf '  %s✘%s %-24s %s%s%s\n' "$RED" "$RST" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"
   fi
+}
+AT_NOTE=''
+auto_refine() { # AT_RANK from the 8 MB screening -> re-measure the top 3 at 20 MB (slow start dominates small transfers), re-rank
+  local i k=0 top=() pool=() save=$AT_MB w ok d u r t0=$SECONDS; local -A sv=()
+  [ "${#AT_RANK[@]}" -gt 0 ] || return 0
+  for i in "${AT_RANK[@]}"; do [ "$k" -ge 3 ] && break; top+=("$i"); k=$((k+1)); sv[$i]="${AR_OK[$i]}|${AR_DOWN[$i]}|${AR_UP[$i]}|${AR_RTT[$i]}"; done
+  at_prep || return 0
+  AT_MB=20
+  [ "$AT_QUIET" = 1 ] || { echo; say "  ${BOLD}Confirming the top ${#top[@]} with 20 MB each way${RST}"; }
+  for i in "${top[@]}"; do
+    if [ "${AV_KIND[$i]}" = r ] && is_pool "${AV_CAR[$i]}"; then pool+=("$i"); continue; fi
+    w=8; [ "${AV_KIND[$i]}" = r ] && [ "${AV_CAR[$i]}" = icmp ] && w=30
+    [ "$AT_QUIET" = 1 ] || at_busy "${AV_LABEL[$i]}"
+    at_probe "$i" "$w"
+    [ "$AT_QUIET" = 1 ] || { at_idle; at_print "$i"; }
+  done
+  [ "${#pool[@]}" -gt 0 ] && at_pool_batch "${pool[@]}"
+  at_cleanup
+  AT_MB=$save
+  for i in "${top[@]}"; do # a variant that fails the longer test keeps its screening numbers
+    [ "${AR_OK[$i]}" = 1 ] && continue
+    IFS='|' read -r ok d u r <<<"${sv[$i]}"; AR_OK[$i]=$ok; AR_DOWN[$i]=$d; AR_UP[$i]=$u; AR_RTT[$i]=$r
+  done
+  AT_SECS=$((AT_SECS + SECONDS - t0))
+  AT_NOTE="Screened with $AT_MB MB each way; the top ${#top[@]} re-measured with 20 MB."
+  at_rank
+  return 0
 }
 auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKIP ; fills AR_*, AT_SECS
   local i n t0=$SECONDS kind last='' w pool=() j sc
@@ -1924,7 +1959,7 @@ at_table() {
   for ((i=0; i<${#AV_LABEL[@]}; i++)); do
     [ "${AR_OK[$i]}" = 1 ] || printf '  %s  ✘  %-24s %s%s%s\n' "$RED" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"
   done
-  hint "Tested with ${AT_MB} MB each way; finished in ${AT_SECS} s."
+  hint "${AT_NOTE:-Tested with ${AT_MB} MB each way.} Finished in ${AT_SECS} s."
 }
 at_to_t() { # AT_SEL (one index, or several = bond) -> T_CARRIER T_PEER T_PATH T_SNI T_REV AT_EXTRA + labels
   local i c cars='' cdn='' l
@@ -2011,9 +2046,9 @@ auto_iran_front() { # token : test everything, ranked table, choose. Leaves T_* 
   echo
   hint "Testing from this server, about 2-3 minutes. Nothing is published and no tunnel is touched."
   echo
-  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN=''
+  AT_QUIET=0; AT_MB=8; AT_NOTE=""; AT_SKIP=''; AT_AGAIN=''
   auto_test || { err "Could not prepare the test (is $AUTO_RUN writable?)."; return 1; }
-  at_rank
+  at_rank; auto_refine
   if [ "${#AT_RANK[@]}" -eq 0 ]; then echo; at_none; return 1; fi
   at_table
   at_choose || { warn "Cancelled."; return 1; }
@@ -2060,13 +2095,13 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   fi
   if ! { read_token "$(cat "$CONF/$n.auto")" && [ -n "$T_AUTO" ]; }; then err "$CONF/$n.auto is not a valid auto token."; return 1; fi
   cur=$(auto_current_key "$n")
-  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN="$SELF auto-test $n"
+  AT_QUIET=0; AT_MB=8; AT_NOTE=""; AT_SKIP=''; AT_AGAIN="$SELF auto-test $n"
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac # its own port / ICMP are in use by the running tunnel
   page "Auto test" "$n"
   hint "Current: $cur. The running tunnel is not touched until you choose."
   echo
   auto_test || { err "Could not prepare the test (is $AUTO_RUN writable?)."; return 1; }
-  at_rank
+  at_rank; auto_refine
   if [ "${#AT_RANK[@]}" -eq 0 ]; then echo; at_none; return 1; fi
   at_table
   at_choose || { warn "No change."; [ "$NONINTERACTIVE" = 1 ] && return 1; return 0; }
@@ -2081,7 +2116,7 @@ auto_retest() { # name : unattended (auto-heal): 1 MB tests, switch only if the 
     cdn_tunnel_p "$n" && { cdn_refresh_edges "$n"; return 0; }
     return 1
   fi
-  AT_QUIET=1; AT_MB=1; AT_SKIP=''; AT_AGAIN=''
+  AT_QUIET=1; AT_MB=1; AT_NOTE=''; AT_SKIP=''; AT_AGAIN=''
   cur=$(auto_current_key "$n")
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac
   auto_test || return 1
@@ -2177,13 +2212,23 @@ cdn_ipv4hints() { # domain : the IPv4 addresses of its HTTPS record's ipv4hint, 
   sed -E 's/^[^=]*=//' <<<"$s" | tr ',' '\n' | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || true
   return 0
 }
+now_us() { if [ -n "${EPOCHREALTIME:-}" ]; then local t=${EPOCHREALTIME/[.,]/}; echo "$t"; else echo $(( $(date +%s%N) / 1000 )); fi; }
+cdn_pick_edges() { # up to 3 of the ips given (already fastest first): one per /24 (v6: /48) when there are alternatives, then fill up
+  local ip k out=() rest=(); local -A pf=()
+  for ip in "$@"; do
+    if [[ "$ip" == *:* ]]; then k=$(cut -d: -f1-3 <<<"$ip"); else k=${ip%.*}; fi
+    if [ -z "${pf[$k]:-}" ] && [ "${#out[@]}" -lt 3 ]; then pf[$k]=1; out+=("$ip"); else rest+=("$ip"); fi
+  done
+  for ip in ${rest[@]+"${rest[@]}"}; do [ "${#out[@]}" -ge 3 ] && break; out+=("$ip"); done
+  CS_EDGES=("${out[@]}")
+}
 cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve this domain, judged by the tunnel engine itself
   # -> CS_EDGES (best 3), CS_REACH_IPS (every edge that is up), CS_REACH (up) / CS_TOTAL (TCP-reachable) ; CS_FALLBACK=1 when none was
   # verified (CS_EDGES is then the domain's own addresses) ; rc 1 when there is nothing to choose from at all.
   # curl cannot do ECH, so it only pre-filters plain TCP reachability. A throw-away client with -fp chrome -ech auto and one pool
   # connection per candidate spreads over all of them; /stats then says which candidates really carried a connection.
   local dom=$1 port=$2 path=${3:-/} car=${4:-wss} ip n=0 v6=0 i own=() cand=() reach=() peers='' up='' mp pid t end a N
-  local -A seen=() isup=()
+  local -A seen=() isup=() tcpms=()
   CS_EDGES=(); CS_REACH_IPS=(); CS_REACH=0; CS_TOTAL=0; CS_BEST_IP=''; CS_BEST_MS=0; CS_FALLBACK=0; CS_RAN=0
   [[ "$path" == /* ]] || path=/$path
   ipv4_ok "$dom" && return 1 # an IP address has no Cloudflare edges to choose from
@@ -2210,13 +2255,15 @@ cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve t
   CS_PIDS=()
   for ip in "${cand[@]}"; do
     n=$((n+1))
-    ( timeout 2 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null && : >"$CS_DIR/$n" ) &
+    ( t0=$(now_us); timeout 2 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null && echo $(( $(now_us) - t0 )) >"$CS_DIR/$n" ) &
     CS_PIDS+=($!)
   done
   wait "${CS_PIDS[@]}" 2>/dev/null
   CS_PIDS=()
   n=0
-  for ip in "${cand[@]}"; do n=$((n+1)); [ -e "$CS_DIR/$n" ] && reach+=("$ip"); done
+  # fastest TCP connect first: that order decides which edges are kept
+  for ip in "${cand[@]}"; do n=$((n+1)); [ -s "$CS_DIR/$n" ] && tcpms[$ip]=$(< "$CS_DIR/$n"); done
+  while read -r _ ip; do [ -n "$ip" ] && reach+=("$ip"); done < <(for ip in "${!tcpms[@]}"; do echo "${tcpms[$ip]} $ip"; done | sort -n)
   rm -rf "$CS_DIR"; CS_DIR=''
   CS_TOTAL=${#reach[@]}
   if [ "$CS_TOTAL" -eq 0 ]; then # nothing answers on TCP (or the check itself is unreliable here): the domain's own addresses are the only guess
@@ -2249,7 +2296,7 @@ cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve t
   fi
   CS_REACH=${#CS_REACH_IPS[@]}
   if [ "$CS_REACH" -gt 0 ]; then
-    CS_EDGES=("${CS_REACH_IPS[@]:0:3}"); CS_BEST_IP=${CS_EDGES[0]}
+    cdn_pick_edges "${CS_REACH_IPS[@]}"; CS_BEST_IP=${CS_EDGES[0]}; CS_BEST_MS=$(( ${tcpms[$CS_BEST_IP]:-0} / 1000 ))
   else
     CS_FALLBACK=1
     if [ "${#own[@]}" -gt 0 ]; then CS_EDGES=("${own[@]:0:3}"); else CS_EDGES=("${reach[@]:0:3}"); fi
@@ -2314,7 +2361,8 @@ cdn_variants() { # carrier edge-peer default-peer [skip-ech] : TLS variants in p
   cdn_try "$car" "$car · chrome" "$pa" chrome '' ''; [ "${AR_OK[$CT_I]}" = 1 ] && any=1
   cdn_try "$car" "$car · go" "$pd" '' '' '';          [ "${AR_OK[$CT_I]}" = 1 ] && any=1
   # the ClientHello cut comes after the handshake, so it rarely helps against an SNI filter: last resort only
-  [ "$any" = 1 ] || cdn_try "$car" "$car · frag" "$pa" chrome '' 100
+  if [ "$any" != 1 ]; then cdn_try "$car" "$car · frag" "$pa" chrome '' 100
+  elif [ "$AT_FULL" = 1 ]; then cdn_try "$car" "$car · frag (diagnostic)" "$pa" chrome '' 100; fi
   return 0
 }
 cdn_auto_extras() { # Auto: after (a) chrome+ech of each CDN carrier: the remaining variants only when (a) failed (or full)
@@ -2329,13 +2377,16 @@ cdn_auto_extras() { # Auto: after (a) chrome+ech of each CDN carrier: the remain
   return 0
 }
 cdn_tune() { # [full] : needs T_CARRIER T_PEER T_KEY T_PATH T_SNI (the domain), AT_QUIET, AT_MB ; fills AV_*, AR_*, CT_IDX ; rc 1 = could not start
-  local car=$T_CARRIER port pa pd label a t0=$SECONDS
+  local car=$T_CARRIER port pa pd label a t0=$SECONDS i
   AT_FULL=${1:-0}
   AV_LABEL=(); AV_CAR=(); AV_KIND=(); AV_PEER=(); AV_PORT=(); AV_SNI=(); AV_FP=(); AV_ECH=(); AV_FRAG=()
   AR_OK=(); AR_DOWN=(); AR_UP=(); AR_RTT=(); AR_WHY=(); CT_IDX=''
   port=${T_PEER%%,*}; port=${port##*:}
   pd=$T_PEER; case "$pd" in *,*) pd="$T_SNI:$port" ;; esac
   [ "$car" = h2 ] && [ "$AT_QUIET" != 1 ] && hint "h2 does not work through Cloudflare; use grpc or wss"
+  if [ "$AT_FULL" = 1 ] && [ "$AT_QUIET" != 1 ]; then # the Kharej tunnel runs one carrier; say what the other CDN carrier would have been
+    case "$car" in wss) hint "grpc: not offered by this Kharej tunnel" ;; grpc) hint "wss: not offered by this Kharej tunnel" ;; esac
+  fi
   at_prep || return 1
   [ "$AT_QUIET" = 1 ] || at_busy "Cloudflare edges"
   CS_QUIET=1; cdn_scan "$T_SNI" "$port" "${T_PATH:-/wat}" "$car"
@@ -2350,7 +2401,7 @@ cdn_tune() { # [full] : needs T_CARRIER T_PEER T_KEY T_PATH T_SNI (the domain), 
   esac
   at_cleanup
   at_rank; AT_SECS=$((SECONDS-t0))
-  [ "${#AT_RANK[@]}" -gt 0 ] && CT_IDX=${AT_RANK[0]}
+  for i in ${AT_RANK[@]+"${AT_RANK[@]}"}; do [[ "${AV_LABEL[$i]}" == *"(diagnostic)" ]] && continue; CT_IDX=$i; break; done # the diagnostic row is never chosen
   return 0
 }
 cdn_take() { # the best variant (CT_IDX) -> T_PEER, T_SNI, AT_EXTRA, CT_DESC
@@ -2366,7 +2417,7 @@ cdn_wizard_tune() { # Iran wizard, token accepted: CDN carrier + domain + wattun
   T_SNI=$dom
   echo
   [ "$T_CARRIER" = h2 ] && hint "h2 does not work through Cloudflare; use grpc or wss"
-  AT_QUIET=1; AT_MB=2; AT_SKIP=''
+  AT_QUIET=1; AT_MB=20; AT_NOTE=''; AT_SKIP=''
   at_busy "the Cloudflare edges and TLS settings (ECH first) for $dom"
   cdn_tune 0
   at_idle
@@ -2414,7 +2465,7 @@ cdn_tune_cmd() { # name [full] : re-run the CDN tuning for an Iran CDN tunnel, s
   page "CDN tune" "$n"
   hint "Testing from this server. The running tunnel is not touched until you confirm."
   echo
-  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN=''
+  AT_QUIET=0; AT_MB=20; AT_NOTE=''; AT_SKIP=''; AT_AGAIN=''
   cdn_tune "$full" || { err "Could not prepare the test (is $AUTO_RUN writable?)."; return 1; }
   if [ -z "$CT_IDX" ]; then
     echo; err "No CDN variant got a working link from this server. Nothing was changed."
@@ -3188,16 +3239,29 @@ update() { # [installer args...]
   before=$(bin_ver); mbefore=$(cksum <"${imgr:-$MGR}" 2>/dev/null)
   tmp=$(mktemp /tmp/wattun-install.XXXXXX)
   [ "$SANDBOX" = 1 ] && ienv=(WAT_BIN="$BIN" WAT_MGR="$imgr" WAT_CONF="$CONF" WAT_UNIT="$tmp.unit" WAT_REQUIRE_SANDBOX=1) # the installer's unit file goes to a throwaway path
+  # raw.githubusercontent.com caches main for minutes: resolve main to a commit sha and fetch everything by it
+  local sha mref="" mkeep
+  sha=$(curl -fsSL --max-time 10 "${WAT_PROXY:-}https://api.github.com/repos/$REPO/commits/main" 2>/dev/null | grep -m1 '"sha"' | sed -n 's/.*"sha"[^"]*"\([0-9a-f]\{40\}\)".*/\1/p')
+  if [ -n "$sha" ]; then url="https://raw.githubusercontent.com/$REPO/$sha/install.sh"; mref=$sha; ienv+=(WAT_MGR_REF="$sha")
+  else warn "Could not resolve the latest commit; using the main branch (GitHub's cache may be a few minutes old)."; fi
+  # keep the current manager so a bad replacement can be undone
+  mkeep=$(mktemp /tmp/wattun-mgr.XXXXXX); cp -f "${imgr:-$MGR}" "$mkeep" 2>/dev/null || { rm -f "$mkeep"; mkeep=""; }
   spin_start "Downloading the installer"
   curl -fsSL --max-time 60 --retry 2 -o "$tmp" "${WAT_PROXY:-}$url"; local rc=$?
   spin_stop
   if [ "$rc" -ne 0 ] || ! head -c 2 "$tmp" | grep -q '#!'; then
-    rm -f "$tmp"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ $SELF update"; return 1
+    rm -f "$tmp" "$mkeep"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ $SELF update"; return 1
   fi
-  ok "Installer downloaded"
+  ok "Installer downloaded${mref:+ (${mref:0:7})}"
   env ${ienv[@]+"${ienv[@]}"} WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
   rm -f "$tmp" "$tmp.unit"
-  [ "$rc" -eq 0 ] || { err "The installer reported an error. Nothing was changed: still wattun ${before:-?}."; return 1; }
+  [ "$rc" -eq 0 ] || { rm -f "$mkeep"; err "The installer reported an error. Nothing was changed: still wattun ${before:-?}."; return 1; }
+  # self-check: in a sandbox the new manager must understand WAT_PREFIX, or it would drive the production paths
+  if [ "$SANDBOX" = 1 ] && [ -n "$mkeep" ] && ! grep -q 'WAT_PREFIX' "${imgr:-$MGR}" 2>/dev/null; then
+    install -m 755 "$mkeep" "${imgr:-$MGR}.new" && mv -f "${imgr:-$MGR}.new" "${imgr:-$MGR}"
+    rm -f "$mkeep"; err "The new manager has no sandbox (WAT_PREFIX) support; the previous manager was restored."; return 1
+  fi
+  rm -f "$mkeep"
   after=$(bin_ver)
   echo
   if [ -z "$after" ]; then err "$BIN does not run after the update. Roll back from the dashboard ([r])."; return 1
@@ -3247,7 +3311,10 @@ uninstall_all() {
   ok "Services and binaries removed."
   if [ -d "$CONF" ] && confirm "Also delete $CONF (tunnel configs, keys, tokens)?" "$([ "$SANDBOX" = 1 ] || [ "$NONINTERACTIVE" = 1 ] && echo y || echo n)"; then rm -rf "$CONF"; ok "Configuration deleted."; fi
   ok "WatTunnel removed."
-  if [ "$SANDBOX" = 1 ]; then hint "Sandbox: this script ($MGR) was left in place; delete it by hand if you copied it."; else rm -f "$MGR"; fi
+  if [ "$SANDBOX" = 1 ]; then
+    if [ "${MGR%/*}" = "/opt/$WAT_PREFIX" ]; then rm -rf "/opt/$WAT_PREFIX"; ok "Removed /opt/$WAT_PREFIX (including this script)"
+    else hint "Sandbox: this script ($MGR) was left in place; delete it by hand if you copied it."; fi
+  else rm -f "$MGR"; fi
   return 0
 }
 settings_menu() {

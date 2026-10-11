@@ -329,13 +329,22 @@ step_install_mgr() {
   if [ -f "$HERE/wattun-manager" ]; then cp "$HERE/wattun-manager" "$TMP/mgr"
   # the manager is served from main (it checks the binary's version before using newer features); the release
   # tag's copy is only a fallback, since a tag's manager can be older than main's fixes
-  elif fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr"; then MGR_FALLBACK=1
+  elif fetch "https://raw.githubusercontent.com/$REPO/${WAT_MGR_REF:-main}/wattun-manager" "$TMP/mgr"; then MGR_FALLBACK=1
   elif [ -n "$TAG" ] && fetch "https://raw.githubusercontent.com/$REPO/$TAG/wattun-manager" "$TMP/mgr"; then :
   else ERRMSG="could not download wattun-manager"; return 1; fi
   head -c 2 "$TMP/mgr" | grep -q '#!' || { ERRMSG="wattun-manager looks corrupt"; return 1; }
   # a sandboxed manager (WAT_PREFIX) must never be replaced by one that would ignore the prefix and use /etc/wattun
   if [ "${WAT_REQUIRE_SANDBOX:-0}" = 1 ] && ! grep -q 'WAT_PREFIX' "$TMP/mgr"; then
     ERRMSG="the downloaded wattun-manager has no sandbox (WAT_PREFIX) support; keeping the current one"; return 1
+  fi
+  # never replace a manager with an older one (a stale CDN copy): compare MGR_VERSION when both have it
+  if [ -f "$MGR" ]; then
+    local vold vnew
+    vold=$(sed -n 's/^MGR_VERSION=\([0-9]\{10\}\).*/\1/p' "$MGR" 2>/dev/null | head -n1)
+    vnew=$(sed -n 's/^MGR_VERSION=\([0-9]\{10\}\).*/\1/p' "$TMP/mgr" | head -n1)
+    if [ -n "$vold" ] && [ -n "$vnew" ] && [ "$vnew" -lt "$vold" ]; then
+      ERRMSG="the downloaded wattun-manager ($vnew) is older than the installed one ($vold); keeping the current one"; return 1
+    fi
   fi
   bash -n "$TMP/mgr" 2>/dev/null || { ERRMSG="the downloaded wattun-manager fails a syntax check (bash -n); not installing it"; return 1; }
   # atomic replace: a manager that is running right now keeps reading its old file safely
