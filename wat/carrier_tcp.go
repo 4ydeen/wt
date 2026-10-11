@@ -55,6 +55,42 @@ type poolAddr struct {
 func (poolAddr) Network() string  { return "pool" }
 func (a poolAddr) String() string { return hex.EncodeToString([]byte(a.key)) }
 
+// Send-side datagram buffers of the pool carriers are recycled (v2.3.0): Send copies into one and the connection's
+// writer hands it back once bufio has taken the bytes. Two size classes cover the default 4096 MTU and -mtu 16384;
+// anything else is allocated and left to the GC. Received datagrams are NOT recycled: doing so (handing the buffer
+// back on the next Recv) cost 15-25 % of loopback wss download throughput in repeated A/B runs, with a channel free
+// list and with sync.Pool alike, so readLoop keeps allocating a fresh slice per datagram.
+const (
+	pktSmall = 4096
+	pktBig   = poolMaxMTU
+)
+
+var (
+	pktPoolSmall = sync.Pool{New: func() any { return new([pktSmall]byte) }}
+	pktPoolBig   = sync.Pool{New: func() any { return new([pktBig]byte) }}
+)
+
+// getPkt returns a buffer of length n, recycled when one of the size classes fits.
+func getPkt(n int) []byte {
+	switch {
+	case n <= pktSmall:
+		return pktPoolSmall.Get().(*[pktSmall]byte)[:n]
+	case n <= pktBig:
+		return pktPoolBig.Get().(*[pktBig]byte)[:n]
+	}
+	return make([]byte, n)
+}
+
+// putPkt hands a buffer from getPkt back; the caller must not touch it afterwards.
+func putPkt(b []byte) {
+	switch cap(b) {
+	case pktSmall:
+		pktPoolSmall.Put((*[pktSmall]byte)(b[:pktSmall]))
+	case pktBig:
+		pktPoolBig.Put((*[pktBig]byte)(b[:pktBig]))
+	}
+}
+
 // poolConn is one framed connection with its own bounded send queue.
 type poolConn struct {
 	c    net.Conn
@@ -89,6 +125,7 @@ func (pc *poolConn) enqueue(p []byte) bool {
 		return true
 	default:
 		poolDrops.Add(1)
+		putPkt(p)
 		return false
 	}
 }
@@ -118,7 +155,9 @@ func (pc *poolConn) writeLoop() {
 					pc.fail()
 					return
 				}
-				if _, err := bw.Write(p); err != nil {
+				_, err := bw.Write(p)
+				putPkt(p) // bufio has copied it (or written it through)
+				if err != nil {
 					pc.fail()
 					return
 				}
@@ -423,6 +462,9 @@ func (c *TCPPoolClient) slotLoop(i int) {
 	}
 }
 
+// Send copies p, but the pool carriers deliberately do not declare CopiesOnSend: letting the session recycle its
+// sealed buffers saved ~7 % of the pump's CPU yet cost about a third of single-session wss download throughput on
+// loopback in repeated A/B runs (2.3.0 measurements), so the session keeps allocating them.
 func (c *TCPPoolClient) Send(p []byte, path int) error {
 	select {
 	case <-c.done:
@@ -434,9 +476,28 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 		conns[i] = c.slots[i].Load()
 	}
 	if pc := leastQueued(conns, int(c.rr.Add(1))); pc != nil {
-		pc.enqueue(append([]byte(nil), p...)) // full queue: drop, the session repairs it
+		pc.enqueue(append(getPkt(len(p))[:0], p...)) // full queue: drop, the session repairs it
 	}
 	return nil
+}
+
+// Clone returns a new pool client to the same peer(s) with the same dial function, and with it the same TLS engine
+// (fingerprint, ECH state and cache) and the same per-address health, but its own connections and its own random
+// pool id, so the server sees an independent pool. The clone's slot i dials as slot i+slotOffset of the original
+// would, which moves its starting edge on a multi-address -peer. (-sessions N, client only, 2.3.0.)
+func (c *TCPPoolClient) Clone(slotOffset int) (*TCPPoolClient, error) {
+	n, err := newSlotPoolClient(func(ctx context.Context, slot int) (net.Conn, error) {
+		return c.dial(ctx, slot+slotOffset)
+	}, len(c.slots))
+	if err != nil {
+		return nil, err
+	}
+	n.ps, n.tlsFn = c.ps, c.tlsFn
+	n.maxBackoff.Store(c.maxBackoff.Load())
+	if l := c.logf.Load(); l != nil {
+		n.logf.Store(l)
+	}
+	return n, nil
 }
 
 func (c *TCPPoolClient) Recv() ([]byte, int, net.Addr, error) {
@@ -634,7 +695,7 @@ func (s *TCPPoolServer) SendTo(p []byte, lane int, dst net.Addr) error {
 	}
 	s.mu.Unlock()
 	if pc := leastQueued(conns, int(s.rr.Add(1))); pc != nil {
-		pc.enqueue(append([]byte(nil), p...))
+		pc.enqueue(append(getPkt(len(p))[:0], p...))
 	}
 	return nil // no live conn or full queue: dropped, the session repairs it
 }

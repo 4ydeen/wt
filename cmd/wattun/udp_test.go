@@ -60,7 +60,7 @@ func newUDPRig(t *testing.T, al *allow, idle time.Duration) *udpRig {
 		t.Fatal(err)
 	}
 	t.Cleanup(sess.Close)
-	return &udpRig{dc: newDgramClient(sess, idle)}
+	return &udpRig{dc: newDgramClient(newTunnel([]*wat.Session{sess}), idle)}
 }
 
 func allowUDP(ports ...int) *allow {

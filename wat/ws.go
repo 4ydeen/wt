@@ -36,10 +36,27 @@ type wsConn struct {
 	key    [4]byte
 	kpos   int
 	once   sync.Once
+	wbuf   []byte // frame assembly buffer, reused under wmu (one alloc per connection, not per frame)
 }
 
 func newWSConn(c net.Conn, br *bufio.Reader, client bool) *wsConn {
 	return &wsConn{Conn: c, br: br, client: client}
+}
+
+// wsMask XORs b with the masking key, starting at key position pos (RFC 6455 5.3), eight bytes at a time.
+func wsMask(b []byte, key [4]byte, pos int) {
+	var k8 [8]byte
+	for i := range k8 {
+		k8[i] = key[(pos+i)&3]
+	}
+	kw := binary.LittleEndian.Uint64(k8[:])
+	i := 0
+	for ; i+8 <= len(b); i += 8 {
+		binary.LittleEndian.PutUint64(b[i:], binary.LittleEndian.Uint64(b[i:])^kw)
+	}
+	for ; i < len(b); i++ {
+		b[i] ^= k8[i&7]
+	}
 }
 
 func (w *wsConn) writeFrame(op byte, p []byte) error {
@@ -58,7 +75,13 @@ func (w *wsConn) writeFrame(op byte, p []byte) error {
 		binary.BigEndian.PutUint64(hdr[2:], uint64(l))
 		n = 10
 	}
-	buf := make([]byte, n+4+len(p))
+	w.wmu.Lock()
+	defer w.wmu.Unlock()
+	need := n + 4 + len(p)
+	if cap(w.wbuf) < need {
+		w.wbuf = make([]byte, need)
+	}
+	buf := w.wbuf[:need]
 	copy(buf, hdr[:n])
 	body := buf[n:]
 	if w.client {
@@ -67,17 +90,16 @@ func (w *wsConn) writeFrame(op byte, p []byte) error {
 		crand.Read(k[:])
 		copy(body, k[:])
 		body = body[4:]
-		for i, b := range p {
-			body[i] = b ^ k[i&3]
-		}
-		buf = buf[:n+4+len(p)]
+		copy(body, p)
+		wsMask(body[:len(p)], k, 0)
 	} else {
 		copy(body, p)
 		buf = buf[:n+len(p)]
 	}
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
 	_, err := w.Conn.Write(buf)
+	if cap(w.wbuf) > 256<<10 { // an unusually large frame: do not keep its buffer
+		w.wbuf = nil
+	}
 	return err
 }
 
@@ -171,9 +193,7 @@ func (w *wsConn) Read(p []byte) (int, error) {
 	}
 	n, err := w.br.Read(p)
 	if w.masked {
-		for i := 0; i < n; i++ {
-			p[i] ^= w.key[(w.kpos+i)&3]
-		}
+		wsMask(p[:n], w.key, w.kpos)
 		w.kpos += n
 	}
 	w.left -= int64(n)

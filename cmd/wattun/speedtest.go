@@ -12,6 +12,10 @@ package main
 // The client side is the /speedtest endpoint on the metrics address (127.0.0.1 only):
 //
 //	curl '127.0.0.1:19700/speedtest?dir=down&mb=10'
+//
+// With -sessions N (2.3.0) the test runs one stream on every live session at once, each moving its share of the
+// size, and reports the total over the wall time ("sessions" says how many took part). The server side is unchanged:
+// it only ever sees ordinary speed-test streams.
 
 import (
 	"encoding/binary"
@@ -21,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/JohnWatsoon/WatTunnel/wat"
@@ -83,17 +88,60 @@ func writeN(w io.Writer, n uint64) error {
 }
 
 type speedResult struct {
-	Dir     string  `json:"dir"`
-	Bytes   uint64  `json:"bytes"`
-	Seconds float64 `json:"seconds"`
-	MBps    float64 `json:"mb_per_s"`
-	Mbit    float64 `json:"mbit_per_s"`
-	OK      bool    `json:"ok"`
-	Error   string  `json:"error,omitempty"`
+	Dir      string  `json:"dir"`
+	Bytes    uint64  `json:"bytes"`
+	Seconds  float64 `json:"seconds"`
+	MBps     float64 `json:"mb_per_s"`
+	Mbit     float64 `json:"mbit_per_s"`
+	OK       bool    `json:"ok"`
+	Error    string  `json:"error,omitempty"`
+	Sessions int     `json:"sessions"` // sessions the test ran on in parallel (2.3.0)
 }
 
-// runSpeedTest moves size bytes in one direction through sess and times it.
-func runSpeedTest(sess *wat.Session, dir string, size uint64) speedResult {
+// runSpeedTest moves size bytes in one direction through every live session of tun at once (size split between
+// them) and times the whole.
+func runSpeedTest(tun *tunnel, dir string, size uint64) speedResult {
+	list := tun.live()
+	if len(list) == 0 {
+		return speedResult{Dir: dir, Bytes: size, Error: "tunnel is not connected", Sessions: len(tun.list)}
+	}
+	if len(list) == 1 {
+		r := speedOne(list[0], dir, size)
+		r.Sessions = 1
+		return r
+	}
+	part := size / uint64(len(list))
+	parts := make([]speedResult, len(list))
+	var wg sync.WaitGroup
+	t0 := time.Now()
+	for i, s := range list {
+		n := part
+		if i == 0 {
+			n += size - part*uint64(len(list)) // the remainder
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			parts[i] = speedOne(s, dir, n)
+		}()
+	}
+	wg.Wait()
+	res := speedResult{Dir: dir, Bytes: size, Sessions: len(list)}
+	for i, p := range parts {
+		if !p.OK {
+			res.Error = fmt.Sprintf("session %d of %d: %s", i+1, len(list), p.Error)
+			return res
+		}
+	}
+	res.Seconds = time.Since(t0).Seconds()
+	res.MBps = float64(size) / 1e6 / res.Seconds
+	res.Mbit = res.MBps * 8
+	res.OK = true
+	return res
+}
+
+// speedOne moves size bytes in one direction through one stream of sess and times it.
+func speedOne(sess *wat.Session, dir string, size uint64) speedResult {
 	res := speedResult{Dir: dir, Bytes: size}
 	fail := func(err error) speedResult { res.Error = err.Error(); return res }
 	if !sess.Alive() {
@@ -146,7 +194,7 @@ func runSpeedTest(sess *wat.Session, dir string, size uint64) speedResult {
 }
 
 // speedTestHandler serves /speedtest?dir=down|up&mb=N on the client's metrics address.
-func speedTestHandler(sess *wat.Session) http.HandlerFunc {
+func speedTestHandler(tun *tunnel) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		dir := r.URL.Query().Get("dir")
 		if dir != "up" {
@@ -157,6 +205,6 @@ func speedTestHandler(sess *wat.Session) http.HandlerFunc {
 			mb = 10
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(runSpeedTest(sess, dir, uint64(mb)<<20))
+		json.NewEncoder(w).Encode(runSpeedTest(tun, dir, uint64(mb)<<20))
 	}
 }

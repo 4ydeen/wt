@@ -144,7 +144,7 @@ func (st *Stream) Read(b []byte) (int, error) {
 	n := copy(b, st.ready)
 	st.ready = st.ready[n:]
 	if len(st.ready) == 0 {
-		if cap(st.rroot) > 64<<10 {
+		if cap(st.rroot) > 1<<20 { // keep a working buffer (re-growing it from zero after every drain cost ~10 % CPU at 100 MB/s)
 			st.rroot = nil
 		}
 		st.ready = nil
@@ -408,13 +408,18 @@ func (st *Stream) makeRoom(n int) {
 
 // appendReady adds in-order bytes for Read. When Read has drained ready, the next bytes start again at the front of
 // the same backing array instead of allocating a new one per packet.
+//
+// When the end of the backing array is reached while Read has consumed its front, the unread bytes move back to the
+// front instead of growing a new array (same idea as makeRoom on the send side).
 func (st *Stream) appendReady(data []byte) {
 	old := st.ready
 	if len(old) == 0 {
 		old = st.rroot[:0]
+	} else if cap(old)-len(old) < len(data) && cap(st.rroot) >= len(old)+len(data) {
+		old = st.rroot[:copy(st.rroot[:len(old)], old)]
 	}
 	st.ready = append(old, data...)
-	if len(old) == 0 || &st.ready[0] != &old[0] { // new backing array (it starts at its front)
+	if cap(old)-len(old) < len(data) { // append moved to a new backing array (it starts at its front)
 		st.rroot = st.ready[:0]
 	}
 }

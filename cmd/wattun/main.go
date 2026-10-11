@@ -50,7 +50,7 @@ func main() {
 	bind := flag.String("bind", "0.0.0.0", "client: listen address")
 	offset := flag.Int("port-offset", 0, "client: add this to every listen port (second slot)")
 	lanes := flag.Int("lanes", 4, "client: ICMP identifiers to stripe over")
-	maxMB := flag.Float64("max-mbps", 16, "pace ceiling, MB/s per direction")
+	maxMB := flag.Float64("max-mbps", 0, "pace ceiling, MB/s per direction, per session (0 = the carrier default: 16 when icmp is among the carriers, 200 for udp|tcp|tls|ws|wss|h2|h2c|grpc; 2.3.0, before: 16 for all)")
 	slackMs := flag.Int("slack-ms", 8, "tolerated RTT growth before slowing down, ms")
 	metrics := flag.String("metrics", "", "serve JSON stats on this address (e.g. 127.0.0.1:19700)")
 	allowLo := flag.Int("allow-min", 1, "server: lowest target port a client may ask for")
@@ -66,6 +66,7 @@ func main() {
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
 	conns := flag.Int("conns", wat.DefaultPoolConns, "client, tcp/tls carrier: connections in the pool")
+	nSess := flag.Int("sessions", 1, "client: independent sessions to the server (1-16), each with its own -conns pool, pacer and session id; new TCP streams go to the least loaded live one, UDP flows stick to one, /speedtest uses all; udp|tcp|tls|ws|wss|h2|h2c|grpc only (not icmp, bonded carriers or -reverse); each counts against the server's 32-session limit (client only, 2.3.0; server unchanged)")
 	tlsCert := flag.String("tls-cert", "", "server, tls carrier: certificate file (empty = self-signed in memory)")
 	tlsKey := flag.String("tls-key", "", "server, tls carrier: private key file")
 	sni := flag.String("sni", "", "client, tls carrier: server name sent in the ClientHello")
@@ -157,6 +158,25 @@ func main() {
 	if *reverse && !anyPool && !seen["icmp"] {
 		fmt.Fprintf(os.Stderr, "-reverse needs icmp or a connection-pool carrier (tcp|tls|ws|wss|h2|h2c|grpc), not %q\n", *carrier)
 		os.Exit(2)
+	}
+	if *nSess != 1 && !server {
+		switch {
+		case *nSess < 1 || *nSess > maxSessions:
+			fmt.Fprintf(os.Stderr, "-sessions must be 1..%d, got %d\n", maxSessions, *nSess)
+			os.Exit(2)
+		case len(names) > 1 || names[0] == "icmp":
+			fmt.Fprintf(os.Stderr, "-sessions > 1 works with one udp|tcp|tls|ws|wss|h2|h2c|grpc carrier, not %q\n", *carrier)
+			os.Exit(2)
+		case *reverse:
+			fmt.Fprintln(os.Stderr, "-sessions > 1 does not work with -reverse (the server dials one pool)")
+			os.Exit(2)
+		}
+	}
+	if *maxMB <= 0 { // carrier default: the ICMP path keeps its measured 16 MB/s, the others are not capped by it
+		*maxMB = 200
+		if seen["icmp"] {
+			*maxMB = 16
+		}
 	}
 	if _, err := wat.NormFingerprint(*tlsFP); err != nil {
 		log.Fatal(err)
@@ -316,28 +336,55 @@ func main() {
 		Server: server, Key: k, Paths: *lanes, MaxBps: *maxMB * 1e6, Slack: time.Duration(*slackMs) * time.Millisecond,
 		Logf: log.Printf, Hedge: *hedge, FEC: *fecMode == "auto", MaxPayload: *mtu,
 	}
-	var sess *wat.Session
+	var tun *tunnel
 	var srv *wat.Server
-	var err error
 	if server {
+		if *nSess != 1 {
+			log.Printf("-sessions is a client option, ignored on the server")
+		}
 		srv = wat.NewServer(cfg, raw)
-	} else if sess, err = wat.NewSession(cfg, pio); err != nil {
-		log.Fatal(err)
+	} else {
+		pios := []wat.PacketIO{pio}
+		for k := 1; k < *nSess; k++ { // -sessions: more independent carriers to the same peer(s)
+			var p wat.PacketIO
+			var err error
+			switch c := pio.(type) {
+			case *wat.TCPPoolClient: // same TLS engine and edge health, own connections; the next slots continue the edge rotation
+				p, err = c.Clone(k * max(*conns, 1))
+			case *wat.UDPClient:
+				p, err = wat.NewUDPClient(pick(peerBy, *peer, "udp"))
+			default:
+				err = fmt.Errorf("-sessions > 1 is not supported on this carrier")
+			}
+			if err != nil {
+				log.Fatalf("session %d: %v", k+1, err)
+			}
+			pios = append(pios, p)
+		}
+		var list []*wat.Session
+		for _, p := range pios {
+			s, err := wat.NewSession(cfg, p)
+			if err != nil {
+				log.Fatal(err)
+			}
+			list = append(list, s)
+		}
+		tun = newTunnel(list)
 	}
 	stats := func() wat.Stats {
 		if srv != nil {
 			return srv.Stats()
 		}
-		return sess.Stats()
+		return tun.stats()
 	}
-	alive := func() bool { return srv != nil && srv.Sessions() > 0 || sess != nil && sess.Alive() }
+	alive := func() bool { return srv != nil && srv.Sessions() > 0 || tun != nil && tun.alive() }
 	// rxAge: ms since the last authenticated packet from the peer (server: from any client), -1 if none yet.
 	rxAge := func() int64 {
 		var t time.Time
 		if srv != nil {
 			t = srv.LastRecv()
 		} else {
-			t = sess.LastRecv()
+			t = tun.lastRecv()
 		}
 		if t.IsZero() {
 			return -1
@@ -348,7 +395,7 @@ func main() {
 		if srv != nil {
 			return srv.CarrierStats()
 		}
-		return sess.CarrierStats()
+		return tun.list[0].CarrierStats() // bonded carriers run one session
 	}
 	side = "c"
 	if server {
@@ -362,6 +409,9 @@ func main() {
 	}
 	go portReg.run()
 	log.Printf("wattun %s up (ident base %d, lanes %d, max %.0f MB/s)", *mode, wat.IdentBase(k), *lanes, *maxMB)
+	if tun != nil && len(tun.list) > 1 {
+		log.Printf("%d sessions (new streams go to the least loaded live one)", len(tun.list))
+	}
 	if len(names) > 1 {
 		log.Printf("bonded carriers: %s", strings.Join(names, " + "))
 	}
@@ -385,8 +435,8 @@ func main() {
 				json.NewEncoder(w).Encode(portReg.snapshot(side))
 			})
 			mux.HandleFunc("/quota/reset", quotaResetHandler)
-			if sess != nil {
-				mux.HandleFunc("/speedtest", speedTestHandler(sess))
+			if tun != nil {
+				mux.HandleFunc("/speedtest", speedTestHandler(tun))
 			}
 			mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 				st := stats()
@@ -400,7 +450,7 @@ func main() {
 						if srv != nil {
 							return srv.Sessions()
 						}
-						return 1
+						return len(tun.list)
 					}(),
 					"dgram_sent": st.DgramSent, "dgram_recv": st.DgramRecv, "dgram_dropped_queue": st.DgramDropQueue,
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_flows": udpFlowsActive.Load(),
@@ -425,6 +475,11 @@ func main() {
 				}
 				if srv != nil {
 					out["clients"] = clientsJSON(srv.Clients())
+				} else {
+					out["sessions_up"] = tun.up()
+					if len(tun.list) > 1 {
+						out["session_list"] = tun.sessionList()
+					}
 				}
 				json.NewEncoder(w).Encode(out)
 			})
@@ -510,10 +565,10 @@ func main() {
 				}
 				log.Printf("forwarding %s -> server :%d", addr, sp)
 				ps := portReg.get("c", lp+*offset)
-				go acceptLoop(ln, func(c net.Conn) { forward(sess, c, sp, ps) })
+				go acceptLoop(ln, func(c net.Conn) { forward(tun, c, sp, ps) })
 			}
 		}
-		dc := newDgramClient(sess, *udpIdle)
+		dc := newDgramClient(tun, *udpIdle)
 		for _, m := range strings.Split(*udpMaps, ",") {
 			if strings.TrimSpace(m) == "" {
 				continue
@@ -542,7 +597,7 @@ func main() {
 				if err == nil {
 					log.Printf("forwarding %s -> server :%d", addr, t)
 					ps := portReg.get("c", p+*offset)
-					go acceptLoop(ln, func(c net.Conn) { forward(sess, c, t, ps) })
+					go acceptLoop(ln, func(c net.Conn) { forward(tun, c, t, ps) })
 				}
 				return ln, err
 			})
@@ -575,7 +630,7 @@ func main() {
 	if srv != nil {
 		srv.Close()
 	} else {
-		sess.Close()
+		tun.Close()
 	}
 }
 
@@ -595,14 +650,15 @@ func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 	}
 }
 
-// forward opens a stream to server port target and bridges c to it.
-func forward(sess *wat.Session, c net.Conn, target int, ps *portStat) {
+// forward opens a stream to server port target on the least loaded live session and bridges c to it.
+func forward(tun *tunnel, c net.Conn, target int, ps *portStat) {
 	if !ps.track(c) { // quota used up
 		c.Close()
 		return
 	}
 	defer ps.untrack(c)
-	if !sess.Alive() { // tunnel is down: fail fast so the client retries elsewhere
+	sess := tun.pick()
+	if !sess.Alive() { // tunnel is down (pick prefers a live session): fail fast so the client retries elsewhere
 		ps.errs.Add(1)
 		c.Close()
 		return

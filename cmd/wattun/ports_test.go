@@ -61,7 +61,8 @@ func newTCPRig(t *testing.T) *tcpRig {
 	t.Cleanup(func() { ln.Close() })
 	pub := ln.Addr().(*net.TCPAddr).Port
 	cs := portReg.get("c", pub)
-	go acceptLoop(ln, func(c net.Conn) { forward(sess, c, target, cs) })
+	tun := newTunnel([]*wat.Session{sess})
+	go acceptLoop(ln, func(c net.Conn) { forward(tun, c, target, cs) })
 	return &tcpRig{pub: pub, target: target, cs: cs, ss: portReg.get("s", target)}
 }
 

@@ -1426,7 +1426,12 @@ sessions_check() { # --sessions N: only when the installed wattun knows the key 
   else warn "--sessions $NI_SESSIONS ignored: it needs wattun 2.3.0 or newer (this is ${VER:-unknown}); run: $SELF update"; fi
   return 0
 }
-sessions_line() { [ -n "$SESS_USE" ] && echo "sessions: $SESS_USE"; return 0; }
+sessions_line() { # the engine refuses sessions with icmp, bonded carriers, reverse, or more than 16
+  [ -n "$SESS_USE" ] || return 0
+  case "$T_CARRIER" in icmp|*,*) warn "--sessions ignored: not supported with carrier '$T_CARRIER'" >&2; return 0 ;; esac
+  [ "$T_REV" = 1 ] && { warn "--sessions ignored: not supported in reverse mode" >&2; return 0; }
+  echo "sessions: $(( SESS_USE > 16 ? 16 : SESS_USE ))"; return 0
+}
 
 # ======================================================================================
 #  Auto carrier: one token, Iran tests every connection type and keeps the best

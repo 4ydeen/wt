@@ -317,6 +317,14 @@ func (s *Session) Stats() Stats {
 	return st
 }
 
+// Load reports the open streams and the bytes in flight: what a client running several sessions (-sessions N)
+// balances new streams on. Cheaper than Stats.
+func (s *Session) Load() (streams, inflight int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.streams), s.inflight
+}
+
 // OpenStream starts a new stream (client side).
 func (s *Session) OpenStream() (*Stream, error) {
 	s.mu.Lock()

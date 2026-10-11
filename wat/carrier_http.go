@@ -478,9 +478,11 @@ const grpcMaxMsg = 1 << 20
 // Xray's gun Hunk) and Read unwraps them.
 type grpcConn struct {
 	net.Conn
-	br  *bufio.Reader
-	rem []byte
-	mu  sync.Mutex
+	br   *bufio.Reader
+	rem  []byte
+	mu   sync.Mutex
+	wbuf []byte // message assembly, reused under mu
+	rbuf []byte // message receive buffer, reused once rem is consumed (Read is never called concurrently)
 }
 
 func newGRPCConn(c net.Conn) *grpcConn {
@@ -494,13 +496,14 @@ func (g *grpcConn) Write(p []byte) (int, error) {
 		var vb [binary.MaxVarintLen32]byte
 		vl := binary.PutUvarint(vb[:], uint64(n))
 		pb := 1 + vl + n
-		buf := make([]byte, 0, 5+pb)
+		g.mu.Lock()
+		buf := g.wbuf[:0]
 		buf = append(buf, 0)
 		buf = binary.BigEndian.AppendUint32(buf, uint32(pb))
 		buf = append(buf, 0x0a)
 		buf = append(buf, vb[:vl]...)
 		buf = append(buf, p[:n]...)
-		g.mu.Lock()
+		g.wbuf = buf[:0]
 		_, err := g.Conn.Write(buf)
 		g.mu.Unlock()
 		if err != nil {
@@ -521,7 +524,15 @@ func (g *grpcConn) Read(p []byte) (int, error) {
 		if h[0] != 0 || n > grpcMaxMsg {
 			return 0, errors.New("grpc: bad message")
 		}
-		msg := make([]byte, n)
+		var msg []byte
+		if n <= 64<<10 { // our own messages are <= 32 KiB; a larger one is not worth keeping a buffer for
+			if uint32(cap(g.rbuf)) < n {
+				g.rbuf = make([]byte, 64<<10)
+			}
+			msg = g.rbuf[:n]
+		} else {
+			msg = make([]byte, n)
+		}
 		if _, err := io.ReadFull(g.br, msg); err != nil {
 			return 0, err
 		}

@@ -476,7 +476,8 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
 | `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
-| `max-mbps` | 16 | both | Pacing ceiling, MB/s per direction. See "ICMP path limits and pacing". |
+| `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 200 for udp, tcp, tls, ws, wss, h2, h2c and grpc (2.3.0; before, 16 for every carrier, which capped a pool carrier at 16 MB/s, and the server's value caps the download). See "ICMP path limits and pacing". |
+| `sessions` | 1 | client | Independent sessions to the server, 1 to 16 (2.3.0, client only; the server is unchanged). See "Several sessions". |
 | `icmp-type` | `echo` | both | ICMP carrier: `echo`, `timestamp`, `info` or `mask`. Both ends must match. |
 | `loss-ceiling` | false | both | Opt-in loss-aware ceiling for the pacer (see "ICMP path limits and pacing"). Off = delay only. |
 | `slack-ms` | 8 | both | RTT growth tolerated before slowing down. |
@@ -619,7 +620,8 @@ Every flag can also be a config key. Flags win over the file.
 | `-lanes N` | 4 | ICMP identifiers. |
 | `-conns N` | 8 | Pool connections. |
 | `-mtu N` | 0 | Datagram cap. |
-| `-max-mbps F` | 16 | Pace ceiling per direction. |
+| `-max-mbps F` | 0 | Pace ceiling per direction and session; 0 = 16 with icmp, 200 otherwise (2.3.0). |
+| `-sessions N` | 1 | Client: N independent sessions, udp and the pool carriers only (2.3.0, server unchanged). |
 | `-icmp-type T` | `echo` | ICMP carrier: `echo`, `timestamp`, `info`, `mask` (both ends the same). |
 | `-loss-ceiling` | off | Pacer: also cut the rate when loss jumps far above its learned baseline (opt-in). |
 | `-slack-ms N` | 8 | Tolerated RTT growth. |
@@ -700,14 +702,16 @@ metrics port, even if the port is in the allowlist.
 | `version` | The wattun version string (for example `2.0.2`). |
 | `carriers` | Only with bonded carriers (`carrier: a+b`): one entry per carrier with `name`, `alive`, `srtt_ms`, `share` (fraction of traffic), `sent`, `acked`, `lost`. |
 | `ports` | Per-port counters (same data as `/ports`). |
-| `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive). |
+| `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive); with `sessions` > 1, on any session. |
 | `last_rx_age_ms` | Since 2.0.1. Milliseconds since the last authenticated packet from the peer (server: from any client, including sessions that have closed). `-1` = none since the process started. Monitors should use this rather than ping: it only moves on real tunnel packets. |
 | `clients` | Since 2.1.0, servers only. One entry per live client session: `[{"ip":"203.0.113.5","carrier":"tcp","age_ms":1234}]`. Behind a CDN carrier (`ws`, `wss`, `h2`, `h2c`, `grpc`) `ip` is the proxy's address. Auto mode uses it to learn Iran's IP. |
 | `tls_fp` | Since 2.2.0, pool carriers. The TLS fingerprint in use (`go`, `chrome`, ...). |
 | `tls_mode` | Since 2.2.0. Fingerprint plus ECH state, for example `chrome+ech`, `go`. |
 | `ech` | Since 2.2.0. `true` when Encrypted Client Hello is active on the dialed connections. |
 | `edges` | Since 2.2.0, when `peer` lists several addresses: `[{"addr":"162.159.140.220:443","up":true}]`, one entry per address. |
-| `sessions` | Server: client sessions. Client: always 1. |
+| `sessions` | Server: client sessions. Client: the configured `-sessions` (1 before 2.3.0). |
+| `sessions_up` | Since 2.3.0, clients. Sessions that are alive. |
+| `session_list` | Since 2.3.0, clients with `sessions` > 1: one entry per session, `[{"alive":true,"srtt_ms":41.2,"rate_bps":2.4e7,"streams":3}]`. |
 | `draining` | Server: not accepting new sessions. |
 | `streams` | Open TCP streams. The drain timer waits for 0. |
 | `srtt_ms`, `min_rtt_ms` | Smoothed and minimum round-trip time. |
@@ -725,6 +729,10 @@ metrics port, even if the port is in the allowlist.
 | `dgram_rejected` | UDP flows refused (port not allowed). |
 | `dgram_flow_cap_drops` | Datagrams dropped at the flow cap. |
 
+With `sessions` > 1 (client) the top-level numbers cover all sessions: counters, `rate_bps`, `ceiling_bps`, `streams`
+and `inflight` are sums, `srtt_ms` is the median of the live sessions, `min_rtt_ms` the smallest, `loss_pct` the
+highest, and `last_rx_age_ms` the newest packet on any session.
+
 The process also logs a stats line every 10 seconds when something moves (it includes `ceiling=` and `loss=`).
 
 ### Speed test (1.8.1)
@@ -733,7 +741,31 @@ On a client, `GET /speedtest?dir=down|up&mb=N` (on the `metrics` address, N 1 to
 the live session and returns `{"dir","bytes","seconds","mb_per_s","mbit_per_s","ok","error"}`. The stream asks the
 server for target port 0, which the server answers itself (it sends or absorbs the bytes), so no test service or
 extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or newer.
-`wattun test NAME` runs it 10 MB each way.
+`wattun test NAME` runs it 10 MB each way. Since 2.3.0 the answer also has `"sessions"`: with `sessions` > 1 the
+test opens one stream on every live session at once, each moving its share of N MB, and reports the total over the
+wall time.
+
+### Several sessions (2.3.0)
+
+`sessions: N` (client only; the server needs no change, it already tells sessions apart by their random id) runs N
+independent sessions to the same server, each with its own carrier (`conns` connections of a pool carrier, or its own
+udp socket), its own pacer and its own session id. Why: one session has one receive goroutine and one send
+goroutine, and every stream is limited by its 4 MB flow-control window, so one stream moves at most about
+4 MB / RTT (measured on a simulated lossless link: 59 MB/s at 40 ms, 29 at 100 ms, 15 at 200 ms). Through a CDN
+from Iran the RTT under load is far above the ICMP path's 40 ms, which is what kept one session at 16-18 MB/s while
+separate processes added up.
+
+- New TCP connections go to the live session with the fewest open streams, then the fewest bytes in flight; ties
+  rotate. A session that is down (nothing heard for 10 s) gets no new streams while another is up; it reconnects
+  by itself as before.
+- UDP flows stick to one session, chosen by a hash of the flow id (so a flow's datagrams stay in order); only while
+  that session is down does the flow use the next live one.
+- With several `peer` addresses the sessions share one TLS engine (fingerprint, ECH state and cache) and one view of
+  which edges work; session k's connections continue the edge rotation where session k-1's stopped.
+- Every session counts against the server's limit of 32 sessions (a handover runs two clients), hence the cap of 16.
+- Not for `icmp`, bonded carriers (`a+b`) or `reverse`: the client refuses to start with a clear message.
+- Wire: nothing new. The server has always run one session per session id (that is how the two slots of a
+  handover share it), so any 2.x server serves a multi-session client.
 
 ## ICMP path limits and pacing
 
@@ -742,7 +774,7 @@ Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):
 - The path delivers at most about 50-55k ICMP packets per second Kharej -> Iran (about 33 MB/s at 640 B payload),
   shared by every ICMP type. Past about 45k pps a queue builds (p99 one-way delay +300 ms) and loss rises. Random
   loss on this path is only about 0.2 %.
-- `max-mbps` stays at 16 by default. The ceiling that really binds is the path's packet rate, so values above
+- `max-mbps` stays at 16 by default for `icmp` (and any bond that includes it). The ceiling that really binds is the path's packet rate, so values above
   roughly 30 only add queueing.
 - **Loss-aware ceiling (1.8.0, opt-in).** Off by default: the pacer is delay-based and loss alone is not congestion.
   With `loss-ceiling: true` (`-loss-ceiling`) it also compares, every 50 ms, the interval's loss with a learned

@@ -41,41 +41,35 @@ type cflow struct {
 	last atomic.Int64
 }
 
-// dgramClient is the client-side UDP forwarder for one session.
+// dgramClient is the client-side UDP forwarder for the tunnel's sessions; each flow sticks to one (tunnel.forFlow).
 type dgramClient struct {
-	sess *wat.Session
+	tun  *tunnel
 	idle time.Duration
 	mu   sync.Mutex
 	byID map[uint64]*cflow
 }
 
-func newDgramClient(sess *wat.Session, idle time.Duration) *dgramClient {
-	c := &dgramClient{sess: sess, idle: idle, byID: map[uint64]*cflow{}}
-	go c.replyLoop()
+func newDgramClient(tun *tunnel, idle time.Duration) *dgramClient {
+	c := &dgramClient{tun: tun, idle: idle, byID: map[uint64]*cflow{}}
+	go tun.eachDatagram(c.reply)
 	go c.janitor()
 	return c
 }
 
-func (c *dgramClient) replyLoop() {
-	for {
-		select {
-		case d := <-c.sess.Datagrams():
-			c.mu.Lock()
-			f := c.byID[d.Flow]
-			c.mu.Unlock()
-			if f == nil {
-				continue
-			}
-			f.last.Store(time.Now().UnixNano())
-			if !f.l.stat.dgramOK(false, len(d.Data)) {
-				continue
-			}
-			f.l.stat.dgram(false, len(d.Data))
-			f.l.conn.WriteToUDPAddrPort(d.Data, f.src)
-		case <-c.sess.Done():
-			return
-		}
+// reply delivers a datagram from the server to the flow's local sender (replies may come in on any session).
+func (c *dgramClient) reply(d wat.Datagram) {
+	c.mu.Lock()
+	f := c.byID[d.Flow]
+	c.mu.Unlock()
+	if f == nil {
+		return
 	}
+	f.last.Store(time.Now().UnixNano())
+	if !f.l.stat.dgramOK(false, len(d.Data)) {
+		return
+	}
+	f.l.stat.dgram(false, len(d.Data))
+	f.l.conn.WriteToUDPAddrPort(d.Data, f.src)
 }
 
 func (c *dgramClient) janitor() {
@@ -92,7 +86,7 @@ func (c *dgramClient) janitor() {
 				}
 			}
 			c.mu.Unlock()
-		case <-c.sess.Done():
+		case <-c.tun.Done():
 			return
 		}
 	}
@@ -160,7 +154,7 @@ func (l *udpListener) readLoop() {
 		}
 		f.last.Store(time.Now().UnixNano())
 		l.stat.dgram(true, n)
-		l.c.sess.SendDatagram(f.id, l.target, buf[:n]) // full queue / oversize: dropped and counted by the session
+		l.c.tun.forFlow(f.id).SendDatagram(f.id, l.target, buf[:n]) // full queue / oversize: dropped and counted by the session
 	}
 }
 
