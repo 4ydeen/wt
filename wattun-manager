@@ -9,6 +9,8 @@
 #   Auto carrier (one token, Iran tests every connection type): auto-test NAME | auto-ip NAME IP |
 #                   auto-watch NAME | auto-retest NAME   (the last two are run by systemd, not by hand)
 #   CDN carriers (ws, wss, h2, h2c, grpc via Cloudflare; wattun >= 2.2.0): cdn-tune NAME [full]
+#   Unattended (no tty, for scripts and test rigs): kharej --carrier C --name N --yes | iran --token T --map L:T --yes |
+#                   cdn-tune NAME --yes | auto-test NAME --yes | delete NAME --yes | uninstall --yes   (see: help)
 # Environment: WAT_NO_ANIM=1 (no animations), NO_COLOR=1 (no colours), WAT_REPO, WAT_PROXY, WAT_PREFIX (sandbox, see below).
 set -uo pipefail
 shopt -s extglob
@@ -82,14 +84,31 @@ EOF
 }
 LIB=${WAT_MANAGER_LIB:-0}
 
+# Non-interactive mode: no tty, no stdin reads, no animation, no screen clearing, plain lines. Every prompt helper
+# (ask, ask_ok, confirm, key_read, pick_carrier, port_editor, at_choose...) answers with its preset or default.
+# On with --yes, or NONINTERACTIVE=1 in the environment, or when stdin is not a tty and a --flag is given.
+NONINTERACTIVE=${NONINTERACTIVE:-0}
+case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall)
+  for _a in "$@"; do
+    case "$_a" in --yes) NONINTERACTIVE=1 ;; --*) [ -t 0 ] || NONINTERACTIVE=1 ;; esac
+  done ;;
+esac
+[ "$NONINTERACTIVE" = 1 ] || NONINTERACTIVE=0
+# Answers set by flags (see ni_parse); empty = the wizard's own default
+NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''
+NI_TOKEN=''; NI_MAP=''; NI_PICK=best; NI_SESSIONS=''; NI_YES=0; NI_POS=()
+ERRN=0
+
 case "$(locale charmap 2>/dev/null)" in UTF-8) ;; *) export LC_ALL=C.UTF-8 ;; esac
 
 # ======================================================================================
 #  Terminal UI core: colours, cursor, animations, prompts
 # ======================================================================================
 IS_TTY=0; [ -t 1 ] && IS_TTY=1
+[ "$NONINTERACTIVE" = 1 ] && IS_TTY=0
 USE_COLOR=0
 if [ "${WAT_FORCE_COLOR:-0}" = 1 ] || { [ "$IS_TTY" = 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; }; then USE_COLOR=1; fi
+[ "$NONINTERACTIVE" = 1 ] && USE_COLOR=0
 NCOL=8
 if [ "$USE_COLOR" = 1 ]; then
   NCOL=$(tput colors 2>/dev/null || echo 8)
@@ -138,7 +157,7 @@ strip_ansi() { printf '%s' "${1//$'\e'\[*([0-9;?])[a-zA-Z]/}"; }
 say()  { printf '%b\n' "$*"; }
 ok()   { printf '  %s✔%s %s\n' "$GRN" "$RST" "$*"; }
 warn() { printf '  %s!%s %s\n' "$YEL" "$RST" "$*"; }
-err()  { printf '  %s✘%s %s\n' "$RED" "$RST" "$*"; }
+err()  { ERRN=$((ERRN+1)); if [ "$NONINTERACTIVE" = 1 ]; then printf 'error: %s\n' "$*" >&2; else printf '  %s✘%s %s\n' "$RED" "$RST" "$*"; fi; }
 hint() { printf '  %s%s%s\n' "$GRY" "$*" "$RST"; }
 hr()   { printf '  %s%s%s\n' "$GRY" "$(rep ─ 74)" "$RST"; }
 key_label() { printf '%s[%s]%s' "$CYN" "$1" "$RST"; }
@@ -209,6 +228,7 @@ make_logo
 EL=''; [ "$IS_TTY" = 1 ] && EL=$'\e[K'
 clear_screen() { [ "$IS_TTY" = 1 ] && printf '\e[H\e[2J'; return 0; }
 page_full() { # title [subtitle] : big banner (dashboard, first screens)
+  if [ "$NONINTERACTIVE" = 1 ]; then printf '== %s%s ==\n' "$1" "${2:+ ($2)}"; return 0; fi
   clear_screen; echo
   if [ "$ANIM" = 1 ] && [ "$INTRO_DONE" = 0 ]; then banner 1; else banner 0; fi
   INTRO_DONE=1
@@ -216,6 +236,7 @@ page_full() { # title [subtitle] : big banner (dashboard, first screens)
   printf '  %s%s%s%s\n\n' "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
 }
 page() { # title [subtitle] : compact header with breadcrumb
+  if [ "$NONINTERACTIVE" = 1 ]; then printf '== %s%s ==\n' "$1" "${2:+ ($2)}"; return 0; fi
   clear_screen
   printf '\n  %s◆%s %s%s%s %s›%s %s%s%s%s\n' "$CYN" "$RST" "$LOGO" "${VER:+ $GRY$VER$RST}" "" "$GRY" "$RST" "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
   hr; echo
@@ -275,6 +296,7 @@ celebrate() { # text : short success flourish
 # shellcheck disable=SC2120
 key_read() { # [timeout] -> KEY ; rc 0 key, 2 timeout ; EOF exits
   local rc k2 c i; KEY=''
+  [ "$NONINTERACTIVE" = 1 ] && { KEY=enter; return 0; }
   while :; do
     if [ -n "${1:-}" ]; then IFS= read -rsn1 -t "$1" KEY; rc=$?; else IFS= read -rsn1 KEY; rc=$?; fi
     if [ "$rc" -ne 0 ]; then
@@ -302,6 +324,7 @@ key_read() { # [timeout] -> KEY ; rc 0 key, 2 timeout ; EOF exits
 }
 ask() { # prompt [default] -> REPLY_V (free text). Enter keeps the default.
   local d=${2:-} v
+  if [ "$NONINTERACTIVE" = 1 ]; then REPLY_V=$d; return 0; fi
   printf '  %s?%s %s%s %s›%s ' "$CYN" "$RST" "$1" "${d:+ ${GRY}[$d]${RST}}" "$GRY" "$RST"
   IFS= read -r v || eof_exit
   v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
@@ -309,6 +332,10 @@ ask() { # prompt [default] -> REPLY_V (free text). Enter keeps the default.
 }
 ask_ok() { # prompt default validator : up to 3 tries, validator prints its own error
   local t
+  if [ "$NONINTERACTIVE" = 1 ]; then # the preset/default is the only answer: validate once and say what is wrong
+    ask "$1" "$2"; "$3" "$REPLY_V" && return 0
+    err "'$1': '$REPLY_V' is not accepted (set it with the matching command-line flag)"; return 1
+  fi
   for t in 1 2 3; do
     ask "$1" "$2"
     if "$3" "$REPLY_V"; then return 0; fi
@@ -318,6 +345,9 @@ ask_ok() { # prompt default validator : up to 3 tries, validator prints its own 
 confirm() { # prompt [y|n default]
   local def=${2:-y} t lab='Y/n'
   [ "$def" = n ] && lab='y/N'
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    if [ "$def" = y ]; then echo "  ? $1 -> yes"; return 0; else echo "  ? $1 -> no"; return 1; fi
+  fi
   for t in 1 2 3; do
     printf '  %s?%s %s %s[%s]%s ' "$CYN" "$RST" "$1" "$GRY" "$lab" "$RST"
     key_read
@@ -964,7 +994,15 @@ pe_remove() {
   pe_msg "${GRN}✔${RST} Removed."
 }
 port_editor() { # rc 0 = done (MAPS ready), 1 = cancelled
-  local line cmd arg
+  local line cmd arg msg
+  if [ "$NONINTERACTIVE" = 1 ]; then # --map replaces what the token pre-filled; otherwise keep the pre-filled rows
+    if [ -n "$NI_MAP" ]; then MAPS=(); PE_MSG=''; pe_bulk "$NI_MAP"; fi
+    msg=$PE_MSG; PE_MSG=''
+    [ -n "$msg" ] && printf '%b' "$msg" | sed 's/^/  /'
+    if [[ "$msg" == *✘* ]]; then err "Some ports were rejected (see above). Fix them with --map LISTEN:TARGET[,..]"; return 1; fi
+    if [ "$PE_ROLE" = Iran ] && [ "${#MAPS[@]}" -eq 0 ]; then err "No ports to publish: give --map LISTEN:TARGET[,..] (example: --map 8443:443)"; return 1; fi
+    return 0
+  fi
   while :; do
     pe_draw
     printf '  %s▸%s ' "$CYN" "$RST"
@@ -1003,6 +1041,11 @@ pick_carrier() { # [auto] : with "auto" (Kharej wizard) the first choice is the 
     "tcp   plain TCP works" "tls   looks like HTTPS" "wss   WebSocket over TLS; works behind Cloudflare or a CDN"
     "ws    WebSocket without TLS (CDN on port 80, or a proxy that does TLS)" "grpc  gRPC, for CDNs that allow it" "h2    HTTP/2")
   n=${#opts[@]}
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    CARRIER=${NI_CARRIER:-${opts[0]}}
+    for t in "${opts[@]}"; do [ "$t" = "$CARRIER" ] && { echo "  carrier: $CARRIER"; return 0; }; done
+    err "Carrier '$CARRIER' is not available here (use: ${opts[*]})"; return 1
+  fi
   say "  ${BOLD}Carrier${RST}: how the two servers talk to each other"
   for ((i=0; i<n; i++)); do say "    ${CYN}$((i+1))${RST} ${descs[$i]}"; done
   for t in 1 2 3; do
@@ -1021,7 +1064,7 @@ pick_carrier() { # [auto] : with "auto" (Kharej wizard) the first choice is the 
 summary_line() { printf '    %s%-14s%s %s\n' "$GRY" "$1" "$RST" "$2"; }
 
 wizard_kharej() {
-  local name cr listen='' path='' sni='' itype='' mbps='' fec='' addr key m peer allow t rev='' iranip=''
+  local name cr listen='' path='' sni='' itype='' mbps='' fec='' addr key m peer allow t rev='' iranip='' advdef=n
   page "New tunnel" "STEP 1 · Kharej (outside server)"
   step_diagram 1
   echo
@@ -1029,26 +1072,32 @@ wizard_kharej() {
   say "  It creates a ${BOLD}token${RST}; you paste that token on the Iran server next."
   hint "Ctrl+C cancels at any time."
   echo
-  name=$(suggest_name kharej)
+  name=$(suggest_name kharej); [ -n "$NI_NAME" ] && name=$NI_NAME
   pick_carrier auto || return 1
   cr=$CARRIER
   if [ "$cr" = auto ]; then wizard_kharej_auto "$name"; return; fi
   [ "$cr" != icmp ] && listen=$(default_listen "$cr")
-  case "$cr" in ws|wss|grpc|h2|h2c) path=/wat ;; esac
+  case "$cr" in ws|wss|grpc|h2|h2c) path=/wat; [ -n "$NI_PATH" ] && path=$NI_PATH ;; esac
+  [ "$cr" != icmp ] && [ -n "$NI_LISTEN" ] && listen=$NI_LISTEN
+  sni=$NI_SNI; mbps=$NI_MBPS
+  advdef=n; [ -n "$NI_LISTEN$NI_PATH$NI_SNI$NI_MBPS" ] && advdef=y # a flag for an advanced setting opens that block (defaults = the flags)
 
-  # allowed ports: all (no question; the port editor stays in the tunnel menu)
+  # allowed ports: all unless --ports is given (the port editor stays in the tunnel menu)
   MAPS=(); PE_ROLE=Kharej; PE_TUNNEL=$name; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
   allow=''
+  if [ -n "$NI_PORTS" ]; then ni_kharej_ports || return 1; allow=$(maps_allow_str); fi
 
   # address Iran connects to
   page "New tunnel" "STEP 1 · Kharej (outside server)"
-  spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop
-  if [ -n "$addr" ] && ip_is_private "$addr"; then
+  if [ -n "$NI_ADDR" ]; then addr=$NI_ADDR
+  else spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop; fi
+  if [ -z "$NI_ADDR" ] && [ -n "$addr" ] && ip_is_private "$addr"; then
     warn "$addr looks like a private address; Iran cannot reach it."
     confirm "Use $addr anyway? (n = enter the public IP yourself)" n || addr=''
     [ -z "$addr" ] && hint "Behind NAT or a cloud 1:1 mapping? Enter the public IP shown in your provider's panel."
   elif [ -z "$addr" ]; then
     warn "Could not detect this server's public IP."
+    [ "$NONINTERACTIVE" = 1 ] && hint "Give it with --addr HOST"
   fi
   if [ -z "$addr" ]; then
     ask_ok "Public IP or domain of this server" "" v_host || return 1; addr=$REPLY_V
@@ -1064,7 +1113,7 @@ wizard_kharej() {
   # advanced
   echo
   hint "Automatic: name $name, address $addr${listen:+, port $listen}${path:+, path $path}, no speed limit, FEC off."
-  if confirm "Change advanced settings? (Enter = no, keep the automatic ones)" n; then
+  if confirm "Change advanced settings? (Enter = no, keep the automatic ones)" "$advdef"; then
     ask_ok "Tunnel name" "$name" v_name && name=$REPLY_V || return 1
     ask_ok "Address Iran connects to (IP or domain)" "$addr" v_host || return 1; addr=$REPLY_V
     if [ "$cr" = icmp ]; then
@@ -1089,7 +1138,7 @@ wizard_kharej() {
     fi
     case "$cr" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "$path" v_path || return 1; path=$REPLY_V ;; esac
     case "$cr" in wss|tls|grpc|h2) ask "Domain / SNI sent by Iran (empty = none)" "$sni"; sni=$REPLY_V ;; esac
-    ask_ok "Speed ceiling in MB/s (empty = default 16)" "" v_mbps || return 1; mbps=$REPLY_V
+    ask_ok "Speed ceiling in MB/s (empty = default 16)" "$mbps" v_mbps || return 1; mbps=$REPLY_V
     ask_ok "FEC: off or auto (auto needs auto on both ends)" off v_fec || return 1; fec=$REPLY_V
   fi
   valid_name "$name" || { err "The name '$name' is not available."; return 1; }
@@ -1160,16 +1209,28 @@ wizard_kharej() {
   say "  choose Iran and paste the token."
   hint "Show it again any time: $SELF token $name"
   warn "The token contains the key. Share it only over a private channel."
+  [ "$NONINTERACTIVE" = 1 ] && printf 'TUNNEL=%s\nTOKEN=%s\n' "$name" "$(cat "$CONF/$name.token")"
+  return 0
+}
+
+ni_kharej_ports() { # --ports "18999,2000,53/udp" -> MAPS (Kharej side: the service ports Iran may reach)
+  local msg
+  pe_bulk "$NI_PORTS"
+  msg=$PE_MSG; PE_MSG=''
+  [ -n "$msg" ] && printf '%b' "$msg" | sed 's/^/  /'
+  if [[ "$msg" == *✘* ]]; then err "--ports '$NI_PORTS' was rejected (see above)"; return 1; fi
+  return 0
 }
 
 wizard_iran() {
-  local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0 rport=''
+  local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0 rport='' advdef=n linkok=1
   page "New tunnel" "STEP 2 · Iran (inside server)"
   step_diagram 2
   echo
   say "  This is the server your ${BOLD}users connect to${RST}. It needs the token made on Kharej."
   echo
-  name=$(suggest_name iran)
+  name=$(suggest_name iran); [ -n "$NI_NAME" ] && name=$NI_NAME
+  mbps=$NI_MBPS; [ -n "$mbps" ] && advdef=y
   T_CARRIER=''; T_PEER=''; T_KEY=''; T_PATH=''; T_SNI=''; T_ICMP=''; T_PORTS=''; T_REV=''; T_AUTO=''
   AUTO_TOKEN=''; AT_EXTRA=''; CT_DESC=''
   confirm "Do you have the token from the Kharej server?" y && have=y || have=n
@@ -1186,7 +1247,7 @@ wizard_iran() {
   fi
   if [ "$manual" = 0 ]; then
     echo
-    ask_ok "Paste the connection token" "" v_token || return 1
+    ask_ok "Paste the connection token" "$NI_TOKEN" v_token || return 1
     tok=$REPLY_V; read_token "$tok"
     echo
     ok "Token accepted"
@@ -1257,10 +1318,10 @@ wizard_iran() {
   # advanced
   echo
   hint "Automatic: name $name, listen on all addresses, no speed limit, FEC off."
-  if confirm "Change advanced settings? (Enter = no, keep the automatic ones)" n; then
+  if confirm "Change advanced settings? (Enter = no, keep the automatic ones)" "$advdef"; then
     ask_ok "Tunnel name" "$name" v_name && name=$REPLY_V || return 1
     ask_ok "Bind address for the public ports" 0.0.0.0 v_bind || return 1; bind=$REPLY_V
-    ask_ok "Speed ceiling in MB/s (empty = default 16)" "" v_mbps || return 1; mbps=$REPLY_V
+    ask_ok "Speed ceiling in MB/s (empty = default 16)" "$mbps" v_mbps || return 1; mbps=$REPLY_V
     ask_ok "FEC: off or auto (auto needs auto on both ends)" off v_fec || return 1; fec=$REPLY_V
     if [ "$T_CARRIER" = icmp ]; then ask_ok "ICMP type (must match Kharej)" "${T_ICMP:-echo}" v_icmp || return 1; T_ICMP=$REPLY_V; fi
     case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
@@ -1308,12 +1369,14 @@ wizard_iran() {
       [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && echo "bind: $bind"
       [ -n "$mbps" ] && echo "max-mbps: $mbps"
       [ "$fec" = auto ] && echo "fec: auto"
+      sessions_line
       echo "metrics: 127.0.0.1:$m"
       maps_yaml_block
     } >"$CONF/$name.yml"
     umask "$old"
   }
   mkdir -p "$CONF"; chmod 700 "$CONF"
+  sessions_check
   step "Writing key and config" write_client || return 1
   if [ -n "$AUTO_TOKEN" ]; then # kept so auto-test / auto-heal can test again later
     ( umask 077; printf '%s\n' "$AUTO_TOKEN" >"$CONF/$name.auto" ); chmod 600 "$CONF/$name.auto"
@@ -1329,6 +1392,7 @@ wizard_iran() {
     say "  ${BOLD}Users can now connect to this server${RST}:"
     conn_diagram "$T_CARRIER" "${MAPS[@]}"
   else
+    linkok=0
     err "Not connected yet. Running a diagnosis..."
     test_tunnel "$name"
   fi
@@ -1339,7 +1403,22 @@ wizard_iran() {
   fi
   echo
   hint "Manage this tunnel any time: $SELF"
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    printf 'LINK=%s\nTUNNEL=%s\n' "$([ "$linkok" = 1 ] && echo up || echo down)" "$name"
+    [ "$linkok" = 1 ] || return 1
+  fi
+  return 0
 }
+
+SESS_USE=''
+sessions_check() { # --sessions N: only when the installed wattun knows the key (>= 2.3.0; older engines reject unknown keys)
+  SESS_USE=''
+  [ -n "$NI_SESSIONS" ] || return 0
+  if ver_ge "$(bin_ver || true)" 2.3.0 2>/dev/null; then SESS_USE=$NI_SESSIONS
+  else warn "--sessions $NI_SESSIONS ignored: it needs wattun 2.3.0 or newer (this is ${VER:-unknown}); run: $SELF update"; fi
+  return 0
+}
+sessions_line() { [ -n "$SESS_USE" ] && echo "sessions: $SESS_USE"; return 0; }
 
 # ======================================================================================
 #  Auto carrier: one token, Iran tests every connection type and keeps the best
@@ -1420,13 +1499,15 @@ auto_pick_ports() { # -> AUTO_D "udp:4443,tcp:4443,..." and AUTO_NOTE ; rc 1 whe
 }
 ask_public_addr() { # -> AUTO_ADDR ; rc 1 when cancelled
   local addr
-  spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop
-  if [ -n "$addr" ] && ip_is_private "$addr"; then
+  if [ -n "$NI_ADDR" ]; then addr=$NI_ADDR
+  else spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop; fi
+  if [ -z "$NI_ADDR" ] && [ -n "$addr" ] && ip_is_private "$addr"; then
     warn "$addr looks like a private address; Iran cannot reach it."
     confirm "Use $addr anyway? (n = enter the public IP yourself)" n || addr=''
     [ -z "$addr" ] && hint "Behind NAT or a cloud 1:1 mapping? Enter the public IP shown in your provider's panel."
   elif [ -z "$addr" ]; then
     warn "Could not detect this server's public IP."
+    [ "$NONINTERACTIVE" = 1 ] && hint "Give it with --addr HOST"
   fi
   if [ -z "$addr" ]; then
     ask_ok "Public IP or domain of this server" "" v_host || return 1; addr=$REPLY_V
@@ -1450,6 +1531,9 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
     err "Auto needs wattun 2.1.0 or newer on this server (found ${ver:-none})."; hint "Update first: $SELF update"; return 1
   fi
   command -v systemd-run >/dev/null 2>&1 || { err "Auto needs systemd (systemd-run) on this server."; return 1; }
+  if [ -n "$NI_NAME" ]; then
+    { [ -e "$CONF/$name.yml" ] || [ -e "$CONF/$name-r.yml" ]; } && { err "A tunnel named '$name' (or '$name-r') already exists."; return 1; }
+  fi
   while { [ -e "$CONF/$name.yml" ] || [ -e "$CONF/$name-r.yml" ]; } && [ "$n" -lt 99 ]; do n=$((n+1)); name="kharej-$n"; done
   echo
   say "  ${BOLD}Auto${RST}: Iran tests every connection type against this server and keeps the best one."
@@ -1457,11 +1541,12 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   echo
   hint "Cloudflare-proxied domain for the CDN tests (optional; used only to test wss/grpc through Cloudflare."
   hint "Point it at this server with the orange cloud on, SSL mode Full). Press Enter to skip."
-  ask_ok "CDN domain (optional)" "" v_domain_opt || return 1; cdn=$REPLY_V
+  ask_ok "CDN domain (optional)" "$NI_CDN" v_domain_opt || return 1; cdn=$REPLY_V
   auto_pick_ports || { err "Could not find a free port for $AUTO_FAIL on this server."; hint "Check what listens there: ss -ltnup"; return 1; }
 
   MAPS=(); PE_ROLE=Kharej; PE_TUNNEL=$name; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
-  allow='' # all ports allowed; edit later from the tunnel menu
+  allow='' # all ports allowed (unless --ports); edit later from the tunnel menu
+  if [ -n "$NI_PORTS" ]; then ni_kharej_ports || return 1; allow=$(maps_allow_str); fi
 
   ask_public_addr || return 1
   plan="d=$AUTO_D;r=$AUTO_RPLAN"
@@ -1520,6 +1605,8 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   hint "Show it again any time: $SELF token $name"
   hint "If the reverse tests fail because this server never learned Iran's IP: $SELF auto-ip $name IRAN_IP"
   warn "The token contains the key. Share it only over a private channel."
+  [ "$NONINTERACTIVE" = 1 ] && printf 'TUNNEL=%s\nTOKEN=%s\n' "$name" "$(cat "$CONF/$name.token")"
+  return 0
 }
 
 # Reverse companion: written once Iran's IP is known. Only the first Iran client matters; with a CDN domain the
@@ -1769,7 +1856,7 @@ at_pool_batch() { # indices... : probe every reverse pool variant given
   at_kill; at_fw_close
   return 0
 }
-at_busy() { if [ "$ANIM" = 1 ]; then spin_start "Testing $1"; elif [ "$IS_TTY" = 1 ]; then printf '  testing %s ...' "$1"; fi; return 0; }
+at_busy() { if [ "$ANIM" = 1 ]; then spin_start "Testing $1"; elif [ "$NONINTERACTIVE" = 1 ]; then printf '  testing %s ...\n' "$1"; elif [ "$IS_TTY" = 1 ]; then printf '  testing %s ...' "$1"; fi; return 0; }
 at_idle() { if [ "$ANIM" = 1 ]; then spin_stop; elif [ "$IS_TTY" = 1 ]; then printf '\r\e[K'; fi; return 0; }
 at_print() {
   local i=$1
@@ -1864,6 +1951,17 @@ at_to_t() { # AT_SEL (one index, or several = bond) -> T_CARRIER T_PEER T_PATH T
 at_choose() { # rc 0 = chosen (T_* ready), 1 = cancelled
   local n=${#AT_RANK[@]} best=${AT_RANK[0]} bond=() i t num rest bd bu
   for i in "${AT_RANK[@]}"; do [ "${AV_KIND[$i]}" = d ] && bond+=("$i"); done
+  if [ "$NONINTERACTIVE" = 1 ]; then # --pick best (default) | bond | N (row number of the table)
+    case "${NI_PICK:-best}" in
+      best) AT_SEL=("$best") ;;
+      bond) [ "${#bond[@]}" -ge 2 ] || { err "--pick bond needs two or more working direct carriers (only ${#bond[@]} work)"; return 1; }
+            AT_SEL=("${bond[@]}") ;;
+      ''|*[!0-9]*) err "--pick must be best, bond or a row number of the table"; return 1 ;;
+      *) if [ "$NI_PICK" -ge 1 ] && [ "$NI_PICK" -le "$n" ]; then AT_SEL=("${AT_RANK[$((NI_PICK-1))]}")
+         else err "--pick $NI_PICK: the table has $n working row(s)"; return 1; fi ;;
+    esac
+    at_to_t; return 0
+  fi
   printf -v bd '%.1f' "${AR_DOWN[$best]:-0}"
   printf -v bu '%.1f' "${AR_UP[$best]:-0}"
   echo
@@ -1952,7 +2050,8 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
     [ "$AT_QUIET" = 1 ] || kreply_offer
   else reverse_iran_left || kreply_restore; fi
   [ "$AT_QUIET" = 1 ] && return 0
-  wait_link "$n" 25 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
+  if wait_link "$n" 25; then ok "CONNECTED (RTT ${LINK_RTT} ms)"; else warn "Not connected yet."; [ "$NONINTERACTIVE" = 1 ] && return 1; fi
+  return 0
 }
 auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and offer to switch
   local n=$1 cur
@@ -1970,7 +2069,7 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   at_rank
   if [ "${#AT_RANK[@]}" -eq 0 ]; then echo; at_none; return 1; fi
   at_table
-  at_choose || { warn "No change."; return 0; }
+  at_choose || { warn "No change."; [ "$NONINTERACTIVE" = 1 ] && return 1; return 0; }
   if [ "$AT_SEL_KEY" = "$cur" ]; then ok "'$n' already uses $AT_SEL_LABEL."; return 0; fi
   confirm "Switch '$n' to $AT_SEL_LABEL? (open connections drop)" y || { warn "No change."; return 0; }
   auto_apply "$n"
@@ -2273,6 +2372,7 @@ cdn_wizard_tune() { # Iran wizard, token accepted: CDN carrier + domain + wattun
   at_idle
   if [ -n "$CT_IDX" ]; then
     [ "$CS_RAN" = 1 ] && cdn_scan_say
+    [ "$NONINTERACTIVE" = 1 ] && at_table
     cdn_take; ok "$(cdn_result_line)"
   else
     T_SNI=$sni0
@@ -2293,7 +2393,8 @@ cdn_apply() { # name : write T_PEER, T_SNI and AT_EXTRA (fp / ech / tls-frag) in
   l=$(ech_cache_line "$n"); if [ -n "$l" ]; then set_value "$n" ech-cache "${l#*: }"; fi
   if [ "$AT_QUIET" = 1 ]; then systemctl restart "${WAT_PREFIX}@$n" >/dev/null 2>&1; return 0; fi
   step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
-  wait_link "$n" 25 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
+  if wait_link "$n" 25; then ok "CONNECTED (RTT ${LINK_RTT} ms)"; else warn "Not connected yet."; [ "$NONINTERACTIVE" = 1 ] && return 1; fi
+  return 0
 }
 cdn_load_t() { # name -> T_CARRIER T_PEER T_KEY T_PATH T_SNI from NAME.yml ; rc 1 when it is not a CDN tunnel
   local n=$1 kf
@@ -2834,7 +2935,8 @@ change_key() {
 delete_tunnel() {
   local n=$1
   warn "This stops '$n' and deletes its config, key and token."
-  ask "Type the tunnel name to confirm (empty = cancel)" ""
+  if [ "$NONINTERACTIVE" = 1 ]; then REPLY_V=$n # --yes is the confirmation
+  else ask "Type the tunnel name to confirm (empty = cancel)" ""; fi
   [ "$REPLY_V" = "$n" ] || { warn "Not deleted."; return 1; }
   if [ -f "$CONF/$n-r.yml" ] && is_auto_kharej "$n"; then # the auto reverse companion goes with its parent
     systemctl disable --now "${WAT_PREFIX}@$n-r" >/dev/null 2>&1
@@ -3124,7 +3226,8 @@ uninstall_all() {
     for n in "${list[@]}"; do printf '      %s%-14s%s %s · %s\n' "$BOLD" "$n" "$RST" "$(role "$n")" "$(cfg "$n" carrier)"; done
   else hint "No tunnels are configured."; fi
   echo
-  ask "Type 'uninstall' to remove WatTunnel (empty = cancel)" ""
+  if [ "$NONINTERACTIVE" = 1 ]; then REPLY_V=uninstall # --yes is the confirmation
+  else ask "Type 'uninstall' to remove WatTunnel (empty = cancel)" ""; fi
   [ "$REPLY_V" = uninstall ] || { warn "Cancelled."; return 1; }
   heal_disable >/dev/null 2>&1; rm -f "/etc/systemd/system/$HEAL_UNIT.service" "/etc/systemd/system/$HEAL_UNIT.timer"
   # loaded instances plus every configured name (enabled-but-unloaded ones are not in list-units)
@@ -3142,7 +3245,7 @@ uninstall_all() {
   if [ "$SANDBOX" = 1 ] && [ "${BIN%/*}" = "/opt/$WAT_PREFIX" ]; then rm -rf "/opt/$WAT_PREFIX"; ok "Removed /opt/$WAT_PREFIX"; fi
   systemctl daemon-reload
   ok "Services and binaries removed."
-  if [ -d "$CONF" ] && confirm "Also delete $CONF (tunnel configs, keys, tokens)?" "$([ "$SANDBOX" = 1 ] && echo y || echo n)"; then rm -rf "$CONF"; ok "Configuration deleted."; fi
+  if [ -d "$CONF" ] && confirm "Also delete $CONF (tunnel configs, keys, tokens)?" "$([ "$SANDBOX" = 1 ] || [ "$NONINTERACTIVE" = 1 ] && echo y || echo n)"; then rm -rf "$CONF"; ok "Configuration deleted."; fi
   ok "WatTunnel removed."
   if [ "$SANDBOX" = 1 ]; then hint "Sandbox: this script ($MGR) was left in place; delete it by hand if you copied it."; else rm -f "$MGR"; fi
   return 0
@@ -3210,6 +3313,52 @@ main_menu() {
   done
 }
 
+# Flags of kharej / iran / cdn-tune / auto-test / delete / uninstall -> NI_* presets and NI_POS (positional words).
+# Both "--flag value" and "--flag=value" work. A bad value stops here with a message on stderr (rc 1).
+ni_parse() {
+  local f v hasv
+  NI_POS=()
+  while [ $# -gt 0 ]; do
+    f=$1; shift; hasv=0; v=''
+    case "$f" in --*=*) v=${f#*=}; f=${f%%=*}; hasv=1 ;; esac
+    case "$f" in
+      --yes) NI_YES=1; continue ;;
+      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--sessions)
+        if [ "$hasv" = 0 ]; then
+          [ $# -gt 0 ] || { err "$f needs a value"; return 1; }
+          v=$1; shift
+        fi ;;
+      --*) err "Unknown option '$f'. See: $SELF help"; return 1 ;;
+      *) NI_POS+=("$f"); continue ;;
+    esac
+    case "$f" in
+      --carrier) case "$v" in wss|grpc|tcp|tls|ws|h2|h2c|udp|icmp|auto) NI_CARRIER=$v ;; *) err "--carrier: use wss, grpc, tcp, tls, ws, h2, h2c, udp, icmp or auto (got '$v')"; return 1 ;; esac ;;
+      --name) v_name_fmt "$v" || return 1; NI_NAME=$v ;;
+      --listen) v_port "$v" || return 1; NI_LISTEN=$((10#$v)) ;;
+      --path) v_path "$v" || return 1; NI_PATH=$v ;;
+      --addr) v_host "$v" || return 1; NI_ADDR=$v ;;
+      --sni) v_host "$v" || return 1; NI_SNI=$v ;;
+      --cdn-domain) v_domain_opt "$v" || return 1; NI_CDN=$v ;;
+      --ports) [ -n "$v" ] || { err "--ports needs a list such as 18999,2000,53/udp"; return 1; }; NI_PORTS=$v ;;
+      --max-mbps) v_mbps "$v" || return 1; NI_MBPS=$v ;;
+      --token) v_token "$v" || return 1; NI_TOKEN=$v ;;
+      --map) [ -n "$v" ] || { err "--map needs a list such as 39901:18999,8443:443"; return 1; }; NI_MAP=$v ;;
+      --pick) case "$v" in best|bond) NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond or a row number (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
+      --sessions) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$v))" -ge 1 ] || { err "--sessions: use a number of sessions, 1 or more (got '$v')"; return 1; }; NI_SESSIONS=$((10#$v)) ;;
+    esac
+  done
+  return 0
+}
+v_name_fmt() { [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] && return 0; err "--name: use 1-32 letters, digits, - or _ (got '$1')"; return 1; }
+# Run a command-line flow without a subshell (so ERRN counts) and make sure a failure always says something on stderr.
+ni_run() { # fn args...
+  local rc
+  ERRN=0
+  "$@"; rc=$?
+  if [ "$rc" -ne 0 ] && [ "$ERRN" -eq 0 ] && [ "$NONINTERACTIVE" = 1 ]; then err "failed (rc $rc), see the output above"; fi
+  return "$rc"
+}
+
 usage() {
   cat <<EOF
 WatTunnel manager $VER
@@ -3231,7 +3380,25 @@ Usage: $SELF [command]
   cdn-tune NAME [full]  Iran CDN tunnel (ws/wss/h2/h2c/grpc): find the Cloudflare edges that serve the domain over ECH + TLS settings, apply (needs wattun 2.2.0)
   heal                  restart Iran tunnels whose link is down (used by the timer)
   update | rollback     install the latest release / go back one version
+  delete NAME           stop a tunnel and delete its config, key and token (asks you to type the name)
+  uninstall             remove WatTunnel from this server (asks first)
   help                  this text
+
+Unattended mode (no tty, nothing is asked; --yes turns it on, and so does any --flag when stdin is not a tty;
+or NONINTERACTIVE=1). Plain output, errors on stderr, exit code 0 = done, 1 = failed:
+  kharej --carrier wss|grpc|tcp|tls|ws|h2|h2c|udp|icmp|auto --name NAME [--listen PORT] [--path /wat] [--addr HOST]
+         [--sni HOST] [--cdn-domain D] [--ports 18999,2000,53/udp] [--max-mbps N] --yes
+         creates and starts the Kharej tunnel; the last lines are TUNNEL=NAME and TOKEN=wat1:...
+         (--addr skips the public-IP detection; --cdn-domain is for auto; --listen/--path/--sni/--max-mbps for the others)
+  iran --token TOKEN --map 39901:18999[,8443:443] [--name NAME] [--pick best|bond|N] [--sessions N] [--max-mbps N] --yes
+         creates and starts the Iran tunnel. Auto token: runs the test, --pick chooses a row (default best, bond = all
+         working direct carriers). CDN token: automatic CDN tuning. Ends with LINK=up|down and TUNNEL=NAME; exit 1 if down.
+         --sessions N writes "sessions: N" (only with wattun 2.3.0 or newer; otherwise it is ignored with a warning)
+  cdn-tune NAME [full] --yes      apply the best CDN variant without asking
+  auto-test NAME --yes            re-test an auto Iran tunnel, switch to --pick (default best) without asking
+  delete NAME --yes               delete a tunnel without asking
+  uninstall --yes                 uninstall without asking; also deletes the config directory
+  Flags also accept --flag=value.
 
 Environment: WAT_NO_ANIM=1 (no animations)  NO_COLOR=1 (no colours)  WAT_PROXY=https://ghproxy.net/
 
@@ -3243,6 +3410,11 @@ EOF
 main() {
   [ -x "$BIN" ] && VER=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
   case "${1:-}" in help|-h|--help) usage; return 0 ;; esac
+  case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall) ni_parse "${@:2}" || exit 1 ;; esac
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    case "${1:-}" in ''|new|monitor|ports|logs) err "'${1:-(no command)}' needs a terminal; unattended use: kharej, iran, cdn-tune, auto-test, delete, uninstall, status, test, token (see: help)"; exit 1 ;; esac
+    case "${1:-}" in delete|uninstall) [ "$NI_YES" = 1 ] || { err "$1 without a terminal needs --yes"; exit 1; } ;; esac
+  fi
   [ "$(id -u)" -eq 0 ] || { err "Run as root."; exit 1; }
   if [ ! -x "$BIN" ]; then
     if [ "$SANDBOX" = 1 ]; then
@@ -3259,8 +3431,10 @@ main() {
   case "${1:-}" in
     "") main_menu ;;
     new) new_tunnel "${2:-}" ;;
-    kharej) run_flow wizard_kharej ;;
-    iran) run_flow wizard_iran ;;
+    kharej) if [ "$NONINTERACTIVE" = 1 ]; then ni_run wizard_kharej; else run_flow wizard_kharej; fi ;;
+    iran) if [ "$NONINTERACTIVE" = 1 ]; then ni_run wizard_iran; else run_flow wizard_iran; fi ;;
+    delete) need_tunnel "${NI_POS[0]:?name}" && if [ "$NONINTERACTIVE" = 1 ]; then ni_run delete_tunnel "${NI_POS[0]}"; else run_flow delete_tunnel "${NI_POS[0]}"; fi ;;
+    uninstall) if [ "$NONINTERACTIVE" = 1 ]; then ni_run uninstall_all; else run_flow uninstall_all; fi ;;
     status|list) status_all ;;
     monitor) live_monitor ;;
     ports) need_tunnel "${2:?name}" && run_flow edit_ports "$2" ;;
@@ -3269,11 +3443,11 @@ main() {
     logs) need_tunnel "${2:?name}" && journalctl -u "${WAT_PREFIX}@$2" -f -o short-iso ;;
     token) need_tunnel "${2:?name}" && show_token "$2" ;;
     heal) heal ;;
-    auto-test) need_tunnel "${2:?name}" && auto_test_cmd "$2" ;;
+    auto-test) need_tunnel "${NI_POS[0]:?name}" && ni_run auto_test_cmd "${NI_POS[0]}" ;;
     auto-ip) need_tunnel "${2:?name}" && auto_ip "$2" "${3:-}" ;;
     auto-watch) need_tunnel "${2:?name}" && auto_watch "$2" ;;
     auto-retest) need_tunnel "${2:?name}" && auto_retest "$2" ;;
-    cdn-tune) need_tunnel "${2:?name}" && cdn_tune_cmd "$2" "${3:-}" ;;
+    cdn-tune) need_tunnel "${NI_POS[0]:?name}" && ni_run cdn_tune_cmd "${NI_POS[0]}" "${NI_POS[1]:-}" ;;
     update) shift; update "$@" ;;
     rollback) rollback ;;
     *) usage; exit 1 ;;
