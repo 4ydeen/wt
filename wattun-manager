@@ -1242,6 +1242,7 @@ wizard_iran() {
       [ "$T_REV" = 1 ] && echo "reverse: true"
       [ -n "$rport" ] && echo "listen: \":$rport\""
       [ -n "$AT_EXTRA" ] && printf '%s\n' "$AT_EXTRA"
+      ech_cache_line "$name"
       [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && echo "bind: $bind"
       [ -n "$mbps" ] && echo "max-mbps: $mbps"
       [ "$fec" = auto ] && echo "fec: auto"
@@ -1867,7 +1868,7 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
   ol=$(cfg "$n" listen); ol=${ol##*:}
   is_reverse "$n" && oldrev=1
   [ "$oldrev" = 1 ] && is_pool "$(cfg "$n" carrier)" && oldpool=1
-  sed -i -E '/^(carrier|peer|path|sni|host|reverse|listen|fp|ech|tls-frag|peer-[a-z0-9]+|listen-[a-z0-9]+):/d' "$f"
+  sed -i -E '/^(carrier|peer|path|sni|host|reverse|listen|fp|ech|ech-cache|tls-frag|peer-[a-z0-9]+|listen-[a-z0-9]+):/d' "$f"
   set_value "$n" carrier "$T_CARRIER"
   set_value "$n" peer "$T_PEER"
   [ -n "$T_PATH" ] && set_value "$n" path "$T_PATH"
@@ -1878,6 +1879,7 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
     [ -n "$l" ] || continue
     k=${l%%: *}; v=${l#*: }; set_value "$n" "$k" "$v"
   done <<<"$AT_EXTRA"
+  l=$(ech_cache_line "$n"); if [ -n "$l" ]; then set_value "$n" ech-cache "${l#*: }"; fi
   step "Restarting wattun@$n" systemctl restart "wattun@$n"
   [ -n "$rport" ] && fw_open "$rport/tcp"
   [ "$oldpool" = 1 ] && [ -n "$ol" ] && [ "$ol" != "$rport" ] && fw_close "$ol/tcp"
@@ -1964,6 +1966,11 @@ cdn_ok() { # is the installed binary new enough for fp / ech / tls-frag / severa
   [ -n "$CDN_OK" ] || { ver_ge "$(bin_ver || true)" "$CDN_MINVER" 2>/dev/null && CDN_OK=1 || CDN_OK=0; }
   [ "$CDN_OK" = 1 ]
 }
+ech_cache_line() { # name : the "ech-cache:" config line for a tunnel that uses ech: auto (wattun >= 2.2.3 only; older engines reject unknown keys)
+  grep -qx 'ech: auto' <<<"$AT_EXTRA" || return 0
+  ver_ge "$(bin_ver || true)" 2.2.3 2>/dev/null && echo "ech-cache: $CONF/$1.ech"
+  return 0
+}
 cdn_tunnel_p() { # name : an Iran client on a CDN carrier with a domain (not reverse, not an auto companion)
   [ "$(role "$1")" = Iran ] && ! is_reverse "$1" && is_cdn_carrier "$(cfg "$1" carrier)" || return 1
   [ -n "$(cfg "$1" sni)$(cfg "$1" host)" ]
@@ -1992,6 +1999,19 @@ cdn_up_edges() { # metrics-port : the edge addresses the engine reports as up (/
   curl -fs --noproxy '*' --max-time 3 "http://127.0.0.1:$1/stats" 2>/dev/null | grep -oE '"addr":"[^"]+","up":true' \
     | sed -E 's/^"addr":"//; s/","up":true$//; s/:[0-9]+$//; s/^\[//; s/\]$//'
 }
+cdn_ipv4hints() { # domain : the IPv4 addresses of its HTTPS record's ipv4hint, one per line (dig, else DoH JSON); silent on any failure
+  local d=$1 s=''
+  if command -v dig >/dev/null 2>&1; then
+    s=$(timeout 4 dig +short +time=2 +tries=1 HTTPS "$d" 2>/dev/null | grep -io 'ipv4hint=[0-9.,]*')
+  fi
+  if [ -z "$s" ] && command -v curl >/dev/null 2>&1; then
+    s=$(curl -fs --noproxy '*' --connect-timeout 2 --max-time 4 -k -H 'accept: application/dns-json' \
+      "https://8.8.8.8/resolve?name=$d&type=HTTPS" 2>/dev/null | grep -io 'ipv4hint=[0-9.,]*')
+  fi
+  [ -n "$s" ] || return 0
+  sed -E 's/^[^=]*=//' <<<"$s" | tr ',' '\n' | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || true
+  return 0
+}
 cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve this domain, judged by the tunnel engine itself
   # -> CS_EDGES (best 3), CS_REACH_IPS (every edge that is up), CS_REACH (up) / CS_TOTAL (TCP-reachable) ; CS_FALLBACK=1 when none was
   # verified (CS_EDGES is then the domain's own addresses) ; rc 1 when there is nothing to choose from at all.
@@ -2003,7 +2023,11 @@ cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve t
   [[ "$path" == /* ]] || path=/$path
   ipv4_ok "$dom" && return 1 # an IP address has no Cloudflare edges to choose from
   ip -6 route get 2606:4700::1 >/dev/null 2>&1 && v6=1 # DNS may return AAAA on a server without any v6 route
-  # the domain's own A records first: they are what Cloudflare hands out for this very zone
+  # the HTTPS record's ipv4hint addresses come first: they are the edges the zone itself advertises to browsers
+  for ip in $(cdn_ipv4hints "$dom"); do
+    [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; own+=("$ip"); cand+=("$ip"); }
+  done
+  # then the domain's own A records: they are what Cloudflare hands out for this very zone
   for ip in $(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1}' | sort -u); do
     [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; own+=("$ip"); cand+=("$ip"); }
   done
@@ -2192,7 +2216,7 @@ cdn_wizard_tune() { # Iran wizard, token accepted: CDN carrier + domain + wattun
 }
 cdn_apply() { # name : write T_PEER, T_SNI and AT_EXTRA (fp / ech / tls-frag) into NAME.yml and restart
   local n=$1 l k v
-  sed -i -E '/^(peer|fp|ech|tls-frag):/d' "$CONF/$n.yml"
+  sed -i -E '/^(peer|fp|ech|ech-cache|tls-frag):/d' "$CONF/$n.yml"
   set_value "$n" peer "$T_PEER"
   [ -n "$(cfg "$n" sni)" ] || set_value "$n" sni "$T_SNI"
   [ -n "$(cfg "$n" host)" ] || set_value "$n" host "$T_SNI"
@@ -2200,6 +2224,7 @@ cdn_apply() { # name : write T_PEER, T_SNI and AT_EXTRA (fp / ech / tls-frag) in
     [ -n "$l" ] || continue
     k=${l%%: *}; v=${l#*: }; set_value "$n" "$k" "$v"
   done <<<"$AT_EXTRA"
+  l=$(ech_cache_line "$n"); if [ -n "$l" ]; then set_value "$n" ech-cache "${l#*: }"; fi
   if [ "$AT_QUIET" = 1 ]; then systemctl restart "wattun@$n" >/dev/null 2>&1; return 0; fi
   step "Restarting wattun@$n" systemctl restart "wattun@$n"
   wait_link "$n" 25 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
@@ -2747,12 +2772,12 @@ delete_tunnel() {
   [ "$REPLY_V" = "$n" ] || { warn "Not deleted."; return 1; }
   if [ -f "$CONF/$n-r.yml" ] && is_auto_kharej "$n"; then # the auto reverse companion goes with its parent
     systemctl disable --now "wattun@$n-r" >/dev/null 2>&1
-    rm -f "$CONF/$n-r".yml
+    rm -f "$CONF/$n-r".yml "$CONF/$n-r".ech
     ok "Reverse side '$n-r' deleted."
   fi
   systemctl stop "wattun-autowatch-$n.service" >/dev/null 2>&1
   systemctl disable --now "wattun@$n" >/dev/null 2>&1
-  rm -f "$CONF/$n".yml "$CONF/$n".key "$CONF/$n".token "$CONF/$n".auto "$RUN/$n.down" "$RUN/$n.cycles" "$RUN/$n.retest"
+  rm -f "$CONF/$n".yml "$CONF/$n".ech "$CONF/$n".key "$CONF/$n".token "$CONF/$n".auto "$RUN/$n.down" "$RUN/$n.cycles" "$RUN/$n.retest"
   ok "Tunnel '$n' deleted."
   reverse_iran_left || kreply_restore
   return 0

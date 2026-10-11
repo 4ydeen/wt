@@ -26,6 +26,7 @@ type TLSClientOptions struct {
 	// Client-side tuning, engine 2.2.0 (the server and the wire format are unchanged); see tlsfp.go and ech.go.
 	Fingerprint string                // go (default), chrome, firefox, safari, edge, random
 	ECH         string                // off (default), auto, or a base64 ECHConfigList
+	ECHCache    string                // ech auto: file keeping the last good ECHConfigList across restarts (2.2.3)
 	Frag        int                   // split the ClientHello into this many bytes per TCP segment (0 = off)
 	Logf        func(string, ...any) // optional: one-time notes (ECH lookups, fallbacks)
 }

@@ -155,7 +155,7 @@ func newTLSEngine(o TLSClientOptions, alpn string) (*tlsEngine, error) {
 		e.fp = fp
 	}
 	e.uid = utlsID(fp)
-	if e.ech, err = newECHState(o.ECH); err != nil {
+	if e.ech, err = newECHState(o.ECH, o.ECHCache); err != nil {
 		return nil, err
 	}
 	return e, nil

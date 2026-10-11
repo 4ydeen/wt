@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -719,4 +721,52 @@ func TestECHDoHRaceAndStale(t *testing.T) {
 	if !bytes.Equal(s.get(context.Background(), "inner.example", e), list) {
 		t.Fatal("a failed refresh dropped the known config")
 	}
+}
+
+// -ech-cache: written after a DoH fetch, and used by a new engine while DoH is unreachable.
+func TestECHCacheFile(t *testing.T) {
+	old := dohServers
+	defer func() { dohServers = old }()
+	key, cfg := echKey(t, 7, "public.example")
+	list := echList(cfg)
+	doh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q, _ := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+		w.Write(dnsHTTPSAnswer(q, list))
+	}))
+	dohServers = []string{doh.URL}
+	file := filepath.Join(t.TempDir(), "x.ech")
+	opts := TLSClientOptions{ServerName: "inner.example", ECH: "auto", ECHCache: file}
+	e, err := newTLSEngine(opts, "http/1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.ech.get(context.Background(), "inner.example", e); !bytes.Equal(got, list) {
+		t.Fatal("DoH config not returned")
+	}
+	b, err := os.ReadFile(file)
+	if err != nil || strings.TrimSpace(string(b)) != "inner.example "+base64.StdEncoding.EncodeToString(list) {
+		t.Fatalf("cache file %q, %v", b, err)
+	}
+	doh.Close() // DoH unreachable now
+	e2, _ := newTLSEngine(opts, "http/1.1")
+	if got := e2.ech.get(context.Background(), "inner.example", e2); !bytes.Equal(got, list) {
+		t.Fatal("cached config not used")
+	}
+	// and it really works for a handshake
+	ln, addr := echTLSListener(t, []tls.EncryptedClientHelloKey{key})
+	defer ln.Close()
+	seen := echServe(ln)
+	c, err := e2.dial(context.Background(), addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	if s := <-seen; !s.accepted {
+		t.Fatal("ECH not accepted with the cached config")
+	}
+	// a broken cache path never fails anything
+	bad := opts
+	bad.ECHCache = filepath.Join(t.TempDir(), "no", "dir", "x")
+	e3, _ := newTLSEngine(bad, "")
+	e3.ech.get(context.Background(), "inner.example", e3)
 }

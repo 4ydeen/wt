@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,10 @@ type echState struct {
 	mu       sync.Mutex
 	m        map[string]*echEntry
 	inflight map[string]bool // background refreshes running
+
+	cachePath   string // -ech-cache file ("" = off)
+	cacheLoaded bool
+	cacheWarned bool
 }
 
 // ParseECHFlag validates a -ech value: off, auto or a base64 ECHConfigList.
@@ -69,12 +74,15 @@ func ParseECHFlag(s string) (mode string, list []byte, err error) {
 	return "", nil, errors.New("-ech must be off, auto or a base64 ECHConfigList")
 }
 
-func newECHState(v string) (*echState, error) {
+func newECHState(v, cachePath string) (*echState, error) {
 	mode, list, err := ParseECHFlag(v)
 	if err != nil {
 		return nil, err
 	}
-	return &echState{mode: mode, static: list, m: map[string]*echEntry{}, inflight: map[string]bool{}}, nil
+	if mode != "auto" {
+		cachePath = ""
+	}
+	return &echState{mode: mode, static: list, m: map[string]*echEntry{}, inflight: map[string]bool{}, cachePath: cachePath}, nil
 }
 
 // get returns the ECHConfigList to offer for name, or nil to connect without ECH.
@@ -95,6 +103,7 @@ func (s *echState) get(ctx context.Context, name string, e *tlsEngine) []byte {
 		return nil
 	}
 	s.mu.Lock()
+	s.loadCacheLocked(e)
 	en := s.m[name]
 	if en != nil && time.Now().Before(en.next) {
 		defer s.mu.Unlock()
@@ -123,6 +132,7 @@ func (s *echState) lookupLocked(name string, e *tlsEngine) {
 	case err == nil:
 		e.note("ech-ok:"+name, "ech auto: using the ECH config published for %s (%d bytes)", name, len(list))
 		s.m[name] = &echEntry{list: list, next: time.Now().Add(echPosTTL)}
+		s.saveCacheLocked(e)
 	case errors.Is(err, errNoECH) && (old == nil || old.list == nil):
 		e.note("ech-fetch:"+name, "ech auto: no ECH config for %s (%v); connecting without ECH", name, err)
 		s.m[name] = &echEntry{next: time.Now().Add(echNegTTL)}
@@ -167,6 +177,7 @@ func (s *echState) rejected(name string, retry []byte, e *tlsEngine) bool {
 			key = ""
 		}
 		s.m[key] = &echEntry{list: retry, next: time.Now().Add(echPosTTL)}
+		s.saveCacheLocked(e)
 		e.note("ech-retry", "ech: the server rejected our ECH config and sent a new one; retrying with it")
 		if s.mode == "auto" && name != "" { // also re-read DNS in the background (the keys rotated)
 			go func() {
@@ -369,4 +380,66 @@ func parseHTTPSECH(m, q []byte) ([]byte, error) {
 		}
 	}
 	return nil, errNoECH
+}
+
+// ---------------------------------------------------------------- -ech-cache (2.2.3)
+// The cache file holds one line per name: "name base64(ECHConfigList)". It lets a restart start with the last good
+// config at once (DoH may be blocked or slow) while the normal refresh runs in the background. Errors never stop
+// the tunnel: the first one is logged, the rest are silent.
+
+func (s *echState) cacheErr(e *tlsEngine, what string, err error) {
+	if s.cacheWarned {
+		return
+	}
+	s.cacheWarned = true
+	e.note("ech-cache", "ech-cache %s: %s: %v (continuing without the cache)", what, s.cachePath, err)
+}
+
+// loadCacheLocked seeds s.m from the cache file once (s.mu held). Seeded entries are due at once, so the first use
+// returns the cached config and refreshes it behind the scenes.
+func (s *echState) loadCacheLocked(e *tlsEngine) {
+	if s.cachePath == "" || s.cacheLoaded {
+		return
+	}
+	s.cacheLoaded = true
+	data, err := os.ReadFile(s.cachePath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.cacheErr(e, "read", err)
+		}
+		return
+	}
+	for _, ln := range strings.Split(string(data), "\n") {
+		f := strings.Fields(ln)
+		if len(f) != 2 || s.m[f[0]] != nil {
+			continue
+		}
+		b, err := base64.StdEncoding.DecodeString(f[1])
+		if err != nil || len(b) < 6 || int(binary.BigEndian.Uint16(b)) != len(b)-2 {
+			continue
+		}
+		s.m[f[0]] = &echEntry{list: b} // next is zero: due for a refresh
+	}
+}
+
+// saveCacheLocked writes every known config atomically (tmp + rename, 0600) (s.mu held).
+func (s *echState) saveCacheLocked(e *tlsEngine) {
+	if s.cachePath == "" {
+		return
+	}
+	var sb strings.Builder
+	for name, en := range s.m {
+		if name != "" && en.list != nil {
+			sb.WriteString(name + " " + base64.StdEncoding.EncodeToString(en.list) + "\n")
+		}
+	}
+	tmp := s.cachePath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(sb.String()), 0o600); err != nil {
+		s.cacheErr(e, "write", err)
+		return
+	}
+	if err := os.Rename(tmp, s.cachePath); err != nil {
+		os.Remove(tmp)
+		s.cacheErr(e, "write", err)
+	}
 }

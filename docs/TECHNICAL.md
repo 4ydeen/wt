@@ -496,6 +496,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `header` | | client (server with `reverse`) | Extra request header `Name: value`. Repeatable. |
 | `fp` | `go` | client (server with `reverse`) | TLS ClientHello fingerprint (utls): `go`, `chrome`, `firefox`, `safari`, `edge` or `random`. Since 2.2.0. |
 | `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. Since 2.2.0. |
+| `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
@@ -632,6 +633,7 @@ Every flag can also be a config key. Flags win over the file.
 | `-path`, `-host`, `-header`, `-plain` | `/wat` | HTTP carrier options. |
 | `-fp NAME` | `go` | Dialer: TLS fingerprint `go`, `chrome`, `firefox`, `safari`, `edge`, `random` (2.2.0). |
 | `-ech MODE` | `off` | Dialer: `off`, `auto` or a base64 ECHConfigList (2.2.0). |
+| `-ech-cache FILE` | empty | Dialer, with `-ech auto`: ECH config cache file (2.2.3). |
 | `-tls-frag N` | 0 | Dialer: split the ClientHello into N-byte pieces (2.2.0). |
 | `-metrics ADDR` | off | Serve `/stats` and pprof. |
 | `-debug` | off | Log every stream. |
