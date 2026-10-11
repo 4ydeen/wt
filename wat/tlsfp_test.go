@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -624,5 +625,98 @@ func TestParseECHFlag(t *testing.T) {
 	}
 	if _, err := NormFingerprint("netscape"); err == nil {
 		t.Fatal("bad fingerprint accepted")
+	}
+}
+
+// ECH and ClientHello fragmentation together: the fragmented hello must still carry ECH and be accepted.
+func TestECHWithFrag(t *testing.T) {
+	for _, fp := range []string{"go", "chrome"} {
+		t.Run(fp, func(t *testing.T) {
+			key, cfg := echKey(t, 7, "public.example")
+			ln, addr := echTLSListener(t, []tls.EncryptedClientHelloKey{key})
+			defer ln.Close()
+			seen := echServe(ln)
+			e, err := newTLSEngine(TLSClientOptions{ServerName: "inner.example", Fingerprint: fp, Frag: 100,
+				ECH: base64.StdEncoding.EncodeToString(echList(cfg))}, "http/1.1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rec *segRec
+			e.dialF = func(ctx context.Context, a string) (net.Conn, error) {
+				c, err := net.Dial("tcp", a)
+				rec = &segRec{Conn: c}
+				return rec, err
+			}
+			c, err := e.dial(context.Background(), addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			s := <-seen
+			if !s.accepted || s.sni != "inner.example" {
+				t.Fatalf("server saw %+v", s)
+			}
+			if _, mode, on := e.info(); !on || mode != fp+"+ech+frag" {
+				t.Fatalf("info mode %q ech %v", mode, on)
+			}
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			if len(rec.segs) < 3 || rec.segs[0] != 100 {
+				t.Fatalf("ClientHello went out as %v", rec.segs)
+			}
+		})
+	}
+}
+
+// DoH: the four servers are raced, so a dead or hanging one costs nothing; a lookup that later fails keeps the last
+// good config (stale-while-error).
+func TestECHDoHRaceAndStale(t *testing.T) {
+	old := dohServers
+	defer func() { dohServers = old }()
+	_, cfg := echKey(t, 5, "public.example")
+	list := echList(cfg)
+	var down atomic.Bool
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "blocked", 503)
+			return
+		}
+		q, _ := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+		w.Write(dnsHTTPSAnswer(q, list))
+	}))
+	defer good.Close()
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer hang.Close()
+	dohServers = []string{hang.URL, "http://127.0.0.1:1/dns-query", hang.URL, good.URL}
+	t0 := time.Now()
+	got, err := FetchECHConfigList(context.Background(), "inner.example")
+	if err != nil || !bytes.Equal(got, list) {
+		t.Fatalf("%x %v", got, err)
+	}
+	if d := time.Since(t0); d > time.Second {
+		t.Fatalf("hanging servers delayed the answer by %v", d)
+	}
+
+	s := &echState{mode: "auto", m: map[string]*echEntry{}, inflight: map[string]bool{}}
+	e := &tlsEngine{noted: map[string]bool{}}
+	if !bytes.Equal(s.get(context.Background(), "inner.example", e), list) {
+		t.Fatal("no config")
+	}
+	down.Store(true)
+	s.m["inner.example"].next = time.Now().Add(-time.Second) // expired
+	if !bytes.Equal(s.get(context.Background(), "inner.example", e), list) {
+		t.Fatal("expired config not served while refreshing")
+	}
+	for i := 0; i < 100; i++ { // the background refresh fails and must keep the config
+		s.mu.Lock()
+		busy := s.inflight["inner.example"]
+		s.mu.Unlock()
+		if !busy {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !bytes.Equal(s.get(context.Background(), "inner.example", e), list) {
+		t.Fatal("a failed refresh dropped the known config")
 	}
 }

@@ -302,6 +302,10 @@ func (c *h2Conn) wait(ctx context.Context) {
 
 // ---------------------------------------------------------------- h2 client / server
 
+// h2 (and h2c) through a CDN such as Cloudflare does not work: the carrier is one full-duplex streaming POST whose
+// response headers only arrive once the server has seen the request, but Cloudflare talks HTTP/1.1 to the origin
+// (except for gRPC) and buffers the request body until it ends, so the call never completes. Not fixable on our
+// side; use grpc (Cloudflare streams it when the zone has gRPC enabled) or wss.
 func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPoolClient, error) {
 	addrs, err := SplitPeers(peer)
 	if err != nil {

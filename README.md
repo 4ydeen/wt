@@ -66,6 +66,17 @@ HTTP/2 or gRPC, including behind Cloudflare.
 
 ## 🆕 What's new
 
+**2.2.1: CDN tuning fixed by a field test (Iran side only).** v2.2.0 was tried on a real Iran server through
+Cloudflare: only Encrypted Client Hello (ECH) got through, and every non-ECH variant failed. Measured with ECH:
+`wss` 8.0 MB/s down and 7.5 MB/s up, `grpc` 6.7 MB/s down and 9.9 MB/s up. What changed: the ECH config lookup now
+races all four DoH servers (1.1.1.1 was blocked from Iran while 8.8.8.8 worked), runs before the dial, keeps the last
+good config if DoH fails, and refreshes in the background after a rejection. `h2` does not work through Cloudflare,
+because Cloudflare speaks HTTP/1.1 to the origin except for gRPC, so use `wss` or `grpc` for a CDN. The manager now
+tests Chrome + ECH first and stops early when it works, tests only `wss` and `grpc` through Cloudflare, and picks
+Cloudflare edges by a real ECH connection to your domain (the domain's own A records first) instead of curl, because
+an edge that serves `speed.cloudflare.com` can still fail for your zone. Kharej and the wire format are unchanged.
+See [CDN tuning](docs/TECHNICAL.md#cdn-tuning).
+
 **2.2.0: CDN tuning (Iran side only).** Some Iran filters let the TLS handshake through and then black-hole the flow
 by the SNI of your domain, or the edges DNS gives you for a zone are degraded while other Cloudflare edges work. When
 Iran sets up a CDN tunnel (`wss`, `h2`, `grpc`, `ws`, `h2c` through a Cloudflare domain), the manager now scans about
@@ -387,8 +398,9 @@ Good to know: several ports are open on Kharej at once, and Kharej must run 2.1.
 | `ws` / `h2c` | A CDN on port 80, or a reverse proxy that handles TLS. | Cleartext to the proxy. The session itself is still encrypted. |
 | `grpc` / `h2` | CDNs or proxies that prefer gRPC or HTTP/2. | |
 
-**Behind Cloudflare (2.2.0).** Prefer `wss`, `grpc` or `h2` on a Cloudflare HTTPS port, SSL mode *Full*, and turn on
-gRPC in Cloudflare's Network settings for `grpc`. Plain `ws` on HTTP ports can hang at the Upgrade. The Iran side
+**Behind Cloudflare (2.2.1).** Use `wss` or `grpc` on a Cloudflare HTTPS port, SSL mode *Full*, and turn on
+gRPC in Cloudflare's Network settings for `grpc`. `h2` does not work through Cloudflare (it speaks HTTP/1.1 to the
+origin except for gRPC). Plain `ws` on HTTP ports can hang at the Upgrade. The Iran side
 picks the edge IPs, the TLS fingerprint, ECH and fragmentation by itself (`wattun cdn-tune NAME` repeats it); details
 and the manual keys are in [docs/TECHNICAL.md](docs/TECHNICAL.md#cdn-tuning).
 

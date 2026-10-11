@@ -374,27 +374,38 @@ TLS behaviour, and does not rely on fronting.
 **What the manager does.** When Iran sets up a CDN tunnel (`wss`, `h2`, `grpc`, `ws`, `h2c` through a Cloudflare
 domain) it runs, without questions:
 
-1. Scan about 22 Cloudflare edge IPs. An edge counts only if it returns a real HTTP response. IPv6 edges are tried
-   only when the server has an IPv6 route.
-2. If no edge answers for the domain (SNI filtering), rank the edges with `speed.cloudflare.com` instead and make
-   sure ECH is tried.
-3. Keep the best 3 as `peer`.
-4. Speed-test, in this order: Chrome fingerprint, ECH, plain, and last fragmentation.
-5. Write the winner (`fp`, `ech`, `tls-frag`, `peer`) into the config and restart.
+1. Scan about 22 Cloudflare edge IPs, with the domain's own A records first. One test client dials all the candidate
+   edges with a real ECH connection to the domain, and an edge counts only if that connection works. This replaces the
+   old curl probe and the `speed.cloudflare.com` ranking, because an edge serving `speed.cloudflare.com` can still fail
+   for the zone. IPv6 edges are tried only when the server has an IPv6 route.
+2. Keep the best 3 as `peer`.
+3. Speed-test, in this order: Chrome fingerprint with ECH first (the test stops early when it works), then the other
+   variants (plain, fragmentation) only if it does not. Through Cloudflare only `wss` and `grpc` are tested.
+4. Write the winner (`fp`, `ech`, `tls-frag`, `peer`) into the config and restart.
 
 In Auto mode this is part of the CDN phase; the table labels look like `wss · chrome · 3 edges`.
 `wattun cdn-tune NAME [full]` repeats the tuning at any time. Auto-heal refreshes dead edges.
 
-**Cloudflare settings.** Use `wss`, `grpc` or `h2` on a Cloudflare HTTPS port (443, 2053, 2083, 2087, 2096, 8443),
-SSL mode Full, ECH on, and enable gRPC in the Cloudflare Network settings for `grpc`. Avoid plain `ws` on HTTP ports.
+**DoH behaviour (2.2.1).** `ech: auto` looks up the domain's HTTPS record by racing all four DoH servers (1.1.1.1,
+1.0.0.1, 8.8.8.8, 9.9.9.9) and takes the first answer; from Iran 1.1.1.1 was blocked while 8.8.8.8 worked. The lookup
+happens before the dial. If DoH fails, the last good config is kept, and after a rejection the config is refreshed in
+the background.
+
+**Field result (v2.2.0, real Iran server through Cloudflare).** Only ECH got through; every non-ECH variant failed.
+With ECH: `wss` 8.0 MB/s down and 7.5 MB/s up, `grpc` 6.7 MB/s down and 9.9 MB/s up.
+
+**Cloudflare settings.** Use `wss` or `grpc` on a Cloudflare HTTPS port (443, 2053, 2083, 2087, 2096, 8443),
+SSL mode Full, ECH on, and enable gRPC in the Cloudflare Network settings for `grpc`. `h2` does not work through
+Cloudflare: it speaks HTTP/1.1 to the origin except for gRPC. Avoid plain `ws` on HTTP ports.
 
 **Troubleshooting.**
 
 | Symptom | Cause and fix |
 |---|---|
 | Connects, then stalls with no data | SNI black-holing. Set `ech: auto`, or try `fp: chrome` and `tls-frag`. Run `wattun cdn-tune NAME full`. |
-| All edges fail the scan | The domain is blocked by SNI. The manager falls back to ranking by `speed.cloudflare.com` and tries ECH. Check `ech` and `tls_mode` in `/stats`. |
-| `ech: false` although `ech: auto` is set | The domain has no HTTPS DNS record (the zone is not on Cloudflare's ECH), or DoH is blocked. The tunnel runs without ECH. |
+| All edges fail the scan | The domain is blocked even over ECH, or the zone has no ECH. Check `ech` and `tls_mode` in `/stats` and that the domain's HTTPS record exists. |
+| `ech: false` although `ech: auto` is set | The domain has no HTTPS DNS record (the zone is not on Cloudflare's ECH), or all four DoH servers are blocked and no earlier config was cached. The tunnel runs without ECH. |
+| `h2` never works through Cloudflare | Expected: Cloudflare speaks HTTP/1.1 to the origin except for gRPC. Use `wss` or `grpc`. |
 | `grpc` never connects | gRPC is off in Cloudflare Network settings. |
 | `ws` hangs at the Upgrade | Plain ws on an HTTP port. Move to `wss` on an HTTPS port. |
 | 403 from Cloudflare | A fronted SNI/Host mismatch. Keep `sni` and `host` the same domain. |

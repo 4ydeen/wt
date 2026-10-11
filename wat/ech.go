@@ -19,19 +19,25 @@ import (
 // fetched from the HTTPS DNS record (type 65) of the SNI name over DNS-over-HTTPS addressed by IP, never through the
 // system resolver. The handshake itself is the standard library's (or utls's) ECH.
 
-// dohServers are tried in order, addressed by IP so no DNS lookup is needed to reach them. A variable for tests.
+// dohServers are raced in parallel (first answer wins), addressed by IP so no DNS lookup is needed to reach them.
+// Some are blocked on some networks (1.1.1.1 from Iran, say), so none may be relied on. A variable for tests.
 var dohServers = []string{"https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"}
 
 const (
 	dnsTypeHTTPS = 65
 	svcParamECH  = 5
-	echNegTTL    = 5 * time.Minute
+	echNegTTL    = 5 * time.Minute  // the name publishes no ech parameter
+	echErrTTL    = 30 * time.Second // the lookup itself failed (DoH blocked): try again soon
 	echPosTTL    = time.Hour
+	dohTimeout   = 3 * time.Second // per DoH server; they are queried in parallel
 )
+
+// errNoECH: DNS answered, but the name has no ech parameter (a definitive answer, unlike a failed lookup).
+var errNoECH = errors.New("the HTTPS record has no ech parameter")
 
 type echEntry struct {
 	list []byte
-	at   time.Time
+	next time.Time // when to look the name up again
 }
 
 // echState caches the ECHConfigList per name.
@@ -39,8 +45,9 @@ type echState struct {
 	mode   string // "off", "auto" or "static"
 	static []byte
 
-	mu sync.Mutex
-	m  map[string]*echEntry
+	mu       sync.Mutex
+	m        map[string]*echEntry
+	inflight map[string]bool // background refreshes running
 }
 
 // ParseECHFlag validates a -ech value: off, auto or a base64 ECHConfigList.
@@ -67,7 +74,7 @@ func newECHState(v string) (*echState, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &echState{mode: mode, static: list, m: map[string]*echEntry{}}, nil
+	return &echState{mode: mode, static: list, m: map[string]*echEntry{}, inflight: map[string]bool{}}, nil
 }
 
 // get returns the ECHConfigList to offer for name, or nil to connect without ECH.
@@ -88,28 +95,65 @@ func (s *echState) get(ctx context.Context, name string, e *tlsEngine) []byte {
 		return nil
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock() // held over the fetch: concurrent slots wait for one lookup instead of making eight
-	if en := s.m[name]; en != nil {
-		ttl := echPosTTL
-		if en.list == nil {
-			ttl = echNegTTL
-		}
-		if time.Since(en.at) < ttl {
-			return en.list
-		}
+	en := s.m[name]
+	if en != nil && time.Now().Before(en.next) {
+		defer s.mu.Unlock()
+		return en.list
 	}
-	fctx, cancel := context.WithTimeout(ctx, 16*time.Second)
+	if en != nil && en.list != nil { // known config, due for a refresh: use it now, refresh behind the scenes
+		list := en.list
+		s.mu.Unlock()
+		s.refreshAsync(name, e)
+		return list
+	}
+	// held over the first fetch: concurrent slots wait for one lookup instead of making eight
+	defer s.mu.Unlock()
+	s.lookupLocked(name, e)
+	return s.m[name].list
+}
+
+// lookupLocked fetches name's config (s.mu held). The lookup does not use the dial's context, so a slow DoH cannot eat
+// the dial's budget. A failed lookup never drops a config we already have (stale-while-error).
+func (s *echState) lookupLocked(name string, e *tlsEngine) {
+	fctx, cancel := context.WithTimeout(context.Background(), dohTimeout+time.Second)
 	defer cancel()
 	list, err := FetchECHConfigList(fctx, name)
+	old := s.m[name]
 	switch {
-	case err != nil:
-		e.note("ech-fetch:"+name, "ech auto: no ECH config for %s (%v); connecting without ECH", name, err)
-		list = nil
-	default:
+	case err == nil:
 		e.note("ech-ok:"+name, "ech auto: using the ECH config published for %s (%d bytes)", name, len(list))
+		s.m[name] = &echEntry{list: list, next: time.Now().Add(echPosTTL)}
+	case errors.Is(err, errNoECH) && (old == nil || old.list == nil):
+		e.note("ech-fetch:"+name, "ech auto: no ECH config for %s (%v); connecting without ECH", name, err)
+		s.m[name] = &echEntry{next: time.Now().Add(echNegTTL)}
+	default: // lookup failed (or the record vanished): keep what we know, try again soon
+		var keep []byte
+		if old != nil {
+			keep = old.list
+		}
+		if keep != nil {
+			e.note("ech-stale:"+name, "ech auto: could not refresh the ECH config for %s (%v); keeping the old one", name, err)
+		} else {
+			e.note("ech-fetch:"+name, "ech auto: no ECH config for %s (%v); connecting without ECH", name, err)
+		}
+		s.m[name] = &echEntry{list: keep, next: time.Now().Add(echErrTTL)}
 	}
-	s.m[name] = &echEntry{list: list, at: time.Now()}
-	return list
+}
+
+func (s *echState) refreshAsync(name string, e *tlsEngine) {
+	s.mu.Lock()
+	if s.inflight[name] {
+		s.mu.Unlock()
+		return
+	}
+	s.inflight[name] = true
+	s.mu.Unlock()
+	go func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.lookupLocked(name, e)
+		delete(s.inflight, name)
+	}()
 }
 
 // rejected records the server's retry configs after an ECH rejection and says whether to redial. Without retry
@@ -122,12 +166,25 @@ func (s *echState) rejected(name string, retry []byte, e *tlsEngine) bool {
 		if s.mode == "static" {
 			key = ""
 		}
-		s.m[key] = &echEntry{list: retry, at: time.Now()}
+		s.m[key] = &echEntry{list: retry, next: time.Now().Add(echPosTTL)}
 		e.note("ech-retry", "ech: the server rejected our ECH config and sent a new one; retrying with it")
+		if s.mode == "auto" && name != "" { // also re-read DNS in the background (the keys rotated)
+			go func() {
+				time.Sleep(2 * time.Second) // let the retry connection win first; the refresh must not stall it
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if s.inflight[name] {
+					return
+				}
+				s.inflight[name] = true
+				defer delete(s.inflight, name)
+				s.lookupLocked(name, e)
+			}()
+		}
 		return true
 	}
 	if s.mode == "auto" {
-		s.m[name] = &echEntry{list: nil, at: time.Now()}
+		s.m[name] = &echEntry{next: time.Now().Add(echNegTTL)}
 		e.note("ech-none:"+name, "ech auto: %s rejected ECH without new configs; connecting without ECH", name)
 		return true
 	}
@@ -140,19 +197,56 @@ func FetchECHConfigList(ctx context.Context, name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var last error
+	type res struct {
+		list []byte
+		err  error
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan res, len(dohServers))
 	for _, srv := range dohServers {
-		list, err := dohQuery(ctx, srv, q)
-		if err == nil {
-			return list, nil
+		go func() {
+			list, err := dohQuery(ctx, srv, q)
+			if err != nil && !errors.Is(err, errNoECH) {
+				err = fmt.Errorf("%s: %w", srv, err)
+			}
+			ch <- res{list, err}
+		}()
+	}
+	var last error
+	noECH := false
+	var grace <-chan time.Time
+	for n := 0; n < len(dohServers); n++ {
+		select {
+		case r := <-ch:
+			switch {
+			case r.err == nil:
+				return r.list, nil
+			case errors.Is(r.err, errNoECH):
+				if !noECH { // a resolver may lag behind the others: give them a moment to produce a config
+					noECH = true
+					grace = time.After(400 * time.Millisecond)
+				}
+			default:
+				last = r.err
+			}
+		case <-grace:
+			return nil, errNoECH
+		case <-ctx.Done():
+			n = len(dohServers)
+			if last == nil {
+				last = ctx.Err()
+			}
 		}
-		last = fmt.Errorf("%s: %w", srv, err)
+	}
+	if noECH {
+		return nil, errNoECH
 	}
 	return nil, last
 }
 
 func dohQuery(ctx context.Context, server string, q []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 3500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, dohTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", server+"?dns="+base64.RawURLEncoding.EncodeToString(q), nil)
 	if err != nil {
@@ -274,5 +368,5 @@ func parseHTTPSECH(m, q []byte) ([]byte, error) {
 			p += l
 		}
 	}
-	return nil, errors.New("the HTTPS record has no ech parameter")
+	return nil, errNoECH
 }

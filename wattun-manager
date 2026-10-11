@@ -1391,7 +1391,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   say "  ${BOLD}Auto${RST}: Iran tests every connection type against this server and keeps the best one."
   hint "This server opens one port per carrier. A second unit, ${name}-r, is added by itself once Iran connects."
   echo
-  hint "Cloudflare-proxied domain for the CDN tests (optional; used only to test wss/grpc/h2 through Cloudflare."
+  hint "Cloudflare-proxied domain for the CDN tests (optional; used only to test wss/grpc through Cloudflare."
   hint "Point it at this server with the orange cloud on, SSL mode Full). Press Enter to skip."
   ask_ok "CDN domain (optional)" "" v_domain_opt || return 1; cdn=$REPLY_V
   auto_pick_ports || { err "Could not find a free port for $AUTO_FAIL on this server."; hint "Check what listens there: ss -ltnup"; return 1; }
@@ -1540,11 +1540,11 @@ auto_variants() { # T_* from the auto token -> AV_*
     p=$(plan_port "$d" "$c"); [ -n "$p" ] && av_add "$c" "$c" d "$AT_ADDR:$p" '' ''
   done
   if [ -n "$T_SNI" ]; then
-    for c in wss grpc h2; do
+    for c in wss grpc; do # h2 never connects through Cloudflare
       p=$(plan_port "$d" "$c"); [ -n "$p" ] || continue
-      if cdn_ok; then # variant (a): Chrome fingerprint on the best Cloudflare edges (CS_EDGES, filled by auto_test); b-d: cdn_auto_extras
-        if [ "${#CS_EDGES[@]}" -gt 0 ]; then av_add "$c · chrome · ${#CS_EDGES[@]} edges" "$c" c "$(cdn_peer_list "$p")" '' "$T_SNI" chrome
-        else av_add "$c · chrome" "$c" c "$T_SNI:$p" '' "$T_SNI" chrome; fi
+      if cdn_ok; then # variant (a): chrome+ech on the best Cloudflare edges (CS_EDGES, filled by auto_test); b-d: cdn_auto_extras
+        if [ "${#CS_EDGES[@]}" -gt 0 ]; then av_add "$c · chrome+ech · ${#CS_EDGES[@]} edges" "$c" c "$(cdn_peer_list "$p")" '' "$T_SNI" chrome auto
+        else av_add "$c · chrome+ech" "$c" c "$T_SNI:$p" '' "$T_SNI" chrome auto; fi
       else av_add "$c via CDN" "$c" c "$T_SNI:$p" '' "$T_SNI"; fi
     done
   fi
@@ -1714,15 +1714,15 @@ at_print() {
   fi
 }
 auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKIP ; fills AR_*, AT_SECS
-  local i n t0=$SECONDS kind last='' w pool=() j
+  local i n t0=$SECONDS kind last='' w pool=() j sc
   at_prep || return 1
   AR_OK=(); AR_DOWN=(); AR_UP=(); AR_RTT=(); AR_WHY=()
-  CS_EDGES=(); CS_TOTAL=0
+  CS_EDGES=(); CS_TOTAL=0; CS_RAN=0
   if [ -n "$T_SNI" ] && cdn_ok; then # one scan for all CDN carriers; its summary line is printed in the CDN section
-    j=''; for i in wss grpc h2; do j=$(plan_port "$(plan_part "$T_AUTO" d)" "$i"); [ -n "$j" ] && break; done
+    j=''; sc=wss; for i in wss grpc; do j=$(plan_port "$(plan_part "$T_AUTO" d)" "$i"); [ -n "$j" ] && { sc=$i; break; }; done
     if [ -n "$j" ]; then
       [ "$AT_QUIET" = 1 ] || at_busy "Cloudflare edges"
-      CS_QUIET=1; cdn_scan "$T_SNI" "$j" "${T_PATH:-/wat}" wss
+      CS_QUIET=1; cdn_scan "$T_SNI" "$j" "${T_PATH:-/wat}" "$sc"
       [ "$AT_QUIET" = 1 ] || at_idle
     fi
   fi
@@ -1733,7 +1733,7 @@ auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKI
     if [ "$kind" != "$last" ] && [ "$AT_QUIET" != 1 ]; then
       case "$kind" in
         d) say "  ${BOLD}Direct connections${RST}" ;;
-        c) echo; say "  ${BOLD}Through the CDN${RST} ($T_SNI)"; [ "$CS_TOTAL" -gt 0 ] && cdn_scan_say ;;
+        c) echo; say "  ${BOLD}Through the CDN${RST} ($T_SNI)"; [ "$CS_RAN" = 1 ] && cdn_scan_say ;;
         r) echo; say "  ${BOLD}Reverse${RST} (Kharej connects out to this server)" ;;
       esac
     fi
@@ -1947,15 +1947,15 @@ heal_retest() { # name : at most once per 30 min, in a transient unit so it outl
 
 # ======================================================================================
 #  CDN tuning (wattun >= 2.2.0 on Iran): find the fastest Cloudflare edges and TLS settings, no questions
-#    cdn_scan   probes Cloudflare edge addresses from this server (CS_*)
-#    cdn_tune   tests fp / ech / tls-frag variants with the same throw-away clients as Auto (AV_*, AR_*) -> CT_IDX
+#    cdn_scan   finds the edges that serve the domain over ECH: TCP pre-filter, then one throw-away client over all candidates, /stats edges (CS_*)
+#    cdn_tune   tests chrome+ech, chrome, go (frag last resort) variants with the same throw-away clients as Auto (AV_*, AR_*) -> CT_IDX
 #    Config keys written: peer (several edges, comma separated), fp, ech, tls-frag. sni/host stay the domain.
 # ======================================================================================
 CDN_MINVER=2.2.0
 CDN_OK=''
 CS_DIR=''; CS_PIDS=(); CS_EDGES=(); CS_REACH_IPS=(); CS_REACH=0; CS_TOTAL=0; CS_BEST_IP=''; CS_BEST_MS=0; CS_QUIET=0
 CS_VERBOSE=${WAT_VERBOSE:-0}
-CS_FALLBACK=0; CS_ROWS=()
+CS_FALLBACK=0; CS_RAN=0
 CS_V4='162.159.140.220 162.159.141.1 162.159.141.100 162.159.135.1 162.159.135.100 162.159.136.1 162.159.136.100 162.159.128.1 162.159.128.100 104.16.0.1 104.17.0.1 104.18.0.1 104.19.0.1 104.21.0.1 104.24.0.1 172.64.0.1 172.64.80.1 172.65.0.1 172.66.0.1 172.67.0.1 172.67.74.1 188.114.96.1 188.114.97.6'
 CS_V6='2a06:98c1:3121::7 2a06:98c1:3120::7 2606:4700:3030::1 2606:4700:3033::1 2606:4700::6810:1 2606:4700:20::1'
 CT_IDX=''; CT_I=''; CT_DESC=''; CT_W=8; AT_FULL=0
@@ -1983,78 +1983,88 @@ cdn_peer_list() { # port -> "ip:port,[v6]:port" from CS_EDGES
   done
   echo "$out"
 }
-cdn_probe_round() { # host port scheme path ip... : probe every ip in parallel -> CS_ROWS ("rank-key ms ip code", fastest first)
-  local host=$1 port=$2 scheme=$3 path=$4 ip n=0 r; shift 4
-  CS_ROWS=(); CS_PIDS=(); rm -f "$CS_DIR"/*
-  for ip in "$@"; do
-    n=$((n+1)); r=$ip; [[ "$ip" == *:* ]] && r="[$ip]"
-    ( echo "$ip $(curl -s -o /dev/null --resolve "$host:$port:$r" --connect-timeout 3 -m 6 \
-        -w '%{time_total} %{http_code}' "$scheme://$host:$port$path" 2>/dev/null)" >"$CS_DIR/$n" ) &
+cdn_scan_say() { # one summary line for the last cdn_scan
+  if [ "$CS_REACH" -gt 0 ]; then ok "Cloudflare edges: $CS_REACH serve this domain over ECH (of $CS_TOTAL reachable)"
+  elif [ "$CS_TOTAL" -gt 0 ]; then warn "Cloudflare edges: none of the $CS_TOTAL reachable ones served this domain over ECH; using the domain's own addresses"
+  else warn "Cloudflare edges: none of the tested addresses accepts a TCP connection from this server"; fi
+}
+cdn_up_edges() { # metrics-port : the edge addresses the engine reports as up (/stats "edges": [{"addr":"ip:port","up":true}]), one per line
+  curl -fs --noproxy '*' --max-time 3 "http://127.0.0.1:$1/stats" 2>/dev/null | grep -oE '"addr":"[^"]+","up":true' \
+    | sed -E 's/^"addr":"//; s/","up":true$//; s/:[0-9]+$//; s/^\[//; s/\]$//'
+}
+cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve this domain, judged by the tunnel engine itself
+  # -> CS_EDGES (best 3), CS_REACH_IPS (every edge that is up), CS_REACH (up) / CS_TOTAL (TCP-reachable) ; CS_FALLBACK=1 when none was
+  # verified (CS_EDGES is then the domain's own addresses) ; rc 1 when there is nothing to choose from at all.
+  # curl cannot do ECH, so it only pre-filters plain TCP reachability. A throw-away client with -fp chrome -ech auto and one pool
+  # connection per candidate spreads over all of them; /stats then says which candidates really carried a connection.
+  local dom=$1 port=$2 path=${3:-/} car=${4:-wss} ip n=0 v6=0 i own=() cand=() reach=() peers='' up='' mp pid t end a N
+  local -A seen=() isup=()
+  CS_EDGES=(); CS_REACH_IPS=(); CS_REACH=0; CS_TOTAL=0; CS_BEST_IP=''; CS_BEST_MS=0; CS_FALLBACK=0; CS_RAN=0
+  [[ "$path" == /* ]] || path=/$path
+  ipv4_ok "$dom" && return 1 # an IP address has no Cloudflare edges to choose from
+  ip -6 route get 2606:4700::1 >/dev/null 2>&1 && v6=1 # DNS may return AAAA on a server without any v6 route
+  # the domain's own A records first: they are what Cloudflare hands out for this very zone
+  for ip in $(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1}' | sort -u); do
+    [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; own+=("$ip"); cand+=("$ip"); }
+  done
+  if [ "$v6" = 1 ]; then
+    for ip in $(getent ahostsv6 "$dom" 2>/dev/null | awk '{print $1}' | grep -v -i '^::ffff:' | sort -u); do
+      [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; own+=("$ip"); cand+=("$ip"); }
+    done
+  fi
+  for ip in $CS_V4 $( [ "$v6" = 1 ] && echo "$CS_V6" ); do
+    [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; cand+=("$ip"); }
+  done
+  CS_RAN=1
+  CS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/wattun-cdn.XXXXXX") || { CS_DIR=''; return 1; }
+  # fast pre-filter: drop what cannot even open a TCP connection (any TLS / HTTP outcome is fine here)
+  CS_PIDS=()
+  for ip in "${cand[@]}"; do
+    n=$((n+1))
+    ( timeout 2 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null && : >"$CS_DIR/$n" ) &
     CS_PIDS+=($!)
   done
   wait "${CS_PIDS[@]}" 2>/dev/null
   CS_PIDS=()
-  # only a real HTTP status counts (000 = nothing came back); a 52x (origin trouble behind that edge) is ranked last
-  mapfile -t CS_ROWS < <(cat "$CS_DIR"/* 2>/dev/null | LC_ALL=C awk 'NF==3 && $3 ~ /^[1-5][0-9][0-9]$/ {
-      ms = int($2 * 1000 + 0.5); if (ms < 1) ms = 1
-      printf "%d %d %s %s\n", ms + (($3 ~ /^52/) ? 100000 : 0), ms, $1, $3 }' | sort -n)
-}
-cdn_scan_say() { # one summary line for the last cdn_scan
-  if [ "$CS_REACH" -gt 0 ] && [ "$CS_FALLBACK" = 1 ]; then
-    ok "Cloudflare edges: $CS_REACH clean of $CS_TOTAL (best $CS_BEST_IP, $CS_BEST_MS ms), but none answers for this domain (SNI filtered?): trying ECH"
-  elif [ "$CS_REACH" -gt 0 ]; then ok "Cloudflare edges: $CS_REACH reachable of $CS_TOTAL (best $CS_BEST_IP, $CS_BEST_MS ms)"
-  else warn "Cloudflare edges: none of the $CS_TOTAL tested addresses answered from this server"; fi
-}
-cdn_scan() { # domain port path carrier : probe Cloudflare edges in parallel -> CS_EDGES (best 3), CS_REACH_IPS, CS_REACH/TOTAL ; rc 1 when none answers
-  local dom=$1 port=$2 path=${3:-/} car=${4:-wss} scheme=https ip n=0 f v6=0 cand=() rows=() r k key ms rip code pick=() v6row='' bms
-  local -A seen=()
-  CS_EDGES=(); CS_REACH_IPS=(); CS_REACH=0; CS_TOTAL=0; CS_BEST_IP=''; CS_BEST_MS=0; CS_FALLBACK=0
-  case "$car" in ws|h2c) scheme=http ;; esac
-  [[ "$path" == /* ]] || path=/$path
-  ipv4_ok "$dom" && return 1 # an IP address has no Cloudflare edges to choose from
-  ip -6 route get 2606:4700::1 >/dev/null 2>&1 && v6=1 # DNS may return AAAA on a server without any v6 route
-  for ip in $(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1}' | sort -u) $CS_V4; do
-    [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; cand+=("$ip"); }
-  done
-  if [ "$v6" = 1 ]; then
-    for ip in $(getent ahostsv6 "$dom" 2>/dev/null | awk '{print $1}' | grep -v -i '^::ffff:' | sort -u) $CS_V6; do
-      [ -n "${seen[$ip]:-}" ] || { seen[$ip]=1; cand+=("$ip"); }
-    done
-  fi
-  CS_TOTAL=${#cand[@]}
-  CS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/wattun-cdn.XXXXXX") || { CS_DIR=''; return 1; }
-  # An edge counts only when curl got a real HTTP status (http_code != 000): the filter drops by SNI after the handshake,
-  # so a completed TCP connect / TLS handshake alone proves nothing. Ranked by time_total of the finished request.
-  cdn_probe_round "$dom" "$port" "$scheme" "$path" "${cand[@]}"
-  CS_FALLBACK=0
-  if [ "${#CS_ROWS[@]}" -eq 0 ]; then
-    # no edge answers for this domain: maybe only its SNI is blocked. Rank edges by speed.cloudflare.com instead
-    # (proves the edge itself is clean); the tunnel variants then run on the best edges and ech=auto is expected to win.
-    cdn_probe_round speed.cloudflare.com 443 https /__down?bytes=0 "${cand[@]}"
-    [ "${#CS_ROWS[@]}" -gt 0 ] && CS_FALLBACK=1
-  fi
+  n=0
+  for ip in "${cand[@]}"; do n=$((n+1)); [ -e "$CS_DIR/$n" ] && reach+=("$ip"); done
   rm -rf "$CS_DIR"; CS_DIR=''
-  rows=(); [ "${#CS_ROWS[@]}" -gt 0 ] && rows=("${CS_ROWS[@]}")
-  CS_REACH=${#rows[@]}
-  if [ "$CS_VERBOSE" = 1 ]; then
-    for r in ${rows[@]+"${rows[@]}"}; do set -- $r; printf '    %s%-40s %5d ms  HTTP %s%s\n' "$GRY" "$3" "$2" "$4" "$RST"; done
+  CS_TOTAL=${#reach[@]}
+  if [ "$CS_TOTAL" -eq 0 ]; then # nothing answers on TCP (or the check itself is unreliable here): the domain's own addresses are the only guess
+    [ "${#own[@]}" -gt 0 ] || return 1
+    CS_FALLBACK=1; CS_EDGES=("${own[@]:0:3}"); [ "$CS_QUIET" = 1 ] || cdn_scan_say
+    return 0
   fi
-  [ "$CS_REACH" -gt 0 ] || { [ "$CS_QUIET" = 1 ] || cdn_scan_say; return 1; }
-  for r in "${rows[@]}"; do
-    set -- $r; CS_REACH_IPS+=("$3")
-    [ -z "$v6row" ] && [[ "$3" == *:* ]] && v6row=$r
-    [ "${#pick[@]}" -lt 3 ] && pick+=("$r")
+  [ "${#reach[@]}" -gt 24 ] && reach=("${reach[@]:0:24}")
+  N=${#reach[@]}
+  for ip in "${reach[@]}"; do
+    [[ "$ip" == *:* ]] && ip="[$ip]"
+    peers="${peers:+$peers,}$ip:$port"
   done
-  set -- ${rows[0]}; CS_BEST_IP=$3; CS_BEST_MS=$2; bms=$2
-  # mix in one IPv6 edge when none of the best three is IPv6 and it is within 1.5x of the best
-  if [ -n "$v6row" ]; then
-    k=0; for r in "${pick[@]}"; do set -- $r; [[ "$3" == *:* ]] && k=1; done
-    set -- $v6row
-    if [ "$k" = 0 ] && [ $(( $2 * 2 )) -le $(( bms * 3 )) ]; then
-      if [ "${#pick[@]}" -ge 3 ]; then pick[2]=$v6row; else pick+=("$v6row"); fi
-    fi
+  if [ -n "${AT_DIR:-}" ] && [ -r "$AT_DIR/key" ] || { [ -n "${T_KEY:-}" ] && at_prep; }; then
+    mp=$(at_free_port)
+    a=(-mode client -carrier "$car" -key-file "$AT_DIR/key" -peer "$peers" -metrics "127.0.0.1:$mp" -conns "$N"
+       -path "$path" -sni "$dom" -host "$dom" -map "$(at_free_port $((mp + 1))):1@127.0.0.1")
+    case "$car" in wss|grpc|h2) a+=(-fp chrome -ech auto) ;; esac
+    timeout -k 2 40 "$BIN" "${a[@]}" >"$AT_DIR/scan.log" 2>&1 &
+    AT_PID=$!
+    end=$((SECONDS + 12))
+    while [ "$SECONDS" -lt "$end" ]; do
+      sleep 1
+      up=$(cdn_up_edges "$mp"); [ -n "$up" ] && [ "$(wc -l <<<"$up")" -ge "$N" ] && break
+    done
+    up=$(cdn_up_edges "$mp")
+    at_kill
+    for ip in $up; do isup[$ip]=1; done
+    for ip in "${reach[@]}"; do [ -n "${isup[$ip]:-}" ] && CS_REACH_IPS+=("$ip"); done
   fi
-  for r in "${pick[@]}"; do set -- $r; CS_EDGES+=("$3"); done
+  CS_REACH=${#CS_REACH_IPS[@]}
+  if [ "$CS_REACH" -gt 0 ]; then
+    CS_EDGES=("${CS_REACH_IPS[@]:0:3}"); CS_BEST_IP=${CS_EDGES[0]}
+  else
+    CS_FALLBACK=1
+    if [ "${#own[@]}" -gt 0 ]; then CS_EDGES=("${own[@]:0:3}"); else CS_EDGES=("${reach[@]:0:3}"); fi
+  fi
   [ "$CS_QUIET" = 1 ] || cdn_scan_say
   return 0
 }
@@ -2101,30 +2111,31 @@ cdn_try() { # carrier label peer fp ech tls-frag : add a CDN variant, test it, p
   [ "$AT_QUIET" = 1 ] || { at_idle; at_print "$i"; }
   return 0
 }
-cdn_extras() { # carrier edge-peer default-peer a-index : (b) ech, (d) the plain default, (c) tls-frag last
-  local car=$1 pa=$2 pd=$3 ai=${4:-} eok=0
-  case "$car" in
-    wss|h2|grpc)
-      # ech is never skipped (when the domain's SNI is filtered it is the variant expected to win)
-      CT_W=12; cdn_try "$car" "$car · ech" "$pa" chrome auto ''; CT_W=8
-      [ "${AR_OK[$CT_I]}" = 1 ] && eok=1 ;;
-  esac
-  cdn_try "$car" "$car · default" "$pd" '' '' ''
-  # the ClientHello cut comes after the handshake, so it rarely helps against an SNI filter: only when chrome and ech both failed
-  case "$car" in
-    wss|h2|grpc) if [ "$eok" = 0 ] && [ "${AR_OK[${ai:-0}]:-0}" != 1 ]; then cdn_try "$car" "$car · frag" "$pa" chrome '' 100; fi ;;
-  esac
+cdn_variants() { # carrier edge-peer default-peer [skip-ech] : TLS variants in preference order: chrome+ech, chrome, go; frag only when all failed
+  local car=$1 pa=$2 pd=$3 skip=${4:-0} any=0 eok=0 i
+  if [ "$skip" = 1 ]; then eok=${AR_OK[$CT_I]:-0}
+  else
+    # ECH is the variant that works against an SNI filter (field result: every non-ECH variant failed through Cloudflare from Iran)
+    CT_W=12; cdn_try "$car" "$car · chrome+ech" "$pa" chrome auto ''; CT_W=8
+    eok=${AR_OK[$CT_I]}
+  fi
+  [ "$eok" = 1 ] && any=1
+  # chrome+ech works: nothing further to test, unless "full"
+  [ "$eok" = 1 ] && [ "$AT_FULL" != 1 ] && return 0
+  cdn_try "$car" "$car · chrome" "$pa" chrome '' ''; [ "${AR_OK[$CT_I]}" = 1 ] && any=1
+  cdn_try "$car" "$car · go" "$pd" '' '' '';          [ "${AR_OK[$CT_I]}" = 1 ] && any=1
+  # the ClientHello cut comes after the handshake, so it rarely helps against an SNI filter: last resort only
+  [ "$any" = 1 ] || cdn_try "$car" "$car · frag" "$pa" chrome '' 100
+  return 0
 }
-cdn_auto_extras() { # Auto: b-d for the best 1-2 CDN carriers, for all of them when every (a) failed
-  local i car port list=() okl=() chosen=() s
+cdn_auto_extras() { # Auto: after (a) chrome+ech of each CDN carrier: the remaining variants only when (a) failed (or full)
+  local i car port list=()
   for ((i=0; i<${#AV_LABEL[@]}; i++)); do [ "${AV_KIND[$i]}" = c ] && list+=("$i"); done
-  while read -r _ i; do okl+=("$i"); done < <(for i in "${list[@]}"; do [ "${AR_OK[$i]}" = 1 ] && printf '%s %s\n' "$(at_score "$i")" "$i"; done | sort -k1,1gr)
-  if [ "${#okl[@]}" -gt 0 ]; then chosen=("${okl[@]:0:2}"); else chosen=("${list[@]}"); fi
-  for i in "${chosen[@]}"; do
-    # (a) works and is within 10% of the best seen: nothing to gain
-    [ "$AT_FULL" = 1 ] || [ "$CS_FALLBACK" = 1 ] || { [ "${AR_OK[$i]}" = 1 ] && at_near_best "$i" && continue; }
+  for i in "${list[@]}"; do
+    [ "$AT_FULL" = 1 ] || [ "${AR_OK[$i]}" != 1 ] || continue
     car=${AV_CAR[$i]}; port=${AV_PEER[$i]%%,*}; port=${port##*:}
-    cdn_extras "$car" "${AV_PEER[$i]}" "$T_SNI:$port" "$i"
+    CT_I=$i
+    cdn_variants "$car" "${AV_PEER[$i]}" "$T_SNI:$port" 1
   done
   return 0
 }
@@ -2135,19 +2146,19 @@ cdn_tune() { # [full] : needs T_CARRIER T_PEER T_KEY T_PATH T_SNI (the domain), 
   AR_OK=(); AR_DOWN=(); AR_UP=(); AR_RTT=(); AR_WHY=(); CT_IDX=''
   port=${T_PEER%%,*}; port=${port##*:}
   pd=$T_PEER; case "$pd" in *,*) pd="$T_SNI:$port" ;; esac
+  [ "$car" = h2 ] && [ "$AT_QUIET" != 1 ] && hint "h2 does not work through Cloudflare; use grpc or wss"
   at_prep || return 1
   [ "$AT_QUIET" = 1 ] || at_busy "Cloudflare edges"
   CS_QUIET=1; cdn_scan "$T_SNI" "$port" "${T_PATH:-/wat}" "$car"
-  [ "$AT_QUIET" = 1 ] || { at_idle; [ "$CS_TOTAL" -gt 0 ] && cdn_scan_say; echo; }
+  [ "$AT_QUIET" = 1 ] || { at_idle; [ "$CS_RAN" = 1 ] && cdn_scan_say; echo; }
   pa=$pd; label=$car
   if [ "${#CS_EDGES[@]}" -gt 0 ]; then pa=$(cdn_peer_list "$port"); label="$car · ${#CS_EDGES[@]} edges"; fi
   case "$car" in
-    wss|h2|grpc) cdn_try "$car" "${label/$car/$car · chrome}" "$pa" chrome '' '' ;;
-    *) cdn_try "$car" "$label" "$pa" '' '' '' ;;
+    wss|grpc|h2) cdn_variants "$car" "$pa" "$pd" 0 ;;
+    *) # plain ws / h2c only get the edge choice; the default is tried only when that failed
+      cdn_try "$car" "$label" "$pa" '' '' ''
+      [ "${AR_OK[$CT_I]}" = 1 ] || cdn_try "$car" "$car · default" "$pd" '' '' '' ;;
   esac
-  a=$CT_I
-  # plain ws / h2c only get the edge choice; the default is tried only when that failed
-  if [ "$AT_FULL" = 1 ] || [ "$CS_FALLBACK" = 1 ] || [ "${AR_OK[$a]}" != 1 ] || ! at_near_best "$a"; then cdn_extras "$car" "$pa" "$pd" "$a"; fi
   at_cleanup
   at_rank; AT_SECS=$((SECONDS-t0))
   [ "${#AT_RANK[@]}" -gt 0 ] && CT_IDX=${AT_RANK[0]}
@@ -2165,12 +2176,13 @@ cdn_wizard_tune() { # Iran wizard, token accepted: CDN carrier + domain + wattun
   dom=$(cdn_domain); [ -n "$dom" ] || return 0
   T_SNI=$dom
   echo
+  [ "$T_CARRIER" = h2 ] && hint "h2 does not work through Cloudflare; use grpc or wss"
   AT_QUIET=1; AT_MB=2; AT_SKIP=''
-  at_busy "the fastest Cloudflare edges and TLS settings for $dom"
+  at_busy "the Cloudflare edges and TLS settings (ECH first) for $dom"
   cdn_tune 0
   at_idle
   if [ -n "$CT_IDX" ]; then
-    [ "$CS_TOTAL" -gt 0 ] && cdn_scan_say
+    [ "$CS_RAN" = 1 ] && cdn_scan_say
     cdn_take; ok "$(cdn_result_line)"
   else
     T_SNI=$sni0
@@ -2226,21 +2238,27 @@ cdn_tune_cmd() { # name [full] : re-run the CDN tuning for an Iran CDN tunnel, s
   confirm "Apply to '$n'? (restarts the tunnel, open connections drop)" y || { warn "No change."; return 0; }
   cdn_apply "$n"
 }
-cdn_refresh_edges() { # name : unattended (auto-heal): fresh scan, replace edge IPs that no longer answer, restart
+cdn_refresh_edges() { # name : unattended (auto-heal): same scan as cdn-tune (the engine tells which edges serve the domain over ECH), replace dead edge IPs, restart
   local n=$1 peer port dom c cur h bad=0 new
   cdn_ok && cdn_tunnel_p "$n" || return 0
   peer=$(cfg "$n" peer); c=$(cfg "$n" carrier)
   h=${peer%%,*}; h=${h%:*}; h=${h#[}; h=${h%]}
   [[ "$h" == *[A-Za-z]* ]] && [[ "$h" != *:* ]] && return 0 # plain domain: Cloudflare DNS already hands out live edges
-  dom=$(cfg "$n" sni); [ -n "$dom" ] || dom=$(cfg "$n" host)
+  cdn_load_t "$n" || return 0
+  dom=$T_SNI
   port=${peer%%,*}; port=${port##*:}
-  CS_QUIET=1
-  if ! cdn_scan "$dom" "$port" "$(cfg "$n" path)" "$c"; then logger -t wattun-heal "cdn scan for $n: no Cloudflare edge answers right now"; return 0; fi
+  AT_QUIET=1; CS_QUIET=1
+  at_prep || return 0
+  if ! cdn_scan "$dom" "$port" "$(cfg "$n" path)" "$c"; then
+    at_cleanup; logger -t wattun-heal "cdn scan for $n: no Cloudflare edge to choose from"; return 0
+  fi
+  at_cleanup
+  if [ "$CS_FALLBACK" = 1 ]; then logger -t wattun-heal "cdn scan for $n: no edge served the domain over ECH right now, peer left as is"; return 0; fi
   for cur in ${peer//,/ }; do
     h=${cur%:*}; h=${h#[}; h=${h%]}
     [[ " ${CS_REACH_IPS[*]} " == *" $h "* ]] || bad=1
   done
-  [ "$bad" = 1 ] || { logger -t wattun-heal "cdn scan for $n: all edges still answer"; return 0; }
+  [ "$bad" = 1 ] || { logger -t wattun-heal "cdn scan for $n: all edges still serve the domain"; return 0; }
   new=$(cdn_peer_list "$port")
   logger -t wattun-heal "cdn scan for $n: replacing dead edges, peer is now $new"
   set_value "$n" peer "$new" 2>/dev/null
@@ -3106,7 +3124,7 @@ Usage: wattun [command]
   token NAME            print the Kharej token again
   auto-test NAME        test every connection type again for an auto Iran tunnel, offer to switch
   auto-ip NAME IP       auto Kharej tunnel: set Iran's IP by hand (creates NAME-r, the reverse side)
-  cdn-tune NAME [full]  Iran CDN tunnel (ws/wss/h2/h2c/grpc): find the fastest Cloudflare edges + TLS settings, apply (needs wattun 2.2.0)
+  cdn-tune NAME [full]  Iran CDN tunnel (ws/wss/h2/h2c/grpc): find the Cloudflare edges that serve the domain over ECH + TLS settings, apply (needs wattun 2.2.0)
   heal                  restart Iran tunnels whose link is down (used by the timer)
   update | rollback     install the latest release / go back one version
   help                  this text

@@ -207,6 +207,7 @@ func (e *tlsEngine) dial(ctx context.Context, addr string) (net.Conn, error) {
 	d := net.Dialer{Timeout: 5 * time.Second}
 	sni := e.sniFor(addr)
 	for attempt := 0; ; attempt++ {
+		list := e.ech.get(ctx, sni, e) // before the TCP dial: a slow lookup must not leave an idle connection waiting
 		var raw net.Conn
 		var err error
 		if e.dialF != nil {
@@ -217,7 +218,6 @@ func (e *tlsEngine) dial(ctx context.Context, addr string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		list := e.ech.get(ctx, sni, e)
 		c, accepted, err := e.handshake(ctx, raw, sni, list)
 		if err == nil {
 			e.echOn.Store(accepted)
