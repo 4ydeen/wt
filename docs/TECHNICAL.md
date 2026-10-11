@@ -750,8 +750,8 @@ wall time.
 `sessions: N` (client only; the server needs no change, it already tells sessions apart by their random id) runs N
 independent sessions to the same server, each with its own carrier (`conns` connections of a pool carrier, or its own
 udp socket), its own pacer and its own session id. Why: one session has one receive goroutine and one send
-goroutine, and every stream is limited by its 4 MB flow-control window, so one stream moves at most about
-4 MB / RTT (measured on a simulated lossless link: 59 MB/s at 40 ms, 29 at 100 ms, 15 at 200 ms). Through a CDN
+goroutine, and every stream starts with a 4 MB flow-control window (2.4.0 grows it, see below; before that one stream moved at
+most about 4 MB / RTT) (measured on a simulated lossless link: 59 MB/s at 40 ms, 29 at 100 ms, 15 at 200 ms). Through a CDN
 from Iran the RTT under load is far above the ICMP path's 40 ms, which is what kept one session at 16-18 MB/s while
 separate processes added up.
 
@@ -766,6 +766,27 @@ separate processes added up.
 - Not for `icmp`, bonded carriers (`a+b`) or `reverse`: the client refuses to start with a clear message.
 - Wire: nothing new. The server has always run one session per session id (that is how the two slots of a
   handover share it), so any 2.x server serves a multi-session client.
+
+### Stream window auto-tuning and cheaper receive path (2.4.0)
+
+- **Per-stream window.** Every stream still starts with the implicit 4 MB window, so an old peer behaves exactly as
+  before. The receiver now grows the window it advertises (the existing window frame, nothing new on the wire): once
+  per RTT it checks how much arrived; if the sender filled at least half the window and the reader is keeping up
+  (under a quarter of the window unread), the window doubles toward 2x the bytes per RTT, up to **16 MB per stream**
+  and **64 MB of growth per session** (beyond the 4 MB bases). A lagging reader stops the growth, and an advertised
+  limit is never taken back. The sender accepts whatever the window frame says and lets `Write` buffer that much.
+  A one-stream download is no longer capped at 4 MB / RTT: on a simulated lossless 150 ms RTT link one stream went
+  from 20.5 to 32.7 MB/s (`TestStreamWindowAutoTune`; a 40 MB/s link, so the new figure is link-limited).
+  Compatibility: only the receiving end decides, so the gain needs the *receiver* of the bulk data to be 2.4.0
+  (a 2.3.x receiver never advertises more than 4 MB, and a 2.3.x sender never buffers more than 4 MB, so either
+  one keeps the old limit).
+- **Pool carriers, receive side.** `tcp|tls|ws|wss|h2|h2c|grpc` read each connection into 64 KB slabs and hand the
+  datagrams out as slices of them: no bufio copy and no allocation per datagram. The gRPC reader moves a message
+  straight into the caller's buffer (no staging copy). Smaller bufio buffers for the ws/grpc readers were tried and
+  measured no better. Write coalescing was already there (each connection's writer fills a 64 KB buffer and flushes when its
+  queue runs dry); a yield before the flush to gather more was measured and gave nothing, so it is not in.
+- **GC.** `wattun` sets the GC target to 200 % at startup unless `GOGC` is set (fewer collections of the per-packet
+  garbage, a few MB more heap).
 
 ## ICMP path limits and pacing
 

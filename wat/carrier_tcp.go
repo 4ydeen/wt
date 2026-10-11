@@ -27,6 +27,7 @@ const (
 	poolQueue     = 256      // packets queued per connection
 	poolMaxFrame  = 32 << 10 // receive bound; datagrams are at most poolMaxMTU
 	poolBufSize   = 64 << 10
+	poolSlabMin   = 16 << 10 // a slab with less room than this left is replaced before the next read
 	poolHelloWait = 5 * time.Second
 	poolMaxPools  = 4096
 	poolMaxConns  = 64 // per pool
@@ -176,25 +177,52 @@ func (pc *poolConn) writeLoop() {
 	}
 }
 
+// readLoop reads the connection into 64 KB slabs and hands out the datagrams as sub-slices of them (v2.4.0): no
+// bufio copy and no allocation per datagram (one slab per ~16 datagrams). A slab is never reused: Recv's slice stays
+// valid for as long as the session holds it. The unread tail of a full slab moves to the next one.
 func (pc *poolConn) readLoop(push func([]byte) bool) {
-	br := bufio.NewReaderSize(pc.c, poolBufSize)
-	var hdr [2]byte
+	buf := make([]byte, poolBufSize)
+	r, w := 0, 0
 	for {
-		if _, err := io.ReadFull(br, hdr[:]); err != nil {
-			return
+		if w-r < 2 {
+			if n, ok := pc.fill(&buf, &r, &w, 2); !ok {
+				_ = n
+				return
+			}
 		}
-		n := int(binary.BigEndian.Uint16(hdr[:]))
+		n := int(binary.BigEndian.Uint16(buf[r:]))
 		if n == 0 || n > poolMaxFrame {
 			return
 		}
-		p := make([]byte, n) // fresh: Recv's slice stays valid until its next call
-		if _, err := io.ReadFull(br, p); err != nil {
-			return
+		if w-r < 2+n {
+			if _, ok := pc.fill(&buf, &r, &w, 2+n); !ok {
+				return
+			}
 		}
+		p := buf[r+2 : r+2+n : r+2+n]
+		r += 2 + n
 		if !push(p) {
 			return
 		}
 	}
+}
+
+// fill reads until at least need bytes are buffered at buf[*r:*w], moving to a fresh slab when the current one has
+// no room left for them (or is nearly full, so reads stay large).
+func (pc *poolConn) fill(buf *[]byte, r, w *int, need int) (int, bool) {
+	if len(*buf)-*r < need || len(*buf)-*w < poolSlabMin {
+		nb := make([]byte, poolBufSize)
+		*w = copy(nb, (*buf)[*r:*w])
+		*buf, *r = nb, 0
+	}
+	for *w-*r < need {
+		n, err := pc.c.Read((*buf)[*w:])
+		*w += n
+		if err != nil && *w-*r < need {
+			return n, false
+		}
+	}
+	return 0, true
 }
 
 // leastQueued picks the live conn with the shortest queue; start rotates so ties spread.

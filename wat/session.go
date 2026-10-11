@@ -23,6 +23,8 @@ const (
 	overhead     = hdrLen + tagLen
 	streamWindow = 4 << 20
 	sendBufMax   = 4 << 20
+	maxStreamWin = 16 << 20 // auto-tuned window cap per stream (stream.go tuneWindow)
+	maxSessionWin = 64 << 20 // total window growth beyond the 4 MB bases, per session
 	prioBytes    = 64 << 10 // streams that sent less than this go first (interactive traffic)
 	dirServerBit = uint64(1) << 63
 	replayWin    = 1024
@@ -129,6 +131,8 @@ type Session struct {
 	wantPing bool
 	stats    Stats
 	openBuf  []byte
+	noWinTune bool   // tests: behave like a peer that never advertises more than the implicit window
+	winExtra uint64 // sum over streams of (win - streamWindow): the auto-tuned growth in use
 	winSlack uint64 // bytes a peer's largest datagram may overshoot the advertised stream window
 	maxPlain int    // plaintext bytes per datagram: cfg.MaxPayload - header - tag
 	plainBuf []byte // reused packet assembly buffer (nextPacket runs under s.mu)
@@ -1054,6 +1058,7 @@ func (s *Session) parse(b []byte, now time.Time) (eliciting bool) {
 			eliciting = true
 			if st := s.streams[sid]; st != nil && max > st.peerMax {
 				st.peerMax = max
+				st.wc.Broadcast() // Write may buffer more now
 				s.activate(st)
 			}
 		case frRst:
@@ -1111,7 +1116,7 @@ func (s *Session) onStream(sid, off uint64, data []byte, fin bool) {
 		s.acceptQ = append(s.acceptQ, st)
 		s.acceptC.Signal()
 	}
-	if off+uint64(len(data)) > st.consumed+streamWindow+s.winSlack { // slack for the largest datagram any peer may send
+	if off+uint64(len(data)) > max(st.advMax, st.consumed+streamWindow)+s.winSlack { // slack for the largest datagram any peer may send
 		return // beyond the advertised window
 	}
 	if fin {

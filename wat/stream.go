@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"time"
 )
 
 var (
@@ -55,6 +56,9 @@ type Stream struct {
 	rroot    []byte // backing array of ready, same idea
 	consumed uint64
 	advMax   uint64
+	win      uint64 // window this end advertises beyond consumed: streamWindow, auto-tuned upward (see tuneWindow)
+	tuneAt   time.Time
+	tuneRx   uint64 // rnext at the start of the current measuring epoch
 	peerFin  bool
 	peerFinO uint64
 	eof      bool
@@ -64,7 +68,7 @@ type Stream struct {
 }
 
 func (s *Session) newStream(id uint64) *Stream {
-	st := &Stream{s: s, id: id, peerMax: streamWindow, advMax: streamWindow}
+	st := &Stream{s: s, id: id, peerMax: streamWindow, advMax: streamWindow, win: streamWindow}
 	st.rc = sync.NewCond(&s.mu)
 	st.wc = sync.NewCond(&s.mu)
 	s.streams[id] = st
@@ -88,7 +92,7 @@ func (st *Stream) Write(b []byte) (int, error) {
 	defer s.mu.Unlock()
 	total := 0
 	for len(b) > 0 {
-		for st.err == nil && !st.finQueued && len(st.sbuf) >= sendBufMax {
+		for st.err == nil && !st.finQueued && len(st.sbuf) >= st.sendCap() {
 			st.wc.Wait()
 		}
 		if st.err != nil {
@@ -97,7 +101,7 @@ func (st *Stream) Write(b []byte) (int, error) {
 		if st.finQueued {
 			return total, ErrClosed
 		}
-		n := sendBufMax - len(st.sbuf)
+		n := st.sendCap() - len(st.sbuf)
 		if n > len(b) {
 			n = len(b)
 		}
@@ -108,6 +112,50 @@ func (st *Stream) Write(b []byte) (int, error) {
 		s.activate(st)
 	}
 	return total, nil
+}
+
+// sendCap is how many unacknowledged bytes Write may buffer: 4 MB, or what the peer has advertised beyond that
+// (a peer that never advertises more than the implicit 4 MB window keeps exactly the old behaviour).
+func (st *Stream) sendCap() int {
+	if st.peerMax > st.sbase+sendBufMax {
+		return int(min(st.peerMax-st.sbase, maxStreamWin))
+	}
+	return sendBufMax
+}
+
+// tuneWindow grows the window this end advertises (receiver-driven; the sender just honours frWindow). Once per
+// RTT it looks at how much arrived: a sender that fills most of the window every RTT is window-limited, so the
+// window doubles toward 2x the observed bytes per RTT (cap maxStreamWin per stream, maxSessionWin extra per session).
+// A reader that lags (more than a quarter of the window unread) stops the growth. The advertised limit never moves
+// back, so nothing already granted is refused.
+func (st *Stream) tuneWindow() {
+	s := st.s
+	if s.noWinTune {
+		return
+	}
+	now := time.Now()
+	if st.tuneAt.IsZero() {
+		st.tuneAt, st.tuneRx = now, st.rnext
+		return
+	}
+	rtt := s.cc.srtt
+	if rtt < 5*time.Millisecond {
+		rtt = 5 * time.Millisecond
+	}
+	if now.Sub(st.tuneAt) < rtt {
+		return
+	}
+	got := st.rnext - st.tuneRx
+	st.tuneAt, st.tuneRx = now, st.rnext
+	if st.win >= maxStreamWin || got < st.win/2 || st.rnext-st.consumed > st.win/4 {
+		return
+	}
+	nw := min(2*got, 2*st.win, maxStreamWin)
+	if nw <= st.win || s.winExtra+(nw-st.win) > maxSessionWin {
+		return
+	}
+	s.winExtra += nw - st.win
+	st.win = nw
 }
 
 // CloseWrite sends FIN: the peer's Read returns io.EOF after the buffered data.
@@ -150,8 +198,9 @@ func (st *Stream) Read(b []byte) (int, error) {
 		st.ready = nil
 	}
 	st.consumed += uint64(n)
-	if st.consumed+streamWindow-st.advMax >= streamWindow/4 {
-		st.advMax = st.consumed + streamWindow
+	st.tuneWindow()
+	if st.consumed+st.win-st.advMax >= st.win/4 {
+		st.advMax = st.consumed + st.win
 		var f []byte
 		f = append(f, frWindow)
 		f = appendUv(f, st.id)
@@ -184,11 +233,13 @@ func (s *Session) killStream(st *Stream, err error) {
 		return
 	}
 	st.dead = true
+	s.winExtra -= st.win - streamWindow
 	if st.err == nil {
 		st.err = err
 	}
 	delete(s.streams, st.id)
 	s.tomb[st.id] = s.now
+	s.winExtra -= st.win - streamWindow
 	st.rc.Broadcast()
 	st.wc.Broadcast()
 }
@@ -202,6 +253,7 @@ func (st *Stream) maybeFinish() {
 	st.dead = true
 	delete(s.streams, st.id)
 	s.tomb[st.id] = s.now
+	s.winExtra -= st.win - streamWindow
 	st.rc.Broadcast()
 	st.wc.Broadcast()
 }

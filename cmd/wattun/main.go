@@ -22,6 +22,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,9 @@ var poolCarriers = map[string]bool{"tcp": true, "tls": true, "ws": true, "wss": 
 
 func main() {
 	runManager()
+	if os.Getenv("GOGC") == "" { // the receive path allocates per datagram; fewer collections cost a few MB of heap (2.4.0)
+		debug.SetGCPercent(200)
+	}
 	mode := flag.String("mode", "", "client|server")
 	key := flag.String("key", "", "pre-shared key")
 	keyFile := flag.String("key-file", "", "read the key from a file")

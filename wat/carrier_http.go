@@ -524,29 +524,45 @@ func (g *grpcConn) Read(p []byte) (int, error) {
 		if h[0] != 0 || n > grpcMaxMsg {
 			return 0, errors.New("grpc: bad message")
 		}
+		if n == 0 {
+			continue
+		}
+		// The hunk is 0x0a, a varint length and the bytes. The payload goes straight into the caller's buffer
+		// when it fits (v2.4.0): no staging copy per message.
+		pre, err := g.br.Peek(min(int(n), 1+binary.MaxVarintLen32))
+		if err != nil {
+			return 0, err
+		}
+		if pre[0] != 0x0a {
+			return 0, errors.New("grpc: unexpected field")
+		}
+		l, vn := binary.Uvarint(pre[1:])
+		if vn <= 0 || uint64(n)-1-uint64(vn) != l {
+			return 0, errors.New("grpc: bad hunk")
+		}
+		g.br.Discard(1 + vn)
+		if l == 0 {
+			continue
+		}
+		if int(l) <= len(p) {
+			if _, err := io.ReadFull(g.br, p[:l]); err != nil {
+				return 0, err
+			}
+			return int(l), nil
+		}
 		var msg []byte
-		if n <= 64<<10 { // our own messages are <= 32 KiB; a larger one is not worth keeping a buffer for
-			if uint32(cap(g.rbuf)) < n {
+		if l <= 64<<10 { // our own messages are <= 32 KiB; a larger one is not worth keeping a buffer for
+			if uint32(cap(g.rbuf)) < uint32(l) {
 				g.rbuf = make([]byte, 64<<10)
 			}
-			msg = g.rbuf[:n]
+			msg = g.rbuf[:l]
 		} else {
-			msg = make([]byte, n)
+			msg = make([]byte, l)
 		}
 		if _, err := io.ReadFull(g.br, msg); err != nil {
 			return 0, err
 		}
-		if len(msg) == 0 {
-			continue
-		}
-		if msg[0] != 0x0a {
-			return 0, errors.New("grpc: unexpected field")
-		}
-		l, vn := binary.Uvarint(msg[1:])
-		if vn <= 0 || uint64(len(msg)-1-vn) != l {
-			return 0, errors.New("grpc: bad hunk")
-		}
-		g.rem = msg[1+vn:]
+		g.rem = msg
 	}
 	n := copy(p, g.rem)
 	g.rem = g.rem[n:]
