@@ -9,17 +9,77 @@
 #   Auto carrier (one token, Iran tests every connection type): auto-test NAME | auto-ip NAME IP |
 #                   auto-watch NAME | auto-retest NAME   (the last two are run by systemd, not by hand)
 #   CDN carriers (ws, wss, h2, h2c, grpc via Cloudflare; wattun >= 2.2.0): cdn-tune NAME [full]
-# Environment: WAT_NO_ANIM=1 (no animations), NO_COLOR=1 (no colours), WAT_REPO, WAT_PROXY.
+# Environment: WAT_NO_ANIM=1 (no animations), NO_COLOR=1 (no colours), WAT_REPO, WAT_PROXY, WAT_PREFIX (sandbox, see below).
 set -uo pipefail
 shopt -s extglob
 
-CONF=${WAT_CONF:-/etc/wattun}
-BIN=${WAT_BIN:-/usr/local/bin/wattun}
-MGR=/usr/local/bin/wattun-manager
+# Sandbox: WAT_PREFIX=NAME (default wattun) moves every path and unit name this manager creates or controls:
+#   $CONF=/etc/NAME  $RUN=/run/NAME  $AUTO_RUN=/run/NAME-auto  $BIN=/opt/NAME/wattun  units NAME@X, NAME-heal, NAME-autowatch-X.
+# WAT_CONF / WAT_BIN / WAT_RUN / WAT_AUTO_RUN still override single paths. The manager itself is then THIS script file.
+WAT_PREFIX=${WAT_PREFIX:-wattun}
+case "$WAT_PREFIX" in ''|-*|*[!A-Za-z0-9_.]*|*-) printf 'WAT_PREFIX must be letters, digits, "_" or "." and may contain "-" inside (got "%s").\n' "$WAT_PREFIX" >&2; exit 1 ;; esac
+SANDBOX=0; [ "$WAT_PREFIX" = wattun ] || SANDBOX=1
+CONF=${WAT_CONF:-/etc/$WAT_PREFIX}
+RUN=${WAT_RUN:-/run/$WAT_PREFIX}
+if [ "$SANDBOX" = 1 ]; then
+  BIN=${WAT_BIN:-/opt/$WAT_PREFIX/wattun}
+  MGR=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  # a sandbox must never share a path with the production install
+  if [ "$CONF" = /etc/wattun ] || [ "$BIN" = /usr/local/bin/wattun ] || [ "$RUN" = /run/wattun ]; then
+    printf 'Sandbox %s refuses to use a production path (CONF=%s BIN=%s RUN=%s MGR=%s).\n' "$WAT_PREFIX" "$CONF" "$BIN" "$RUN" "$MGR" >&2; exit 1
+  fi
+  export WAT_PREFIX
+else
+  BIN=${WAT_BIN:-/usr/local/bin/wattun}
+  MGR=/usr/local/bin/wattun-manager
+fi
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
-RUN=${WAT_RUN:-/run/wattun}
-HEAL_UNIT=wattun-heal
+HEAL_UNIT=$WAT_PREFIX-heal
 MCONF=$CONF/.manager.conf
+self_cmd() { # the command to type to start this manager (user-facing hints)
+  if [ "$SANDBOX" = 1 ]; then printf 'WAT_PREFIX=%s %s' "$WAT_PREFIX" "$MGR"; else printf wattun; fi
+}
+SELF=$(self_cmd)
+# Environment for units that call this manager again (heal timer, watcher, retest): same sandbox, same paths.
+unit_env_lines() { # Environment= lines for a service file
+  [ "$SANDBOX" = 1 ] && printf 'Environment="WAT_PREFIX=%s"\n' "$WAT_PREFIX"
+  [ -n "${WAT_CONF:-}" ] && printf 'Environment="WAT_CONF=%s"\n' "$WAT_CONF"
+  [ -n "${WAT_BIN:-}" ] && printf 'Environment="WAT_BIN=%s"\n' "$WAT_BIN"
+  [ -n "${WAT_RUN:-}" ] && printf 'Environment="WAT_RUN=%s"\n' "$WAT_RUN"
+  [ -n "${WAT_AUTO_RUN:-}" ] && printf 'Environment="WAT_AUTO_RUN=%s"\n' "$WAT_AUTO_RUN"
+  return 0
+}
+run_env_args() { # --setenv arguments for systemd-run, one per line (read with mapfile)
+  printf '%s\n' "--setenv=WAT_CONF=$CONF" "--setenv=WAT_RUN=$RUN" "--setenv=WAT_PREFIX=$WAT_PREFIX"
+  [ -n "${WAT_BIN:-}" ] || [ "$SANDBOX" = 1 ] && printf '%s\n' "--setenv=WAT_BIN=$BIN"
+  [ -n "${WAT_AUTO_RUN:-}" ] && printf '%s\n' "--setenv=WAT_AUTO_RUN=$WAT_AUTO_RUN"
+  return 0
+}
+# The systemd template unit NAME@.service. install.sh writes wattun@.service; in a sandbox the manager writes its own.
+ensure_template() {
+  [ "$SANDBOX" = 1 ] || return 0
+  local f="/etc/systemd/system/$WAT_PREFIX@.service"
+  [ -f "$f" ] && return 0
+  cat >"$f" <<EOF
+[Unit]
+Description=WatTunnel %i (sandbox $WAT_PREFIX)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$BIN -config $CONF/%i.yml
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$f" && systemctl daemon-reload && ok "Sandbox: created $f (ExecStart $BIN, configs in $CONF)"
+}
 LIB=${WAT_MANAGER_LIB:-0}
 
 case "$(locale charmap 2>/dev/null)" in UTF-8) ;; *) export LC_ALL=C.UTF-8 ;; esac
@@ -323,7 +383,7 @@ public_ip() { # prints a valid IPv4 or nothing
   return 0
 }
 new_key() { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40; }
-uptime_of() { local t; t=$(systemctl show "wattun@$1" -p ActiveEnterTimestamp --value 2>/dev/null); [ -n "$t" ] && echo "since $t" || echo "-"; }
+uptime_of() { local t; t=$(systemctl show "${WAT_PREFIX}@$1" -p ActiveEnterTimestamp --value 2>/dev/null); [ -n "$t" ] && echo "since $t" || echo "-"; }
 
 free_metrics_port() {
   local p=19700
@@ -487,7 +547,7 @@ is_reverse() { [ "$(cfg "$1" reverse)" = true ]; }
 # those copies and keeps ordinary pings answered. The tunnel's replies are raw-socket sends and are not limited.
 # Measured on the real path: without it OutEchoReps = 2 x InEchos. The old values are kept and restored when the
 # last reverse Iran tunnel is gone.
-KREPLY_CONF=/etc/sysctl.d/90-wattun-reverse.conf
+KREPLY_CONF=/etc/sysctl.d/90-$WAT_PREFIX-reverse.conf
 kreply_on() { [ -f "$KREPLY_CONF" ]; }
 kreply_apply() {
   local mask lim
@@ -516,6 +576,7 @@ kreply_needed() { ! kreply_on && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>
 kreply_offer() {
   kreply_needed || return 0
   hint "Reverse mode: Linux here also answers every tunnel packet with a full-size copy, doubling this server's upload."
+  [ "$SANDBOX" = 1 ] && warn "Sandbox: this changes GLOBAL kernel settings (net.ipv4.icmp_ratemask |= 16385, icmp_ratelimit = 100) via $KREPLY_CONF; original values saved in $CONF/.kreply.orig."
   step "Limiting the kernel's ping replies (normal pings keep working)" kreply_apply \
     && hint "Undo: remove $KREPLY_CONF and run: sysctl --system (it is also undone when the last reverse Iran tunnel is deleted)."
   return 0
@@ -629,7 +690,7 @@ conn_diagram() { # carrier canonical... : users ──► Iran :8443 ══ icmp
 TI_STATE=stopped; TI_RTT=0; TI_STREAMS=0; TI_SESS=0; TI_IN=0; TI_OUT=0; TI_RATE=0; TI_RAW=''
 tinfo() { # name -> TI_*  (state: up | down | stopped)
   TI_STATE=stopped; TI_RTT=0; TI_STREAMS=0; TI_SESS=0; TI_IN=0; TI_OUT=0; TI_RATE=0; TI_RAW=''
-  systemctl is-active -q "wattun@$1" 2>/dev/null || return 0
+  systemctl is-active -q "${WAT_PREFIX}@$1" 2>/dev/null || return 0
   TI_RAW=$(stats "$1")
   if [ "$(jget "$TI_RAW" alive)" = true ]; then TI_STATE=up; else TI_STATE=down; fi
   TI_RTT=$(jget "$TI_RAW" srtt_ms); TI_STREAMS=$(jget "$TI_RAW" streams); TI_SESS=$(jget "$TI_RAW" sessions)
@@ -685,7 +746,7 @@ dash_table() {
   if [ "${#DASH_N[@]}" -eq 0 ]; then
     printf '  %sWelcome! No tunnels yet. A tunnel needs two servers, set up in this order:%s\n\n' "$BOLD" "$RST"
     step_diagram
-    printf '\n  %sStep 1%s  on Kharej: run %swattun%s, press %s[n]%s, choose Kharej.\n' "$BOLD" "$RST" "$CYN" "$RST" "$CYN" "$RST"
+    printf '\n  %sStep 1%s  on Kharej: run %s%s%s, press %s[n]%s, choose Kharej.\n' "$BOLD" "$RST" "$CYN" "$SELF" "$RST" "$CYN" "$RST"
     printf '  %sStep 2%s  on Iran: press %s[n]%s, choose Iran, paste the token from step 1.\n\n' "$BOLD" "$RST" "$CYN" "$RST"
     printf '  Press %s[n]%s to create your first tunnel.\n' "$CYN$BOLD" "$RST"
     return 0
@@ -738,16 +799,17 @@ fw_close() { # "443/tcp 53/udp" ... : mirror of fw_open, never asks
 }
 unit_up() { # name : enable + start, wait up to 10 s for "active"
   local i
-  systemctl enable --now "wattun@$1" || return 1
+  ensure_template || return 1
+  systemctl enable --now "${WAT_PREFIX}@$1" || return 1
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    systemctl is-active -q "wattun@$1" && { sleep 1; systemctl is-active -q "wattun@$1" && return 0; }
+    systemctl is-active -q "${WAT_PREFIX}@$1" && { sleep 1; systemctl is-active -q "${WAT_PREFIX}@$1" && return 0; }
     sleep 0.5
   done
   return 1
 }
 start_unit() { # name : with feedback
-  if step "Starting wattun@$1" unit_up "$1"; then return 0; fi
-  err "Tunnel '$1' failed to start. Last log lines:"; journalctl -u "wattun@$1" -n 15 --no-pager -o cat 2>/dev/null; return 1
+  if step "Starting ${WAT_PREFIX}@$1" unit_up "$1"; then return 0; fi
+  err "Tunnel '$1' failed to start. Last log lines:"; journalctl -u "${WAT_PREFIX}@$1" -n 15 --no-pager -o cat 2>/dev/null; return 1
 }
 link_alive() { [ "$(jget "$(stats "$1")" alive)" = true ]; }
 wait_link() { # name seconds : spinner + progress bar while waiting for the link
@@ -759,7 +821,7 @@ wait_link() { # name seconds : spinner + progress bar while waiting for the link
       LINK_RTT=$(ms "$(jget "$(stats "$n")" srtt_ms)"); return 0
     fi
     el=$((SECONDS-t0))
-    if [ "$el" -ge "$max" ] || ! systemctl is-active -q "wattun@$n" 2>/dev/null; then break; fi
+    if [ "$el" -ge "$max" ] || ! systemctl is-active -q "${WAT_PREFIX}@$n" 2>/dev/null; then break; fi
     if [ "$ANIM" = 1 ]; then
       for f in 1 2 3 4; do
         printf '\r\e[K  %s%s%s Waiting for the link  [%s]  %ds / %ds' "$CYN" "${SPIN_FR[$((i%10))]}" "$RST" "$(bar "$el" "$max" 20)" "$el" "$max"
@@ -1094,9 +1156,9 @@ wizard_kharej() {
   printf '%s%s%s\n\n' "$BOLD$YEL" "$(cat "$CONF/$name.token")" "$RST"
   step_diagram 2
   echo
-  say "  ${BOLD}Now, STEP 2${RST}: on the ${BOLD}Iran${RST} server run ${CYN}wattun${RST}, press ${CYN}[n]${RST},"
+  say "  ${BOLD}Now, STEP 2${RST}: on the ${BOLD}Iran${RST} server run ${CYN}${SELF}${RST}, press ${CYN}[n]${RST},"
   say "  choose Iran and paste the token."
-  hint "Show it again any time: wattun token $name"
+  hint "Show it again any time: $SELF token $name"
   warn "The token contains the key. Share it only over a private channel."
 }
 
@@ -1115,7 +1177,7 @@ wizard_iran() {
     echo
     say "  ${BOLD}Get the token first${RST}"
     say "    1. Log in to the ${BOLD}Kharej${RST} (outside) server"
-    say "    2. Run  ${CYN}wattun${RST}  then press ${CYN}[n]${RST} and choose ${BOLD}Kharej${RST}"
+    say "    2. Run  ${CYN}${SELF}${RST}  then press ${CYN}[n]${RST} and choose ${BOLD}Kharej${RST}"
     say "    3. Copy the token it prints (one long line starting with ${BOLD}wat1:${RST})"
     echo
     printf '  %s[Enter]%s I have it now   %s[m]%s enter the details by hand (advanced)   %s[q]%s go back\n  ' "$CYN" "$RST" "$CYN" "$RST" "$CYN" "$RST"
@@ -1273,10 +1335,10 @@ wizard_iran() {
   echo
   fw_open "${new_pub[*]}"
   if ! systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null; then
-    heal_enable >/dev/null && ok "Auto-heal enabled (turn off: wattun → s settings → h)"
+    heal_enable >/dev/null && ok "Auto-heal enabled (turn off: $SELF → s settings → h)"
   fi
   echo
-  hint "Manage this tunnel any time: wattun"
+  hint "Manage this tunnel any time: $SELF"
 }
 
 # ======================================================================================
@@ -1285,7 +1347,7 @@ wizard_iran() {
 #    is known). Iran: auto_test runs one throw-away client per variant and uses the built-in /speedtest.
 #    Token field 9 (the plan): "d=udp:4443,tcp:4443,...;r=tcp:24431,..." (see make_token).
 # ======================================================================================
-AUTO_RUN=${WAT_AUTO_RUN:-/run/wattun-auto}
+AUTO_RUN=${WAT_AUTO_RUN:-/run/$WAT_PREFIX-auto}
 AUTO_RPLAN='tcp:24431,tls:24432,ws:24433,wss:24434,h2:24435,h2c:24436,grpc:24437'
 AUTO_D=''; AUTO_NOTE=''; AUTO_ADDR=''
 plan_part() { # plan d|r -> "udp:4443,tcp:4443,..."
@@ -1374,17 +1436,18 @@ ask_public_addr() { # -> AUTO_ADDR ; rc 1 when cancelled
   AUTO_ADDR=$addr
 }
 start_watcher() { # name : transient unit that waits for Iran's first connection, then writes NAME-r
-  local u="wattun-autowatch-$1" m=$MGR
+  local u="${WAT_PREFIX}-autowatch-$1" m=$MGR renv
+  mapfile -t renv < <(run_env_args)
   [ -x "$m" ] || m=$(readlink -f "$0")
   systemctl stop "$u.service" >/dev/null 2>&1; systemctl reset-failed "$u.service" >/dev/null 2>&1
-  systemd-run --quiet --collect --unit "$u" --property=RuntimeMaxSec=3600 --setenv="WAT_CONF=$CONF" --setenv="WAT_RUN=$RUN" \
+  systemd-run --quiet --collect --unit "$u" --property=RuntimeMaxSec=3600 "${renv[@]}" \
     "$m" auto-watch "$1" >/dev/null 2>&1
 }
 wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the carrier is "auto"
   local name=$1 n=1 cdn='' key m allow plan c p cars='' fwl='' ver line
   ver=$(bin_ver)
   if ! ver_ge "${ver:-0}" 2.1.0; then
-    err "Auto needs wattun 2.1.0 or newer on this server (found ${ver:-none})."; hint "Update first: wattun update"; return 1
+    err "Auto needs wattun 2.1.0 or newer on this server (found ${ver:-none})."; hint "Update first: $SELF update"; return 1
   fi
   command -v systemd-run >/dev/null 2>&1 || { err "Auto needs systemd (systemd-run) on this server."; return 1; }
   while { [ -e "$CONF/$name.yml" ] || [ -e "$CONF/$name-r.yml" ]; } && [ "$n" -lt 99 ]; do n=$((n+1)); name="kharej-$n"; done
@@ -1443,7 +1506,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   fw_open "${fwl# }"
   hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."
   start_watcher "$name" && ok "Watching for Iran (creates ${name}-r by itself, no action needed)" \
-    || warn "Could not start the watcher. After Iran connects run: wattun auto-ip $name IRAN_IP"
+    || warn "Could not start the watcher. After Iran connects run: $SELF auto-ip $name IRAN_IP"
 
   echo
   celebrate "Kharej auto tunnel '$name' is ready"
@@ -1454,8 +1517,8 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   step_diagram 2
   echo
   say "  ${BOLD}Now paste this token on Iran.${RST} It tests every connection type by itself (about 2-3 minutes)."
-  hint "Show it again any time: wattun token $name"
-  hint "If the reverse tests fail because this server never learned Iran's IP: wattun auto-ip $name IRAN_IP"
+  hint "Show it again any time: $SELF token $name"
+  hint "If the reverse tests fail because this server never learned Iran's IP: $SELF auto-ip $name IRAN_IP"
   warn "The token contains the key. Share it only over a private channel."
 }
 
@@ -1486,9 +1549,10 @@ companion_create() { # name ip
     maps_yaml_block
   } >"$tmp"
   chmod 600 "$tmp"; mv -f "$tmp" "$f"; umask "$old"
-  systemctl enable "wattun@$r" >/dev/null 2>&1
-  systemctl restart "wattun@$r" >/dev/null 2>&1
-  logger -t wattun-auto "learned Iran IP $ip for $n; started wattun@$r (reverse side)"
+  ensure_template >/dev/null
+  systemctl enable "${WAT_PREFIX}@$r" >/dev/null 2>&1
+  systemctl restart "${WAT_PREFIX}@$r" >/dev/null 2>&1
+  logger -t wattun-auto "learned Iran IP $ip for $n; started ${WAT_PREFIX}@$r (reverse side)"
   return 0
 }
 auto_watch() { # name : run by systemd-run; poll /stats clients, write the companion on the first usable Iran client
@@ -1515,9 +1579,9 @@ auto_watch() { # name : run by systemd-run; poll /stats clients, write the compa
 auto_ip() { # name ip : the manual fallback of auto_watch
   local n=$1 ip=${2:-}
   is_auto_kharej "$n" || { err "'$n' is not an auto Kharej tunnel."; return 1; }
-  ipv4_ok "$ip" || { err "Usage: wattun auto-ip $n IRAN_IPV4"; return 1; }
+  ipv4_ok "$ip" || { err "Usage: $SELF auto-ip $n IRAN_IPV4"; return 1; }
   companion_create "$n" "$ip" || return 1
-  systemctl stop "wattun-autowatch-$n.service" >/dev/null 2>&1
+  systemctl stop "${WAT_PREFIX}-autowatch-$n.service" >/dev/null 2>&1
   ok "Reverse side ${n}-r is set for Iran $ip. Run the test again on Iran."
 }
 
@@ -1577,6 +1641,7 @@ at_kill() { # the single probe client and every client of the reverse batch
 }
 at_fw_open() { # port/tcp : temporary rule for a reverse test port (firewalld: runtime only)
   local fw p=$1; fw=$(fw_kind); [ -n "$fw" ] || return 0
+  [ "$SANDBOX" = 1 ] && hint "Sandbox: test port $p is opened in $fw if not already allowed, and closed when the test ends."
   if [ "$fw" = ufw ]; then
     ufw status 2>/dev/null | grep -q "^$p[[:space:]]" && return 0
     ufw allow "$p" >/dev/null 2>&1 && AT_FW="$AT_FW $p"
@@ -1833,7 +1898,7 @@ at_none() { # nothing worked
   if [ "$AT_DLINK" = 0 ]; then
     echo
     warn "Kharej may not know this server's IP yet, so the reverse side may never have started."
-    hint "On Kharej run:  wattun auto-ip <kharej tunnel name> $(public_ip)"
+    hint "On Kharej run:  $SELF auto-ip <kharej tunnel name> $(public_ip)"
     hint "then run the test again: ${AT_AGAIN:-paste the token again on this server}"
   fi
   hint "Also check: the Kharej tunnel is running, the key is current (paste the token again), and Kharej's cloud firewall."
@@ -1880,7 +1945,7 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
     k=${l%%: *}; v=${l#*: }; set_value "$n" "$k" "$v"
   done <<<"$AT_EXTRA"
   l=$(ech_cache_line "$n"); if [ -n "$l" ]; then set_value "$n" ech-cache "${l#*: }"; fi
-  step "Restarting wattun@$n" systemctl restart "wattun@$n"
+  step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
   [ -n "$rport" ] && fw_open "$rport/tcp"
   [ "$oldpool" = 1 ] && [ -n "$ol" ] && [ "$ol" != "$rport" ] && fw_close "$ol/tcp"
   if [ "$T_CARRIER" = icmp ] && [ "$T_REV" = 1 ]; then
@@ -1896,7 +1961,7 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   fi
   if ! { read_token "$(cat "$CONF/$n.auto")" && [ -n "$T_AUTO" ]; }; then err "$CONF/$n.auto is not a valid auto token."; return 1; fi
   cur=$(auto_current_key "$n")
-  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN="wattun auto-test $n"
+  AT_QUIET=0; AT_MB=2; AT_SKIP=''; AT_AGAIN="$SELF auto-test $n"
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac # its own port / ICMP are in use by the running tunnel
   page "Auto test" "$n"
   hint "Current: $cur. The running tunnel is not touched until you choose."
@@ -1936,13 +2001,14 @@ auto_retest() { # name : unattended (auto-heal): 1 MB tests, switch only if the 
   return 0
 }
 heal_retest() { # name : at most once per 30 min, in a transient unit so it outlives the heal run
-  local n=$1 stamp="$RUN/$1.retest" m=$MGR
+  local n=$1 stamp="$RUN/$1.retest" m=$MGR renv
+  mapfile -t renv < <(run_env_args)
   [ -n "$(find "$stamp" -mmin -30 2>/dev/null)" ] && return 0
   command -v systemd-run >/dev/null 2>&1 || return 0
   [ -x "$m" ] || m=$(readlink -f "$0")
   touch "$stamp"
   logger -t wattun-heal "tunnel $n still down after restarts, testing the other connection types"
-  systemd-run --quiet --collect --unit "wattun-autoretest-$n" --setenv="WAT_CONF=$CONF" --setenv="WAT_RUN=$RUN" \
+  systemd-run --quiet --collect --unit "${WAT_PREFIX}-autoretest-$n" "${renv[@]}" \
     "$m" auto-retest "$n" >/dev/null 2>&1
   return 0
 }
@@ -2225,8 +2291,8 @@ cdn_apply() { # name : write T_PEER, T_SNI and AT_EXTRA (fp / ech / tls-frag) in
     k=${l%%: *}; v=${l#*: }; set_value "$n" "$k" "$v"
   done <<<"$AT_EXTRA"
   l=$(ech_cache_line "$n"); if [ -n "$l" ]; then set_value "$n" ech-cache "${l#*: }"; fi
-  if [ "$AT_QUIET" = 1 ]; then systemctl restart "wattun@$n" >/dev/null 2>&1; return 0; fi
-  step "Restarting wattun@$n" systemctl restart "wattun@$n"
+  if [ "$AT_QUIET" = 1 ]; then systemctl restart "${WAT_PREFIX}@$n" >/dev/null 2>&1; return 0; fi
+  step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
   wait_link "$n" 25 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
 }
 cdn_load_t() { # name -> T_CARRIER T_PEER T_KEY T_PATH T_SNI from NAME.yml ; rc 1 when it is not a CDN tunnel
@@ -2241,7 +2307,7 @@ cdn_load_t() { # name -> T_CARRIER T_PEER T_KEY T_PATH T_SNI from NAME.yml ; rc 
 cdn_tune_cmd() { # name [full] : re-run the CDN tuning for an Iran CDN tunnel, show the table, apply the best
   local n=$1 full=0 cur new
   [ "${2:-}" = full ] && full=1
-  cdn_ok || { err "CDN tuning needs wattun $CDN_MINVER or newer (this is $(bin_ver)). Run: wattun update"; return 1; }
+  cdn_ok || { err "CDN tuning needs wattun $CDN_MINVER or newer (this is $(bin_ver)). Run: $SELF update"; return 1; }
   cdn_load_t "$n" || { err "'$n' is not an Iran tunnel on a CDN carrier (ws, wss, h2, h2c, grpc) with a domain."; return 1; }
   cur=$(cfg "$n" peer)/$(cfg "$n" fp)/$(cfg "$n" ech)/$(cfg "$n" tls-frag)
   page "CDN tune" "$n"
@@ -2287,7 +2353,7 @@ cdn_refresh_edges() { # name : unattended (auto-heal): same scan as cdn-tune (th
   new=$(cdn_peer_list "$port")
   logger -t wattun-heal "cdn scan for $n: replacing dead edges, peer is now $new"
   set_value "$n" peer "$new" 2>/dev/null
-  systemctl restart "wattun@$n" >/dev/null 2>&1
+  systemctl restart "${WAT_PREFIX}@$n" >/dev/null 2>&1
   return 0
 }
 # short CDN settings of an Iran tunnel: "wss · chrome · 3 edges" (second argument "short": "chrome · 3 edges"); nothing when default
@@ -2402,7 +2468,7 @@ icmp_path_report() { # name host
     hint "Either ICMP is blocked on the route, or Kharej drops it (cloud firewall, or net.ipv4.icmp_echo_ignore_all=1 there)."
     hint "Allow ICMP on Kharej's cloud firewall. If the route itself blocks ICMP right now, no ICMP tunnel can work until it opens;"
     hint "the tunnel reconnects by itself when it does (keep auto-heal on). Meanwhile, switch both sides to another carrier:"
-    hint "wattun → Kharej setup / Iran setup with udp, tcp or wss."
+    hint "$SELF → Kharej setup / Iran setup with udp, tcp or wss."
     hint "${BOLD}One-way block?${RST}${GRY} If Kharej CAN ping this server (run Diagnose on Kharej to check), the block is only on"
     hint "Iran's own pings. Switch BOTH sides to reverse ICMP: tunnel → Advanced settings → d (direction)."
   elif [ -n "$bad_sizes" ] && [ "$maxok" -lt 256 ]; then
@@ -2410,11 +2476,11 @@ icmp_path_report() { # name host
     hint "An ICMP tunnel cannot work on this route. Use another carrier (udp, tcp, wss) on both sides."
   elif [ -n "$bad_sizes" ] && [ "$maxok" -lt 640 ]; then
     err "Small packets pass, big ones do not: the route drops packets larger than about $maxok bytes."
-    hint "Set the same smaller size on BOTH sides: add  mtu: $maxok  to /etc/wattun/NAME.yml on Kharej and Iran, then restart both."
+    hint "Set the same smaller size on BOTH sides: add  mtu: $maxok  to $CONF/NAME.yml on Kharej and Iran, then restart both."
   elif [ "$pout" -gt 0 ] && [ "$pin" -eq 0 ]; then
     err "Ping works at every size, but the tunnel's own packets get no answer."
     hint "Check, in this order: 1) both sides have the SAME key (paste the Kharej token on Iran again), 2) the same carrier and icmp-type,"
-    hint "3) the Kharej tunnel is running ('wattun status' there), 4) try icmp-type: timestamp on BOTH sides (some filters only"
+    hint "3) the Kharej tunnel is running ('$SELF status' there), 4) try icmp-type: timestamp on BOTH sides (some filters only"
     hint "pass plain echo, others only pass other ICMP types), 5) otherwise use another carrier (udp, tcp, wss)."
   elif [ "$pin" -gt 0 ]; then
     warn "Ping works and the tunnel did receive packets earlier, but it is silent now."
@@ -2430,8 +2496,8 @@ test_tunnel() {
   echo
   say "  ${BOLD}Diagnosing '$n'${RST} ($r · $cr)"
   echo
-  if systemctl is-active -q "wattun@$n"; then ok "Service is running"
-  else err "Service is not running"; journalctl -u "wattun@$n" -n 10 --no-pager -o cat 2>/dev/null; return; fi
+  if systemctl is-active -q "${WAT_PREFIX}@$n"; then ok "Service is running"
+  else err "Service is not running"; journalctl -u "${WAT_PREFIX}@$n" -n 10 --no-pager -o cat 2>/dev/null; return; fi
   if [ "$r" = Iran ]; then
     host=${peer%:*}; port=${peer##*:}; [ "$host" = "$peer" ] && port=''
     if [ "$cr" = icmp ] && is_reverse "$n"; then
@@ -2472,8 +2538,8 @@ test_tunnel() {
   fi
   if [ "$r" = Kharej ] && [ "$(jget "$s" alive)" != true ]; then
     local seen idle
-    seen=$(journalctl -u "wattun@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'new client session')
-    idle=$(journalctl -u "wattun@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'idle, closing')
+    seen=$(journalctl -u "${WAT_PREFIX}@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'new client session')
+    idle=$(journalctl -u "${WAT_PREFIX}@$n" --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -c 'idle, closing')
     echo
     if [ "$seen" -gt 0 ]; then
       warn "Iran reached this server $seen time(s) in the last 6 hours and went silent $idle time(s)."
@@ -2527,7 +2593,7 @@ test_tunnel() {
   fi
   if [ "$r" = Iran ] && [ "$cr" = icmp ] && is_reverse "$n" && kreply_needed; then
     echo; warn "The kernel here answers every tunnel packet with a copy (wasted upload)."
-    if [ -t 0 ]; then kreply_offer; else hint "Fix: wattun → this tunnel → o → d (or see docs: Reverse ICMP)."; fi
+    if [ -t 0 ]; then kreply_offer; else hint "Fix: $SELF → this tunnel → o → d (or see docs: Reverse ICMP)."; fi
   fi
   while IFS= read -r it; do
     [ -n "$it" ] || continue
@@ -2541,7 +2607,7 @@ test_tunnel() {
   done < <(yml_maps "$n")
   if [ "$r" = Iran ] && [ "$(jget "$s" alive)" = true ]; then speed_test "$n"
   elif [ "$r" = Kharej ]; then echo; hint "Speed test: run Diagnose on the Iran side (it tests both directions)."; fi
-  e=$(journalctl -u "wattun@$n" -n 200 --no-pager -o cat 2>/dev/null | grep -iE "error|fail|denied|refused|restart needed" | tail -5)
+  e=$(journalctl -u "${WAT_PREFIX}@$n" -n 200 --no-pager -o cat 2>/dev/null | grep -iE "error|fail|denied|refused|restart needed" | tail -5)
   [ -n "$e" ] && { echo; warn "Recent problems in the log:"; printf '%s\n' "$e" | sed "s/^/      $GRY/; s/\$/$RST/"; }
   return 0
 }
@@ -2568,7 +2634,7 @@ speed_test() { # name [mb]
     else
       er=$(grep -o '"error":"[^"]*"' <<<"$r" | cut -d'"' -f4)
       printf '  %s✘%s %s  %sfailed%s  %s\n' "$RED" "$RST" "$label" "$RED" "$RST" "${er:-unknown error}"
-      [[ "$er" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it (wattun update) and restart its tunnel."
+      [[ "$er" == *"1.8.1"* ]] && warn "Kharej runs an older wattun: update it ($SELF update) and restart its tunnel."
     fi
   done
 }
@@ -2581,10 +2647,10 @@ logs_menu() {
   printf '  %s?%s Choice %s[1]%s ' "$CYN" "$RST" "$GRY" "$RST"
   key_read; echo; echo
   case "$KEY" in
-    1|enter) journalctl -u "wattun@$n" -n 100 --no-pager -o short-iso ;;
-    2) journalctl -u "wattun@$n" -f -o short-iso ;;
-    3) journalctl -u "wattun@$n" -n 2000 --no-pager -o short-iso | grep -iE "error|fail|denied|refused|lost|restart" | tail -50 ;;
-    4) journalctl -u "wattun@$n" -b --no-pager -o short-iso | tail -200 ;;
+    1|enter) journalctl -u "${WAT_PREFIX}@$n" -n 100 --no-pager -o short-iso ;;
+    2) journalctl -u "${WAT_PREFIX}@$n" -f -o short-iso ;;
+    3) journalctl -u "${WAT_PREFIX}@$n" -n 2000 --no-pager -o short-iso | grep -iE "error|fail|denied|refused|lost|restart" | tail -50 ;;
+    4) journalctl -u "${WAT_PREFIX}@$n" -b --no-pager -o short-iso | tail -200 ;;
     *) return 0 ;;
   esac
 }
@@ -2644,7 +2710,7 @@ live_monitor() {
 status_all() { # plain, scriptable list
   local n any=0
   for n in $(tunnels); do any=1; status_row "$n"; done
-  [ "$any" = 1 ] || { warn "No tunnels yet. Start with Kharej: run wattun and press n."; return 1; }
+  [ "$any" = 1 ] || { warn "No tunnels yet. Start with Kharej: run $SELF and press n."; return 1; }
 }
 status_row() {
   local n=$1 r cr load
@@ -2664,8 +2730,8 @@ tunnel_card() {
   elif is_auto_kharej "$n"; then
     line="$SC_COL$SC_DOT $SC_TXT$RST   $r · auto (every carrier at once)"
     if [ -f "$CONF/$n-r.yml" ]; then sub="reverse side: $n-r (Iran $(cfg "$n-r" peer-icmp))"
-    elif systemctl is-active -q "wattun-autowatch-$n.service" 2>/dev/null; then sub="watching for Iran's first connection (then $n-r is created)"
-    else sub="Iran's IP not learned yet: wattun auto-ip $n IRAN_IP"; fi
+    elif systemctl is-active -q "${WAT_PREFIX}-autowatch-$n.service" 2>/dev/null; then sub="watching for Iran's first connection (then $n-r is created)"
+    else sub="Iran's IP not learned yet: $SELF auto-ip $n IRAN_IP"; fi
   elif [ "$cr" = icmp ] && is_reverse "$n"; then
     if [ "$r" = Iran ]; then line="$line (reverse) ← pinged by ${peer:--}"; else line="$line (reverse) → pings Iran ${peer:--}"; fi
   elif is_pool "$cr" && is_reverse "$n"; then
@@ -2674,7 +2740,7 @@ tunnel_card() {
   box_row "$line"
   [ -n "$sub" ] && box_row "${GRY}$sub${RST}"
   sub=$(cdn_summary "$n"); [ -n "$sub" ] && box_row "${GRY}CDN: $sub${RST}"
-  box_row "${GRY}service $(systemctl is-active "wattun@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "wattun@$n" 2>/dev/null | head -1)${RST}"
+  box_row "${GRY}service $(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "${WAT_PREFIX}@$n" 2>/dev/null | head -1)${RST}"
   if [ "$TI_STATE" != stopped ]; then
     box_row "rtt $(ms "$TI_RTT") ms (min $(ms "$(jget "$TI_RAW" min_rtt_ms)"))   rate $(human "$TI_RATE")/s   loss $(jget "$TI_RAW" loss_pct)%   retrans $(jget "$TI_RAW" retrans)"
     box_row "streams $TI_STREAMS   clients $TI_SESS   udp flows $(jget "$TI_RAW" dgram_flows)   ↓$(human "$TI_IN") ↑$(human "$TI_OUT")"
@@ -2693,7 +2759,7 @@ edit_ports() { # name
   load_maps "$n"; old=("${MAPS[@]+"${MAPS[@]}"}")
   PE_ROLE=$r; PE_TUNNEL=$n; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
   for it in ${old[@]+"${old[@]}"}; do PE_OWNED+=("$(spec_L "$it")/$(spec_P "$it")"); done
-  systemctl is-active -q "wattun@$n" 2>/dev/null || PE_OWNED=()
+  systemctl is-active -q "${WAT_PREFIX}@$n" 2>/dev/null || PE_OWNED=()
   port_editor || { warn "No changes saved."; return 0; }
   write_ports "$n" || { err "Could not write the config."; return 1; }
   [ "$r" = Kharej ] && refresh_token "$n"
@@ -2734,7 +2800,7 @@ change_peer() {
     v="${v%:*}:$np"
   fi
   set_value "$n" peer "$v"
-  step "Restarting wattun@$n" systemctl restart "wattun@$n" || return 1
+  step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n" || return 1
   wait_link "$n" 20 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
 }
 change_key() {
@@ -2746,8 +2812,8 @@ change_key() {
     if [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
       make_token "$T_CARRIER" "$T_PEER" "$k" "$T_PATH" "$T_SNI" "$T_ICMP" "$T_PORTS" "$T_REV" "$T_AUTO" >"$CONF/$n.token"
     fi
-    step "Restarting wattun@$n" systemctl restart "wattun@$n"
-    [ -f "$CONF/$n-r.yml" ] && is_auto_kharej "$n" && step "Restarting wattun@$n-r" systemctl restart "wattun@$n-r"
+    step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
+    [ -f "$CONF/$n-r.yml" ] && is_auto_kharej "$n" && step "Restarting ${WAT_PREFIX}@$n-r" systemctl restart "${WAT_PREFIX}@$n-r"
     echo; ok "New token (paste it on every Iran server):"; echo
     show_token "$n"
   else
@@ -2756,12 +2822,12 @@ change_key() {
     if [ "$T_CARRIER" = auto ]; then # new auto token: keep the key and token, the variant is chosen by the test
       printf '%s\n' "$T_KEY" >"$CONF/$n.key"
       ( umask 077; printf '%s\n' "$t" >"$CONF/$n.auto" ); chmod 600 "$CONF/$n.auto"
-      step "Restarting wattun@$n" systemctl restart "wattun@$n"
-      hint "This is an auto token. Test again and pick the best connection: wattun auto-test $n"
+      step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
+      hint "This is an auto token. Test again and pick the best connection: $SELF auto-test $n"
       return 0
     fi
     printf '%s\n' "$T_KEY" >"$CONF/$n.key"; set_value "$n" peer "$T_PEER"
-    step "Restarting wattun@$n" systemctl restart "wattun@$n" || return 1
+    step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n" || return 1
     wait_link "$n" 20 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
   fi
 }
@@ -2771,12 +2837,12 @@ delete_tunnel() {
   ask "Type the tunnel name to confirm (empty = cancel)" ""
   [ "$REPLY_V" = "$n" ] || { warn "Not deleted."; return 1; }
   if [ -f "$CONF/$n-r.yml" ] && is_auto_kharej "$n"; then # the auto reverse companion goes with its parent
-    systemctl disable --now "wattun@$n-r" >/dev/null 2>&1
+    systemctl disable --now "${WAT_PREFIX}@$n-r" >/dev/null 2>&1
     rm -f "$CONF/$n-r".yml "$CONF/$n-r".ech
     ok "Reverse side '$n-r' deleted."
   fi
-  systemctl stop "wattun-autowatch-$n.service" >/dev/null 2>&1
-  systemctl disable --now "wattun@$n" >/dev/null 2>&1
+  systemctl stop "${WAT_PREFIX}-autowatch-$n.service" >/dev/null 2>&1
+  systemctl disable --now "${WAT_PREFIX}@$n" >/dev/null 2>&1
   rm -f "$CONF/$n".yml "$CONF/$n".ech "$CONF/$n".key "$CONF/$n".token "$CONF/$n".auto "$RUN/$n.down" "$RUN/$n.cycles" "$RUN/$n.retest"
   ok "Tunnel '$n' deleted."
   reverse_iran_left || kreply_restore
@@ -2875,7 +2941,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
          if [ "$REPLY_V" = echo ]; then unset_value "$n" icmp-type; else set_value "$n" icmp-type "$REPLY_V"; fi; changed=1 ;;
       d) rev_capable "$cr" || continue; echo
          # applied at once, so the direction never sits in the file without running
-         set_direction "$n" && step "Restarting wattun@$n" systemctl restart "wattun@$n"
+         set_direction "$n" && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
          pause ;;
       b|0|q|enter|esc) break ;;
       *) : ;;
@@ -2884,7 +2950,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
   # Every setting here needs a restart; apply it automatically (an unapplied change only logs "restart needed").
   if [ "$changed" = 1 ]; then
     hint "Applying: restarting '$n' (open connections drop and reconnect)."
-    step "Restarting wattun@$n" systemctl restart "wattun@$n"
+    step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
   fi
   return 0
 }
@@ -2896,7 +2962,7 @@ tunnel_page() {
     r=$(role "$n")
     page "Tunnel $n" "$r"
     tunnel_card "$n"
-    run=$(systemctl is-active "wattun@$n" 2>/dev/null)
+    run=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null)
     echo
     printf '  %sStatus%s      %s diagnose + speed test   %s speed test only   %s logs\n' "$BOLD" "$RST" "$(key_label d)" "$(key_label v)" "$(key_label l)"
     printf '  %sPorts%s       %s edit port mappings\n' "$BOLD" "$RST" "$(key_label p)"
@@ -2911,21 +2977,21 @@ tunnel_page() {
       l) page "Logs" "$n"; run_flow logs_menu "$n"; pause ;;
       p) run_flow edit_ports "$n"; pause ;;
       t) if [ "$r" = Kharej ]; then
-           page "Token" "$n"; echo; say "  Paste this on the Iran server (wattun → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
+           page "Token" "$n"; echo; say "  Paste this on the Iran server ($SELF → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
          else page "New token" "$n"; echo; run_flow change_key "$n"; fi
          pause ;;
       k) [ "$r" = Kharej ] && { page "New key" "$n"; run_flow change_key "$n"; pause; } ;;
       a) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
       o) run_flow adv_menu "$n" ;;
-      r) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting wattun@$n" systemctl restart "wattun@$n"; sleep 1; fi ;;
+      r) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; sleep 1; fi ;;
       s) echo
-         if [ "$run" = active ]; then systemctl stop "wattun@$n" 2>/dev/null; ok "Stopped (it still starts at boot if enabled)."; sleep 1
+         if [ "$run" = active ]; then systemctl stop "${WAT_PREFIX}@$n" 2>/dev/null; ok "Stopped (it still starts at boot if enabled)."; sleep 1
          else start_unit "$n"; sleep 1; fi ;;
       e) echo
-         if systemctl is-enabled -q "wattun@$n" 2>/dev/null; then systemctl disable "wattun@$n" >/dev/null 2>&1; ok "Will NOT start at boot."
-         else systemctl enable "wattun@$n" >/dev/null 2>&1; ok "Will start at boot."; fi
+         if systemctl is-enabled -q "${WAT_PREFIX}@$n" 2>/dev/null; then systemctl disable "${WAT_PREFIX}@$n" >/dev/null 2>&1; ok "Will NOT start at boot."
+         else systemctl enable "${WAT_PREFIX}@$n" >/dev/null 2>&1; ok "Will start at boot."; fi
          sleep 1 ;;
-      c) ${EDITOR:-nano} "$CONF/$n.yml"; echo; confirm "Restart to apply? (port changes apply without restart)" n && step "Restarting wattun@$n" systemctl restart "wattun@$n" ;;
+      c) ${EDITOR:-nano} "$CONF/$n.yml"; echo; confirm "Restart to apply? (port changes apply without restart)" n && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n" ;;
       x|X) page "Delete tunnel" "$n"; echo; run_flow delete_tunnel "$n"; pause ;;
       b|0|q|enter|esc) return 0 ;;
       *) : ;;
@@ -2937,13 +3003,13 @@ tunnel_page() {
 #  Auto-heal, update, rollback, uninstall, settings
 # ======================================================================================
 heal_enable() {
-  cat >"/etc/systemd/system/$HEAL_UNIT.service" <<EOF
-[Unit]
-Description=WatTunnel auto-heal
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/wattun-manager heal
-EOF
+  local mgr=/usr/local/bin/wattun-manager
+  [ "$SANDBOX" = 1 ] && mgr=$MGR
+  {
+    printf '[Unit]\nDescription=WatTunnel auto-heal%s\n[Service]\nType=oneshot\n' "$([ "$SANDBOX" = 1 ] && echo " (sandbox $WAT_PREFIX)")"
+    unit_env_lines
+    printf 'ExecStart=%s heal\n' "$mgr"
+  } >"/etc/systemd/system/$HEAL_UNIT.service"
   cat >"/etc/systemd/system/$HEAL_UNIT.timer" <<EOF
 [Unit]
 Description=WatTunnel auto-heal every minute
@@ -2961,15 +3027,15 @@ heal() { # restart Iran tunnels whose link is down 3 checks in a row
   local n cnt f st cyc
   mkdir -p "$RUN"
   for n in $(tunnels); do
-    [ "$(role "$n")" = Iran ] && systemctl is-enabled -q "wattun@$n" || continue
+    [ "$(role "$n")" = Iran ] && systemctl is-enabled -q "${WAT_PREFIX}@$n" || continue
     f="$RUN/$n.down"
-    st=$(systemctl is-active "wattun@$n" 2>/dev/null)
+    st=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null)
     if [ "$st" = inactive ]; then rm -f "$f" "$RUN/$n.cycles"; continue; fi # stopped on purpose: leave it alone
     if [ "$(jget "$(stats "$n")" alive)" = true ]; then rm -f "$f" "$RUN/$n.cycles"; continue; fi
     cnt=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$cnt" >"$f"
     if [ "$cnt" -ge 3 ]; then
       logger -t wattun-heal "tunnel $n down for $cnt checks, restarting"
-      systemctl restart "wattun@$n"; rm -f "$f"
+      systemctl restart "${WAT_PREFIX}@$n"; rm -f "$f"
       cyc=$(( $(cat "$RUN/$n.cycles" 2>/dev/null || echo 0) + 1 )); echo "$cyc" >"$RUN/$n.cycles"
       # auto tunnel still down after two restart cycles (6 checks): test the other connection types in the background
       # (a plain CDN tunnel gets a fresh Cloudflare edge scan instead: dead edge IPs are replaced)
@@ -2982,10 +3048,10 @@ heal() { # restart Iran tunnels whose link is down 3 checks in a row
 bin_ver() { "${1:-$BIN}" -version 2>/dev/null | awk '{print $2; exit}'; }
 is_stale() {
   local pid
-  pid=$(systemctl show -p MainPID --value "wattun@$1" 2>/dev/null)
+  pid=$(systemctl show -p MainPID --value "${WAT_PREFIX}@$1" 2>/dev/null)
   [ -n "$pid" ] && [ "$pid" != 0 ] && [[ "$(readlink "/proc/$pid/exe" 2>/dev/null)" == *"(deleted)"* ]]
 }
-stale_tunnels() { local n; for n in $(tunnels); do systemctl is-active -q "wattun@$n" 2>/dev/null && is_stale "$n" && printf '%s ' "$n"; done; }
+stale_tunnels() { local n; for n in $(tunnels); do systemctl is-active -q "${WAT_PREFIX}@$n" 2>/dev/null && is_stale "$n" && printf '%s ' "$n"; done; }
 restart_stale() { # offer to restart tunnels that still run the old binary, then prove they switched
   local st n bad=''
   st=$(stale_tunnels)
@@ -2993,41 +3059,49 @@ restart_stale() { # offer to restart tunnels that still run the old binary, then
   warn "Still running the OLD binary: ${BOLD}${st% }${RST}"
   hint "They switch to $(bin_ver) only after a restart. A restart drops open connections for a few seconds."
   confirm "Restart them now?" y || { hint "Later: open the tunnel and press [r], or Settings -> restart all."; return 0; }
-  for n in $st; do step "Restarting wattun@$n" systemctl restart "wattun@$n"; done
+  for n in $st; do step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; done
   sleep 1
   for n in $st; do is_stale "$n" && bad="$bad $n"; done
-  if [ -n "$bad" ]; then err "Still on the old binary:$bad (see: journalctl -u wattun@NAME)"; return 1; fi
+  if [ -n "$bad" ]; then err "Still on the old binary:$bad (see: journalctl -u ${WAT_PREFIX}@NAME)"; return 1; fi
   ok "Tunnels now run wattun $(bin_ver)."
 }
 restart_all() {
   local n c=0
   for n in $(tunnels); do
-    if systemctl is-enabled -q "wattun@$n" 2>/dev/null || systemctl is-active -q "wattun@$n" 2>/dev/null; then
-      step "Restarting wattun@$n" systemctl restart "wattun@$n"; c=$((c+1))
+    if systemctl is-enabled -q "${WAT_PREFIX}@$n" 2>/dev/null || systemctl is-active -q "${WAT_PREFIX}@$n" 2>/dev/null; then
+      step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; c=$((c+1))
     fi
   done
   [ "$c" -gt 0 ] || warn "No tunnels to restart."
 }
 update() { # [installer args...]
-  local url="https://raw.githubusercontent.com/$REPO/main/install.sh" tmp before after mbefore
-  before=$(bin_ver); mbefore=$(cksum <"$MGR" 2>/dev/null)
+  local url="https://raw.githubusercontent.com/$REPO/main/install.sh" tmp before after mbefore imgr a
+  local ienv=()
+  if [ "$SANDBOX" = 1 ]; then
+    for a in "$@"; do [ "$a" = --uninstall ] && { err "Sandbox: use the manager's uninstall (Settings), not the installer's --uninstall (it removes the production units)."; return 1; }; done
+    imgr=$MGR; [ "$MGR" = /usr/local/bin/wattun-manager ] && imgr=${BIN%/*}/wattun-manager
+    mkdir -p "${BIN%/*}" || { err "Cannot create ${BIN%/*}"; return 1; }
+    say "  Sandbox $WAT_PREFIX: the update writes only $BIN, $imgr and $CONF (not /usr/local/bin, not wattun@.service)."
+  fi
+  before=$(bin_ver); mbefore=$(cksum <"${imgr:-$MGR}" 2>/dev/null)
   tmp=$(mktemp /tmp/wattun-install.XXXXXX)
+  [ "$SANDBOX" = 1 ] && ienv=(WAT_BIN="$BIN" WAT_MGR="$imgr" WAT_CONF="$CONF" WAT_UNIT="$tmp.unit") # the installer's unit file goes to a throwaway path
   spin_start "Downloading the installer"
   curl -fsSL --max-time 60 --retry 2 -o "$tmp" "${WAT_PROXY:-}$url"; local rc=$?
   spin_stop
   if [ "$rc" -ne 0 ] || ! head -c 2 "$tmp" | grep -q '#!'; then
-    rm -f "$tmp"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ wattun update"; return 1
+    rm -f "$tmp"; err "Update failed (could not download the installer). If GitHub is blocked: WAT_PROXY=https://ghproxy.net/ $SELF update"; return 1
   fi
   ok "Installer downloaded"
-  WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
-  rm -f "$tmp"
+  env ${ienv[@]+"${ienv[@]}"} WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
+  rm -f "$tmp" "$tmp.unit"
   [ "$rc" -eq 0 ] || { err "The installer reported an error. Nothing was changed: still wattun ${before:-?}."; return 1; }
   after=$(bin_ver)
   echo
   if [ -z "$after" ]; then err "$BIN does not run after the update. Roll back from the dashboard ([r])."; return 1
   elif [ "$after" != "$before" ]; then ok "wattun updated: ${BOLD}${before:-none} -> $after${RST}"
   else ok "wattun is already the latest release (${BOLD}$after${RST})."; fi
-  [ "$(cksum <"$MGR" 2>/dev/null)" != "$mbefore" ] && ok "Manager updated."
+  [ "$(cksum <"${imgr:-$MGR}" 2>/dev/null)" != "$mbefore" ] && ok "Manager updated."
   restart_stale
   return 0
 }
@@ -3054,18 +3128,23 @@ uninstall_all() {
   [ "$REPLY_V" = uninstall ] || { warn "Cancelled."; return 1; }
   heal_disable >/dev/null 2>&1; rm -f "/etc/systemd/system/$HEAL_UNIT.service" "/etc/systemd/system/$HEAL_UNIT.timer"
   # loaded instances plus every configured name (enabled-but-unloaded ones are not in list-units)
-  units=$(systemctl list-units --all --plain --no-legend 'wattun@*' 2>/dev/null | awk '{print $1}')
-  for n in "${list[@]}"; do units+=$'\n'"wattun@$n.service"; done
+  units=$(systemctl list-units --all --plain --no-legend "${WAT_PREFIX}@*" 2>/dev/null | awk '{print $1}')
+  for n in "${list[@]}"; do units+=$'\n'"${WAT_PREFIX}@$n.service"; done
   for u in $(printf '%s\n' "$units" | sort -u); do
     systemctl disable --now "$u" >/dev/null 2>&1
   done
   kreply_restore
-  rm -f /etc/systemd/system/wattun@.service "$BIN" "$BIN.prev"
+  for u in $(systemctl list-units --all --plain --no-legend "${WAT_PREFIX}-autowatch-*" "${WAT_PREFIX}-autoretest-*" 2>/dev/null | awk '{print $1}'); do
+    systemctl stop "$u" >/dev/null 2>&1
+  done
+  rm -f "/etc/systemd/system/${WAT_PREFIX}@.service" "$BIN" "$BIN.prev"
+  [ "$SANDBOX" = 1 ] && rm -rf "$RUN" "$AUTO_RUN"
+  if [ "$SANDBOX" = 1 ] && [ "${BIN%/*}" = "/opt/$WAT_PREFIX" ]; then rm -rf "/opt/$WAT_PREFIX"; ok "Removed /opt/$WAT_PREFIX"; fi
   systemctl daemon-reload
   ok "Services and binaries removed."
-  if [ -d "$CONF" ] && confirm "Also delete $CONF (tunnel configs, keys, tokens)?" n; then rm -rf "$CONF"; ok "Configuration deleted."; fi
+  if [ -d "$CONF" ] && confirm "Also delete $CONF (tunnel configs, keys, tokens)?" "$([ "$SANDBOX" = 1 ] && echo y || echo n)"; then rm -rf "$CONF"; ok "Configuration deleted."; fi
   ok "WatTunnel removed."
-  rm -f "$MGR"
+  if [ "$SANDBOX" = 1 ]; then hint "Sandbox: this script ($MGR) was left in place; delete it by hand if you copied it."; else rm -f "$MGR"; fi
   return 0
 }
 settings_menu() {
@@ -3097,7 +3176,7 @@ settings_menu() {
 # ======================================================================================
 #  Main dashboard
 # ======================================================================================
-need_tunnel() { [ -f "$CONF/$1.yml" ] || { err "No tunnel named '$1'. See: wattun status"; return 1; }; }
+need_tunnel() { [ -f "$CONF/$1.yml" ] || { err "No tunnel named '$1'. See: $SELF status"; return 1; }; }
 main_menu() {
   local num d rest
   while :; do
@@ -3135,7 +3214,7 @@ usage() {
   cat <<EOF
 WatTunnel manager $VER
 
-Usage: wattun [command]
+Usage: $SELF [command]
 
   (no command)          dashboard: all tunnels; manage one, create, update...
   new [kharej|iran]     create a tunnel (do Kharej FIRST: it makes the token)
@@ -3155,6 +3234,9 @@ Usage: wattun [command]
   help                  this text
 
 Environment: WAT_NO_ANIM=1 (no animations)  NO_COLOR=1 (no colours)  WAT_PROXY=https://ghproxy.net/
+
+Sandbox: WAT_PREFIX=wattest wattun-manager ... keeps everything under /etc/wattest, /opt/wattest and wattest@ units.
+  Other overrides: WAT_CONF, WAT_BIN, WAT_RUN, WAT_AUTO_RUN (single paths). The first run needs: WAT_PREFIX=wattest wattun-manager update
 EOF
 }
 
@@ -3162,7 +3244,14 @@ main() {
   [ -x "$BIN" ] && VER=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
   case "${1:-}" in help|-h|--help) usage; return 0 ;; esac
   [ "$(id -u)" -eq 0 ] || { err "Run as root."; exit 1; }
-  [ -x "$BIN" ] || { err "wattun is not installed. Run install.sh first."; exit 1; }
+  if [ ! -x "$BIN" ]; then
+    if [ "$SANDBOX" = 1 ]; then
+      [ "${1:-}" = update ] || { err "Sandbox $WAT_PREFIX: no wattun binary at $BIN yet. Install it with: $SELF update"; exit 1; }
+    else err "wattun is not installed. Run install.sh first."; exit 1; fi
+  fi
+  case "${1:-}" in heal|auto-watch|auto-retest) ;; *)
+    [ "$SANDBOX" = 1 ] && hint "Sandbox $WAT_PREFIX: configs $CONF, binary $BIN, units ${WAT_PREFIX}@NAME, runtime $RUN (production wattun is not touched)." ;;
+  esac
   mkdir -p "$CONF" "$RUN"; chmod 700 "$CONF"
   trap on_int INT
   trap cleanup EXIT
@@ -3177,7 +3266,7 @@ main() {
     ports) need_tunnel "${2:?name}" && run_flow edit_ports "$2" ;;
     test) need_tunnel "${2:?name}" && test_tunnel "$2" ;;
     speedtest) need_tunnel "${2:?name}" && speed_test "$2" "${3:-10}" ;;
-    logs) need_tunnel "${2:?name}" && journalctl -u "wattun@$2" -f -o short-iso ;;
+    logs) need_tunnel "${2:?name}" && journalctl -u "${WAT_PREFIX}@$2" -f -o short-iso ;;
     token) need_tunnel "${2:?name}" && show_token "$2" ;;
     heal) heal ;;
     auto-test) need_tunnel "${2:?name}" && auto_test_cmd "$2" ;;
