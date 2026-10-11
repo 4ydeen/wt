@@ -259,6 +259,8 @@ func main() {
 		case pc != nil && !server:
 			pio = pc
 		case pc != nil:
+			pc.SetMaxBackoff(30 * time.Second) // the client may be listening on another carrier only
+			pc.SetDialLog(carrier+" reverse dial", log.Printf)
 			raw = wat.NewReverseDialRaw(pc)
 		}
 		return
@@ -383,6 +385,9 @@ func main() {
 				out["ports"] = portReg.snapshot(side)
 				if len(names) > 1 {
 					out["carriers"] = carrierStats()
+				}
+				if srv != nil {
+					out["clients"] = clientsJSON(srv.Clients())
 				}
 				json.NewEncoder(w).Encode(out)
 			})
@@ -870,4 +875,19 @@ func bridge(c net.Conn, st *wat.Stream, tag string, ps *portStat, server bool) {
 	wg.Wait()
 	c.Close()
 	dbg("%s done in %v: tcp->stream %d B (%v), stream->tcp %d B (%v)", tag, time.Since(t0).Round(time.Millisecond), up, upErr, down, downErr)
+}
+
+type clientJSON struct {
+	IP      string `json:"ip"`
+	Carrier string `json:"carrier"`
+	AgeMS   int64  `json:"age_ms"`
+}
+
+// clientsJSON is the /stats "clients" list (server only): one row per live client session.
+func clientsJSON(list []wat.ClientInfo) []clientJSON {
+	out := make([]clientJSON, 0, len(list))
+	for _, c := range list {
+		out = append(out, clientJSON{c.IP, c.Carrier, c.Age.Milliseconds()})
+	}
+	return out
 }

@@ -34,6 +34,7 @@ HTTP/2 or gRPC, including behind Cloudflare.
 - [Benchmarks and comparison](#-benchmarks-and-comparison)
 - [Quick start](#-quick-start)
 - [The manager](#-the-manager)
+- [Auto mode](#-auto-mode)
 - [Choosing a carrier](#-choosing-a-carrier)
 - [Reverse mode](#-reverse-mode)
 - [Configuration](#-configuration)
@@ -64,6 +65,12 @@ HTTP/2 or gRPC, including behind Cloudflare.
   quotas.
 
 ## 🆕 What's new
+
+**2.1.0: Auto mode.** Pick `auto` as the carrier in the Kharej wizard and one tunnel listens on every carrier at
+once. Paste the single token on Iran and the manager tests each carrier, direct, through Cloudflare and reverse, then
+shows a ranked table so you can use the best, or bond the working ones. Auto-heal can switch to another working
+carrier by itself. `/stats` on a server has a new `clients` list (IP, carrier, age). Wire-compatible with 2.0.x, but
+Kharej needs 2.1.0 for auto. See [Auto mode](#-auto-mode).
 
 **2.0.2: safer metrics, a more reliable manager.** The metrics address is forced to `127.0.0.1`, and the tunnel
 refuses to forward to the server's own metrics port. In the manager, changes made in **Advanced settings** are now
@@ -321,6 +328,36 @@ wattun-manager logs NAME       # follow the log
 wattun-manager token NAME      # print the Kharej token
 wattun-manager update | rollback | help
 ```
+
+## 🤖 Auto mode
+
+Not sure which carrier works on your route? Let the manager find out (needs `wattun` 2.1.0 or newer and systemd on
+Kharej).
+
+1. **Kharej:** New tunnel, and choose `auto` (the first carrier option). You can enter a Cloudflare-proxied domain; it
+   is used only to test the CDN carriers (`ws`, `wss`, `h2`, `h2c`, `grpc` through Cloudflare), and it is optional.
+   The wizard creates **one bonded server tunnel** that listens on every carrier: `udp` 4443, `tcp` 4443, `tls` 8443,
+   `ws` 2052, `wss` 2053, `h2` 2087, `h2c` 2082, `grpc` 2083, plus `icmp`. A busy port moves to a free one. It prints
+   one token.
+2. **Iran:** paste the token. The test starts by itself, in phases: direct, then CDN (if you gave a domain), then
+   reverse. Each variant is a throw-away client (nothing is published, temp files live in `/run/wattun-auto`) that runs
+   a 2 MB down and up speed test. Reverse test ports are opened in the firewall only while their probe runs. It takes
+   about 2 to 3 minutes.
+3. A ranked table follows. **Enter** uses the best, **b** bonds the working carriers, **1-N** picks one, **q** quits.
+   The normal wizard then continues at port mapping.
+
+Reverse is automatic too. A short-lived watcher on Kharej (`wattun-autowatch-NAME`, one hour at most) waits for Iran's
+first test connection, learns Iran's IP and starts a companion tunnel `NAME-r` (reverse ICMP plus reverse dials to
+Iran's test ports). If you set a CDN domain, the IP is learned only from `icmp`, `udp`, `tcp` or `tls` clients, because
+CDN clients show Cloudflare's address. If it cannot learn it, run `wattun-manager auto-ip NAME IRAN_IP` on Kharej.
+`NAME-r` shows on the dashboard as the reverse side of `NAME`, and it is deleted with it.
+
+Re-run the test any time with `wattun-manager auto-test NAME` (the token is kept in `/etc/wattun/NAME.auto`). **Auto-heal**
+follows it: after two failed restart cycles on an auto tunnel it re-tests (1 MB, at most once per 30 minutes) and
+switches to another working carrier only if the current one fails. It logs `wattun-heal: switched NAME from X to Y`.
+
+Good to know: several ports are open on Kharej at once, and Kharej must run 2.1.0. Details are in
+[docs/TECHNICAL.md](docs/TECHNICAL.md#auto-mode).
 
 ## 🛰 Choosing a carrier
 

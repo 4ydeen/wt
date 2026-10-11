@@ -183,6 +183,59 @@ func (srv *Server) Stats() Stats {
 	return t
 }
 
+// ClientInfo describes one live client session.
+type ClientInfo struct {
+	IP      string // the session's current peer source IP, no port
+	Carrier string // carrier it was last heard on (MultiRaw servers only, else empty)
+	Age     time.Duration
+}
+
+// Clients lists the live client sessions. Cheap enough for a stats endpoint.
+func (srv *Server) Clients() []ClientInfo {
+	mr, _ := srv.raw.(*MultiRaw)
+	now := time.Now()
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	out := make([]ClientInfo, 0, len(srv.sessions))
+	for _, ss := range srv.sessions {
+		var ci ClientInfo
+		if lr := ss.s.LastRecv(); !lr.IsZero() {
+			ci.Age = max(now.Sub(lr), 0)
+		} else {
+			ci.Age = max(now.Sub(time.Unix(0, ss.last.Load())), 0)
+		}
+		a, _ := ss.io.peer.Load().(net.Addr)
+		if t, ok := a.(*TaggedAddr); ok {
+			a = t.Addr
+			if mr != nil && t.Idx >= 0 && t.Idx < len(mr.names) {
+				ci.Carrier = mr.names[t.Idx]
+			}
+		}
+		ci.IP = addrIP(a)
+		out = append(out, ci)
+	}
+	return out
+}
+
+func addrIP(a net.Addr) string {
+	switch v := a.(type) {
+	case nil:
+		return ""
+	case poolAddr:
+		return v.ip
+	case *net.UDPAddr:
+		return v.IP.String()
+	case *net.TCPAddr:
+		return v.IP.String()
+	case *net.IPAddr:
+		return v.IP.String()
+	}
+	if h, _, err := net.SplitHostPort(a.String()); err == nil {
+		return h
+	}
+	return a.String()
+}
+
 // LastRecv is when the newest authenticated packet from any client arrived, including sessions that have closed
 // since the server started (zero: none yet).
 func (srv *Server) LastRecv() time.Time {

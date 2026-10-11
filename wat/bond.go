@@ -297,6 +297,7 @@ func (m *multiSubIO) SetPeer(a net.Addr) {
 	if !ok || t.Idx < 0 || t.Idx >= len(m.slots) {
 		return
 	}
+	m.subIO.peer.Store(a) // newest source, for Server.Clients (Send is overridden here, so nothing else reads it)
 	m.mu.Lock()
 	s := &m.slots[t.Idx]
 	s.dst = t

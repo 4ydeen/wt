@@ -16,6 +16,7 @@ Version: see `wat/version.go` (`wattun -version`).
 4. [Carriers](#carriers)
 5. [Bonding](#bonding)
 6. [Reverse mode](#reverse-mode)
+   - [Auto mode](#auto-mode)
 7. [UDP forwarding](#udp-forwarding)
 8. [Config file](#config-file)
 9. [Command-line flags](#command-line-flags)
@@ -283,6 +284,9 @@ received 3528 B and then stalled (3 out of 3 tries). That filter cuts TCP both w
 there. If a plain TCP connection from Kharej to Iran's port already stalls, use reverse `icmp` or the normal `icmp`
 instead.
 
+Since 2.1.0 the reverse dialers back off up to 30 s between attempts. They log the first failure, then at most one
+failure line every 5 minutes, and a `connected` line when a dial succeeds.
+
 ### Carrier matrix
 
 | Carrier | Direct | Reverse | Minimum version (both ends) |
@@ -293,6 +297,54 @@ instead.
 
 The reverse pool carriers are in the first release of this repository's history (1.8.0). An earlier release may
 have had them too; this table says 1.8.0 because that is the oldest one that can be checked.
+
+## Auto mode
+
+`wattun-manager` only (no engine flag). It needs `wattun` 2.1.0 on Kharej and `systemd-run`. It finds the carrier that
+works on a route by testing all of them, so the operator does not have to guess.
+
+**Kharej.** In the new-tunnel wizard the first carrier option is `auto`. It asks for an optional Cloudflare-proxied
+domain, used only to test the CDN carriers through Cloudflare. It creates one bonded server tunnel `NAME` that listens
+on every carrier, and prints one token.
+
+| Carrier | Listen port |
+|---|---|
+| `udp`, `tcp` | 4443 |
+| `tls` | 8443 |
+| `ws` | 2052 |
+| `wss` | 2053 |
+| `h2` | 2087 |
+| `h2c` | 2082 |
+| `grpc` | 2083 |
+| `icmp` | none |
+
+A port that is already taken moves to a free fallback; the real ports are in the token.
+
+**Token.** `wat1:` + base64 of `carrier|peer|key|path|sni|icmp-type|allowed-ports|reverse|plan`. Field 9 (`plan`) looks
+like `d=udp:4443,tcp:4443,...;r=tcp:24431,tls:24432,ws:24433,wss:24434,h2:24435,h2c:24436,grpc:24437`. `d` is the
+Kharej listen port per carrier. `r` is the port Iran listens on for each reverse test. Tokens with 7 or 8 fields (older
+managers, non-auto tunnels) still work.
+
+**Reverse side.** A transient unit `wattun-autowatch-NAME` (`systemd-run`, 1 hour at most) polls the Kharej tunnel's
+`/stats` `clients` list. When Iran's first test client connects, it learns Iran's IP and writes and starts a companion
+tunnel `NAME-r`: a reverse server with reverse ICMP and reverse dials to Iran's `r` ports. With a CDN domain set, the IP
+is taken only from `icmp`, `udp`, `tcp` and `tls` clients, because CDN clients show the proxy's IP. Manual fallback on
+Kharej: `wattun-manager auto-ip NAME IRAN_IP`. `NAME-r` appears on the dashboard as the reverse side of `NAME`, follows
+its ports and key, and is deleted with it.
+
+**Iran test.** Pasting an auto token runs the test (re-run later with `wattun-manager auto-test NAME`). Phases: direct,
+then CDN (if a domain was given), then reverse. Each variant is a throw-away client with its own `/speedtest`
+(2 MB down + up). Nothing is published; temp files are in `/run/wattun-auto`. Reverse test ports are opened in the
+firewall only during their probe. The ranked table accepts Enter (best), `b` (bond the working carriers), `1`-`N`
+(one variant) and `q`. The normal wizard continues at port mapping. The token is saved in `/etc/wattun/NAME.auto`.
+
+**Auto-heal.** After two failed restart cycles on an auto tunnel, `wattun-manager heal` starts a re-test (1 MB, at most
+once per 30 minutes). It switches to another working variant only when the current one fails, and logs
+`wattun-heal: switched NAME from X to Y`.
+
+**Costs and limits.** Several ports are open on Kharej at once. The test takes about 2 to 3 minutes. Kharej must be
+2.1.0 or newer (the `clients` field and the reverse dial backoff). The wire format did not change, so 2.1.0 peers work
+with 2.0.x ones for normal tunnels.
 
 ## UDP forwarding
 
@@ -577,6 +629,7 @@ metrics port, even if the port is in the allowlist.
 | `ports` | Per-port counters (same data as `/ports`). |
 | `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive). |
 | `last_rx_age_ms` | Since 2.0.1. Milliseconds since the last authenticated packet from the peer (server: from any client, including sessions that have closed). `-1` = none since the process started. Monitors should use this rather than ping: it only moves on real tunnel packets. |
+| `clients` | Since 2.1.0, servers only. One entry per live client session: `[{"ip":"203.0.113.5","carrier":"tcp","age_ms":1234}]`. Behind a CDN carrier (`ws`, `wss`, `h2`, `h2c`, `grpc`) `ip` is the proxy's address. Auto mode uses it to learn Iran's IP. |
 | `sessions` | Server: client sessions. Client: always 1. |
 | `draining` | Server: not accepting new sessions. |
 | `streams` | Open TCP streams. The drain timer waits for 0. |

@@ -47,7 +47,10 @@ const poolMaxMTU = 16 << 10
 var poolProfile = Profile{Reliable: true, MTU: 4096, MaxMTU: poolMaxMTU, InitBps: 8e6}
 
 // poolAddr identifies a client pool on the server: it is the net.Addr handed to Server and back to SendTo.
-type poolAddr struct{ key string }
+type poolAddr struct {
+	key string
+	ip  string // remote IP of the connection the packet came in on (informational: Server.Clients)
+}
 
 func (poolAddr) Network() string  { return "pool" }
 func (a poolAddr) String() string { return hex.EncodeToString([]byte(a.key)) }
@@ -180,6 +183,7 @@ type PoolDialFunc func(ctx context.Context) (net.Conn, error)
 type TCPPoolClient struct {
 	dial   PoolDialFunc
 	peer   poolAddr
+	remIP  atomic.Value // string: remote IP of the newest connection
 	id     [8]byte
 	slots  []atomic.Pointer[poolConn]
 	rx     chan []byte
@@ -189,6 +193,12 @@ type TCPPoolClient struct {
 	wg     sync.WaitGroup
 	rr     atomic.Uint32
 	once   sync.Once
+
+	maxBackoff atomic.Int64                  // cap of the redial backoff in ns (0: poolBackoffMax)
+	logf       atomic.Pointer[dialLogger]   // optional, see SetDialLog
+	logMu      sync.Mutex
+	lastLog    time.Time // last failure line
+	failing    bool      // a failure was logged and no connection came up since
 }
 
 // NewTCPPoolClient dials conns (0 = DefaultPoolConns) TCP connections to host:port in the background; Send drops
@@ -220,6 +230,69 @@ func newPoolClient(dial PoolDialFunc, conns int) (*TCPPoolClient, error) {
 		go c.slotLoop(i)
 	}
 	return c, nil
+}
+
+const (
+	poolBackoffMax = 3 * time.Second
+	poolLogEvery   = 5 * time.Minute
+)
+
+type dialLogger struct {
+	name string
+	f    func(string, ...any)
+}
+
+// SetDialLog makes the client report failed dials: the first one, then at most one per few minutes (all slots
+// together), and a line when a connection comes up again. name tags the lines (the carrier). Safe at any time.
+func (c *TCPPoolClient) SetDialLog(name string, f func(string, ...any)) {
+	if f != nil {
+		c.logf.Store(&dialLogger{name, f})
+	}
+}
+
+// SetMaxBackoff caps the redial backoff (default 3 s); a dialer whose far end may simply not be listening wants
+// longer, so it neither hammers the peer nor fills the log.
+func (c *TCPPoolClient) SetMaxBackoff(d time.Duration) { c.maxBackoff.Store(int64(d)) }
+
+func (c *TCPPoolClient) backoffCap() time.Duration {
+	if n := c.maxBackoff.Load(); n > 0 {
+		return time.Duration(n)
+	}
+	return poolBackoffMax
+}
+
+func (c *TCPPoolClient) noteFail(err error) {
+	l := c.logf.Load()
+	if l == nil {
+		return
+	}
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+	if now := time.Now(); !c.failing || now.Sub(c.lastLog) >= poolLogEvery {
+		c.lastLog = now
+		c.failing = true
+		l.f("%s: cannot connect (%v); retrying with backoff, next report in %v", l.name, err, poolLogEvery)
+	}
+}
+
+func (c *TCPPoolClient) noteUp() {
+	l := c.logf.Load()
+	if l == nil {
+		return
+	}
+	c.logMu.Lock()
+	was := c.failing
+	c.failing = false
+	c.logMu.Unlock()
+	if was {
+		l.f("%s: connected", l.name)
+	}
+}
+
+func (c *TCPPoolClient) peerAddr() poolAddr {
+	a := c.peer
+	a.ip, _ = c.remIP.Load().(string)
+	return a
 }
 
 func (c *TCPPoolClient) sleep(d time.Duration) bool {
@@ -261,11 +334,18 @@ func (c *TCPPoolClient) slotLoop(i int) {
 			}
 		}
 		if err != nil {
+			c.noteFail(err)
 			if !c.sleep(backoff) {
 				return
 			}
-			backoff = min(backoff*2, 3*time.Second)
+			backoff = min(backoff*2, c.backoffCap())
 			continue
+		}
+		c.noteUp()
+		if ra, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			c.remIP.Store(ra.IP.String())
+		} else if conn.RemoteAddr() != nil {
+			c.remIP.Store(addrIP(conn.RemoteAddr()))
 		}
 		pc := newPoolConn(conn)
 		c.slots[i].Store(pc)
@@ -283,7 +363,7 @@ func (c *TCPPoolClient) slotLoop(i int) {
 		if !c.sleep(backoff) {
 			return
 		}
-		backoff = min(backoff*2, 3*time.Second)
+		backoff = min(backoff*2, c.backoffCap())
 	}
 }
 
@@ -306,7 +386,7 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 func (c *TCPPoolClient) Recv() ([]byte, int, net.Addr, error) {
 	select {
 	case p := <-c.rx:
-		return p, 0, c.peer, nil
+		return p, 0, c.peerAddr(), nil
 	case <-c.done:
 		return nil, 0, nil, net.ErrClosed
 	}
@@ -431,7 +511,7 @@ func (s *TCPPoolServer) handle(c net.Conn) {
 		pc.fail()
 		return
 	}
-	src := poolAddr{key: key}
+	src := poolAddr{key: key, ip: addrIP(c.RemoteAddr())}
 	pc.serve(&s.wg, func(p []byte) bool {
 		select {
 		case s.rx <- rxPkt{p: p, src: src}:
