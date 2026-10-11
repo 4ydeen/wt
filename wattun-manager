@@ -1684,14 +1684,17 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
          if [ "$REPLY_V" = 0.0.0.0 ]; then unset_value "$n" bind; else set_value "$n" bind "$REPLY_V"; fi; changed=1 ;;
       i) [ "$cr" = icmp ] || continue; echo; hint "Must match the other side."; ask_ok "ICMP type" "$(cfg "$n" icmp-type | sed 's/^$/echo/')" v_icmp || continue
          if [ "$REPLY_V" = echo ]; then unset_value "$n" icmp-type; else set_value "$n" icmp-type "$REPLY_V"; fi; changed=1 ;;
-      d) rev_capable "$cr" || continue; echo; set_direction "$n" && changed=1 ;;
+      d) rev_capable "$cr" || continue; echo
+         # applied at once, so the direction never sits in the file without running
+         set_direction "$n" && step "Restarting wattun@$n" systemctl restart "wattun@$n" ;;
       b|0|q|enter|esc) break ;;
       *) : ;;
     esac
   done
+  # Every setting here needs a restart; apply it automatically (an unapplied change only logs "restart needed").
   if [ "$changed" = 1 ]; then
-    v=$(confirm "Restart '$n' to apply? (open connections drop)" y && echo y)
-    [ "$v" = y ] && step "Restarting wattun@$n" systemctl restart "wattun@$n"
+    hint "Applying: restarting '$n' (open connections drop and reconnect)."
+    step "Restarting wattun@$n" systemctl restart "wattun@$n"
   fi
   return 0
 }
