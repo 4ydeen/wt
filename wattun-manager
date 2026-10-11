@@ -1330,12 +1330,22 @@ auto_pick_ports() { # -> AUTO_D "udp:4443,tcp:4443,..." and AUTO_NOTE ; rc 1 whe
       listen_blocked "$proto" "$p" && continue
       pick=$p; break
     done
-    [ -n "$pick" ] || return 1
+    if [ -z "$pick" ]; then # every usual port is taken (often by an x-ui/v2ray panel): any free high port will do
+      for p in $(seq 24440 24999); do
+        case "$used" in *" $proto$p "*) continue ;; esac
+        listen_blocked "$proto" "$p" && continue
+        pick=$p; break
+      done
+    fi
+    [ -n "$pick" ] || { AUTO_FAIL="$c ($proto $want $fb)"; return 1; }
     used+="$proto$pick "
     list="${list:+$list,}$c:$pick"
     if [ "$pick" != "$want" ]; then
       AUTO_NOTE+="  $c: port $want is busy, using $pick."
-      case "$c" in wss|grpc|h2) case "$cdnok" in *" $pick "*) ;; *) AUTO_NOTE+=" (not a Cloudflare port: the CDN test of $c may not work)" ;; esac ;; esac
+      case "$c" in
+        wss|grpc|h2) case "$cdnok" in *" $pick "*) ;; *) AUTO_NOTE+=" (not a Cloudflare port: the CDN test of $c may not work)" ;; esac ;;
+        ws|h2c) case " 80 8080 8880 2052 2082 2086 2095 " in *" $pick "*) ;; *) AUTO_NOTE+=" (not a Cloudflare port: the CDN test of $c may not work)" ;; esac ;;
+      esac
       AUTO_NOTE+=$'\n'
     fi
   done
@@ -1380,7 +1390,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   hint "Cloudflare-proxied domain for the CDN tests (optional; used only to test wss/grpc/h2 through Cloudflare."
   hint "Point it at this server with the orange cloud on, SSL mode Full). Press Enter to skip."
   ask_ok "CDN domain (optional)" "" v_domain_opt || return 1; cdn=$REPLY_V
-  auto_pick_ports || { err "Could not find free ports for all carriers on this server."; return 1; }
+  auto_pick_ports || { err "Could not find a free port for $AUTO_FAIL on this server."; hint "Check what listens there: ss -ltnup"; return 1; }
 
   MAPS=(); PE_ROLE=Kharej; PE_TUNNEL=$name; PE_ALLOW=(); PE_OWNED=(); PE_MSG=''
   allow='' # all ports allowed; edit later from the tunnel menu
