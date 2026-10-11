@@ -49,6 +49,100 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
   8 MB/s per session, and delay-based cuts apply only while the session fills its window). **Update both ends.**
 - **Easier to drive.** `wattun` alone opens the manager, and Auto mode tests every variant from one token.
 
+## Why WatTunnel: speed, CPU and comparisons
+
+On a heavily filtered route the usual tunnels fail in measurable ways:
+
+| Problem on a filtered route | What usual tools do | What WatTunnel does |
+|---|---|---|
+| TCP and UDP are cut after a few packets | Tunnel dies or flaps | Rides ICMP, which isn't cut |
+| 0.2 - 2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
+| Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default |
+| SNI filtering of CDN domains | Blocked right after the handshake | Cloudflare with ECH; edges and TLS settings are found automatically |
+| One process per port | Server CPU saturates | One process for all ports, batched syscalls |
+| Changing ports | Restart drops every user | `ports:` list is hot-reloaded every 3 s |
+| Link silently dies | You find out from your users | Live status, connection doctor, auto-heal |
+
+### ICMP: real filtered route (Iran ⇄ Europe, October 2026)
+
+Real VLESS (xray) traffic through each tunnel, same servers, same route. WatTunnel numbers are from version 1.8.0.
+
+| | WatTunnel 1.8.0 | GOST v3 ICMP |
+|---|---|---|
+| Peak throughput | **~33 MB/s**, the route's maximum | 1.6 - 5.4 MB/s |
+| Single connection | **~25 MB/s** | 1.0 - 1.6 MB/s |
+| Latency p50 (route's raw RTT is ~40 ms) | **40 - 45 ms**, close to zero added | ~51 ms |
+| CPU per MB moved (Iran side) | **0.026 CPU-s** | 0.15 - 0.20 CPU-s (**6 - 7x more**) |
+| RAM | **~40 MB** | 50 - 70 MB |
+| 120 short TLS requests, 24 parallel | **120 / 120 ok** | - |
+
+The route caps at about 50 - 55k ICMP packets per second (~33 MB/s), and WatTunnel fills it. In production it
+carries **250 - 300 real clients** through a single process.
+
+Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
+
+| Tool | How it works | Throughput measured | Notes |
+|---|---|---|---|
+| **WatTunnel** | Own ICMP transport, one process, 4 lanes, AEAD, batched I/O | **up to ~33 MB/s** | Every port in one process, ~40 MB RAM |
+| GOST v3 ICMP | QUIC over ICMP | 1.6 - 5.4 MB/s | 6 - 7x the CPU per MB |
+| BackPack (tuned) | ICMP transport | ~6.1 MB/s | Latency p50 102 ms / p95 198 ms |
+| Hans | IP-over-ICMP tun device | 1.1 - 3.8 MB/s | Needs a C++ build on both servers |
+| WireGuard over pingtunnel | WireGuard inside one pingtunnel UDP session | 0.25 - 2.7 MB/s | Flat ceiling of a single pingtunnel process |
+| pingtunnel | One process per port | ~0.5 MB/s under load | Each process reads every ICMP packet, so the CPU saturates |
+| ptunnel-ng | One ICMP proxy per port | ~20 KB/s | Last resort only |
+
+### CDN (Cloudflare): field numbers
+
+Real measurements, 2026-10-11, Iran → Cloudflare → Kharej, 2-vCPU servers, `wss` + ECH:
+
+| Setup | Result |
+|---|---|
+| 1 session (2.3.0) | ~19 MB/s down |
+| 4 sessions (2.3.0) | ~52 MB/s down, ~51 MB/s up |
+| 6 sessions (2.3.0) | ~60 MB/s down |
+| 8 sessions (2.3.0) | peak 69 MB/s up |
+| 6 sessions (2.4.0) | 76.6 MB/s up |
+| ICMP tunnel on the same path (only ICMP passes directly there) | ~1.1 MB/s down, ~2.1 MB/s up |
+| Any CDN variant **without** ECH | did not connect at all |
+
+We did not measure competitors' CDN speeds on this route, so there is no speed comparison here, only a feature one:
+
+| | WatTunnel | Typical manual CDN setup (a ws/grpc proxy behind Cloudflare, configured by hand) |
+|---|:-:|:-:|
+| Cloudflare carriers (`ws`/`wss`/`grpc`) | ✅ | ✅ |
+| ECH against SNI filtering, config fetched automatically | ✅ | ❌ by hand |
+| Automatic scan for working Cloudflare IPs | ✅ | ❌ by hand |
+| Automatic choice of TLS fingerprint / ECH / fragmentation by speed test | ✅ | ❌ by hand |
+| Several sessions per tunnel (multi-core) | ✅ | ❌ |
+| All ports in one process, hot-reload | ✅ | ❌ |
+| Auto-heal re-tests and replaces dead edges | ✅ | ❌ |
+
+### Feature comparison
+
+| | WatTunnel | GOST | pingtunnel | Hans | ptunnel-ng |
+|---|:-:|:-:|:-:|:-:|:-:|
+| ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Cloudflare/CDN with ECH | ✅ | - | ❌ | ❌ | ❌ |
+| Auto mode: one token tests every variant | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Loss-tolerant (delay-based) pacing | ✅ | ❌ | ❌ | ❌ | ❌ |
+| All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
+| Add or remove ports without restart | ✅ | ❌ | ❌ | - | ❌ |
+| UDP port forwarding | ✅ | ✅ | ⚠️ | ✅ | ❌ |
+| Built-in encryption | ✅ AEAD | ✅ | ⚠️ | ⚠️ | ❌ |
+| Adaptive FEC | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Reverse mode (TCP-based carriers) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Reverse ICMP (Kharej pings, Iran keeps the ports) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Single static binary, no dependencies | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Guided manager, token pairing, auto-heal | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+**Honest note.** On a clean emulated link (20 ms each way, 0.2 % loss, 100 Mbit) every tunnel reaches line rate and
+GOST uses a little less CPU, but WatTunnel halves small-request latency (p50 **43 ms vs 83 ms**) because it sends
+interactive streams first. WatTunnel's big advantage is on lossy, filtered routes. These numbers come from specific
+routes; yours will differ, so run `wattun test NAME`. Full table: [bench/results-2026-10-09-final.md](bench/results-2026-10-09-final.md)
+and [docs/TECHNICAL.md](docs/TECHNICAL.md#why-it-exists).
+
 ## Quick start
 
 You need two Linux servers with systemd (amd64 or arm64) and root. **Set up Kharej first**, because it creates the
@@ -175,25 +269,6 @@ For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI.
 
 Manual keys (`fp`, `ech`, `tls-frag`, several `peer` addresses) and troubleshooting: [docs/TECHNICAL.md#cdn-tuning](docs/TECHNICAL.md#cdn-tuning).
 More on sessions: [docs/TECHNICAL.md#several-sessions-230](docs/TECHNICAL.md#several-sessions-230).
-
-## Performance
-
-Real field measurements, 2026-10-11, Iran → Cloudflare → Kharej, 2-vCPU servers:
-
-| Setup | Result |
-|---|---|
-| ICMP tunnel on that path (the one where only ICMP passes directly) | ~1.1 MB/s down, ~2.1 MB/s up |
-| Cloudflare `wss` + ECH, 1 session (2.3.0) | ~19 MB/s down |
-| Same tunnel, 4 sessions (2.3.0) | ~52 MB/s down, ~51 MB/s up |
-| 6 sessions (2.3.0) | ~60 MB/s down |
-| 8 sessions (2.3.0) | peak 69 MB/s up |
-| 6 sessions (2.4.0) | 76.6 MB/s up |
-
-On a different, cleaner ICMP-only route (Iran ⇄ Europe, 2026-10-09, real VLESS traffic), WatTunnel 1.8.0 reached
-about 33 MB/s, the route's limit, with ~40 MB of RAM and 6 to 7 times less CPU per MB than GOST's ICMP tunnel (1.6 to
-5.4 MB/s). Your route will differ: use `wattun test NAME` to see what you get. More numbers:
-[bench/results-2026-10-09-final.md](bench/results-2026-10-09-final.md) and
-[docs/TECHNICAL.md](docs/TECHNICAL.md#why-it-exists).
 
 ## Managing tunnels
 
