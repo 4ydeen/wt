@@ -180,6 +180,85 @@ the streams and which ports are published do not change.
 - In `wattun-manager`: Kharej setup → advanced settings → reverse, or for an existing tunnel Advanced settings →
   `d` on both sides. The token carries the flag (field 8), so a fresh Iran setup picks it up.
 
+### Reverse pool carriers
+
+For `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc`. Use it when Iran cannot reach a port on Kharej but Kharej can
+open connections to Iran. Iran listens on `listen`, Kharej dials Iran's `IP:port` as `peer`. The session roles do not
+change: users still connect to Iran, and traffic still goes to Kharej's `127.0.0.1:PORT`. Put `reverse: true` and the
+same `key`, `carrier` and `path` on both ends. Needs a port that Iran's firewall allows in; Kharej needs no open port.
+
+The TLS and HTTP flags swap sides along with the roles:
+
+| Key | Set on | Used for |
+|---|---|---|
+| `listen` | Iran (listener) | Address to accept Kharej on, e.g. `:8443`. |
+| `peer` | Kharej (dialer) | Iran's `IP:port`, the same port as Iran's `listen`. |
+| `tls-cert`, `tls-key` | Iran (listener) | Certificate to present. Empty = an in-memory self-signed certificate generated at start. |
+| `sni`, `host`, `header` | Kharej (dialer) | TLS server name, Host/authority and extra headers of the outgoing connections. |
+| `tls-pin` | Kharej (dialer) | Hex sha256 of Iran's certificate. |
+| `conns` | Kharej (dialer) | Number of connections dialed to Iran. |
+| `plain` | both | grpc without TLS. |
+| `path` | both | URL path. Must match. |
+
+**Certificates.** Without `tls-pin` the dialer (Kharej) does not verify Iran's certificate. This is intended: the
+pre-shared key (the ChaCha20-Poly1305 session) already stops an impostor, and TLS only shapes the traffic. For strict
+checking, give Iran a real certificate (`tls-cert`, `tls-key`) and set `tls-pin` on Kharej to its sha256 fingerprint
+(hex).
+
+Example, `wss`:
+
+```yaml
+# Iran: listens, still opens the streams and serves the public ports
+mode: client
+key-file: /etc/wattun/key
+carrier: wss
+reverse: true
+listen: ":8443"
+path: /wat
+ports:
+  - 443
+```
+
+```yaml
+# Kharej: dials out to Iran
+mode: server
+key-file: /etc/wattun/key
+carrier: wss
+reverse: true
+peer: 198.51.100.20:8443
+path: /wat
+sni: example.com      # optional
+conns: 8
+ports:
+  - 443
+```
+
+In `wattun-manager`:
+
+- New tunnel: Kharej setup → advanced settings → reverse. It asks for Iran's IPv4, and the carrier port P you chose
+  becomes the port Iran listens on. The token carries the flag, so Iran picks it up when you paste it.
+- Existing tunnel: open it → `o` (advanced settings) → `d` (direction), on Kharej first, then on Iran.
+- On Iran the manager opens P/tcp in the firewall. Kharej needs no open port.
+- Diagnose: on Kharej it tests a TCP connection Kharej → Iran on P. On Iran it checks that P is listening.
+
+**When it does not help.** Reverse only changes who dials. If the route cuts TCP in both directions, it does not
+matter who opens the connection. Field result on one real Iran-Kharej path (measured 2026-10-10): reverse `tcp`
+stalled after 192 B, reverse `tls` was reset before any data, and a plain TCP socket from Kharej to Iran connected,
+received 3528 B and then stalled (3 out of 3 tries). That filter cuts TCP both ways, and only reverse ICMP worked
+there. If a plain TCP connection from Kharej to Iran's port already stalls, use reverse `icmp` or the normal `icmp`
+instead.
+
+### Carrier matrix
+
+| Carrier | Direct | Reverse | Minimum version (both ends) |
+|---|---|---|---|
+| `icmp` | yes | yes | direct: any; reverse: 2.0.0 |
+| `udp` | yes | no | not applicable (no reverse) |
+| `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc` | yes | yes | direct: 1.3.0; reverse: 1.8.0 |
+
+The reverse pool carriers are in the first release of this repository's history (1.8.0). An earlier release may
+have had them too; this table says 1.8.0 because that is the oldest one that can be checked.
+
 ## UDP forwarding
 
 Since 1.2.0 WatTunnel also forwards UDP ports (WireGuard, DNS, QUIC, game servers) as unreliable datagrams inside the
@@ -235,14 +314,14 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `key` | | both | Pre-shared key. Prefer `key-file`. |
 | `key-file` | | both | File with the key (whitespace trimmed). Same on both ends. |
 | `carrier` | `icmp` | both | One of the carriers above. |
-| `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. Reverse icmp: Kharej sets Iran's IP, Iran keeps Kharej's. |
-| `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. |
+| `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. Reverse pool carriers: Kharej sets Iran's `IP:port`. Reverse icmp: Kharej sets Iran's IP, Iran keeps Kharej's. |
+| `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. With `reverse` Iran listens here and Kharej's `peer` must point to it. |
 | `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. |
 | `ports` | | both | List of `N`, `N/udp`, `LISTEN:TARGET` and `LISTEN:TARGET/udp`. Client listens on LISTEN, server allows TARGET. Hot-reloaded. |
 | `bind` | `0.0.0.0` | client | Address of the public listeners. |
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
-| `conns` | 8 | client | Connections in a pool carrier. |
+| `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
 | `max-mbps` | 16 | both | Pacing ceiling, MB/s per direction. See "ICMP path limits and pacing". |
 | `icmp-type` | `echo` | both | ICMP carrier: `echo`, `timestamp`, `info` or `mask`. Both ends must match. |
@@ -254,13 +333,13 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `allow-file` | | server | File with allowed ports, re-read when it changes. Overrides `allow-ports`. |
 | `udp` | | client | UDP forwards, `PORT` or `listenPort:serverPort[@bind]`. |
 | `udp-idle` | 60s | both | Close UDP flows idle this long. |
-| `tls-cert`, `tls-key` | in-memory self-signed | server | Certificate files for tls, wss, h2 and grpc. |
-| `sni` | | client | Server name in the TLS ClientHello. |
-| `tls-pin` | | client | Hex sha256 of the server certificate. Also makes the client check the server. |
-| `path` | `/wat` | both | URL path for ws, wss, h2, h2c, grpc (grpc: service name). |
-| `host` | = `peer` | client | Host header / authority. |
-| `plain` | false | both | grpc without TLS. |
-| `header` | | client | Extra request header `Name: value`. Repeatable. |
+| `tls-cert`, `tls-key` | in-memory self-signed | server (client with `reverse`) | Certificate files for tls, wss, h2 and grpc, on whichever side listens. |
+| `sni` | | client (server with `reverse`) | Server name in the TLS ClientHello, set on whichever side dials. |
+| `tls-pin` | | client (server with `reverse`) | Hex sha256 of the listener's certificate. Also makes the dialing side check it. Without it the dialer does not verify the certificate. |
+| `path` | `/wat` | both | URL path for ws, wss, h2, h2c, grpc (grpc: service name). Same on both ends, also with `reverse`. |
+| `host` | = `peer` | client (server with `reverse`) | Host header / authority, set on whichever side dials. |
+| `plain` | false | both (dialer with `reverse`) | grpc without TLS. |
+| `header` | | client (server with `reverse`) | Extra request header `Name: value`. Repeatable. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. |
 | `debug` | false | both | Log every stream open and close. |
 

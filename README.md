@@ -35,7 +35,7 @@ HTTP/2 or gRPC, including behind Cloudflare.
 - [Quick start](#-quick-start)
 - [The manager](#-the-manager)
 - [Choosing a carrier](#-choosing-a-carrier)
-- [Reverse ICMP](#-reverse-icmp)
+- [Reverse mode](#-reverse-mode)
 - [Configuration](#-configuration)
 - [Monitoring and troubleshooting](#-monitoring-and-troubleshooting)
 - [Security](#-security)
@@ -68,7 +68,7 @@ HTTP/2 or gRPC, including behind Cloudflare.
 **2.0.0: Reverse ICMP.** Some Iran IPs get a one-way block: Iran can't ping Kharej, but Kharej can still ping Iran.
 It often comes and goes from day to day. Normal ICMP tunnels (WatTunnel before 2.0.0, Backhaul, Dagger, GOST...) all
 die on those days, because Iran is the side that sends the pings. Reverse ICMP swaps only the ping direction: Kharej
-sends, Iran answers. Port forwarding does not change. See [Reverse ICMP](#-reverse-icmp). Both servers need 2.0.0.
+sends, Iran answers. Port forwarding does not change. See [Reverse ICMP](#-reverse-mode). Both servers need 2.0.0.
 
 Earlier in the 1.9 series:
 
@@ -139,7 +139,7 @@ production it carries **250 – 300 real clients** through a single process.
 | Built-in encryption | ✅ AEAD | ✅ | ⚠️ | ⚠️ | ❌ |
 | Adaptive FEC | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Reverse mode | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Reverse mode (TCP-based carriers) | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Reverse ICMP (Kharej pings, Iran keeps the ports) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Single static binary, no dependencies | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Guided manager, token pairing, auto-heal | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -223,7 +223,7 @@ The manager waits for the link and shows:
 
 Users now connect to the Iran server's IP. Each Iran port is delivered to its Kharej port on `127.0.0.1`.
 
-> **Iran can't ping Kharej, but Kharej can ping Iran?** Use [Reverse ICMP](#-reverse-icmp).
+> **Iran can't ping Kharej, but Kharej can ping Iran?** Use [Reverse ICMP](#-reverse-mode).
 
 ```
 users ──► Iran :8443 ══ WatTunnel (icmp / udp / tls / wss …) ══► Kharej ──► 127.0.0.1:443 (your service)
@@ -323,10 +323,16 @@ wattun-manager update | rollback | help
 | `grpc` / `h2` | CDNs or proxies that prefer gRPC or HTTP/2. | |
 
 Not sure? Start with `icmp` on heavily filtered routes and `wss` behind Cloudflare. If Iran can't ping Kharej but
-Kharej can ping Iran, use `icmp` with [Reverse ICMP](#-reverse-icmp). Reverse mode for the TCP-based carriers,
-bonding, UDP-only forwards and the other advanced options are covered in [docs/TECHNICAL.md](docs/TECHNICAL.md).
+Kharej can ping Iran, use `icmp` with [Reverse ICMP](#-reverse-mode). If Iran can't reach Kharej's TCP port
+but Kharej can reach Iran, see [Reverse mode](#-reverse-mode). Bonding, UDP-only forwards and the other advanced options
+are covered in [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
-## 🔁 Reverse ICMP
+## 🔁 Reverse mode
+
+Reverse mode swaps who starts the connection. It works for ICMP (2.0.0) and for the TCP-based carriers. Users still
+connect to Iran, and traffic still goes to your service on Kharej.
+
+### Reverse ICMP
 
 **When to use it.** Run `ping KHAREJ_IP` on Iran and `ping IRAN_IP` on Kharej. If Iran's ping gets 100 % loss but
 Kharej's ping works, Iran's own pings are blocked one way. Some Iran IPs are greylisted like this, often one day
@@ -382,6 +388,49 @@ peer: 203.0.113.10      # Kharej's IP, as before
 
 Details: [docs/TECHNICAL.md → Reverse ICMP](docs/TECHNICAL.md#reverse-icmp).
 
+### Reverse mode for the TCP-based carriers
+
+**When to use it.** Iran can't connect to Kharej's port (`tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` or `grpc`), but Kharej
+can connect to Iran. With `reverse: true` on both ends, Iran listens and Kharej dials Iran's `IP:port`. Users still
+connect to Iran, and traffic still goes to your service on Kharej. Kharej needs no open port. `udp` has no reverse mode.
+
+**How to turn it on.** In the Kharej wizard choose a TCP-based carrier, then advanced settings → reverse. It asks for
+Iran's IPv4, and the carrier port you pick becomes the port Iran listens on. The token carries it, so Iran picks it up
+when you paste it, and the manager opens that port in Iran's firewall. For an existing tunnel use `o` → `d`, on Kharej
+first and then on Iran. Both servers need 1.8.0 or newer. Diagnose on Kharej checks that it can open
+a TCP connection to Iran on that port. By hand, for `wss`:
+
+```yaml
+# Iran: /etc/wattun/iran.yml
+mode: client
+carrier: wss
+reverse: true
+listen: ":8443"
+path: /wat
+```
+
+```yaml
+# Kharej: /etc/wattun/kharej.yml
+mode: server
+carrier: wss
+reverse: true
+peer: 198.51.100.20:8443    # Iran's IP and the port it listens on
+path: /wat
+```
+
+**Good to know.**
+
+- The TLS options swap sides too: Iran presents the certificate (a self-signed one unless you give it `tls-cert` and
+  `tls-key`), and Kharej sets `sni`, `host` and `conns`. Kharej doesn't verify the certificate unless you set
+  `tls-pin`, which is fine because the pre-shared key already authenticates both ends. For strict checking, see
+  [TECHNICAL.md → Reverse pool carriers](docs/TECHNICAL.md#reverse-pool-carriers).
+- **It won't help if the route cuts TCP in both directions.** On one real path (measured 2026-10-10) reverse `tcp`
+  stalled after 192 bytes, reverse `tls` was reset before any data, and even a plain TCP connection from Kharej to
+  Iran got 3528 bytes and then stalled. Only reverse ICMP worked there. Test a plain TCP connection from Kharej to
+  Iran first; if that stalls, use `icmp`.
+
+Flags, certificates and a per-carrier table: [docs/TECHNICAL.md → Reverse mode](docs/TECHNICAL.md#reverse-mode).
+
 ## ⚙️ Configuration
 
 Each tunnel is one readable file at `/etc/wattun/NAME.yml`, run by systemd as `wattun@NAME`. The keys are the same as
@@ -422,7 +471,7 @@ curl -s 127.0.0.1:19700/ports       # traffic per port
 |---|---|
 | `DISCONNECTED`, no errors | The key or carrier differs between the two sides. Paste the token again on Iran. For ICMP, check that `ping` works from Iran to Kharej. |
 | The Iran log says `no reply from the server` or `lost contact` | The tunnel is sending but nothing comes back. Run **Diagnose** on Iran: it pings Kharej at four packet sizes and tells you which case it is (ICMP blocked, large packets dropped, wrong key or carrier, or the route blocking the answers right now). |
-| Iran can't ping Kharej, but Kharej can ping Iran (often one day blocked, the next day fine) | Iran's own pings are blocked one way. Switch **both** sides to [Reverse ICMP](#-reverse-icmp) (2.0.0): open the tunnel → `o` → `d`, on Kharej first (it asks for Iran's IP), then on Iran. Kharej then sends the pings and Iran answers. |
+| Iran can't ping Kharej, but Kharej can ping Iran (often one day blocked, the next day fine) | Iran's own pings are blocked one way. Switch **both** sides to [Reverse ICMP](#-reverse-mode) (2.0.0): open the tunnel → `o` → `d`, on Kharej first (it asks for Iran's IP), then on Iran. Kharej then sends the pings and Iran answers. |
 | It works some days and not others | First check the row above: if only Iran's pings are blocked, reverse ICMP fixes it. Otherwise the route between the servers is being filtered on the bad days. No tunnel can carry data while its packets are blocked. WatTunnel reconnects by itself when they pass again (keep auto-heal on). For bad days, keep a second tunnel with another carrier (`wss`, `tcp`, `udp`) as a backup. |
 | ICMP: small pings work but the tunnel stalls | MTU. Keep the default 640. |
 | `tcp`, `tls` or `ws` never connect | That carrier is filtered on your route, or the port is closed. Try `icmp` or `wss` behind a CDN. |
