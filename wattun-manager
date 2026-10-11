@@ -144,7 +144,7 @@ make_logo() {
 make_logo
 
 EL=''; [ "$IS_TTY" = 1 ] && EL=$'\e[K'
-clear_screen() { [ "$IS_TTY" = 1 ] && printf '\e[H\e[2J\e[3J'; return 0; }
+clear_screen() { [ "$IS_TTY" = 1 ] && printf '\e[H\e[2J'; return 0; }
 page_full() { # title [subtitle] : big banner (dashboard, first screens)
   clear_screen; echo
   if [ "$ANIM" = 1 ] && [ "$INTRO_DONE" = 0 ]; then banner 1; else banner 0; fi
@@ -211,13 +211,29 @@ celebrate() { # text : short success flourish
 # ---- input ----
 # shellcheck disable=SC2120
 key_read() { # [timeout] -> KEY ; rc 0 key, 2 timeout ; EOF exits
-  local rc; KEY=''
-  if [ -n "${1:-}" ]; then IFS= read -rsn1 -t "$1" KEY; rc=$?; else IFS= read -rsn1 KEY; rc=$?; fi
-  if [ "$rc" -ne 0 ]; then
-    [ "$rc" -gt 128 ] && { KEY=''; return 2; }
-    eof_exit
-  fi
-  if [ "$KEY" = $'\e' ]; then IFS= read -rsn2 -t 0.02 _; KEY=esc; fi
+  local rc k2 c i; KEY=''
+  while :; do
+    if [ -n "${1:-}" ]; then IFS= read -rsn1 -t "$1" KEY; rc=$?; else IFS= read -rsn1 KEY; rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+      [ "$rc" -gt 128 ] && { KEY=''; return 2; }
+      eof_exit
+    fi
+    if [ "$KEY" = $'\e' ]; then
+      # ESC followed by more bytes is an escape sequence (arrows, Home, F-keys): swallow it and read again.
+      # A lone ESC stays "esc".
+      if IFS= read -rsn1 -t 0.05 k2; then
+        if [ "$k2" = '[' ] || [ "$k2" = O ]; then
+          for ((i=0; i<8; i++)); do
+            IFS= read -rsn1 -t 0.05 c || break
+            case "$c" in [A-Za-z~@]) break ;; esac
+          done
+        fi
+        KEY=''; continue
+      fi
+      KEY=esc
+    fi
+    break
+  done
   [ -z "$KEY" ] && KEY=enter
   return 0
 }
@@ -276,7 +292,33 @@ stats()   { local m; m=$(cfg "$1" metrics); [ -n "$m" ] && curl -fs --noproxy '*
 ms()      { printf "%.1f" "${1:-0}"; }
 jget()    { grep -o "\"$2\": *[^,}]*" <<<"$1" | head -1 | sed 's/.*: *//; s/"//g'; }
 human()   { awk -v b="${1:-0}" 'BEGIN{s="B KB MB GB TB";split(s,u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}printf "%.1f %s",b,u[i]}'; }
-public_ip() { curl -fs4 --max-time 5 https://api.ipify.org 2>/dev/null || curl -fs4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'; }
+ipv4_ok() { # is $1 a dotted IPv4 with every octet 0-255 ?
+  local a b c d
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; c=${BASH_REMATCH[3]}; d=${BASH_REMATCH[4]}
+  [ "$((10#$a))" -le 255 ] && [ "$((10#$b))" -le 255 ] && [ "$((10#$c))" -le 255 ] && [ "$((10#$d))" -le 255 ]
+}
+ip_is_private() { # RFC1918, CGNAT 100.64/10, loopback, link-local
+  local a b
+  ipv4_ok "$1" || return 1
+  a=${1%%.*}; b=${1#*.}; b=${b%%.*}; a=$((10#$a)); b=$((10#$b))
+  case "$a" in 10|127) return 0 ;; esac
+  [ "$a" = 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 0
+  [ "$a" = 192 ] && [ "$b" = 168 ] && return 0
+  [ "$a" = 169 ] && [ "$b" = 254 ] && return 0
+  [ "$a" = 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] && return 0
+  return 1
+}
+public_ip() { # prints a valid IPv4 or nothing
+  local ip u
+  for u in https://api.ipify.org https://ifconfig.me; do
+    ip=$(curl -fs4 --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
+    ipv4_ok "$ip" && { echo "$ip"; return 0; }
+  done
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  ipv4_ok "$ip" && echo "$ip"
+  return 0
+}
 new_key() { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40; }
 uptime_of() { local t; t=$(systemctl show "wattun@$1" -p ActiveEnterTimestamp --value 2>/dev/null); [ -n "$t" ] && echo "since $t" || echo "-"; }
 
@@ -533,6 +575,7 @@ reverse_hint() { # [carrier]
   fi
 }
 v_icmp() { case "$1" in echo|timestamp|info|mask) return 0 ;; esac; err "Use echo, timestamp, info or mask."; return 1; }
+v_mbps_adv() { case "$1" in -|0|default) return 0 ;; esac; v_mbps "$1"; }
 v_mbps() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && return 0; err "Enter a number of MB/s (1-9999)."; return 1; }
 v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
 v_fec() { case "$1" in off|auto) return 0 ;; esac; err "Use off or auto."; return 1; }
@@ -911,8 +954,14 @@ wizard_kharej() {
   # address Iran connects to
   page "New tunnel" "STEP 1 · Kharej (outside server)"
   spin_start "Detecting this server's public IP"; addr=$(public_ip); spin_stop
-  if [ -z "$addr" ]; then
+  if [ -n "$addr" ] && ip_is_private "$addr"; then
+    warn "$addr looks like a private address; Iran cannot reach it."
+    confirm "Use $addr anyway? (n = enter the public IP yourself)" n || addr=''
+    [ -z "$addr" ] && hint "Behind NAT or a cloud 1:1 mapping? Enter the public IP shown in your provider's panel."
+  elif [ -z "$addr" ]; then
     warn "Could not detect this server's public IP."
+  fi
+  if [ -z "$addr" ]; then
     ask_ok "Public IP or domain of this server" "" v_host || return 1; addr=$REPLY_V
   else
     ok "Public address: $addr"
@@ -1087,10 +1136,14 @@ wizard_iran() {
   # port mappings
   MAPS=(); PE_ROLE=Iran; PE_TUNNEL=$name; PE_OWNED=()
   allow_to_array "$T_PORTS"
+  PE_MSG=''
   if [ "${#PE_ALLOW[@]}" -gt 0 ]; then
-    for it in "${PE_ALLOW[@]}"; do MAPS+=("$(spec_T "$it"):$(spec_T "$it")/$(spec_P "$it")"); done
+    local skipped=0
     PE_MSG="${GRN}✔${RST} Pre-filled from the token: every port Kharej allows is published on the same port here."$'\n'
     PE_MSG+="  Edit a row to publish it on another Iran port (e.g. users on 8443, service on 443)."$'\n'
+    # same checks as a hand-typed row: busy port, another tunnel publishing it
+    for it in "${PE_ALLOW[@]}"; do pe_try_add "$(spec_T "$it"):$(spec_T "$it")/$(spec_P "$it")" || skipped=$((skipped+1)); done
+    [ "$skipped" -gt 0 ] && pe_msg "${YEL}!${RST} $skipped port(s) from the token were skipped because they conflict (see above). Add each one on another Iran port (e.g. 8443:443)."
   fi
   port_editor || { warn "Cancelled."; return 1; }
   if [ -n "$rport" ]; then
@@ -1115,7 +1168,7 @@ wizard_iran() {
     ask_ok "Speed ceiling in MB/s (empty = default 16)" "" v_mbps || return 1; mbps=$REPLY_V
     ask_ok "FEC: off or auto (auto needs auto on both ends)" off v_fec || return 1; fec=$REPLY_V
     if [ "$T_CARRIER" = icmp ]; then ask_ok "ICMP type (must match Kharej)" "${T_ICMP:-echo}" v_icmp || return 1; T_ICMP=$REPLY_V; fi
-    [ -z "$rport" ] && case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
+    case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
     case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "${T_PATH:-/wat}" v_path || return 1; T_PATH=$REPLY_V ;; esac
   fi
   valid_name "$name" || { err "The name '$name' is not available."; return 1; }
@@ -1150,7 +1203,7 @@ wizard_iran() {
       echo "carrier: $T_CARRIER"
       echo "peer: $T_PEER"
       [ -n "$T_PATH" ] && echo "path: $T_PATH"
-      [ -n "$T_SNI" ] && [ -z "$rport" ] && { echo "sni: $T_SNI"; echo "host: $T_SNI"; }
+      [ -n "$T_SNI" ] && { echo "sni: $T_SNI"; echo "host: $T_SNI"; }
       [ -n "$T_ICMP" ] && [ "$T_ICMP" != echo ] && echo "icmp-type: $T_ICMP"
       [ "$T_REV" = 1 ] && echo "reverse: true"
       [ -n "$rport" ] && echo "listen: \":$rport\""
@@ -1216,21 +1269,48 @@ new_tunnel() { # [kharej|iran]
 # counters, then say which cause fits. Uses plain ping, so it needs nothing installed on Kharej.
 # Does this server itself block ICMP? Looks at the kernel switch and the local firewall rules (iptables, nftables).
 # It cannot see a firewall in the provider's cloud panel. Prints one warning per finding; returns 0 when it found one.
-local_icmp_check() { # [reverse-iran: icmp_echo_ignore_all does not stop the tunnel there]
-  local found=1 rules
+# Does this iptables/nft rule line touch ICMP the tunnel uses? $1 = rule, $2 = space-padded list of type numbers in use.
+# True when the rule has no type restriction or names a type in use; false for icmpv6 and unrelated types (time-exceeded...).
+icmp_rule_hits() {
+  local l=$1 used=$2 toks tok n
+  case "$l" in *icmpv6*|*ipv6-icmp*) return 1 ;; esac
+  case "$l" in *'! --icmp-type'*|*'icmp type !='*) return 0 ;; esac
+  if [[ "$l" =~ --icmp-type[[:space:]]+([^[:space:]]+) ]]; then toks=${BASH_REMATCH[1]}
+  elif [[ "$l" =~ icmp[[:space:]]+type[[:space:]]+(\{[^}]*\}|[^[:space:]]+) ]]; then toks=${BASH_REMATCH[1]}
+  else return 0; fi
+  toks=${toks//[\{\},]/ }
+  for tok in $toks; do
+    tok=${tok%%/*}
+    case "$tok" in
+      echo-reply|pong) n=0 ;; echo-request|ping) n=8 ;;
+      timestamp-request) n=13 ;; timestamp-reply) n=14 ;;
+      info-request) n=15 ;; info-reply) n=16 ;;
+      address-mask-request) n=17 ;; address-mask-reply) n=18 ;;
+      any) return 0 ;;
+      *[!0-9]*) n=x ;; *) n=$tok ;;
+    esac
+    case "$used" in *" $n "*) return 0 ;; esac
+  done
+  return 1
+}
+local_icmp_check() { # [reverse-iran|-] [icmp-type] : icmp_echo_ignore_all does not stop the tunnel itself, only ping checks
+  local found=1 rules hits l used=' 0 8 '
+  case "${2:-echo}" in timestamp) used=' 0 8 13 14 ' ;; info) used=' 0 8 15 16 ' ;; mask) used=' 0 8 17 18 ' ;; esac
   if [ "${1:-}" != reverse-iran ] && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
-    warn "This server ignores ping: net.ipv4.icmp_echo_ignore_all=1  (fix: sysctl -w net.ipv4.icmp_echo_ignore_all=0)"; found=0
+    hint "This server ignores plain ping (icmp_echo_ignore_all=1). The tunnel still works; only ping-based checks go unanswered."
   fi
   if command -v iptables >/dev/null 2>&1; then
-    rules=$(iptables -S 2>/dev/null | grep -i icmp | grep -E -- '-j (DROP|REJECT)')
-    if [ -n "$rules" ]; then warn "iptables has ICMP rules that drop or reject:"; printf '%s\n' "$rules" | sed "s/^/        $GRY/; s/\$/$RST/"; found=0; fi
+    rules=$(iptables -S 2>/dev/null | grep -i icmp | grep -E -- '-j (DROP|REJECT)'); hits=''
+    while IFS= read -r l; do [ -n "$l" ] && icmp_rule_hits "$l" "$used" && hits+="$l"$'\n'; done <<<"$rules"
+    if [ -n "$hits" ]; then warn "iptables has ICMP rules that drop or reject:"; printf '%s' "$hits" | sed "s/^/        $GRY/; s/\$/$RST/"; found=0; fi
     if iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP' && ! iptables -S INPUT 2>/dev/null | grep -qi icmp; then
       warn "iptables INPUT drops everything not allowed, and no ICMP rule exists."; found=0
     fi
   fi
   if command -v nft >/dev/null 2>&1; then
-    rules=$(nft list ruleset 2>/dev/null | grep -i icmp | grep -Ei 'drop|reject')
-    if [ -n "$rules" ]; then warn "nftables has ICMP rules that drop or reject:"; printf '%s\n' "$rules" | sed "s/^/        $GRY/; s/\$/$RST/"; found=0; fi
+    rules=$(nft list ruleset 2>/dev/null | grep -i icmp | grep -Ei 'drop|reject'); hits=''
+    while IFS= read -r l; do [ -n "$l" ] && icmp_rule_hits "$l" "$used" && hits+="$l"$'\n'; done <<<"$rules"
+    if [ -n "$hits" ]; then warn "nftables has ICMP rules that drop or reject:"; printf '%s' "$hits" | sed "s/^/        $GRY/; s/\$/$RST/"; found=0; fi
   fi
   return $found
 }
@@ -1248,8 +1328,7 @@ icmp_path_report() { # name host
     else bad_sizes="$bad_sizes $sz"; err "$sz bytes: no answer (loss ${loss}%)"; fi
   done
   s=$(stats "$n"); pin=$(jget "$s" pkts_in); pout=$(jget "$s" pkts_out); pin=${pin:-0}; pout=${pout:-0}
-  local_icmp_check >/dev/null
-  local_icmp_check
+  local_icmp_check - "$(cfg "$n" icmp-type)"
   echo
   say "  ${BOLD}What this means${RST}"
   if [ -z "$ok_sizes" ]; then
@@ -1321,7 +1400,7 @@ test_tunnel() {
   if [ "$r" = Iran ] && [ "$cr" = icmp ] && [ "$(jget "$s" alive)" != true ]; then
     if is_reverse "$n"; then
       echo; say "  ${BOLD}Is this server blocking ICMP itself?${RST}"
-      if local_icmp_check reverse-iran; then hint "Fix the finding above: in reverse mode this server must receive Kharej's pings."
+      if local_icmp_check reverse-iran "$(cfg "$n" icmp-type)"; then hint "Fix the finding above: in reverse mode this server must receive Kharej's pings."
       else ok "No rule on this server blocks ICMP."; fi
     else icmp_path_report "$n" "${peer%:*}"; fi
   fi
@@ -1354,7 +1433,7 @@ test_tunnel() {
     if [ "$cr" = icmp ]; then
       echo
       say "  ${BOLD}Is this server blocking ICMP itself?${RST}"
-      if local_icmp_check; then
+      if local_icmp_check - "$(cfg "$n" icmp-type)"; then
         hint "Fix the finding above and test again."
       else
         ok "No rule on this server blocks ICMP (kernel switch and local firewall are fine)."
@@ -1557,9 +1636,27 @@ edit_ports() { # name
   fi
 }
 change_peer() {
-  local n=$1
-  ask_ok "New Kharej address (host or host:port)" "$(cfg "$n" peer)" v_host || return 1
-  set_value "$n" peer "$REPLY_V"
+  local n=$1 cr old v op np
+  cr=$(cfg "$n" carrier); old=$(cfg "$n" peer)
+  ask_ok "New Kharej address (host or host:port)" "$old" v_host || return 1
+  v=$REPLY_V
+  if [ "$cr" != icmp ]; then
+    op=${old##*:}; [ "$op" = "$old" ] && op=''
+    if [[ "$v" != *:* ]]; then
+      [ -n "$op" ] || { err "This carrier needs host:port (for example example.com:443)."; return 1; }
+      v="$v:$op"; hint "No port given: keeping port $op."
+    fi
+    v_port "${v##*:}" >/dev/null 2>&1 || { err "The Kharej address needs a valid port, like host:443."; return 1; }
+    np=$((10#${v##*:}))
+    if is_pool "$cr" && is_reverse "$n" && [ "$np" != "$op" ]; then
+      # reverse: Iran listens on the carrier port, so it follows the peer port
+      if listen_blocked tcp "$np"; then err "Port $np/tcp is already in use here (another program or tunnel)."; return 1; fi
+      set_value "$n" listen "\":$np\""
+      fw_open "$np/tcp"
+    fi
+    v="${v%:*}:$np"
+  fi
+  set_value "$n" peer "$v"
   step "Restarting wattun@$n" systemctl restart "wattun@$n" || return 1
   wait_link "$n" 20 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
 }
@@ -1676,7 +1773,8 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
     printf '%s  back\n' "$(key_label b)"
     key_read
     case "$KEY" in
-      m) echo; ask_ok "Speed ceiling in MB/s (empty = default)" "$(cfg "$n" max-mbps)" v_mbps || continue
+      m) echo; ask_ok "Speed ceiling in MB/s (- or 0 or default = unset)" "$(cfg "$n" max-mbps)" v_mbps_adv || continue
+         case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
          if [ -z "$REPLY_V" ]; then unset_value "$n" max-mbps; else set_value "$n" max-mbps "$REPLY_V"; fi; changed=1 ;;
       f) echo; ask_ok "FEC: off or auto" "$(cfg "$n" fec | sed 's/^$/off/')" v_fec || continue
          if [ "$REPLY_V" = off ]; then unset_value "$n" fec; else set_value "$n" fec "$REPLY_V"; fi; changed=1 ;;
@@ -1686,7 +1784,8 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
          if [ "$REPLY_V" = echo ]; then unset_value "$n" icmp-type; else set_value "$n" icmp-type "$REPLY_V"; fi; changed=1 ;;
       d) rev_capable "$cr" || continue; echo
          # applied at once, so the direction never sits in the file without running
-         set_direction "$n" && step "Restarting wattun@$n" systemctl restart "wattun@$n" ;;
+         set_direction "$n" && step "Restarting wattun@$n" systemctl restart "wattun@$n"
+         pause ;;
       b|0|q|enter|esc) break ;;
       *) : ;;
     esac
@@ -1768,11 +1867,13 @@ EOF
 }
 heal_disable() { systemctl disable --now "$HEAL_UNIT.timer" >/dev/null 2>&1; ok "Auto-heal disabled."; }
 heal() { # restart Iran tunnels whose link is down 3 checks in a row
-  local n cnt f
+  local n cnt f st
   mkdir -p "$RUN"
   for n in $(tunnels); do
     [ "$(role "$n")" = Iran ] && systemctl is-enabled -q "wattun@$n" || continue
     f="$RUN/$n.down"
+    st=$(systemctl is-active "wattun@$n" 2>/dev/null)
+    if [ "$st" = inactive ]; then rm -f "$f"; continue; fi # stopped on purpose: leave it alone
     if [ "$(jget "$(stats "$n")" alive)" = true ]; then rm -f "$f"; continue; fi
     cnt=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$cnt" >"$f"
     if [ "$cnt" -ge 3 ]; then
@@ -1846,7 +1947,7 @@ rollback() {
   return 0
 }
 uninstall_all() {
-  local n list=() u
+  local n list=() u units
   for n in $(tunnels); do list+=("$n"); done
   echo
   if [ "${#list[@]}" -gt 0 ]; then
@@ -1857,9 +1958,13 @@ uninstall_all() {
   ask "Type 'uninstall' to remove WatTunnel (empty = cancel)" ""
   [ "$REPLY_V" = uninstall ] || { warn "Cancelled."; return 1; }
   heal_disable >/dev/null 2>&1; rm -f "/etc/systemd/system/$HEAL_UNIT.service" "/etc/systemd/system/$HEAL_UNIT.timer"
-  for u in $(systemctl list-units --all --plain --no-legend 'wattun@*' 2>/dev/null | awk '{print $1}'); do
+  # loaded instances plus every configured name (enabled-but-unloaded ones are not in list-units)
+  units=$(systemctl list-units --all --plain --no-legend 'wattun@*' 2>/dev/null | awk '{print $1}')
+  for n in "${list[@]}"; do units+=$'\n'"wattun@$n.service"; done
+  for u in $(printf '%s\n' "$units" | sort -u); do
     systemctl disable --now "$u" >/dev/null 2>&1
   done
+  kreply_restore
   rm -f /etc/systemd/system/wattun@.service "$BIN" "$BIN.prev"
   systemctl daemon-reload
   ok "Services and binaries removed."
@@ -1922,7 +2027,7 @@ main_menu() {
         m|M) if [ "${#DASH_N[@]}" -gt 0 ]; then run_flow live_monitor; fi; break ;;
         s|S) settings_menu; break ;;
         u|U) page "Update"; echo; if update; then echo; hint "The manager reloads itself to show the new version."; pause; exec "$MGR"; fi; pause; break ;;
-        q|Q|esc) cur_show; echo; exit 0 ;;
+        q|Q) cur_show; echo; exit 0 ;;
         enter) break ;;
         *) if [ "${#DASH_N[@]}" -gt 0 ]; then flash "Unknown key '$KEY'. Press a tunnel's number to manage it, or n, m, u, s, q."
            else flash "Unknown key '$KEY'. Press n to create your first tunnel."; fi ;;

@@ -930,6 +930,7 @@ func (s *Session) compact() {
 // ---- receiving ----
 
 func (s *Session) recvLoop() {
+	var bo recvBackoff
 	for {
 		raw, lane, src, err := s.io.Recv()
 		if err != nil {
@@ -937,10 +938,11 @@ func (s *Session) recvLoop() {
 			case <-s.stop:
 				return
 			default:
-				time.Sleep(time.Millisecond)
+				bo.fail(err, s.cfg.Logf, "session receive")
 				continue
 			}
 		}
+		bo.ok()
 		s.handle(raw, lane, src)
 	}
 }

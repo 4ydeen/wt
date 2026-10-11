@@ -199,7 +199,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ "$(id -u)" -eq 0 ] || die "run as root (sudo bash install.sh)"
+if [ "$(id -u)" -ne 0 ]; then
+  if [ -f "$HERE/install.sh" ]; then die "run as root (sudo bash install.sh)"
+  else die "run as root: sudo bash <(curl -fsSL https://raw.githubusercontent.com/JohnWatsoon/WatTunnel/main/install.sh)"; fi
+fi
 command -v systemctl >/dev/null || die "systemd is required"
 
 tunnel_list() { local f b; for f in "$CONF"/*.yml; do [ -e "$f" ] || continue; b=${f##*/}; echo "${b%.yml}"; done; }
@@ -263,12 +266,12 @@ resolve_tag() {
   local u
   [ "$VERSION" = latest ] || { TAG=$VERSION; return 0; }
   command -v curl >/dev/null || return 1
-  u=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 15 --max-time 30 "${PROXY}https://github.com/$REPO/releases/latest" 2>/dev/null) || return 1
+  u=$(curl -fsSL -o /dev/null -w '%{url_effective}' --connect-timeout 15 --max-time 30 "${PROXY}https://github.com/$REPO/releases/latest" 2>/dev/null) || return 1
   u=${u%/}; u=${u##*/}
   [[ "$u" =~ ^v[0-9]+\.[0-9]+ ]] || return 1
   TAG=$u
 }
-TAG=''
+TAG=''; PREV_WARN=0; MGR_FALLBACK=0
 human_size() { awk -v b="$1" 'BEGIN{printf "%.1f MB", b/1048576}'; }
 
 step_check() {
@@ -311,7 +314,11 @@ step_verify() {
 step_install_bin() {
   [ -x "$BIN" ] && OLD=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
   if [ "$OLD" = "$NEW" ] && [ "$FORCE" = 0 ]; then DETAIL="$NEW already installed (--force reinstalls)"; return 2; fi
-  [ -x "$BIN" ] && cp -f "$BIN" "$BIN.prev"
+  if [ -x "$BIN" ]; then
+    # copy next to the target, check it, then rename (atomic); on failure keep the existing .prev untouched
+    if cp -f "$BIN" "$BIN.prev.tmp" && mv -f "$BIN.prev.tmp" "$BIN.prev"; then :
+    else rm -f "$BIN.prev.tmp"; PREV_WARN=1; fi
+  fi
   install -m 755 "$TMP/wattun" "$BIN.new" && mv -f "$BIN.new" "$BIN" || { ERRMSG="cannot write $BIN"; return 1; }
   # prove it: the file on disk must now report the new version
   local now; now=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
@@ -321,11 +328,14 @@ step_install_bin() {
 step_install_mgr() {
   if [ -f "$HERE/wattun-manager" ]; then cp "$HERE/wattun-manager" "$TMP/mgr"
   elif [ -n "$TAG" ] && fetch "https://raw.githubusercontent.com/$REPO/$TAG/wattun-manager" "$TMP/mgr"; then :
-  else fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr" || { ERRMSG="could not download wattun-manager"; return 1; }; fi
+  else MGR_FALLBACK=1; fetch "https://raw.githubusercontent.com/$REPO/main/wattun-manager" "$TMP/mgr" || { ERRMSG="could not download wattun-manager"; return 1; }; fi
   head -c 2 "$TMP/mgr" | grep -q '#!' || { ERRMSG="wattun-manager looks corrupt"; return 1; }
+  bash -n "$TMP/mgr" 2>/dev/null || { ERRMSG="the downloaded wattun-manager fails a syntax check (bash -n); not installing it"; return 1; }
   # atomic replace: a manager that is running right now keeps reading its old file safely
   install -m 755 "$TMP/mgr" "$MGR.new" && mv -f "$MGR.new" "$MGR" || { ERRMSG="cannot write $MGR"; return 1; }
   DETAIL="${MGR##*/} command${TAG:+ ($TAG)}"
+  [ "$MGR_FALLBACK" = 1 ] && DETAIL="${MGR##*/} command (from main)"
+  return 0
 }
 step_systemd() {
   mkdir -p "$CONF" && chmod 700 "$CONF"
@@ -334,6 +344,7 @@ step_systemd() {
 Description=WatTunnel %i
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -364,6 +375,13 @@ run_step 3 step_install_bin
 run_step 4 step_install_mgr
 run_step 5 step_systemd
 echo
+if [ "$MGR_FALLBACK" = 1 ]; then
+  warn "Could not resolve the release tag, so the manager came from the main branch."
+  hint "The binary and the manager may not match. Re-run the installer later to get a matching pair."
+fi
+if [ "$PREV_WARN" = 1 ]; then
+  warn "Could not save the previous binary as $BIN.prev (disk full?). Rollback keeps the older copy, if any."
+fi
 
 # ---- summary ----
 total=0; running=0; stale_names=''

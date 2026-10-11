@@ -14,16 +14,17 @@ Version: see `wat/version.go` (`wattun -version`).
 2. [Install](#install)
 3. [Quick start](#quick-start)
 4. [Carriers](#carriers)
-5. [Reverse mode](#reverse-mode)
-6. [UDP forwarding](#udp-forwarding)
-7. [Config file](#config-file)
-8. [Command-line flags](#command-line-flags)
-9. [Metrics](#metrics)
-10. [Handover, drain and rollback](#handover-drain-and-rollback)
-11. [Troubleshooting](#troubleshooting)
-12. [Security model](#security-model)
-13. [Build and test](#build-and-test)
-14. [License and attribution](#license-and-attribution)
+5. [Bonding](#bonding)
+6. [Reverse mode](#reverse-mode)
+7. [UDP forwarding](#udp-forwarding)
+8. [Config file](#config-file)
+9. [Command-line flags](#command-line-flags)
+10. [Metrics](#metrics)
+11. [Handover, drain and rollback](#handover-drain-and-rollback)
+12. [Troubleshooting](#troubleshooting)
+13. [Security model](#security-model)
+14. [Build and test](#build-and-test)
+15. [License and attribution](#license-and-attribution)
 
 ## Why it exists
 
@@ -122,6 +123,40 @@ All carriers carry the same encrypted session. Pick one with `carrier:` (or `-ca
 
 Rules for every non-ICMP carrier: the client dials `peer` as `host:port`, and the server listens on `listen`
 (default `:4443`). `mtu` is 256 to 1400 for icmp and udp, and up to 16384 for the pool carriers.
+
+## Bonding
+
+`carrier: icmp+udp+tcp` joins several carriers into ONE session. The session keeps working when any one of them
+is blocked, and traffic is spread over the carriers that are alive (watch `carriers` in `/stats`). Use any
+combination of the carriers above, joined with `+`.
+
+`peer` and `listen` are the defaults for every carrier in the bond. `peer-NAME` and `listen-NAME` override them for
+one carrier, where NAME is the carrier name (`peer-udp`, `peer-tcp`, `listen-udp`, `listen-tcp`, ...). They are
+config keys and flags like any other. ICMP takes a bare IP, the others `host:port`, so a bond usually needs the
+overrides. Both ends must list the same carriers.
+
+```yaml
+# Iran (client)
+mode: client
+key-file: /etc/wattun/iran.key
+carrier: icmp+udp+tcp
+peer: 203.0.113.10          # icmp uses this (bare IP)
+peer-udp: 203.0.113.10:4443
+peer-tcp: 203.0.113.10:4444
+ports:
+  - 443
+```
+
+```yaml
+# Kharej (server)
+mode: server
+key-file: /etc/wattun/kharej.key
+carrier: icmp+udp+tcp
+listen-udp: :4443
+listen-tcp: :4444
+ports:
+  - 443
+```
 
 ## Reverse mode
 
@@ -313,7 +348,8 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `mode` | (required) | both | `client` or `server`. |
 | `key` | | both | Pre-shared key. Prefer `key-file`. |
 | `key-file` | | both | File with the key (whitespace trimmed). Same on both ends. |
-| `carrier` | `icmp` | both | One of the carriers above. |
+| `carrier` | `icmp` | both | One of the carriers above, or several joined with `+` (see Bonding). |
+| `peer-NAME`, `listen-NAME` | = `peer`, `listen` | client / server | Bonded carriers only: per-carrier address (`peer-udp`, `listen-tcp`, ...). |
 | `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. Reverse pool carriers: Kharej sets Iran's `IP:port`. Reverse icmp: Kharej sets Iran's IP, Iran keeps Kharej's. |
 | `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. With `reverse` Iran listens here and Kharej's `peer` must point to it. |
 | `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. |
@@ -325,6 +361,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
 | `max-mbps` | 16 | both | Pacing ceiling, MB/s per direction. See "ICMP path limits and pacing". |
 | `icmp-type` | `echo` | both | ICMP carrier: `echo`, `timestamp`, `info` or `mask`. Both ends must match. |
+| `loss-ceiling` | false | both | Opt-in loss-aware ceiling for the pacer (see "ICMP path limits and pacing"). Off = delay only. |
 | `slack-ms` | 8 | both | RTT growth tolerated before slowing down. |
 | `hedge` | false | both | Send small young packets twice. Helps lossy tails, costs packets. |
 | `fec` | off | both | `off` or `auto`: adaptive XOR parity for small transfers (see FEC). Needs 1.7.0 and `auto` on both ends. |
@@ -340,7 +377,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `host` | = `peer` | client (server with `reverse`) | Host header / authority, set on whichever side dials. |
 | `plain` | false | both (dialer with `reverse`) | grpc without TLS. |
 | `header` | | client (server with `reverse`) | Extra request header `Name: value`. Repeatable. |
-| `metrics` | off | both | Serve `/stats` and pprof on this address. |
+| `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
 
 ### Example: ICMP (the production setup)
@@ -448,7 +485,8 @@ Every flag can also be a config key. Flags win over the file.
 | `-mode client\|server` | | Role. |
 | `-key SECRET`, `-key-file FILE` | | Pre-shared key. |
 | `-config FILE` | | Config file (above). |
-| `-carrier NAME` | `icmp` | Transport. |
+| `-carrier NAME` | `icmp` | Transport, or `a+b+c` to bond several. |
+| `-peer-NAME ADDR`, `-listen-NAME ADDR` | | Bonded carriers: per-carrier peer / listen address. |
 | `-peer ADDR` | | Server IP (icmp, udp) or `host:port`. |
 | `-listen ADDR` | `:4443` | Listen address of non-ICMP carriers. |
 | `-reverse` | off | Swap dial and listen (pool carriers), or which side sends the ICMP requests (`icmp`, 2.0.0). |
@@ -462,6 +500,7 @@ Every flag can also be a config key. Flags win over the file.
 | `-mtu N` | 0 | Datagram cap. |
 | `-max-mbps F` | 16 | Pace ceiling per direction. |
 | `-icmp-type T` | `echo` | ICMP carrier: `echo`, `timestamp`, `info`, `mask` (both ends the same). |
+| `-loss-ceiling` | off | Pacer: also cut the rate when loss jumps far above its learned baseline (opt-in). |
 | `-slack-ms N` | 8 | Tolerated RTT growth. |
 | `-hedge` | off | Duplicate small young packets. |
 | `-fec auto` | off | Adaptive FEC, both ends (see FEC). |
@@ -526,8 +565,16 @@ limits:
 With `metrics: 127.0.0.1:PORT`, `GET /stats` returns JSON. `/debug/pprof/` is on the same address. Keep it on
 localhost.
 
+Since 2.0.2 the metrics address is always loopback: a non-loopback value (`0.0.0.0:19700`, a public IP, a bare
+`:19700`) is rewritten to `127.0.0.1` with the same port, and a log line says so, because `/stats`, pprof and
+`/speedtest` must never be reachable from outside. The server also never forwards a tunnel stream to its own
+metrics port, even if the port is in the allowlist.
+
 | Field | Meaning |
 |---|---|
+| `version` | The wattun version string (for example `2.0.2`). |
+| `carriers` | Only with bonded carriers (`carrier: a+b`): one entry per carrier with `name`, `alive`, `srtt_ms`, `share` (fraction of traffic), `sent`, `acked`, `lost`. |
+| `ports` | Per-port counters (same data as `/ports`). |
 | `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive). |
 | `last_rx_age_ms` | Since 2.0.1. Milliseconds since the last authenticated packet from the peer (server: from any client, including sessions that have closed). `-1` = none since the process started. Monitors should use this rather than ping: it only moves on real tunnel packets. |
 | `sessions` | Server: client sessions. Client: always 1. |
@@ -567,13 +614,14 @@ Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):
   loss on this path is only about 0.2 %.
 - `max-mbps` stays at 16 by default. The ceiling that really binds is the path's packet rate, so values above
   roughly 30 only add queueing.
-- **Loss-aware ceiling (1.8.0).** The pacer is still delay-based (loss alone is not congestion), but every 50 ms
-  it also compares the interval's loss with a learned baseline (slow average of quiet intervals, at least 0.5 %).
-  If loss is above `max(3 %, 4 x baseline)` the rate is cut by 15 % and a soft ceiling is set 5 % above the new
-  rate; the ceiling then rises 2 % per loss-free interval and the rate may not climb past it. Without it a
-  test pair with `max-mbps 80` ran 30-35 % of the wire as retransmissions. Steady random loss (even 2 %) does
-  not trigger it. Intervals with fewer than 50 packets are ignored, and TCP-based carriers never use it. Watch
-  `ceiling_bps` and `loss_pct` in `/stats`.
+- **Loss-aware ceiling (1.8.0, opt-in).** Off by default: the pacer is delay-based and loss alone is not congestion.
+  With `loss-ceiling: true` (`-loss-ceiling`) it also compares, every 50 ms, the interval's loss with a learned
+  baseline (slow average of quiet intervals, at least 0.5 %). If loss is above `max(3 %, 4 x baseline)` the rate is
+  cut by 15 % and a soft ceiling is set 5 % above the new rate; the ceiling then rises 2 % per loss-free interval
+  and the rate may not climb past it. It helps when a too-high `max-mbps` makes the path drop packets (a test pair
+  with `max-mbps 80` ran 30-35 % of the wire as retransmissions). Steady random loss (even 2 %) does not trigger
+  it. Intervals with fewer than 50 packets are ignored, and TCP-based carriers never use it. With it off,
+  `ceiling_bps` stays 0. Watch `ceiling_bps` and `loss_pct` in `/stats`.
 - **Batching is on by default for the ICMP carrier on Linux** (sendmmsg / recvmmsg): one flow went from 15 to
   25 MB/s and CPU per MB from 0.043 to 0.026 on the real path. `WAT_BATCH=0` forces it off; other carriers keep
   batching off unless `WAT_BATCH=1`.

@@ -100,8 +100,12 @@ func (b *subIO) Close() error {
 	b.once.Do(func() {
 		close(b.done)
 		b.srv.mu.Lock()
+		ss := b.srv.sessions[b.sid]
 		delete(b.srv.sessions, b.sid)
 		b.srv.mu.Unlock()
+		if ss != nil { // keep Server.LastRecv monotonic: the session no longer feeds it once it leaves the map
+			b.srv.noteRecv(ss.s.LastRecv())
+		}
 	})
 	return nil
 }
@@ -276,6 +280,7 @@ func (srv *Server) Close() {
 }
 
 func (srv *Server) run() {
+	var bo recvBackoff
 	for {
 		p, lane, src, err := srv.raw.Recv()
 		if err != nil {
@@ -283,10 +288,11 @@ func (srv *Server) run() {
 			case <-srv.stop:
 				return
 			default:
-				time.Sleep(time.Millisecond)
+				bo.fail(err, srv.cfg.Logf, "server receive")
 				continue
 			}
 		}
+		bo.ok()
 		if len(p) < hdrLen+tagLen+1 {
 			continue
 		}
@@ -430,4 +436,33 @@ func (b *subIO) SendBatch(ps [][]byte, lanes []int) error {
 		}
 	}
 	return first
+}
+
+// recvBackoff paces a receive loop whose Recv keeps failing: 1 ms doubling to 200 ms, reset by a good Recv. The
+// first error of a streak is logged once. The no-error path costs one bool test.
+type recvBackoff struct {
+	d      time.Duration
+	failed bool
+}
+
+func (b *recvBackoff) fail(err error, logf func(string, ...any), what string) {
+	if !b.failed {
+		b.failed = true
+		if logf != nil {
+			logf("%s error (retrying with backoff): %v", what, err)
+		}
+	}
+	if b.d == 0 {
+		b.d = time.Millisecond
+	}
+	time.Sleep(b.d)
+	if b.d *= 2; b.d > 200*time.Millisecond {
+		b.d = 200 * time.Millisecond
+	}
+}
+
+func (b *recvBackoff) ok() {
+	if b.failed {
+		b.failed, b.d = false, 0
+	}
 }

@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"sync"
 	"syscall"
 	"time"
@@ -340,6 +341,16 @@ func main() {
 	}
 
 	if *metrics != "" {
+		fixed, changed := loopbackMetricsAddr(*metrics)
+		if changed {
+			log.Printf("metrics: %s is not a loopback address; serving on %s instead (it exposes stats, pprof and /speedtest)", *metrics, fixed)
+		}
+		*metrics = fixed
+		if _, p, err := net.SplitHostPort(fixed); err == nil {
+			if n, err := strconv.Atoi(p); err == nil {
+				metricsPort.Store(int32(n))
+			}
+		}
 		go func() {
 			mux := http.NewServeMux()
 			mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -636,6 +647,34 @@ func (l *listeners) target(p int) int {
 		}
 	}
 	return 0
+}
+
+// metricsPort is the port of the local metrics server (0 when off). The server never forwards a stream to it,
+// whatever the allowlist says: it exposes stats, pprof and /speedtest.
+var metricsPort atomic.Int32
+
+func isMetricsPort(port int) bool {
+	m := int(metricsPort.Load())
+	return m != 0 && port == m
+}
+
+// loopbackMetricsAddr returns addr unchanged when its host is a loopback IP or "localhost"; otherwise (empty,
+// 0.0.0.0, ::, a LAN address, a name) it returns 127.0.0.1:<port> and changed=true.
+func loopbackMetricsAddr(addr string) (string, bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		if p := strings.TrimPrefix(addr, ":"); p != "" && !strings.Contains(p, ":") {
+			return "127.0.0.1:" + p, true
+		}
+		return addr, false // unparseable: let ListenAndServe report it
+	}
+	if strings.EqualFold(host, "localhost") {
+		return addr, false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return addr, false
+	}
+	return net.JoinHostPort("127.0.0.1", port), true
 }
 
 func serve(sess *wat.Session, lo, hi int, al *allow) {

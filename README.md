@@ -65,6 +65,18 @@ HTTP/2 or gRPC, including behind Cloudflare.
 
 ## 🆕 What's new
 
+**2.0.2: safer metrics, a more reliable manager.** The metrics address is forced to `127.0.0.1`, and the tunnel
+refuses to forward to the server's own metrics port. In the manager, changes made in **Advanced settings** are now
+applied automatically (before, they were silently never applied, so a direction switch stayed in normal mode).
+Diagnose only flags firewall rules that can affect the tunnel (a rule that drops traceroute / time-exceeded is
+ignored). Auto-heal no longer restarts a tunnel you stopped, the arrow keys no longer quit the manager, and the
+scrollback (with your token in it) is no longer erased. The installer keeps retrying a tunnel that crashes at boot.
+
+**2.0.1: reverse ICMP fix.** Kharej no longer keeps a dead Iran session alive because of the Iran kernel's own echo
+copies. `/stats` has a new `last_rx_age_ms`. In reverse mode the manager offers to rate-limit the Iran kernel's own
+ping replies, and the `.sha256` files now work with `sha256sum -c`. Also, reverse mode in the manager now covers
+every TCP-based carrier, not just ICMP.
+
 **2.0.0: Reverse ICMP.** Some Iran IPs get a one-way block: Iran can't ping Kharej, but Kharej can still ping Iran.
 It often comes and goes from day to day. Normal ICMP tunnels (WatTunnel before 2.0.0, Backhaul, Dagger, GOST...) all
 die on those days, because Iran is the side that sends the pings. Reverse ICMP swaps only the ping direction: Kharej
@@ -243,7 +255,7 @@ Run `wattun-manager` (version 2.0.0 and newer). The first screen is a dashboard 
          `.           \_/\_/ \__,_|\__||_| \__,_|_| |_|_| |_|\___|_|
            `-.     encrypted port forwarding, even when only ping works
   ──────────────────────────────────────────────────────────────────────────
-  Dashboard   wattun 2.0.0
+  Dashboard   wattun 2.0.2
 
    #  NAME          ROLE   CARRIER   STATE           RTT  LOAD
    1  iran          Iran   icmp   ● CONNECTED     41 ms  37 streams
@@ -324,8 +336,9 @@ wattun-manager update | rollback | help
 
 Not sure? Start with `icmp` on heavily filtered routes and `wss` behind Cloudflare. If Iran can't ping Kharej but
 Kharej can ping Iran, use `icmp` with [Reverse ICMP](#-reverse-mode). If Iran can't reach Kharej's TCP port
-but Kharej can reach Iran, see [Reverse mode](#-reverse-mode). Bonding, UDP-only forwards and the other advanced options
-are covered in [docs/TECHNICAL.md](docs/TECHNICAL.md).
+but Kharej can reach Iran, see [Reverse mode](#-reverse-mode). Bonding (`carrier: icmp+udp+tcp` joins several carriers into one session that survives any one being blocked),
+UDP-only forwards and the other advanced options are covered in
+[docs/TECHNICAL.md](docs/TECHNICAL.md#bonding).
 
 ## 🔁 Reverse mode
 

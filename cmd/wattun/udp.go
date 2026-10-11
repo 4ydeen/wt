@@ -11,6 +11,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -139,9 +140,10 @@ func (l *udpListener) readLoop() {
 	for {
 		n, src, err := l.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			if strings.Contains(err.Error(), "closed") {
+			if errors.Is(err, net.ErrClosed) { // not a string match: Windows reports "forcibly closed" for a vanished UDP sender
 				return
 			}
+			time.Sleep(10 * time.Millisecond)
 			continue // e.g. Windows "forcibly closed" after a reply to a vanished sender
 		}
 		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
