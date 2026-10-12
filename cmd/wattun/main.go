@@ -22,11 +22,10 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,9 +40,9 @@ var poolCarriers = map[string]bool{"tcp": true, "tls": true, "ws": true, "wss": 
 
 func main() {
 	runManager()
-	if os.Getenv("GOGC") == "" { // the receive path allocates per datagram; fewer collections cost a few MB of heap (2.4.0)
-		debug.SetGCPercent(200)
-	}
+	// GOGC 200 (2.4.0-2.4.5) saved little CPU but let a busy CDN tunnel's heap reach ~1.75x its live size: Iran sat at
+	// 1 GB Sys for ~400 MB live, with GC at under 0.1 % CPU (field 2026-10-12). The Go default (100) is used again;
+	// GOGC / GOMEMLIMIT still override it.
 	mode := flag.String("mode", "", "client|server")
 	key := flag.String("key", "", "pre-shared key")
 	keyFile := flag.String("key-file", "", "read the key from a file")
@@ -447,7 +446,7 @@ func main() {
 				out := map[string]any{
 					"pkts_out": st.PktsOut, "pkts_in": st.PktsIn, "bytes_out": st.BytesOut, "bytes_in": st.BytesIn,
 					"fec_sent": st.FecSent, "fec_recovered": st.FecRecovered, "retrans": st.Retrans, "send_errors": st.Dropped, "rate_bps": st.RateBps,
-						"ceiling_bps": st.CeilingBps, "loss_pct": st.LossPct,
+					"ceiling_bps": st.CeilingBps, "loss_pct": st.LossPct,
 					"srtt_ms": float64(st.SRTT) / 1e6, "min_rtt_ms": float64(st.MinRTT) / 1e6,
 					"streams": st.Streams, "inflight": st.Inflight, "alive": alive(), "last_rx_age_ms": rxAge(), "version": wat.Version, "draining": srv != nil && srv.Draining(),
 					"sessions": func() int {

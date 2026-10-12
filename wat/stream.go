@@ -246,7 +246,7 @@ func (st *Stream) Read(b []byte) (int, error) {
 		st.rroot, st.ready = nb[:0], nb
 	}
 	if len(st.ready) == 0 {
-		if cap(st.rroot) > 1<<20 { // keep a working buffer (re-growing it from zero after every drain cost ~10 % CPU at 100 MB/s)
+		if cap(st.rroot) > keepBuf { // keep a working buffer (re-growing it from zero after every drain cost ~10 % CPU at 100 MB/s)
 			st.rroot = nil
 		}
 		st.ready = nil
@@ -327,7 +327,7 @@ func (st *Stream) onAcked(f frameRef) {
 			}
 			st.sbuf = st.sbuf[drop:]
 			if len(st.sbuf) == 0 {
-				if cap(st.sroot) > 1<<20 {
+				if cap(st.sroot) > keepBuf {
 					st.sroot, st.sbuf = nil, nil // do not pin a big buffer on an idle stream
 				} else {
 					st.sbuf = st.sroot[:0]

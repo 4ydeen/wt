@@ -785,8 +785,9 @@ separate processes added up.
   straight into the caller's buffer (no staging copy). Smaller bufio buffers for the ws/grpc readers were tried and
   measured no better. Write coalescing was already there (each connection's writer fills a 64 KB buffer and flushes when its
   queue runs dry); a yield before the flush to gather more was measured and gave nothing, so it is not in.
-- **GC.** `wattun` sets the GC target to 200 % at startup unless `GOGC` is set (fewer collections of the per-packet
-  garbage, a few MB more heap).
+- **GC.** 2.4.0 to 2.4.5 set the GC target to 200 % unless `GOGC` was set. 2.4.6 uses Go's default (100 %) again:
+  on a busy CDN tunnel 200 % let the heap reach about 1 GB for 400 MB of live data, and the GC itself took under
+  0.1 % CPU. `GOGC` and `GOMEMLIMIT` still override it.
 
 ### Memory with slow readers (2.4.3)
 
@@ -816,6 +817,11 @@ need moves with every ack, so the buffer was copied again on almost every ack. A
 6.6 GB in 8 s, and Kharej's `wattun` threads rose from 2-13 % to 40-73 % CPU under load. The buffer is now given back
 at most once a second per stream, and only when it is over 4x the need. That is 142 MB allocated in the same test.
 `TestSlowReaderBuffersBounded` now fails above 1 GB.
+
+**2.4.6.** A drained stream used to keep up to 1 MB of buffer in each direction for reuse. On a busy tunnel most
+streams are idle keep-alive connections, and 220 of them held about 190 MB on the receiving end (field heap profile,
+2.4.5). The kept buffer is now at most 256 KB. `BenchmarkSessionBulk` on 2 CPUs measured 68.5 vs 68.9 MB/s, which is
+within noise.
 
 ## Pacing on TCP-based and CDN carriers
 

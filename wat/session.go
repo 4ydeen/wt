@@ -28,9 +28,12 @@ const (
 	sendStage     = 256 << 10 // Write may buffer this much beyond the peer's window (stream.go writeCap)
 	slowWinMin    = 256 << 10 // a lagging reader's window floor (stream.go tuneSlow)
 	slowWinRTTs   = 2
-	prioBytes     = 64 << 10 // streams that sent less than this go first (interactive traffic)
-	dirServerBit  = uint64(1) << 63
-	replayWin     = 1024
+	// keepBuf is the largest drained buffer a stream keeps for reuse (each direction). Field 2026-10-12: at 1 MB, 220
+	// mostly idle streams pinned ~190 MB on the receiving end.
+	keepBuf      = 256 << 10
+	prioBytes    = 64 << 10 // streams that sent less than this go first (interactive traffic)
+	dirServerBit = uint64(1) << 63
+	replayWin    = 1024
 	// A pool of TCP connections reorders by a whole head-of-line stall (60-100 ms of packets, ~1900 at 640 B and
 	// 12 MB/s); a window of 1024 turned every late packet after a stall into a "replay" and dropped it (measured).
 	reliableReplayWin = 16384
