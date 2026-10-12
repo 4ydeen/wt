@@ -885,13 +885,19 @@ about 1 to 5-7 MB/s and a parallel download from under 1 to 10-14 MB/s, with no 
 (2.4.10) reports the live picture: `delay_cuts`, `deep_trips`, `loss_cuts`, `spurious` of `lost`, what limited the
 sender each tick, and the window and loss-timer gauges.
 
-**Draining to re-measure the base RTT (2.4.12).** The BDP bound is `maxBW x minRTT`, so it needs a true `minRTT`. A
-single, deeply queued connection never delivers a drained sample, so `minRTT` climbed with its own queue and the
-window ran away with it (field 2026-10-13: `minRTT` rose to 550 ms from a real 108, inflight to over a megabyte).
-Every 8 s (just under the 10 s `minRTT` window, so a sample is always fresh) the pacer now holds inflight to about
-half a BDP for ~220 ms, long enough for the queue to drain and `sample` to read the base RTT. It costs a few percent
-of throughput and keeps the window, and the latency, bounded. `minRTT` no longer rises to a queued value on a
-reliable carrier; only a sample taken while draining may move it up, to follow a genuine path change.
+**Draining to re-measure the base RTT (2.4.12, corrected in 2.4.13).** The BDP bound is `maxBW x minRTT`, so it needs
+a true `minRTT`. A single, deeply queued connection never delivers a drained sample, so `minRTT` climbed with its own
+queue and the window ran away with it (field 2026-10-13: `minRTT` rose to 550 ms from a real 108, inflight over a
+megabyte). Every 8 s (just under the 10 s `minRTT` window, so a sample is always fresh) the pacer enters a BBR-style
+PROBE_RTT: it caps inflight to a few packets (`cwnd` returns the drain floor, 4 packets), **waits for inflight to
+actually reach that floor**, then holds there ~1 RTT so `sample` reads the base with the queue empty. 2.4.12's first
+cut drained only to half a BDP, which on a large queue is still a large queue -- the field showed `minRTT` stuck at
+314 ms and the window still running away, so the drain floor is now fixed and low, and the queue depth is read from
+the live inflight (mirrored into the pacer). A sample may raise `minRTT` only while draining *and* with inflight at
+the floor; otherwise `minRTT` only ever falls, so a queued sample can never pull the base RTT up. On a clean single
+connection this holds `minRTT` at the true base and lets a lone stream fill ~90 % of the link; the leftover gap under
+heavy per-connection stalls is single-connection head-of-line blocking, which the production pool (8 connections)
+routes around.
 
 ### Stalled pool connections (2.4.5)
 

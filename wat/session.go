@@ -871,6 +871,7 @@ func (s *Session) pathAcked(acked []*sentPkt, largest uint64, delay time.Duratio
 
 // timers: loss on tail packets, keepalive, pacing adjustments, tombstone pruning.
 func (s *Session) timers(now time.Time) {
+	s.cc.inflight = s.inflight // PROBE_RTT drains until this reaches its floor
 	s.cc.tick(now)
 	if s.sentHead < len(s.sent) {
 		pto := s.cc.pto()
@@ -1215,6 +1216,7 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 		}
 		s.ackBuf = acked[:0]
 	}
+	s.cc.inflight = s.inflight // post-ack, so the PROBE_RTT drain-floor guard in sample() sees the current queue
 	s.cc.onDelivered(newly)
 	if rtt > 0 {
 		s.cc.sample(rtt, now)

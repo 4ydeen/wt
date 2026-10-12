@@ -334,32 +334,51 @@ func TestReliableBWPacer(t *testing.T) {
 	}
 }
 
-// TestReliableProbeRTT checks that a persistently queued reliable carrier re-measures its base RTT by draining:
-// minRTT must not climb with the self-inflicted queue, and the drain caps inflight low.
+// TestReliableProbeRTT checks that a persistently queued reliable carrier re-measures its base RTT by draining.
+// The queue is modelled physically: inflight tracks cwnd (so during a drain it falls to the floor), and the RTT a
+// sample reads is the base plus the queueing delay of the current inflight. A shallow drain (the 2.4.12 bug) would
+// leave inflight — and so the sampled RTT — high, and minRTT would climb with the self-inflicted queue.
 func TestReliableProbeRTT(t *testing.T) {
 	if !relV2 {
 		t.Skip("v1 forced")
 	}
+	const base = 100 * time.Millisecond
+	const rate = 10e6 // bytes/s capacity; queue delay = inflight/rate
 	c := newCC(5e6, 2e5, 80e6, 0)
 	c.reliable, c.maxPlain = true, 1400
 	now := time.Now()
-	c.sample(100*time.Millisecond, now) // true base RTT
-	// 20 s of steady delivery where every RTT sample reads 400 ms (a standing queue), ticks every 100 ms
-	probed := false
-	for k := 1; k <= 200; k++ {
-		at := now.Add(time.Duration(k) * 100 * time.Millisecond)
-		c.onDelivered(int(10e6 * 0.1))
-		rtt := 400 * time.Millisecond
-		if c.reliable && c.probing() { // while draining, the queue empties and the sample reads the true base
-			rtt = 100 * time.Millisecond
-			probed = true
+	c.sample(base, now)
+	inflight := 3_000_000 // ~3 MB standing queue (300 ms of bufferbloat on top of the 100 ms base)
+	drainedOnce := false
+	for k := 1; k <= 300; k++ {
+		at := now.Add(time.Duration(k) * 50 * time.Millisecond)
+		c.inflight = inflight
+		cw := c.cwnd()
+		// inflight relaxes toward the window: a drain (cwnd -> a few packets) empties it within a couple of ticks,
+		// and otherwise the overfilling pacer keeps it pinned near the cap.
+		if inflight > cw {
+			inflight -= 1_600_000 // drains fast once cwnd drops
+			if inflight < cw {
+				inflight = cw
+			}
+		} else {
+			inflight += 200_000
+			if inflight > cw {
+				inflight = cw
+			}
 		}
+		if c.draining && inflight <= c.drainFloor() {
+			drainedOnce = true
+		}
+		rtt := base + time.Duration(float64(inflight)/rate*float64(time.Second))
+		c.inflight = inflight
+		c.onDelivered(int(rate * 0.05))
 		c.sample(rtt, at)
 		c.limited, c.cwndLim = true, true
 		c.tick(at)
 	}
-	if !probed {
-		t.Fatal("never entered a drain in 20 s")
+	if !drainedOnce {
+		t.Fatal("the drain never emptied the queue to the floor in 15 s")
 	}
 	if c.minRTT > 150*time.Millisecond {
 		t.Fatalf("minRTT climbed with the queue to %v (base was 100 ms); the BDP window would run away", c.minRTT)
