@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"net"
 	"runtime"
 	"sync"
 	"testing"
@@ -270,5 +271,38 @@ func TestTLSPinAndTLS13(t *testing.T) {
 	if err == nil {
 		c.Close()
 		t.Fatal("server accepted TLS 1.2")
+	}
+}
+
+// A conn whose socket write is blocked (a CDN edge in TCP backoff) must not be picked while a healthy one exists,
+// and one stuck past poolStallKill is closed so the client redials it (2.4.5).
+func TestLeastQueuedSkipsStalled(t *testing.T) {
+	mk := func() *poolConn {
+		a, b := net.Pipe()
+		t.Cleanup(func() { a.Close(); b.Close() })
+		return newPoolConn(a)
+	}
+	stalled, stuck, ok := mk(), mk(), mk()
+	now := time.Now().UnixNano()
+	stalled.wbusy.Store(now - int64(time.Second))
+	stuck.wbusy.Store(now - int64(10*time.Second))
+	ok.q <- getPkt(10) // longer queue than the others, still preferred
+	for i := 0; i < 6; i++ {
+		if pc := leastQueued([]*poolConn{stalled, stuck, ok}, i); pc != ok {
+			t.Fatal("picked a stalled conn while a healthy one exists")
+		}
+	}
+	select {
+	case <-stuck.done:
+	case <-time.After(time.Second):
+		t.Fatal("a conn stuck past poolStallKill was not closed")
+	}
+	select {
+	case <-stalled.done:
+		t.Fatal("a briefly stalled conn was closed")
+	default:
+	}
+	if pc := leastQueued([]*poolConn{stalled}, 0); pc != stalled { // all stalled: the path is slow, keep sending
+		t.Fatal("no conn picked when every conn is stalled")
 	}
 }

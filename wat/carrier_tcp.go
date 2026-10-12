@@ -94,17 +94,69 @@ func putPkt(b []byte) {
 
 // poolConn is one framed connection with its own bounded send queue.
 type poolConn struct {
-	c    net.Conn
-	q    chan []byte
-	done chan struct{}
-	once sync.Once
+	c     net.Conn
+	q     chan []byte
+	done  chan struct{}
+	once  sync.Once
+	wbusy atomic.Int64 // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
 }
 
+// A pool connection whose socket write has been blocked this long is stalled: through a CDN, one edge connection can
+// sit in TCP retransmit backoff for tens of seconds with megabytes queued while the others flow (field 2026-10-12:
+// backoff 8, 5 MB Send-Q). Its own queue looks empty because the kernel holds the data, so leastQueued kept picking
+// it and every packet sent there was lost for 400+ ms. Stalled conns are skipped while a healthy one exists, and
+// closed (the client redials) once stuck for poolStallKill.
+const (
+	poolStall     = 300 * time.Millisecond
+	poolStallKill = 5 * time.Second
+	poolLowat     = 128 << 10
+)
+
 func newPoolConn(c net.Conn) *poolConn {
-	if tc, ok := c.(*net.TCPConn); ok {
+	if tc := rawTCP(c); tc != nil {
 		tc.SetNoDelay(true)
+		setNotsentLowat(tc, poolLowat) // a stalled conn must block its writer, not swallow megabytes
 	}
 	return &poolConn{c: c, q: make(chan []byte, poolQueue), done: make(chan struct{})}
+}
+
+// rawTCP finds the TCP socket under the TLS / WebSocket / gRPC / fragmenting wrappers (nil for an HTTP/2 stream).
+func rawTCP(c net.Conn) *net.TCPConn {
+	for i := 0; i < 8 && c != nil; i++ {
+		switch x := c.(type) {
+		case *net.TCPConn:
+			return x
+		case *wsConn:
+			c = x.Conn
+		case *grpcConn:
+			c = x.Conn
+		case *fragConn:
+			c = x.Conn
+		case interface{ NetConn() net.Conn }:
+			c = x.NetConn()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// stalledFor is how long the current socket write has been blocked (0 when the writer is not inside one).
+func (pc *poolConn) stalledFor(now int64) time.Duration {
+	if t := pc.wbusy.Load(); t != 0 {
+		return time.Duration(now - t)
+	}
+	return 0
+}
+
+// timedWriter marks the poolConn busy for the duration of every socket write.
+type timedWriter struct{ pc *poolConn }
+
+func (w timedWriter) Write(b []byte) (int, error) {
+	w.pc.wbusy.Store(time.Now().UnixNano())
+	n, err := w.pc.c.Write(b)
+	w.pc.wbusy.Store(0)
+	return n, err
 }
 
 func (pc *poolConn) fail() {
@@ -143,7 +195,7 @@ func (pc *poolConn) serve(wg *sync.WaitGroup, push func([]byte) bool) {
 }
 
 func (pc *poolConn) writeLoop() {
-	bw := bufio.NewWriterSize(pc.c, poolBufSize)
+	bw := bufio.NewWriterSize(timedWriter{pc}, poolBufSize)
 	var hdr [2]byte
 	for {
 		select {
@@ -227,16 +279,34 @@ func (pc *poolConn) fill(buf *[]byte, r, w *int, need int) (int, bool) {
 
 // leastQueued picks the live conn with the shortest queue; start rotates so ties spread.
 func leastQueued(conns []*poolConn, start int) *poolConn {
-	var best *poolConn
-	bl := 1 << 30
+	now := time.Now().UnixNano()
+	var best, any *poolConn
+	bl, al := 1<<30, 1<<30
+	var stuck []*poolConn
 	for i := range conns {
 		pc := conns[(start+i)%len(conns)]
 		if pc == nil {
 			continue
 		}
-		if l := len(pc.q); l < bl {
+		l := len(pc.q)
+		if l < al {
+			any, al = pc, l
+		}
+		if d := pc.stalledFor(now); d > poolStall {
+			if d > poolStallKill {
+				stuck = append(stuck, pc)
+			}
+			continue
+		}
+		if l < bl {
 			best, bl = pc, l
 		}
+	}
+	if best == nil { // every conn is stalled: the whole path is slow, not one edge
+		return any
+	}
+	for _, pc := range stuck { // a healthy conn exists: drop the stuck ones so the client redials them
+		go pc.fail()
 	}
 	return best
 }

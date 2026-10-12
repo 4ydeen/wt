@@ -838,6 +838,23 @@ delay without any queue of ours.
   10 MB/s, with 500 ms stalls (field measurement, 2026-10-12). The change is sender-side only and changes nothing on
   the wire. It matters most on Kharej, which sends the downloads, but update both ends.
 
+### Stalled pool connections (2.4.5)
+
+Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the
+kernel while the others flow. In the field on 2026-10-12, Kharej showed connections with `backoff:8` and up to 5 MB of
+Send-Q. The pool picks the connection with the shortest queue of its own, and a stalled socket still swallows writes
+into the kernel, so it kept getting picked. Every packet sent there was lost for 400+ ms, and its streams waited:
+9-12 % loss, 1 s freezes even at idle, and downloads of 2.5-7 MB/s. 2.4.4 made this visible: 2.4.3's CPU waste had
+throttled the sender enough to hide it.
+
+- Each pool socket gets `TCP_NOTSENT_LOWAT` of 128 KB (Linux), so a stalled connection blocks its writer instead of
+  queueing megabytes.
+- A connection whose socket write has been blocked for more than 300 ms is skipped while any healthy connection
+  exists. If every connection is stalled, the path itself is slow, and the pool keeps sending as before.
+- A connection stuck for more than 5 s while a healthy one exists is closed, and the client redials it.
+
+This is local to each end and changes nothing on the wire.
+
 ## ICMP path limits and pacing
 
 Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):

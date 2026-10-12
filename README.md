@@ -40,10 +40,12 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.4)
+## What's new (latest: 2.4.5)
 
 Update **both** servers for every release below.
 
+- **2.4.5: no more stuck CDN connections.** When one Cloudflare connection stalls, the tunnel now stops using it and
+  reconnects it, instead of losing packets into it. Fixes downloads dropping to a few MB/s and 1-second freezes.
 - **2.4.4: CPU fix.** 2.4.3 made the sending server (Kharej, for downloads) burn CPU on connections whose users read
   slowly: 40-73 % per thread under load instead of 2-13 %. Fixed. Update right away if you are on 2.4.3.
 - **2.4.3: much less RAM.** Connections whose users read slowly no longer hold 4-8 MB each on both servers. A
