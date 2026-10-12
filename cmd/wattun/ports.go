@@ -230,11 +230,24 @@ func (p *portStat) dgram(up bool, n int) {
 }
 
 // copy pipes src to dst counting (and, if limited, pacing) every chunk. up = client->server payload.
+// copy starts with a small buffer and doubles it (up to copyBufMax) only while reads fill it: most forwarded
+// connections are idle or carry small requests, and two 32 KB buffers per connection were ~40 MB of a 200 MB heap at
+// ~1300 connections (field 2026-10-12, 2.4.7 heap profiles on both ends).
+const (
+	copyBufMin = 4 << 10
+	copyBufMax = 32 << 10
+)
+
 func (p *portStat) copy(dst io.Writer, src io.Reader, up bool) (int64, error) {
-	buf := make([]byte, 32<<10)
+	buf := make([]byte, copyBufMin)
 	var total int64
 	for {
 		n, err := src.Read(buf)
+		if n == len(buf) && len(buf) < copyBufMax {
+			nb := make([]byte, 2*len(buf))
+			copy(nb, buf[:n])
+			buf = nb
+		}
 		if n > 0 {
 			b := p.bDown.Load()
 			if up {
