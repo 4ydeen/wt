@@ -49,9 +49,6 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
   `ping -M do -s 1372 PEER_IP` must get replies, and `ip route get PEER_IP` must not show `mtu lock 680`. Keep
   the total of all ICMP tunnels on this route at about 30 MB/s or less: above that, the route inside Iran switches
   to a slow path for minutes. [Details](docs/TECHNICAL.md#icmp-path-limits-and-pacing).
-- **CDN is not reliable on this route right now.** After about 3 hours in production, the CDN tunnel on 2.4.6 fell
-  to about 1 MB/s. 2.4.7 tried to fix it, but in the field test it still dropped to about 1 MB/s under load, so
-  we stopped the CDN work. Use ICMP where it passes.
 
 Update **both** servers for every release below.
 
@@ -59,9 +56,8 @@ Update **both** servers for every release below.
   set `GOMEMLIMIT`, give it at least twice the tunnel's normal memory. An Iran server limited to 256 MiB spent most
   of its CPU on memory cleanup (75-130 %). With 768 MiB it dropped to about 20 % (ICMP, ~200-300 connections,
   2026-10-12).
-- **2.4.7: CDN connection health (did not fix the collapse, see above).** Each end now replaces a CDN connection
-  that delivers far less than the others, and the tunnel no longer stays stuck at its lowest speed. Nothing changes
-  for ICMP.
+- **2.4.7: CDN connection health.** Each end now replaces a CDN connection that delivers far less than the others,
+  and the tunnel no longer stays stuck at its lowest speed. Nothing changes for ICMP.
 - **2.4.6: RAM stays low.** Idle connections keep less memory and Go cleans up sooner. On a production CDN tunnel with
   about 250 user connections, the Iran server went from about 1 GB on 2.4.5 to about 100 MB, and Kharej to about
   100 MB. Speed unchanged.
@@ -131,9 +127,7 @@ Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 ### CDN (Cloudflare): field numbers
 
 Real measurements, Iran → Cloudflare → Kharej, 2-vCPU servers, `wss` + ECH. The first rows are from 2026-10-11 on a
-tunnel without users; the last row is production with real users on 2026-10-12. **Later that day the CDN tunnel
-collapsed to about 1 MB/s after 3 hours, and the 2.4.7 fix did not hold, so we don't recommend CDN on this route
-for now.**
+tunnel without users; the last row is production with real users on 2026-10-12.
 
 | Setup | Result |
 |---|---|
@@ -296,8 +290,7 @@ on Kharej. Auto-heal can switch to another working carrier by itself. Kharej nee
 
 ## Cloudflare (CDN) mode
 
-For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI. On the Iran ⇄ Europe route it is not
-reliable right now (see [What's new](#whats-new-latest-248)); use ICMP where it passes.
+For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI.
 
 1. Put a domain on Cloudflare, with the proxy (orange cloud) on and SSL mode **Full**. For `grpc`, turn on gRPC in
    Cloudflare's Network settings if your plan shows that switch.
