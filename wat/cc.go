@@ -73,12 +73,21 @@ type cc struct {
 	bwLen     int
 	bwBusy    bool    // the current measurement interval had at least one busy tick
 	maxBW     float64 // windowed-max delivery rate (bytes/s); 0 until the first sample
+
+	// PROBE_RTT (reliable): a single deeply-queued connection never delivers a drained RTT sample, so minRTT would
+	// climb with its own queue and the BDP window with it (field 2026-10-13: minRTT rose to 550 ms from a real 108,
+	// inflight ran away). Every probeRTTEvery the pacer briefly caps inflight low to drain the queue and re-measure.
+	probeAt    time.Time // when to next drain
+	probeUntil time.Time // the current drain ends at this time (zero: not draining)
 }
 
 const (
 	bwWin      = 10   // delivery-rate window, samples of >= 1 RTT each (~1 s): its max is the capacity estimate
 	relBWGain  = 1.20 // pace this far above the estimate, to keep probing for more
 	relCwndBDP = 3    // inflight ceiling, in bandwidth-delay products
+
+	probeRTTEvery = 8 * time.Second        // drain this often (< the 10 s minRTT window, so minRTT never goes stale-high)
+	probeRTTFor   = 220 * time.Millisecond // hold the drain at least this long (or 2x minRTT, whichever is more)
 )
 
 // onDelivered adds newly acked bytes to the reliable delivery-rate estimate.
@@ -355,7 +364,13 @@ func (c *cc) sample(rtt time.Duration, now time.Time) {
 		c.rttvar = (3*c.rttvar + d) / 4
 		c.srtt = (7*c.srtt + rtt) / 8
 	}
-	if c.minRTT == 0 || rtt < c.minRTT || now.Sub(c.minRTTAt) > 10*time.Second {
+	stale := now.Sub(c.minRTTAt) > 10*time.Second
+	if c.reliable && relV2 {
+		// never raise minRTT to a queued sample: PROBE_RTT supplies a drained one every 8 s. Only a stale sample
+		// taken while draining (the queue is empty) may move it up, to follow a genuine path change.
+		stale = stale && !c.probeUntil.IsZero()
+	}
+	if c.minRTT == 0 || rtt < c.minRTT || stale {
 		c.minRTT, c.minRTTAt = rtt, now
 	}
 	c.rttSum += rtt
@@ -446,6 +461,7 @@ func (c *cc) tick(now time.Time) {
 // at 1 MB/s with 641 delay cuts to 1 loss cut while TCP below it was idle).
 func (c *cc) tickReliable(now time.Time, cut, busy bool) {
 	c.updateBW(now, busy)
+	c.probeRTT(now)
 	if c.maxBW <= 0 {
 		if c.limited && !cut { // no estimate yet: ramp like slow start
 			c.rate = min(c.rate*1.10, c.maxRate)
@@ -467,11 +483,39 @@ func (c *cc) tickReliable(now time.Time, cut, busy bool) {
 	c.rate = target
 }
 
+// probeRTT runs the drain schedule: every probeRTTEvery, hold inflight low for probeRTTFor (or 2x minRTT) so the
+// queue empties and sample() can read the true base RTT. cwnd returns the low ceiling while draining.
+func (c *cc) probeRTT(now time.Time) {
+	if c.probeAt.IsZero() {
+		c.probeAt = now.Add(probeRTTEvery)
+		return
+	}
+	if !c.probeUntil.IsZero() { // draining
+		if now.After(c.probeUntil) {
+			c.probeUntil = time.Time{}
+			c.probeAt = now.Add(probeRTTEvery)
+		}
+		return
+	}
+	if now.After(c.probeAt) {
+		d := probeRTTFor
+		if m := 2 * c.minRTT; m > d {
+			d = m
+		}
+		c.probeUntil = now.Add(d)
+	}
+}
+
+func (c *cc) probing() bool { return !c.probeUntil.IsZero() }
+
 func (c *cc) cwnd() int {
 	if c.reliable && relV2 && c.maxBW > 0 && c.minRTT > 0 {
 		// bandwidth-delay product bound: keep a few BDP in flight to fill the pipe and survive one RTT of jitter,
 		// but no more, so our own queue (and the measured RTT) stays bounded.
 		bdp := c.maxBW * c.minRTT.Seconds()
+		if c.probing() { // draining to re-measure the base RTT: hold inflight to ~half a BDP
+			return max(int(bdp/2), 4*c.maxPlain)
+		}
 		return int(bdp*relCwndBDP) + 40*c.maxPlain
 	}
 	rtt := c.srtt

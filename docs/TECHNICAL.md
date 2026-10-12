@@ -885,6 +885,14 @@ about 1 to 5-7 MB/s and a parallel download from under 1 to 10-14 MB/s, with no 
 (2.4.10) reports the live picture: `delay_cuts`, `deep_trips`, `loss_cuts`, `spurious` of `lost`, what limited the
 sender each tick, and the window and loss-timer gauges.
 
+**Draining to re-measure the base RTT (2.4.12).** The BDP bound is `maxBW x minRTT`, so it needs a true `minRTT`. A
+single, deeply queued connection never delivers a drained sample, so `minRTT` climbed with its own queue and the
+window ran away with it (field 2026-10-13: `minRTT` rose to 550 ms from a real 108, inflight to over a megabyte).
+Every 8 s (just under the 10 s `minRTT` window, so a sample is always fresh) the pacer now holds inflight to about
+half a BDP for ~220 ms, long enough for the queue to drain and `sample` to read the base RTT. It costs a few percent
+of throughput and keeps the window, and the latency, bounded. `minRTT` no longer rises to a queued value on a
+reliable carrier; only a sample taken while draining may move it up, to follow a genuine path change.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the

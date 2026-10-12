@@ -333,3 +333,35 @@ func TestReliableBWPacer(t *testing.T) {
 		t.Fatalf("app-limited lull lowered the estimate: %.1f -> %.1f", hi/1e6, c.maxBW/1e6)
 	}
 }
+
+// TestReliableProbeRTT checks that a persistently queued reliable carrier re-measures its base RTT by draining:
+// minRTT must not climb with the self-inflicted queue, and the drain caps inflight low.
+func TestReliableProbeRTT(t *testing.T) {
+	if !relV2 {
+		t.Skip("v1 forced")
+	}
+	c := newCC(5e6, 2e5, 80e6, 0)
+	c.reliable, c.maxPlain = true, 1400
+	now := time.Now()
+	c.sample(100*time.Millisecond, now) // true base RTT
+	// 20 s of steady delivery where every RTT sample reads 400 ms (a standing queue), ticks every 100 ms
+	probed := false
+	for k := 1; k <= 200; k++ {
+		at := now.Add(time.Duration(k) * 100 * time.Millisecond)
+		c.onDelivered(int(10e6 * 0.1))
+		rtt := 400 * time.Millisecond
+		if c.reliable && c.probing() { // while draining, the queue empties and the sample reads the true base
+			rtt = 100 * time.Millisecond
+			probed = true
+		}
+		c.sample(rtt, at)
+		c.limited, c.cwndLim = true, true
+		c.tick(at)
+	}
+	if !probed {
+		t.Fatal("never entered a drain in 20 s")
+	}
+	if c.minRTT > 150*time.Millisecond {
+		t.Fatalf("minRTT climbed with the queue to %v (base was 100 ms); the BDP window would run away", c.minRTT)
+	}
+}
