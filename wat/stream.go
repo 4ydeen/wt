@@ -53,8 +53,9 @@ type Stream struct {
 	rnext    uint64
 	segs     []seg
 	ready    []byte
-	rroot    []byte // backing array of ready, same idea
-	slowWin  uint64 // >0: the smaller window advertised while the local reader lags (tuneSlow)
+	rroot    []byte    // backing array of ready, same idea
+	slowWin  uint64    // >0: the smaller window advertised while the local reader lags (tuneSlow)
+	shrunkAt time.Time // last time onAcked gave back an oversized send buffer
 	slowAt   time.Time
 	slowC    uint64
 	consumed uint64
@@ -331,8 +332,13 @@ func (st *Stream) onAcked(f frameRef) {
 				} else {
 					st.sbuf = st.sroot[:0]
 				}
-			} else if c := st.writeCap(); cap(st.sroot) > 1<<20 && cap(st.sroot) > 2*c && len(st.sbuf) <= c {
-				nb := make([]byte, len(st.sbuf), 2*c) // the peer's window shut (slow reader): give back the big buffer
+			} else if c := st.writeCap(); cap(st.sroot) > 1<<20 && cap(st.sroot) > 4*c && len(st.sbuf) <= c &&
+				st.s.now.Sub(st.shrunkAt) > time.Second {
+				// the peer's window shut (slow reader): give back the big buffer, at most once a second. The cap moves
+				// with every ack and window update, so shrinking on each of them re-copied the buffer per ack: 2.4.3
+				// allocated 100x the data in onAcked and tripled the sender's CPU (field 2026-10-12).
+				st.shrunkAt = st.s.now
+				nb := make([]byte, len(st.sbuf), 2*c)
 				copy(nb, st.sbuf)
 				st.sroot, st.sbuf = nb, nb
 			}

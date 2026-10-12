@@ -808,6 +808,15 @@ sender's from 4 MB to under 0.5 MB, while a fast single stream still reached 32.
 (`TestSlowReaderBuffersBounded`, `TestStreamWindowAutoTune`). Each half works on its own: a 2.4.3 receiver
 saves the receiver's memory, and a 2.4.3 sender saves the sender's.
 
+Field result, the same production tunnel 26 minutes after the update: Kharej RSS went from 806 to 74 MB, Iran's from
+808 to 75 MB.
+
+**2.4.4.** In 2.4.3 the sender gave back an oversized buffer whenever it was more than twice what it needed. That
+need moves with every ack, so the buffer was copied again on almost every ack. A single slow stream allocated about
+6.6 GB in 8 s, and Kharej's `wattun` threads rose from 2-13 % to 40-73 % CPU under load. The buffer is now given back
+at most once a second per stream, and only when it is over 4x the need. That is 142 MB allocated in the same test.
+`TestSlowReaderBuffersBounded` now fails above 1 GB.
+
 ## Pacing on TCP-based and CDN carriers
 
 TCP never drops a datagram by itself, so on `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc` the pacer judges delay

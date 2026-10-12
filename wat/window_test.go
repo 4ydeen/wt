@@ -2,6 +2,7 @@ package wat
 
 import (
 	"crypto/sha256"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -86,6 +87,8 @@ func TestSlowReaderBuffersBounded(t *testing.T) {
 	sst = <-got
 	buf := make([]byte, 32<<10)
 	t0 := time.Now()
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
 	next := time.Second
 	for time.Since(t0) < 8*time.Second { // ~1-2 MB/s
 		st.Read(buf)
@@ -104,6 +107,10 @@ func TestSlowReaderBuffersBounded(t *testing.T) {
 	held, capb := len(sst.sbuf), cap(sst.sroot)
 	srv.mu.Unlock()
 	t.Logf("receiver unread %.2f MB, sender buffered %.2f MB (cap %.2f MB)", float64(unread)/1e6, float64(held)/1e6, float64(capb)/1e6)
+	runtime.ReadMemStats(&m1)
+	if a := m1.TotalAlloc - m0.TotalAlloc; a > 1<<30 { // 2.4.3 re-copied the send buffer on every ack: ~6.6 GB here
+		t.Fatalf("buffer churn: %d MB allocated while ~16 MB were read", a>>20)
+	}
 	if unread > 2<<20 || held > 3<<20 || capb > 6<<20 {
 		t.Fatalf("slow reader pins too much: unread %d, sender %d (cap %d)", unread, held, capb)
 	}
