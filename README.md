@@ -40,10 +40,24 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.6)
+## What's new (latest: 2.4.7)
+
+- **ICMP: bigger packets, a setting change (no update needed).** The Iran ⇄ Europe route passes full 1500-byte
+  pings again. With `mtu: 1400` on **both** ends and the same 30 MB/s cap, Kharej resends 0.3-0.8 % of its packets
+  instead of 3-5 %, and in back-to-back tests downloads went from 22-24 to 27.5 MB/s and uploads from 21-22 to
+  26 MB/s, with ping unchanged (~41 ms under load). In production since 2026-10-12. Check your route first:
+  `ping -M do -s 1372 PEER_IP` must get replies, and `ip route get PEER_IP` must not show `mtu lock 680`. Keep
+  the total of all ICMP tunnels on this route at about 30 MB/s or less: above that, the route inside Iran switches
+  to a slow path for minutes. [Details](docs/TECHNICAL.md#icmp-path-limits-and-pacing).
+- **CDN is not reliable on this route right now.** After about 3 hours in production, the CDN tunnel on 2.4.6 fell
+  to about 1 MB/s. 2.4.7 tried to fix it, but in the field test it still dropped to about 1 MB/s under load, so
+  we stopped the CDN work. Use ICMP where it passes.
 
 Update **both** servers for every release below.
 
+- **2.4.7: CDN connection health (did not fix the collapse, see above).** Each end now replaces a CDN connection
+  that delivers far less than the others, and the tunnel no longer stays stuck at its lowest speed. Nothing changes
+  for ICMP.
 - **2.4.6: RAM stays low.** Idle connections keep less memory and Go cleans up sooner. On a production CDN tunnel with
   about 250 user connections, the Iran server went from about 1 GB on 2.4.5 to about 100 MB, and Kharej to about
   100 MB. Speed unchanged.
@@ -73,7 +87,7 @@ On a heavily filtered route the usual tunnels fail in measurable ways:
 |---|---|---|
 | TCP and UDP are cut after a few packets | Tunnel dies or flaps | Rides ICMP, which isn't cut |
 | 0.2–2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
-| Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default |
+| Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default, up to 1400 where the route allows |
 | SNI filtering of CDN domains | Blocked right after the handshake | Cloudflare with ECH; edges and TLS settings are found automatically |
 | One process per port | Server CPU saturates | One process for all ports, batched syscalls |
 | Changing ports | Restart drops every user | `ports:` list is hot-reloaded every 3 s |
@@ -95,6 +109,9 @@ Real VLESS (xray) traffic through each tunnel, same servers, same route. WatTunn
 The route caps at about 50 - 55k ICMP packets per second (~33 MB/s), and WatTunnel fills it. In production it
 carries **250 - 300 real clients** through a single process.
 
+With 1400-byte packets (`mtu: 1400`, 2026-10-12, same route, 30 MB/s cap): **27.5 MB/s down, 26 MB/s up** in a
+single speed test, 0.3-0.8 % of packets resent (3-5 % at 640 bytes), ping 41 ms under load.
+
 Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 
 | Tool | How it works | Throughput measured | Notes |
@@ -110,7 +127,9 @@ Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 ### CDN (Cloudflare): field numbers
 
 Real measurements, Iran → Cloudflare → Kharej, 2-vCPU servers, `wss` + ECH. The first rows are from 2026-10-11 on a
-tunnel without users; the last row is production with real users on 2026-10-12:
+tunnel without users; the last row is production with real users on 2026-10-12. **Later that day the CDN tunnel
+collapsed to about 1 MB/s after 3 hours, and the 2.4.7 fix did not hold, so we don't recommend CDN on this route
+for now.**
 
 | Setup | Result |
 |---|---|
@@ -273,7 +292,8 @@ on Kharej. Auto-heal can switch to another working carrier by itself. Kharej nee
 
 ## Cloudflare (CDN) mode
 
-For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI.
+For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI. On the Iran ⇄ Europe route it is not
+reliable right now (see [What's new](#whats-new-latest-247)); use ICMP where it passes.
 
 1. Put a domain on Cloudflare, with the proxy (orange cloud) on and SSL mode **Full**. For `grpc`, turn on gRPC in
    Cloudflare's Network settings if your plan shows that switch.
