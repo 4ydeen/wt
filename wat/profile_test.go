@@ -66,42 +66,55 @@ func TestProfileDefaults(t *testing.T) {
 	}
 }
 
-// A reliable carrier's late samples (a stalled TCP connection) must not slow the pacer; a standing queue (every
-// sample high) still must. An unreliable carrier keeps judging the mean, exactly as before.
+// The unreliable pacer keeps judging the mean delay. The reliable pacer (2.4.11) ignores delay entirely and tracks
+// the measured delivery rate instead: RTT jitter must not move it, and its rate settles near the delivery rate it is
+// actually achieving, never running away above it.
 func TestReliableCCJudgesFloor(t *testing.T) {
-	run := func(reliable bool, late bool) float64 {
-		c := newCC(5e6, 2e5, 16e6, 8*time.Millisecond)
-		c.reliable = reliable
-		now := time.Now()
-		for i := 0; i < 20; i++ {
-			c.sample(40*time.Millisecond, now) // establishes minRTT
+	// unreliable: a standing queue (every sample at 70 ms over a 40 ms base) still backs the pacer off
+	u := newCC(5e6, 2e5, 16e6, 8*time.Millisecond)
+	now := time.Now()
+	for i := 0; i < 20; i++ {
+		u.sample(40*time.Millisecond, now)
+	}
+	u.tick(now.Add(time.Second))
+	start := u.rate
+	for k := 1; k <= 10; k++ {
+		at := now.Add(time.Second + time.Duration(k)*60*time.Millisecond)
+		for i := 0; i < 100; i++ {
+			u.sample(70*time.Millisecond, at)
 		}
-		c.tick(now.Add(time.Second))
-		start := c.rate
-		for k := 1; k <= 10; k++ {
-			at := now.Add(time.Second + time.Duration(k)*60*time.Millisecond)
-			for i := 0; i < 100; i++ {
-				rtt := 40 * time.Millisecond
-				if late && i%4 == 0 { // 25 % of samples held up by a stalled connection
-					rtt = 110 * time.Millisecond
-				} else if !late {
-					rtt = 70 * time.Millisecond // everything delayed: a real queue
-				}
-				c.sample(rtt, at)
-			}
-			c.limited = true
-			c.tick(at)
+		u.limited = true
+		u.tick(at)
+	}
+	if u.rate/start > 1 {
+		t.Fatalf("unreliable pacer should react to a standing queue: rate x%.2f", u.rate/start)
+	}
+
+	// reliable: deliver a steady 10 MB/s while RTT jitters between 40 and 160 ms. The pacer must not cut on the
+	// jitter, and must settle near the delivery rate (relBWGain above it), not run away to the max.
+	c := newCC(5e6, 2e5, 80e6, 8*time.Millisecond)
+	c.reliable = true
+	base := time.Now()
+	for i := 0; i < 20; i++ {
+		c.sample(40*time.Millisecond, base)
+	}
+	const bwPerTick = 10e6 * 0.06 // 10 MB/s over 60 ms ticks
+	for k := 1; k <= 60; k++ {
+		at := base.Add(time.Duration(k) * 60 * time.Millisecond)
+		c.sample(40*time.Millisecond, at)
+		if k%3 == 0 {
+			c.sample(160*time.Millisecond, at) // a stalled connection's late sample
 		}
-		return c.rate / start
+		c.onDelivered(int(bwPerTick))
+		c.limited = true
+		c.cwndLim = true
+		c.tick(at)
 	}
-	if r := run(true, true); r < 1 {
-		t.Fatalf("reliable pacer backed off on head-of-line stalls: rate x%.2f", r)
+	if c.diag.DelayCuts != 0 || c.diag.DeepTrips != 0 {
+		t.Fatalf("reliable pacer cut on RTT jitter: %d delay cuts, %d deep trips", c.diag.DelayCuts, c.diag.DeepTrips)
 	}
-	if r := run(true, false); r > 0.7 {
-		t.Fatalf("reliable pacer ignored a standing queue: rate x%.2f", r)
-	}
-	if r := run(false, true); r > 1 {
-		t.Fatalf("unreliable pacer should keep reacting to mean delay: rate x%.2f", r)
+	if c.rate < 9e6 || c.rate > 10e6*relBWGain*1.2 {
+		t.Fatalf("reliable rate should settle near the 10 MB/s delivery rate, got %.2f MB/s", c.rate/1e6)
 	}
 }
 

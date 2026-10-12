@@ -61,6 +61,77 @@ type cc struct {
 	// diagnostics (2.4.10, /stats "cc"): what held the sender back, per tick, and why the rate was cut
 	tokLim, cwndLim bool // set by build during the current tick
 	diag            CCDiag
+
+	// delivery-rate pacer for reliable carriers (2.4.11). TCP underneath does its own congestion control and injects
+	// RTT jitter from its retransmits, so delay is a false signal here; instead pace a little above the measured
+	// delivery rate (bytes acked per second, windowed max over busy ticks) and bound inflight to a few BDP.
+	delivered uint64    // cumulative acked bytes (reliable)
+	delLast   uint64    // delivered at the last tick
+	bwAt      time.Time // last delivery-rate tick
+	bwRing    [bwWin]float64
+	bwPos     int
+	bwLen     int
+	bwBusy    bool    // the current measurement interval had at least one busy tick
+	maxBW     float64 // windowed-max delivery rate (bytes/s); 0 until the first sample
+}
+
+const (
+	bwWin      = 10   // delivery-rate window, samples of >= 1 RTT each (~1 s): its max is the capacity estimate
+	relBWGain  = 1.20 // pace this far above the estimate, to keep probing for more
+	relCwndBDP = 3    // inflight ceiling, in bandwidth-delay products
+)
+
+// onDelivered adds newly acked bytes to the reliable delivery-rate estimate.
+func (c *cc) onDelivered(n int) {
+	if c.reliable && n > 0 {
+		c.delivered += uint64(n)
+	}
+}
+
+// updateBW turns the bytes acked since the last tick into a delivery-rate sample. A tick where the sender had nothing
+// to send (app-limited) under-measures the path, so it never lowers the estimate; a busy tick enters the window and
+// the windowed maximum is the capacity estimate.
+func (c *cc) updateBW(now time.Time, busy bool) {
+	c.bwBusy = c.bwBusy || busy
+	if c.bwAt.IsZero() {
+		c.bwAt, c.delLast = now, c.delivered
+		return
+	}
+	// measure over at least one RTT: a stall releasing many packets in one tick is an ack burst, not real bandwidth,
+	// and a per-tick rate would read it as capacity. Averaging over >= 1 RTT smooths that.
+	span := c.minRTT
+	if span < 40*time.Millisecond {
+		span = 40 * time.Millisecond
+	}
+	if now.Sub(c.bwAt) < span {
+		return
+	}
+	dt := now.Sub(c.bwAt).Seconds()
+	c.bwAt = now
+	if dt <= 0 {
+		return
+	}
+	bw := float64(c.delivered-c.delLast) / dt
+	c.delLast = c.delivered
+	busyInterval := c.bwBusy
+	c.bwBusy = false
+	if !busyInterval { // app-limited: let a high sample raise the estimate, never let a low one lower it
+		if bw > c.maxBW {
+			c.maxBW = bw
+		}
+		return
+	}
+	c.bwRing[c.bwPos] = bw
+	c.bwPos = (c.bwPos + 1) % bwWin
+	if c.bwLen < bwWin {
+		c.bwLen++
+	}
+	c.maxBW = 0
+	for i := 0; i < c.bwLen; i++ {
+		if c.bwRing[i] > c.maxBW {
+			c.maxBW = c.bwRing[i]
+		}
+	}
 }
 
 // CCDiag counts, since start, the pacer's ticks by what limited the sender and its rate cuts by cause.
@@ -309,10 +380,16 @@ func (c *cc) tick(now time.Time) {
 	case !c.limited:
 		c.diag.AppLimited++
 	}
+	busy := c.cwndLim || c.tokLim
 	c.tokLim, c.cwndLim = false, false
 	cut := c.lossStep()
 	if cut {
 		c.diag.LossCuts++
+	}
+	if c.reliable && relV2 {
+		c.tickReliable(now, cut, busy)
+		c.rttSum, c.rttN, c.limited = 0, 0, false
+		return
 	}
 	if c.rttN > 0 && c.minRTT > 0 {
 		avg := c.rttSum / time.Duration(c.rttN)
@@ -362,7 +439,41 @@ func (c *cc) tick(now time.Time) {
 	c.rttSum, c.rttN, c.limited = 0, 0, false
 }
 
+// tickReliable paces a reliable carrier by delivery rate, not delay. The target is relBWGain above the windowed-max
+// delivery rate; cwnd (reliableBDP) bounds inflight, so over-pacing turns into token/cwnd-limited headroom that probes
+// for more without inflating latency. Real wire loss (after spurious removal) still cuts via reliableLossV2's ceiling;
+// delay never cuts here, because TCP's retransmit jitter is not our queue (field 2026-10-13: a single CDN stream sat
+// at 1 MB/s with 641 delay cuts to 1 loss cut while TCP below it was idle).
+func (c *cc) tickReliable(now time.Time, cut, busy bool) {
+	c.updateBW(now, busy)
+	if c.maxBW <= 0 {
+		if c.limited && !cut { // no estimate yet: ramp like slow start
+			c.rate = min(c.rate*1.10, c.maxRate)
+		}
+		return
+	}
+	target := relBWGain * c.maxBW
+	if c.ceiling > 0 && target > c.ceiling { // a recent real-loss cut caps the probe until the ceiling creeps back up
+		target = c.ceiling
+	}
+	if target > c.maxRate {
+		target = c.maxRate
+	}
+	if target < c.hardMin {
+		target = c.hardMin
+	}
+	// the windowed-max already smooths single samples, so track the target directly: climb fast to fill the pipe,
+	// drop at once when the estimate falls (loss or a slower path)
+	c.rate = target
+}
+
 func (c *cc) cwnd() int {
+	if c.reliable && relV2 && c.maxBW > 0 && c.minRTT > 0 {
+		// bandwidth-delay product bound: keep a few BDP in flight to fill the pipe and survive one RTT of jitter,
+		// but no more, so our own queue (and the measured RTT) stays bounded.
+		bdp := c.maxBW * c.minRTT.Seconds()
+		return int(bdp*relCwndBDP) + 40*c.maxPlain
+	}
 	rtt := c.srtt
 	// reliable: srtt includes our own queue in the TCP buffers, so a window sized from it grows with the queue it
 	// creates and the sender is never window-limited. Size it from the base RTT instead.

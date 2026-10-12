@@ -858,6 +858,33 @@ delay without any queue of ours.
   10 MB/s, with 500 ms stalls (field measurement, 2026-10-12). The change is sender-side only and changes nothing on
   the wire. It matters most on Kharej, which sends the downloads, but update both ends.
 
+### Delivery-rate pacing (2.4.11)
+
+Through 2.4.10 the pacer judged TCP-based carriers by delay, like the ICMP path. On a real CDN that failed: TCP does
+its own congestion control and its retransmits delay a datagram without any queue of ours, so the measured round trip
+jitters between 1x and 5x the base RTT. The pacer read that jitter as congestion and cut, and a single CDN stream sat
+at about 1 MB/s with hundreds of delay cuts to one loss cut while the TCP socket below it was idle (field 2026-10-13).
+
+From 2.4.11 the reliable carriers are paced by **delivery rate** instead, which TCP's jitter and retransmits do not
+disturb:
+
+- The sender counts bytes acked per second and keeps the windowed maximum over about ten round trips (busy intervals
+  only, so an idle lull never lowers it, and a burst of acks released by a stalled connection is averaged over at
+  least one RTT so it does not inflate it). This is the path's delivery capacity.
+- The pace tracks `relBWGain` (1.2x) above that estimate, and inflight is bounded to `relCwndBDP` (3) bandwidth-delay
+  products, so over-pacing becomes window-limited headroom that probes for a little more without inflating latency.
+- Delay never cuts a reliable carrier now. Genuine wire loss still does, through the 2.4.9 rule below (a gentle
+  multiplicative cut with a ceiling that creeps back up), after spurious retransmits are removed.
+- A slow last leg behind a deep CDN buffer (the 2.4.2 case) is handled by the same BDP bound: delivery plateaus at the
+  drain rate, so the estimate and the pace stop climbing and inflight stays near one BDP, instead of queueing until
+  packets time out. The 2.4.1/2.4.2 floor-drop rules above apply only to the pre-2.4.11 delay pacer, still used for
+  ICMP and UDP and reachable with `WAT_REL_V1=1`.
+
+On an emulated CDN link (shallow edge buffer, 90 ms base RTT, per-connection stalls) this took a single flow from
+about 1 to 5-7 MB/s and a parallel download from under 1 to 10-14 MB/s, with no delay cuts. The `/stats` `cc` object
+(2.4.10) reports the live picture: `delay_cuts`, `deep_trips`, `loss_cuts`, `spurious` of `lost`, what limited the
+sender each tick, and the window and loss-timer gauges.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the

@@ -354,7 +354,11 @@ func TestEmu(t *testing.T) {
 		if mode == "tcp" {
 			addr = emuProxy(t, addr, up, down)
 		}
-		pc, err := NewTCPPoolClient(addr, 8)
+		conns := 8
+		if n, _ := strconv.Atoi(os.Getenv("EMU_CONNS")); n > 0 {
+			conns = n
+		}
+		pc, err := NewTCPPoolClient(addr, conns)
 		if err != nil {
 			t.Fatal(err)
 		}

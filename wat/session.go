@@ -172,13 +172,13 @@ type Session struct {
 	dbuf    []byte // scratch: datagram frames chosen for the packet being built
 
 	// multipath (nil/empty for every single-carrier PacketIO)
-	chooser PathChooser
-	fb      PathFeedback
-	pcc     []pathCC
-	probeQ  []int
-	ackBuf  []*sentPkt
+	chooser  PathChooser
+	fb       PathFeedback
+	pcc      []pathCC
+	probeQ   []int
+	ackBuf   []*sentPkt
 	lostRing []lostRec // reliable single carrier: recently declared lost, for spurious-resend detection
-	smpBuf  []*sentPkt
+	smpBuf   []*sentPkt
 }
 
 // pathCC is the session's own per-path delay/ordering state, used only with a PathChooser: loss detection must
@@ -1215,6 +1215,7 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 		}
 		s.ackBuf = acked[:0]
 	}
+	s.cc.onDelivered(newly)
 	if rtt > 0 {
 		s.cc.sample(rtt, now)
 	}

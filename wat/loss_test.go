@@ -293,3 +293,43 @@ func TestLossCeilingShallowBuffer(t *testing.T) {
 		t.Errorf("loss-aware retransmits more (%.1f%%) than delay-only (%.1f%%)", 100*fr[1], 100*fr[0])
 	}
 }
+
+// TestReliableBWPacer checks the delivery-rate pacer: an ack burst in one tick must not inflate the estimate (it is
+// measured over >= 1 RTT), an app-limited lull must not lower it, and the window bounds inflight to a few BDP.
+func TestReliableBWPacer(t *testing.T) {
+	if !relV2 {
+		t.Skip("v1 forced")
+	}
+	c := newCC(1e6, 2e5, 80e6, 0)
+	c.reliable = true
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		c.sample(50*time.Millisecond, now) // minRTT = 50 ms
+	}
+	// steady 20 MB/s for 2 s, delivered in 10 ms chunks (bursty within a tick), ticks every 50 ms
+	for k := 1; k <= 40; k++ {
+		at := now.Add(time.Duration(k) * 50 * time.Millisecond)
+		c.onDelivered(int(20e6 * 0.05))
+		c.sample(50*time.Millisecond, at)
+		c.limited, c.cwndLim = true, true
+		c.tick(at)
+	}
+	if c.maxBW < 18e6 || c.maxBW > 24e6 {
+		t.Fatalf("bw estimate off: %.1f MB/s (want ~20)", c.maxBW/1e6)
+	}
+	// cwnd bounded to a few BDP (BDP = 20 MB/s * 50 ms = 1 MB)
+	if cw := c.cwnd(); cw > 4<<20 {
+		t.Fatalf("cwnd not BDP-bounded: %d", cw)
+	}
+	// an app-limited lull (no delivery) must not lower the estimate
+	hi := c.maxBW
+	for k := 41; k <= 50; k++ {
+		at := now.Add(time.Duration(k) * 50 * time.Millisecond)
+		c.sample(50*time.Millisecond, at)
+		c.limited = false
+		c.tick(at)
+	}
+	if c.maxBW < hi*0.9 {
+		t.Fatalf("app-limited lull lowered the estimate: %.1f -> %.1f", hi/1e6, c.maxBW/1e6)
+	}
+}
