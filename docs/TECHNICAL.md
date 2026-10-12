@@ -31,7 +31,8 @@ Version: see `wat/version.go` (`wattun -version`).
 ## Why it exists
 
 Since October 2026 the Iran to Kharej path cuts TCP, UDP, GRE, IPIP, SCTP and ESP after a few packets. Only ICMP echo
-passes: payload up to about 640 bytes, about 0.2 to 2 % random loss, about 40 ms. Every ready-made engine we tried
+passes: at first only payloads up to about 640 bytes (full 1500-byte packets again since at least 2026-10-12, see
+[ICMP path limits](#icmp-path-limits-and-pacing)), about 0.2 to 2 % random loss, about 40 ms. Every ready-made engine we tried
 was built for another problem (a TCP stream over a clean link) and failed in a measured way on this path. WatTunnel is
 built for it: small datagrams, delay-based pacing (loss is not treated as congestion), selective acks, fast loss
 repair, and interactive traffic sent before bulk.
@@ -116,7 +117,7 @@ All carriers carry the same encrypted session. Pick one with `carrier:` (or `-ca
 
 | Carrier | Use it when | Default datagram size | Needs root | Notes |
 |---|---|---|---|---|
-| `icmp` | Only ping passes (Iran today). | 640 bytes | yes (raw socket) | 4 lanes by default (`lanes`). Pacing is delay-based. The path allows at most about 640 bytes of payload. Do not raise `mtu` above that. |
+| `icmp` | Only ping passes (Iran today). | 640 bytes | yes (raw socket) | 4 lanes by default (`lanes`). Pacing is delay-based. 640 is the safe default. Raise `mtu` (up to 1400) only after checking that the path passes that size, see [ICMP path limits](#icmp-path-limits-and-pacing). |
 | `udp` | UDP works and you want the lowest CPU and latency. | 1400 bytes | no | Server listens on `listen`; client dials `peer` as `host:port`. |
 | `tcp` | Plain TCP works. | 4096 bytes (up to 16384) | no | A pool of connections (`conns`, default 8). Reliable underneath, the session still repairs drops. |
 | `tls` | A middlebox must see HTTPS. | 4096 | no | The tcp pool inside TLS 1.3. Self-signed certificate if none is given. Pin the fingerprint with `tls-pin`. |
@@ -878,6 +879,21 @@ Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):
 - The path delivers at most about 50-55k ICMP packets per second Kharej -> Iran (about 33 MB/s at 640 B payload),
   shared by every ICMP type. Past about 45k pps a queue builds (p99 one-way delay +300 ms) and loss rises. Random
   loss on this path is only about 0.2 %.
+- **Packet size (2026-10-12).** The path passes full 1500-byte ICMP packets again, both ways, with DF set: 0-0.5 %
+  loss from 640 to 1472 bytes, no fragmentation needed. A route `mtu lock 680` on either end still caps it, so check
+  `ip route get <peer>` first. Measured with a test tunnel next to production, same 30 MB/s cap, 3 runs each:
+
+  | `mtu` | Down MB/s | Up MB/s | Kharej retrans (download) | Ping during download, p50/p95 |
+  |---|---|---|---|---|
+  | 640 (default) | 22-24 | 21-22 | 3.6-4.9 % | 41 / 43 ms |
+  | 1400 | 27.5 | 26 | 0.8 % | 41 / 42 ms |
+
+  Larger packets need fewer packets per MB, so they stay further below the packet-rate limit above. Test the size
+  with `ping -M do -s SIZE <peer>`, then set `mtu` on **both** ends (each end sends at its own size).
+- **Volume limit (2026-10-12).** Twice, ICMP held above ~30 MB/s in total for a few seconds (34.5 and 41.5 MB/s) was
+  followed 5-30 s later by a reroute inside Iran (base RTT 40 -> 76 ms) that lasted minutes. On that route bulk
+  transfers collapse (~2 MB/s, 50-90 % loss) while light traffic is fine. Runs at or below ~27 MB/s never triggered
+  it. Keep the total `max-mbps` of every ICMP tunnel on the path at about 30 or less, whatever the packet size.
 - `max-mbps` stays at 16 by default for `icmp` (and any bond that includes it). The ceiling that really binds is the path's packet rate, so values above
   roughly 30 only add queueing.
 - **Loss-aware ceiling (1.8.0, opt-in).** Off by default: the pacer is delay-based and loss alone is not congestion.
@@ -919,7 +935,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 |---|---|
 | `alive: false` on both ends, no errors | Wrong key, or the carrier is filtered. Compare the key files (`sha256sum`). Try `ping` between the servers: ICMP must pass. |
 | Iran cannot ping Kharej, Kharej can ping Iran (often one day on, one day off) | A one-way block on Iran's own pings. Use `reverse: true` on both ends with `icmp` (see Reverse ICMP). |
-| ICMP works with small pings but the tunnel stalls | MTU. Keep ICMP at 640. Check that the route MTU is not above about 680 and that nothing drops packets over 700 bytes. |
+| ICMP works with small pings but the tunnel stalls | MTU. Go back to the default 640 on both ends, then test larger sizes with `ping -M do -s SIZE <peer>` before raising `mtu` again. |
 | tcp, tls, ws never connect | That carrier is filtered on this path. Check with `nc -vz HOST PORT` from the client. On a path where only ping passes tCP and UDP are cut: use `icmp`. |
 | tcp pool connects, then drops after a few packets | A middlebox cuts long TCP flows. Try `tls`, `wss` or `grpc`, or `reverse`. |
 | Pool carriers or UDP forwards do not work, the other end is older | Version mismatch. Both ends must run 1.3.0 or newer for pool carriers and 1.2.0 or newer for UDP forwards. Check `wattun -version` on both ends. |
