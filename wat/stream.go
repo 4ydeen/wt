@@ -54,6 +54,9 @@ type Stream struct {
 	segs     []seg
 	ready    []byte
 	rroot    []byte // backing array of ready, same idea
+	slowWin  uint64 // >0: the smaller window advertised while the local reader lags (tuneSlow)
+	slowAt   time.Time
+	slowC    uint64
 	consumed uint64
 	advMax   uint64
 	win      uint64 // window this end advertises beyond consumed: streamWindow, auto-tuned upward (see tuneWindow)
@@ -92,7 +95,7 @@ func (st *Stream) Write(b []byte) (int, error) {
 	defer s.mu.Unlock()
 	total := 0
 	for len(b) > 0 {
-		for st.err == nil && !st.finQueued && len(st.sbuf) >= st.sendCap() {
+		for st.err == nil && !st.finQueued && len(st.sbuf) >= st.writeCap() {
 			st.wc.Wait()
 		}
 		if st.err != nil {
@@ -101,7 +104,7 @@ func (st *Stream) Write(b []byte) (int, error) {
 		if st.finQueued {
 			return total, ErrClosed
 		}
-		n := st.sendCap() - len(st.sbuf)
+		n := st.writeCap() - len(st.sbuf)
 		if n > len(b) {
 			n = len(b)
 		}
@@ -121,6 +124,51 @@ func (st *Stream) sendCap() int {
 		return int(min(st.peerMax-st.sbase, maxStreamWin))
 	}
 	return sendBufMax
+}
+
+// writeCap is sendCap, but at most sendStage beyond what the peer's window lets us send: while a slow reader keeps
+// the peer's window shut, there is no point holding another 4 MB here (2.4.3; the local source refills fast).
+func (st *Stream) writeCap() int {
+	room := 0
+	if st.peerMax > st.sbase {
+		room = int(min(st.peerMax-st.sbase, maxStreamWin))
+	}
+	return min(st.sendCap(), room+sendStage)
+}
+
+// tuneSlow shrinks the window this end advertises while the local reader, not the tunnel, sets the pace. A user on a
+// slow last mile otherwise parks a full window (4 MB) here and as much again at the sender (field 2026-10-12: 180
+// streams held ~700 MB on each end). Once per RTT: if unread data keeps piling up, the window becomes slowWinRTTs
+// RTTs of what the reader actually consumed (at least slowWinMin); when the backlog runs dry it grows back by half. The
+// advertised limit never moves back, updates just pause, so an older sender is unaffected (2.4.3).
+func (st *Stream) tuneSlow(now time.Time) {
+	if st.slowAt.IsZero() {
+		st.slowAt, st.slowC = now, st.consumed
+		return
+	}
+	rtt := max(st.s.cc.srtt, 5*time.Millisecond)
+	el := now.Sub(st.slowAt)
+	if el < rtt {
+		return
+	}
+	used := st.consumed - st.slowC
+	st.slowAt, st.slowC = now, st.consumed
+	lim := st.win
+	if st.slowWin > 0 {
+		lim = st.slowWin
+	}
+	if st.rnext-st.consumed > lim/2 {
+		w := max(uint64(float64(used)*float64(rtt)/float64(el))*slowWinRTTs, slowWinMin)
+		st.slowWin = w
+		if w >= st.win {
+			st.slowWin = 0
+		}
+	} else if st.slowWin > 0 && st.rnext-st.consumed < lim/4 { // the reader is starving: open up again
+		st.slowWin += st.slowWin / 2
+		if st.slowWin >= st.win {
+			st.slowWin = 0
+		}
+	}
 }
 
 // tuneWindow grows the window this end advertises (receiver-driven; the sender just honours frWindow). Once per
@@ -191,6 +239,11 @@ func (st *Stream) Read(b []byte) (int, error) {
 	}
 	n := copy(b, st.ready)
 	st.ready = st.ready[n:]
+	if w := st.slowWin; w > 0 && cap(st.rroot) > 1<<20 && uint64(cap(st.rroot)) > 2*w && uint64(len(st.ready)) <= w {
+		nb := make([]byte, len(st.ready), 2*w) // lagging reader (tuneSlow): give back the big buffer
+		copy(nb, st.ready)
+		st.rroot, st.ready = nb[:0], nb
+	}
 	if len(st.ready) == 0 {
 		if cap(st.rroot) > 1<<20 { // keep a working buffer (re-growing it from zero after every drain cost ~10 % CPU at 100 MB/s)
 			st.rroot = nil
@@ -199,8 +252,13 @@ func (st *Stream) Read(b []byte) (int, error) {
 	}
 	st.consumed += uint64(n)
 	st.tuneWindow()
-	if st.consumed+st.win-st.advMax >= st.win/4 {
-		st.advMax = st.consumed + st.win
+	st.tuneSlow(time.Now())
+	lim := st.win
+	if st.slowWin > 0 {
+		lim = st.slowWin
+	}
+	if st.consumed+lim > st.advMax && st.consumed+lim-st.advMax >= lim/4 {
+		st.advMax = st.consumed + lim
 		var f []byte
 		f = append(f, frWindow)
 		f = appendUv(f, st.id)
@@ -273,6 +331,10 @@ func (st *Stream) onAcked(f frameRef) {
 				} else {
 					st.sbuf = st.sroot[:0]
 				}
+			} else if c := st.writeCap(); cap(st.sroot) > 1<<20 && cap(st.sroot) > 2*c && len(st.sbuf) <= c {
+				nb := make([]byte, len(st.sbuf), 2*c) // the peer's window shut (slow reader): give back the big buffer
+				copy(nb, st.sbuf)
+				st.sroot, st.sbuf = nb, nb
 			}
 			st.sbase += drop
 			if st.acked[0].hi <= st.sbase {
@@ -453,7 +515,7 @@ func (st *Stream) makeRoom(n int) {
 		st.sbuf = st.sroot[:live]
 		return
 	}
-	nb := make([]byte, live, max(2*(live+n), 4096))
+	nb := make([]byte, live, max(min(2*(live+n), st.sendCap()), live+n, 4096)) // doubling, but not past the cap
 	copy(nb, st.sbuf)
 	st.sroot, st.sbuf = nb, nb
 }

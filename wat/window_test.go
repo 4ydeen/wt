@@ -61,3 +61,50 @@ func TestStreamWindowAutoTune(t *testing.T) {
 		t.Fatalf("auto-tuned window did not help: %.1f vs %.1f MB/s", nw, old)
 	}
 }
+
+// A reader slower than the tunnel (a user on a slow last mile) must not park a full 4 MB window at the receiver and
+// another 4 MB at the sender: field 2026-10-12, 180 such streams held ~700 MB on each end (2.4.3).
+func TestSlowReaderBuffersBounded(t *testing.T) {
+	cli, srv, _, _ := newPair(t, 0, 75*time.Millisecond, 40e6, Config{InitBps: 40e6, MaxBps: 40e6})
+	for _, x := range []*Session{cli, srv} {
+		x.mu.Lock()
+		x.cc.srtt, x.cc.rttvar = 150*time.Millisecond, 10*time.Millisecond
+		x.mu.Unlock()
+	}
+	var sst *Stream
+	got := make(chan *Stream, 1)
+	go func() {
+		st, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		got <- st
+		st.Write(pattern(64<<20, 7))
+	}()
+	st, _ := cli.OpenStream()
+	st.Write([]byte{1})
+	sst = <-got
+	buf := make([]byte, 32<<10)
+	t0 := time.Now()
+	next := time.Second
+	for time.Since(t0) < 8*time.Second { // ~1-2 MB/s
+		st.Read(buf)
+		time.Sleep(16 * time.Millisecond)
+		if time.Since(t0) > next {
+			next += time.Second
+			cli.mu.Lock()
+			t.Logf("t=%v unread %.2f MB win %.2f MB rrootcap %.2f", time.Since(t0).Round(time.Second), float64(st.rnext-st.consumed)/1e6, float64(st.slowWin)/1e6, float64(cap(st.rroot))/1e6)
+			cli.mu.Unlock()
+		}
+	}
+	cli.mu.Lock()
+	unread := st.rnext - st.consumed
+	cli.mu.Unlock()
+	srv.mu.Lock()
+	held, capb := len(sst.sbuf), cap(sst.sroot)
+	srv.mu.Unlock()
+	t.Logf("receiver unread %.2f MB, sender buffered %.2f MB (cap %.2f MB)", float64(unread)/1e6, float64(held)/1e6, float64(capb)/1e6)
+	if unread > 2<<20 || held > 3<<20 || capb > 6<<20 {
+		t.Fatalf("slow reader pins too much: unread %d, sender %d (cap %d)", unread, held, capb)
+	}
+}

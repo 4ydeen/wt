@@ -788,6 +788,26 @@ separate processes added up.
 - **GC.** `wattun` sets the GC target to 200 % at startup unless `GOGC` is set (fewer collections of the per-packet
   garbage, a few MB more heap).
 
+### Memory with slow readers (2.4.3)
+
+When a user's own connection reads slower than the tunnel delivers, which is typical for mobile users, each stream
+used to park its full 4 MB window at the receiver. The sender, blocked by that window, buffered another 4 MB in a
+backing array of up to 8 MB. Field, 2026-10-12 (production CDN, 180 streams): 761 MB of live heap on Kharej
+(`Stream.makeRoom`) and 625 MB on Iran (`Stream.appendReady`).
+
+- **Receiver.** Once per RTT, if unread data keeps piling up, the stream advertises only 2 RTTs of what its reader
+  actually consumed (at least 256 KB). When the backlog runs dry the window grows back by half, up to the normal
+  window. A fast reader is never limited, because the window only shrinks while the reader is the bottleneck. The
+  advertised limit is never taken back, updates just pause, so an older sender works unchanged.
+- **Sender.** `Write` buffers at most 256 KB beyond what the peer's window lets it send, and the send buffer never
+  grows past its cap.
+- **Both ends.** A big backing array is given back once the stream needs much less.
+
+On a simulated 150 ms link with a reader at about 2 MB/s, the receiver's backlog went from 4 MB to 0.2-0.3 MB and the
+sender's from 4 MB to under 0.5 MB, while a fast single stream still reached 32.7 MB/s
+(`TestSlowReaderBuffersBounded`, `TestStreamWindowAutoTune`). Each half works on its own: a 2.4.3 receiver
+saves the receiver's memory, and a 2.4.3 sender saves the sender's.
+
 ## Pacing on TCP-based and CDN carriers
 
 TCP never drops a datagram by itself, so on `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc` the pacer judges delay

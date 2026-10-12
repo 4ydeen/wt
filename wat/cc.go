@@ -121,10 +121,12 @@ func (c *cc) reliableLoss(sent, lost int) bool {
 	if c.lowTicks > 0 {
 		c.lowTicks--
 	}
+	if sent+lost >= lossMinSent { // judged intervals only, like the datagram rule (2.4.2 kept a stale value)
+		c.lossPct = float64(lost) / float64(max(sent, lost))
+	}
 	if lost < relLossMin || lost*relLossFrac < sent {
 		return false
 	}
-	c.lossPct = float64(lost) / float64(max(sent, lost))
 	c.rate *= relLossCut
 	if c.rate < c.hardMin {
 		c.rate = c.hardMin

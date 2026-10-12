@@ -15,24 +15,27 @@ import (
 )
 
 const (
-	MaxPayload   = 640 // default datagram size: ICMP echo payload cap, stays under the 680 route MTU after IP+ICMP headers
-	MinPayload   = 256 // bounds of Config.MaxPayload
-	MaxPayloadHi = 1400
-	hdrLen       = 16 // session id (8) + explicit packet number (8); nonce = 4 zero bytes + pn
-	tagLen       = 16
-	overhead     = hdrLen + tagLen
-	streamWindow = 4 << 20
-	sendBufMax   = 4 << 20
-	maxStreamWin = 16 << 20 // auto-tuned window cap per stream (stream.go tuneWindow)
-	maxSessionWin = 64 << 20 // total window growth beyond the 4 MB bases, per session
-	prioBytes    = 64 << 10 // streams that sent less than this go first (interactive traffic)
-	dirServerBit = uint64(1) << 63
-	replayWin    = 1024
+	MaxPayload    = 640 // default datagram size: ICMP echo payload cap, stays under the 680 route MTU after IP+ICMP headers
+	MinPayload    = 256 // bounds of Config.MaxPayload
+	MaxPayloadHi  = 1400
+	hdrLen        = 16 // session id (8) + explicit packet number (8); nonce = 4 zero bytes + pn
+	tagLen        = 16
+	overhead      = hdrLen + tagLen
+	streamWindow  = 4 << 20
+	sendBufMax    = 4 << 20
+	maxStreamWin  = 16 << 20  // auto-tuned window cap per stream (stream.go tuneWindow)
+	maxSessionWin = 64 << 20  // total window growth beyond the 4 MB bases, per session
+	sendStage     = 256 << 10 // Write may buffer this much beyond the peer's window (stream.go writeCap)
+	slowWinMin    = 256 << 10 // a lagging reader's window floor (stream.go tuneSlow)
+	slowWinRTTs   = 2
+	prioBytes     = 64 << 10 // streams that sent less than this go first (interactive traffic)
+	dirServerBit  = uint64(1) << 63
+	replayWin     = 1024
 	// A pool of TCP connections reorders by a whole head-of-line stall (60-100 ms of packets, ~1900 at 640 B and
 	// 12 MB/s); a window of 1024 turned every late packet after a stall into a "replay" and dropped it (measured).
 	reliableReplayWin = 16384
-	maxStreams   = 8192
-	ipIcmpHdr    = 28
+	maxStreams        = 8192
+	ipIcmpHdr         = 28
 )
 
 var ErrSessionDead = errors.New("wat: session closed")
@@ -62,7 +65,7 @@ type Stats struct {
 	Streams                            int
 	Inflight                           int
 	// datagrams (UDP forwarding)
-	DgramSent, DgramRecv                      uint64
+	DgramSent, DgramRecv                       uint64
 	DgramDropQueue, DgramDropSize, DgramDropRx uint64
 	FecSent, FecRecovered                      uint64
 	CeilingBps, LossPct                        float64 // loss-aware soft ceiling (0 = none); last judged interval loss in percent
@@ -115,39 +118,39 @@ type Session struct {
 	lastRecv  time.Time // cleared after 30 s of silence (the session then counts as dead)
 	lastAuth  time.Time // same, never cleared: what LastRecv reports
 
-	streams  map[uint64]*Stream
-	tomb     map[uint64]time.Time
-	nextSID  uint64
-	acceptQ  []*Stream
-	acceptC  *sync.Cond
-	prio     streamQ // interactive streams (sent < prioBytes), FIFO
-	bulk     fairQ   // bulk streams: fair between groups (public ports), round-robin inside a group
-	ctrl     [][]byte
-	sent     []*sentPkt
-	sentHead int
-	inflight int
-	cc       cc
-	lastSend time.Time
-	wantPing bool
-	stats    Stats
-	openBuf  []byte
-	noWinTune bool   // tests: behave like a peer that never advertises more than the implicit window
-	winExtra uint64 // sum over streams of (win - streamWindow): the auto-tuned growth in use
-	winSlack uint64 // bytes a peer's largest datagram may overshoot the advertised stream window
-	maxPlain int    // plaintext bytes per datagram: cfg.MaxPayload - header - tag
-	plainBuf []byte // reused packet assembly buffer (nextPacket runs under s.mu)
-	txNonce  [12]byte // seal runs under s.mu; kept here because an array passed to the AEAD interface escapes to the heap
-	rxNonce  [12]byte // handle runs on the receive goroutine only
-	copier   bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
-	outFree  chan []byte
-	batcher  BatchSender // nil: send one datagram at a time
-	bp       [][]byte
-	bl       []int
-	spFree   []*sentPkt
-	ackRs    []rng // parsed ACK ranges, valid for one parse
+	streams   map[uint64]*Stream
+	tomb      map[uint64]time.Time
+	nextSID   uint64
+	acceptQ   []*Stream
+	acceptC   *sync.Cond
+	prio      streamQ // interactive streams (sent < prioBytes), FIFO
+	bulk      fairQ   // bulk streams: fair between groups (public ports), round-robin inside a group
+	ctrl      [][]byte
+	sent      []*sentPkt
+	sentHead  int
+	inflight  int
+	cc        cc
+	lastSend  time.Time
+	wantPing  bool
+	stats     Stats
+	openBuf   []byte
+	noWinTune bool     // tests: behave like a peer that never advertises more than the implicit window
+	winExtra  uint64   // sum over streams of (win - streamWindow): the auto-tuned growth in use
+	winSlack  uint64   // bytes a peer's largest datagram may overshoot the advertised stream window
+	maxPlain  int      // plaintext bytes per datagram: cfg.MaxPayload - header - tag
+	plainBuf  []byte   // reused packet assembly buffer (nextPacket runs under s.mu)
+	txNonce   [12]byte // seal runs under s.mu; kept here because an array passed to the AEAD interface escapes to the heap
+	rxNonce   [12]byte // handle runs on the receive goroutine only
+	copier    bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
+	outFree   chan []byte
+	batcher   BatchSender // nil: send one datagram at a time
+	bp        [][]byte
+	bl        []int
+	spFree    []*sentPkt
+	ackRs     []rng // parsed ACK ranges, valid for one parse
 
 	fec      *fecState // nil unless Config.FEC
-	hedgeTok float64 // bytes of hedging allowed: ~8% of what was sent
+	hedgeTok float64   // bytes of hedging allowed: ~8% of what was sent
 	bootAt   time.Time
 	peerBoot uint64
 	wake     chan struct{}
