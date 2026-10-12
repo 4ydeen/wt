@@ -49,7 +49,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Stream window auto-tuning (2.4.0).** Faster single downloads and uploads on high-latency paths.
 - **2.4.1 and 2.4.2 fixes.** TCP-based and CDN tunnels no longer slow to a crawl under real bursty traffic (2.4.1),
   and no longer flood a CDN path that is slower than the tunnel's starting pace (2.4.2): sustained downloads stay
-  fast and ping stays low during a download instead of jumping to 500+ ms. **Update both ends.**
+  fast and the random half-second freezes are gone. **Update both ends.**
 - **Much less RAM (2.4.3, CPU fix in 2.4.4).** Connections whose users read slowly no longer hold 4-8 MB each on both servers: a
   production CDN tunnel went from about 800 MB to 75 MB per server.
 - **Easier to drive.** `wattun` alone opens the manager, and Auto mode tests every variant from one token.
