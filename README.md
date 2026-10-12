@@ -297,7 +297,7 @@ on Kharej. Auto-heal can switch to another working carrier by itself. Kharej nee
 ## Cloudflare (CDN) mode
 
 For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI. On the Iran ⇄ Europe route it is not
-reliable right now (see [What's new](#whats-new-latest-247)); use ICMP where it passes.
+reliable right now (see [What's new](#whats-new-latest-248)); use ICMP where it passes.
 
 1. Put a domain on Cloudflare, with the proxy (orange cloud) on and SSL mode **Full**. For `grpc`, turn on gRPC in
    Cloudflare's Network settings if your plan shows that switch.
