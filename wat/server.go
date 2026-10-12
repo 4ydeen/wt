@@ -169,6 +169,11 @@ func (srv *Server) Stats() Stats {
 		if t.MinRTT == 0 || (st.MinRTT > 0 && st.MinRTT < t.MinRTT) {
 			t.MinRTT = st.MinRTT
 		}
+		t.CC.add(st.CC)
+		t.FloorBps += st.FloorBps
+		t.Cwnd += st.Cwnd
+		t.WinBlocked += st.WinBlocked
+		t.LossTime, t.PTO, t.RelLossMul = max(t.LossTime, st.LossTime), max(t.PTO, st.PTO), max(t.RelLossMul, st.RelLossMul)
 		now[s] = st
 	}
 	// A closed session leaves the map; keep its last counters so the cumulative totals stay monotonic (callers
@@ -272,6 +277,7 @@ func addCounters(a *Stats, b Stats) {
 	a.Dropped += b.Dropped
 	a.FecSent += b.FecSent
 	a.FecRecovered += b.FecRecovered
+	a.CC.add(b.CC)
 }
 
 // CarrierStats sums the per-carrier numbers of every client session (nil unless the server runs on a MultiRaw).

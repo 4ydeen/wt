@@ -459,6 +459,13 @@ func main() {
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_flows": udpFlowsActive.Load(),
 					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(),
 				}
+				out["cc"] = map[string]any{ // pacer diagnostics (2.4.10): what held the sender back, and why it slowed
+					"ticks": st.CC.Ticks, "tok_limited": st.CC.TokLimited, "cwnd_limited": st.CC.CwndLimited,
+					"app_limited": st.CC.AppLimited, "loss_cuts": st.CC.LossCuts, "delay_cuts": st.CC.DelayCuts,
+					"deep_trips": st.CC.DeepTrips, "lost": st.CC.Lost, "spurious": st.CC.Spurious,
+					"floor_bps": st.FloorBps, "cwnd": st.Cwnd, "loss_time_ms": st.LossTime.Milliseconds(),
+					"pto_ms": st.PTO.Milliseconds(), "loss_timer_x": st.RelLossMul, "win_blocked": st.WinBlocked,
+				}
 				out["ports"] = portReg.snapshot(side)
 				var edges []wat.EdgeStat
 				for _, p := range tlsPools { // dialing pools: per-address health, and the client-side TLS state

@@ -57,6 +57,39 @@ type cc struct {
 	baseLoss     float64 // learned quiet-interval loss (EWMA, floor minBaseLoss)
 	lossPct      float64 // last judged interval's loss, 0..1 (stats)
 	ceiling      float64 // bytes per second; 0 = none
+
+	// diagnostics (2.4.10, /stats "cc"): what held the sender back, per tick, and why the rate was cut
+	tokLim, cwndLim bool // set by build during the current tick
+	diag            CCDiag
+}
+
+// CCDiag counts, since start, the pacer's ticks by what limited the sender and its rate cuts by cause.
+type CCDiag struct {
+	Ticks, TokLimited, CwndLimited, AppLimited uint64 // ticks; app-limited: nothing waiting to be sent
+	LossCuts, DelayCuts, DeepTrips             uint64 // DeepTrips: the delay rule let the rate fall below the start rate
+	Lost, Spurious                             uint64 // declared lost; of those, acked later after all
+}
+
+func (d *CCDiag) add(o CCDiag) {
+	d.Ticks += o.Ticks
+	d.TokLimited += o.TokLimited
+	d.CwndLimited += o.CwndLimited
+	d.AppLimited += o.AppLimited
+	d.LossCuts += o.LossCuts
+	d.DelayCuts += o.DelayCuts
+	d.DeepTrips += o.DeepTrips
+	d.Lost += o.Lost
+	d.Spurious += o.Spurious
+}
+
+// AddPacer folds b's pacer diagnostics into a: counters and gauges (floor, window) add up across sessions, and the
+// timers take the largest. For a client running several sessions.
+func AddPacer(a *Stats, b Stats) {
+	a.CC.add(b.CC)
+	a.FloorBps += b.FloorBps
+	a.Cwnd += b.Cwnd
+	a.WinBlocked += b.WinBlocked
+	a.LossTime, a.PTO, a.RelLossMul = max(a.LossTime, b.LossTime), max(a.PTO, b.PTO), max(a.RelLossMul, b.RelLossMul)
 }
 
 const (
@@ -267,7 +300,20 @@ func (c *cc) tick(now time.Time) {
 		return
 	}
 	c.tickAt = now
+	c.diag.Ticks++
+	switch {
+	case c.cwndLim:
+		c.diag.CwndLimited++
+	case c.tokLim:
+		c.diag.TokLimited++
+	case !c.limited:
+		c.diag.AppLimited++
+	}
+	c.tokLim, c.cwndLim = false, false
 	cut := c.lossStep()
+	if cut {
+		c.diag.LossCuts++
+	}
 	if c.rttN > 0 && c.minRTT > 0 {
 		avg := c.rttSum / time.Duration(c.rttN)
 		if c.reliable {
@@ -291,8 +337,10 @@ func (c *cc) tick(now time.Time) {
 		// until packets timed out).
 		if c.reliable && c.limited && avg > 2*c.minRTT && avg-c.minRTT > 40*time.Millisecond {
 			c.lowTicks = relLowTicks
+			c.diag.DeepTrips++
 		}
 		if avg > c.minRTT+slack && (!c.reliable || c.limited) {
+			c.diag.DelayCuts++
 			c.rate *= 0.93
 			if f := c.floor(); c.rate < f {
 				c.rate = min(f, c.rate/0.93) // clamp to the floor, but never raise a rate already below it

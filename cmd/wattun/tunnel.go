@@ -141,6 +141,7 @@ func (t *tunnel) stats() wat.Stats {
 		tot.FecSent += st.FecSent
 		tot.FecRecovered += st.FecRecovered
 		tot.CeilingBps += st.CeilingBps
+		wat.AddPacer(&tot, st)
 		tot.LossPct = max(tot.LossPct, st.LossPct)
 		if st.MinRTT > 0 && (tot.MinRTT == 0 || st.MinRTT < tot.MinRTT) {
 			tot.MinRTT = st.MinRTT

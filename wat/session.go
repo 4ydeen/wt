@@ -72,6 +72,14 @@ type Stats struct {
 	DgramDropQueue, DgramDropSize, DgramDropRx uint64
 	FecSent, FecRecovered                      uint64
 	CeilingBps, LossPct                        float64 // loss-aware soft ceiling (0 = none); last judged interval loss in percent
+
+	// pacer diagnostics (2.4.10)
+	CC            CCDiag
+	FloorBps      float64
+	Cwnd          int
+	LossTime, PTO time.Duration
+	RelLossMul    float64
+	WinBlocked    int // streams with data waiting but no window from the peer
 }
 
 type sentPkt struct {
@@ -169,6 +177,7 @@ type Session struct {
 	pcc     []pathCC
 	probeQ  []int
 	ackBuf  []*sentPkt
+	lostRing []lostRec // reliable single carrier: recently declared lost, for spurious-resend detection
 	smpBuf  []*sentPkt
 }
 
@@ -327,6 +336,13 @@ func (s *Session) Stats() Stats {
 	st.RateBps, st.SRTT, st.MinRTT = s.cc.rate, s.cc.srtt, s.cc.minRTT
 	st.CeilingBps, st.LossPct = s.cc.ceiling, s.cc.lossPct*100
 	st.Streams, st.Inflight = len(s.streams), s.inflight
+	st.CC, st.FloorBps, st.Cwnd = s.cc.diag, s.cc.floor(), s.cc.cwnd()
+	st.LossTime, st.PTO, st.RelLossMul = s.cc.lossTime(), s.cc.pto(), s.cc.relLossMul
+	for _, x := range s.streams {
+		if len(x.retx) == 0 && x.snext < x.sbase+uint64(len(x.sbuf)) && x.snext >= x.peerMax {
+			st.WinBlocked++
+		}
+	}
 	return st
 }
 
@@ -548,6 +564,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	if !canData && !needAck && !s.wantPing && len(s.ctrl) == 0 && !needBoot {
 		if s.hasWork() {
 			s.cc.limited = true
+			s.noteLimit()
 		}
 		return outPkt{}, false
 	}
@@ -625,6 +642,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 		if s.cc.tokens <= 0 || s.inflight >= s.cc.cwnd() {
 			if s.hasWork() {
 				s.cc.limited = true
+				s.noteLimit()
 			}
 		}
 	}
@@ -677,6 +695,15 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 		}
 	}
 	return outPkt{out, lane, dup}, true
+}
+
+// noteLimit records what held the sender back this tick (diagnostics).
+func (s *Session) noteLimit() {
+	if s.inflight >= s.cc.cwnd() {
+		s.cc.cwndLim = true
+	} else if s.cc.tokens <= 0 {
+		s.cc.tokLim = true
+	}
 }
 
 func (s *Session) seal(p []byte) ([]byte, uint64) {
@@ -907,6 +934,15 @@ func (s *Session) resetAll(err error) {
 func (s *Session) lose(sp *sentPkt) {
 	sp.done, sp.lost = true, true
 	s.cc.lostN++
+	s.cc.diag.Lost++
+	if s.cc.reliable && s.chooser == nil && (len(sp.frames) > 0 || len(sp.ctrl) > 0) {
+		// Remember it: the packet is the oldest in flight, so compact frees it at once, and a late ack (TCP delivered
+		// it after all) could otherwise never be matched (2.4.9 missed most of them).
+		if len(s.lostRing) >= lostRingMax {
+			s.lostRing = append(s.lostRing[:0], s.lostRing[len(s.lostRing)-lostRingMax/2:]...)
+		}
+		s.lostRing = append(s.lostRing, lostRec{sp.pn, sp.at})
+	}
 	s.inflight -= sp.size
 	if s.fb != nil {
 		s.fb.OnLoss(sp.lane)
@@ -1148,14 +1184,6 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 			}
 			continue
 		}
-		if sp.done && sp.lost && s.chooser == nil && s.cc.reliable && rs.contains(sp.pn) {
-			// Reliable single carrier (TCP pool/CDN): a packet we declared lost is now acked, so TCP delivered it
-			// late and our retransmit was spurious. Tell the pacer, so it discounts this from congestion loss and
-			// stretches its loss timer instead of resending what TCP will deliver.
-			sp.lost = false
-			s.cc.spuriousN++
-			continue
-		}
 		if sp.done || !rs.contains(sp.pn) {
 			continue
 		}
@@ -1176,6 +1204,9 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 		if sp.pn == largest {
 			rtt = now.Sub(sp.at) - delay
 		}
+	}
+	if len(s.lostRing) > 0 {
+		s.matchLost(rs, largest, now)
 	}
 	if s.chooser != nil {
 		rtt = s.pathAcked(acked, largest, delay, now, rtt)
@@ -1208,6 +1239,36 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 		}
 	}
 	s.compact()
+}
+
+// lostRec is a packet a reliable single-carrier session declared lost, kept so a late ack can prove it spurious.
+type lostRec struct {
+	pn uint64
+	at time.Time
+}
+
+const (
+	lostRingMax = 8192
+	lostKeep    = 5 * time.Second
+)
+
+// matchLost finds packets declared lost that this ack covers after all: TCP delivered them late, so the resend was
+// spurious. Each is counted once (the pacer discounts it from congestion loss and stretches its loss timer), and
+// records older than lostKeep are dropped.
+func (s *Session) matchLost(rs rangeSet, largest uint64, now time.Time) {
+	keep := s.lostRing[:0]
+	for _, r := range s.lostRing {
+		if now.Sub(r.at) > lostKeep {
+			continue
+		}
+		if r.pn <= largest && rs.contains(r.pn) {
+			s.cc.spuriousN++
+			s.cc.diag.Spurious++
+			continue
+		}
+		keep = append(keep, r)
+	}
+	s.lostRing = keep
 }
 
 // Alive reports whether authenticated packets arrived from the peer in the last 10 seconds.

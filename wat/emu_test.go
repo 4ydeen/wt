@@ -309,6 +309,7 @@ func emuRun(t *testing.T, cli *Session, srv *Server) {
 		single, par, lat[len(lat)/2], lat[len(lat)*95/100], ss.PktsOut, ss.Retrans, 100*float64(ss.Retrans)/float64(max(ss.PktsOut, 1)),
 		ss.RateBps/1e6, ss.SRTT, ss.MinRTT)
 	t.Logf("server out %d client in %d (bytes %d vs %d)", ss.PktsOut, cs.PktsIn, ss.BytesOut, cs.BytesIn)
+	t.Logf("server cc %+v floor %.1f MB/s cwnd %d losstime %v x%.2f winblocked %d", ss.CC, ss.FloorBps/1e6, ss.Cwnd, ss.LossTime, ss.RelLossMul, ss.WinBlocked)
 }
 
 func emuInit() float64 { n, _ := strconv.ParseFloat(os.Getenv("EMU_INIT"), 64); return n * 1e6 }
