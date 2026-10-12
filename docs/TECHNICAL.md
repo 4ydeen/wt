@@ -788,6 +788,27 @@ separate processes added up.
 - **GC.** `wattun` sets the GC target to 200 % at startup unless `GOGC` is set (fewer collections of the per-packet
   garbage, a few MB more heap).
 
+## Pacing on TCP-based and CDN carriers
+
+TCP never drops a datagram by itself, so on `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc` the pacer judges delay
+by each 50 ms interval's fastest sample and allows a third of the base RTT, because CDN edges and TCP buffering add
+delay without any queue of ours.
+
+- **2.4.1.** The pace never drops below the start rate (8 MB/s per session), and delay cuts apply only while the
+  session fills its window, so bursty web traffic is not cut down to a crawl.
+- **2.4.2.** The window is sized from at most 1.5 x the base RTT, not the smoothed RTT, which includes our own queue.
+  Two signals can now take the pace below the start-rate floor for about 30 s, down to the configured floor (200
+  KB/s):
+  - an interval whose fastest sample is above twice the base RTT (and at least 40 ms above it) while the window is
+    full;
+  - an interval in which at least 4 packets, and at least 1/20 of those sent, waited past the loss timer (400 ms).
+    This cuts the pace by 20 %.
+
+  Before 2.4.2, four sessions at the 8 MB/s floor kept pushing at least 32 MB/s into a CDN path that sustained about
+  10 MB/s. Cloudflare buffered the excess until packets timed out. Sustained downloads fell from 40-50 to about
+  10 MB/s, with 500 ms stalls (field measurement, 2026-10-12). The change is sender-side only and changes nothing on
+  the wire. It matters most on Kharej, which sends the downloads, but update both ends.
+
 ## ICMP path limits and pacing
 
 Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):

@@ -47,8 +47,9 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Several sessions per tunnel (2.3.0).** `sessions` (default 4 for TCP-type carriers) lets one tunnel use several
   CPU cores and connections.
 - **Stream window auto-tuning (2.4.0).** Faster single downloads and uploads on high-latency paths.
-- **2.4.1 fix.** TCP-based and CDN tunnels no longer slow to a crawl under real bursty traffic (the pace floor is
-  8 MB/s per session, and delay-based cuts apply only while the session fills its window). **Update both ends.**
+- **2.4.1 and 2.4.2 fixes.** TCP-based and CDN tunnels no longer slow to a crawl under real bursty traffic (2.4.1),
+  and no longer flood a CDN path that is slower than the tunnel's starting pace (2.4.2): sustained downloads stay
+  fast and ping stays low during a download instead of jumping to 500+ ms. **Update both ends.**
 - **Easier to drive.** `wattun` alone opens the manager, and Auto mode tests every variant from one token.
 
 ## Why WatTunnel: speed, CPU and comparisons

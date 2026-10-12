@@ -92,7 +92,6 @@ func runUpload(t *testing.T, up, down *simDir, maxMB float64, total, steady time
 	return r
 }
 
-
 // A hard rate cap with a deep drop-tail FIFO, 0.2 % random loss, 40 ms RTT, pace ceiling 80 MB/s.
 func TestLossCeilingHardCap(t *testing.T) {
 	if testing.Short() {
@@ -182,12 +181,30 @@ func TestLossStepUnit(t *testing.T) {
 	if b.lossLimit() < 0.03 {
 		t.Fatalf("limit %.3f", b.lossLimit())
 	}
-	// reliable carriers ignore loss entirely
+	// reliable carriers ignore a few late packets (a dead conn's tail) but cut on a burst of them, below minRate
 	r := newCC(10e6, 0.1e6, 80e6, 8*time.Millisecond)
-	r.reliable = true
-	r.sentN, r.lostN = 1000, 500
+	r.reliable, r.minRate = true, 8e6
+	r.sentN, r.lostN = 1000, 3
 	if r.lossStep() || r.rate != 10e6 {
-		t.Fatal("reliable carrier reacted to loss")
+		t.Fatal("reliable carrier reacted to a few late packets")
+	}
+	r.sentN, r.lostN = 1000, 20
+	if r.lossStep() || r.rate != 10e6 {
+		t.Fatal("reliable carrier reacted to 2 % late packets")
+	}
+	for i := 0; i < 5; i++ {
+		r.sentN, r.lostN = 200, 30
+		if !r.lossStep() {
+			t.Fatal("reliable carrier ignored an overload")
+		}
+	}
+	if r.rate > 3.3e6 || r.rate < 3.2e6 || r.floor() != 0.1e6 {
+		t.Fatalf("reliable overload: rate %.2f MB/s floor %.2f", r.rate/1e6, r.floor()/1e6)
+	}
+	r.lowTicks = 1
+	r.lossStep()
+	if r.floor() != 8e6 {
+		t.Fatal("start-rate floor not restored")
 	}
 }
 

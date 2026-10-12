@@ -34,9 +34,18 @@ type emuWire struct {
 	stalled int
 }
 
+// EMU_MBPS (MB/s) and EMU_QMS (queue limit in ms) override the link: a slow last leg behind a deep CDN buffer is
+// EMU_MBPS=4 EMU_QMS=2000.
 func newEmuWire(seed int64) *emuWire {
-	return &emuWire{bps: 12.5e6, delay: 20 * time.Millisecond, loss: 0.002, qMax: 120 * time.Millisecond,
+	w := &emuWire{bps: 12.5e6, delay: 20 * time.Millisecond, loss: 0.002, qMax: 120 * time.Millisecond,
 		rtt: 40 * time.Millisecond, rnd: rand.New(rand.NewSource(seed))}
+	if n, _ := strconv.ParseFloat(os.Getenv("EMU_MBPS"), 64); n > 0 {
+		w.bps = n * 1e6
+	}
+	if n, _ := strconv.Atoi(os.Getenv("EMU_QMS")); n > 0 {
+		w.qMax = time.Duration(n) * time.Millisecond
+	}
+	return w
 }
 
 // admit returns when a packet of n bytes sent now arrives; ok=false when the queue is full or the packet is lost.

@@ -47,6 +47,8 @@ type cc struct {
 	// pps a deep queue fills and 30 % of the wire was retransmissions). Then the rate is cut and may not climb past a
 	// ceiling that itself only creeps up while no loss is seen.
 	sentN, lostN int     // tracked packets sent / declared lost in the current tick
+	hardMin      float64 // the configured floor; minRate may sit above it (reliable: the start rate)
+	lowTicks     int     // reliable: ticks left during which overload may cut below minRate, down to hardMin
 	baseLoss     float64 // learned quiet-interval loss (EWMA, floor minBaseLoss)
 	lossPct      float64 // last judged interval's loss, 0..1 (stats)
 	ceiling      float64 // bytes per second; 0 = none
@@ -74,7 +76,10 @@ func (c *cc) lossLimit() float64 {
 func (c *cc) lossStep() bool {
 	sent, lost := c.sentN, c.lostN
 	c.sentN, c.lostN = 0, 0
-	if c.reliable || sent < lossMinSent || !lossAwareOn.Load() {
+	if c.reliable {
+		return c.reliableLoss(sent, lost)
+	}
+	if sent < lossMinSent || !lossAwareOn.Load() {
 		return false
 	}
 	loss := float64(lost) / float64(sent)
@@ -100,8 +105,44 @@ func (c *cc) lossStep() bool {
 	return false
 }
 
+// A reliable carrier loses a datagram only when it sat in some queue past reliableLossTime, or its connection died.
+// Many of those in one tick mean the path is far slower than our pace: a CDN edge buffering for a slow last leg
+// (field 2026-10-12, wss via Cloudflare: four sessions held at the 8 MB/s floor into a ~10 MB/s path, 10 MB in
+// flight, sustained download collapsed from 40-50 to 10 MB/s with ~500 ms stalls). Retransmitted packets give no RTT
+// sample, so the delay rule cannot see that queue. Cut, and for a while let the rate fall below the start-rate floor.
+const (
+	relLossMin  = 4  // lost packets in one tick
+	relLossFrac = 20 // and at least 1/20 of the tick's sent packets
+	relLossCut  = 0.8
+	relLowTicks = 600 // ~30 s at 50 ms per tick, renewed by every cut
+)
+
+func (c *cc) reliableLoss(sent, lost int) bool {
+	if c.lowTicks > 0 {
+		c.lowTicks--
+	}
+	if lost < relLossMin || lost*relLossFrac < sent {
+		return false
+	}
+	c.lossPct = float64(lost) / float64(max(sent, lost))
+	c.rate *= relLossCut
+	if c.rate < c.hardMin {
+		c.rate = c.hardMin
+	}
+	c.lowTicks = relLowTicks
+	return true
+}
+
+// floor is the lowest rate the delay rule may cut to.
+func (c *cc) floor() float64 {
+	if c.lowTicks > 0 {
+		return c.hardMin
+	}
+	return c.minRate
+}
+
 func newCC(initRate, minRate, maxRate float64, slack time.Duration) cc {
-	return cc{rate: initRate, minRate: minRate, maxRate: maxRate, slack: slack}
+	return cc{rate: initRate, minRate: minRate, hardMin: minRate, maxRate: maxRate, slack: slack}
 }
 
 func (c *cc) refill(dt time.Duration) {
@@ -161,10 +202,16 @@ func (c *cc) tick(now time.Time) {
 				slack = s
 			}
 		}
+		// reliable: even the interval's fastest sample at twice the base RTT is our own queue, not edge spread, so the
+		// cut may go under the start-rate floor (field 2026-10-12: a ~10 MB/s CDN leg under a 4 x 8 MB/s floor queued
+		// until packets timed out).
+		if c.reliable && c.limited && avg > 2*c.minRTT && avg-c.minRTT > 40*time.Millisecond {
+			c.lowTicks = relLowTicks
+		}
 		if avg > c.minRTT+slack && (!c.reliable || c.limited) {
 			c.rate *= 0.93
-			if c.rate < c.minRate {
-				c.rate = c.minRate
+			if f := c.floor(); c.rate < f {
+				c.rate = min(f, c.rate/0.93) // clamp to the floor, but never raise a rate already below it
 			}
 			c.backoff++
 		} else {
@@ -185,6 +232,13 @@ func (c *cc) tick(now time.Time) {
 
 func (c *cc) cwnd() int {
 	rtt := c.srtt
+	// reliable: srtt includes our own queue in the TCP buffers, so a window sized from it grows with the queue it
+	// creates and the sender is never window-limited. Size it from the base RTT instead.
+	if c.reliable && c.minRTT > 0 {
+		if lim := c.minRTT + c.minRTT/2; rtt > lim {
+			rtt = lim
+		}
+	}
 	if c.pathRTT > rtt {
 		rtt = c.pathRTT
 	}
