@@ -1,6 +1,7 @@
 package wat
 
 import (
+	"os"
 	"sync/atomic"
 	"time"
 )
@@ -47,6 +48,8 @@ type cc struct {
 	// pps a deep queue fills and 30 % of the wire was retransmissions). Then the rate is cut and may not climb past a
 	// ceiling that itself only creeps up while no loss is seen.
 	sentN, lostN int     // tracked packets sent / declared lost in the current tick
+	spuriousN    int     // reliable: declared lost this tick, then acked after all (TCP delivered it late)
+	relLossMul   float64 // reliable: adaptive multiplier on the loss timer, grows while retransmits are spurious
 	hardMin      float64 // the configured floor; minRate may sit above it (reliable: the start rate)
 	lowTicks     int     // reliable: ticks left during which overload may cut below minRate, down to hardMin
 	stuckTicks   int     // reliable: loss cuts while already at the floor (reset once the rate climbs)
@@ -124,9 +127,21 @@ const (
 	// the loss rule stands down for relLossOff ticks and the delay rule alone sets the pace.
 	relStuckTicks = 40  // >= 2 s of cuts at the floor
 	relLossOff    = 600 // ~30 s
+
+	relLossMulMax = 8   // the loss timer may stretch to 8x its base while retransmits keep turning out spurious
+	relSpurHigh   = 0.5 // a tick is "mostly spurious" when >= half its declared losses were later acked
 )
 
+// relV2 is the 2.4.9 reliable-carrier congestion rule: separate genuine wire loss from TCP's own late delivery
+// (spurious retransmits), adapt the loss timer so the session stops resending what TCP will deliver, and respond to
+// real loss with gentle AIMD and a creeping ceiling instead of slamming to the floor. Gated for an A/B on the
+// emulator and the field; default on.
+var relV2 = os.Getenv("WAT_REL_V1") == ""
+
 func (c *cc) reliableLoss(sent, lost int) bool {
+	if relV2 {
+		return c.reliableLossV2(sent, lost)
+	}
 	if c.lowTicks > 0 {
 		c.lowTicks--
 	}
@@ -158,6 +173,50 @@ func (c *cc) reliableLoss(sent, lost int) bool {
 	return true
 }
 
+// reliableLossV2 judges one tick after removing spurious retransmits. A CDN edge buffers shallowly, so an overfilled
+// path drops rather than delays and the delay rule is blind; but TCP's own fast-retransmit also delays a datagram
+// past our loss timer, and the session then resends a packet TCP is about to deliver (field 2026-10-12: ~12-50 % of
+// the wire was such duplicates, and the old rule read them as congestion and slammed to the floor). Here a
+// declared-lost packet that is later acked is counted spurious and removed from the congestion signal; while losses
+// keep turning out spurious the loss timer stretches (relLossMul), so the session waits for TCP instead of resending;
+// genuine wire loss gets a gentle multiplicative cut and a ceiling that creeps back up, not a slam to the floor.
+func (c *cc) reliableLossV2(sent, lost int) bool {
+	spur := c.spuriousN
+	c.spuriousN = 0
+	if c.lowTicks > 0 {
+		c.lowTicks--
+	}
+	if lost > 0 { // steer the loss timer by how many of this tick's "losses" TCP actually delivered late
+		if float64(spur) >= relSpurHigh*float64(lost) {
+			c.relLossMul = min(c.relLossMul*1.25, relLossMulMax)
+		} else {
+			c.relLossMul = max(c.relLossMul*0.97, 1)
+		}
+	}
+	real := lost - spur // genuine wire drops: the congestion signal
+	if real < 0 {
+		real = 0
+	}
+	if sent+real >= lossMinSent {
+		c.lossPct = float64(real) / float64(max(sent, real))
+	}
+	if real < relLossMin || real*relLossFrac < sent {
+		if c.ceiling > 0 { // quiet tick: let the ceiling creep up, then release it at the max
+			c.ceiling *= ceilingGrowth
+			if c.ceiling >= c.maxRate {
+				c.ceiling = 0
+			}
+		}
+		return false
+	}
+	c.rate *= relLossCut
+	if c.rate < c.hardMin {
+		c.rate = c.hardMin
+	}
+	c.ceiling = c.rate * ceilingHead // AIMD: grow only back toward where loss began
+	return true
+}
+
 // floor is the lowest rate the delay rule may cut to.
 func (c *cc) floor() float64 {
 	if c.lowTicks > 0 {
@@ -167,7 +226,7 @@ func (c *cc) floor() float64 {
 }
 
 func newCC(initRate, minRate, maxRate float64, slack time.Duration) cc {
-	return cc{rate: initRate, minRate: minRate, hardMin: minRate, maxRate: maxRate, slack: slack}
+	return cc{rate: initRate, minRate: minRate, hardMin: minRate, maxRate: maxRate, slack: slack, relLossMul: 1}
 }
 
 func (c *cc) refill(dt time.Duration) {
@@ -279,8 +338,10 @@ func (c *cc) pto() time.Duration {
 	if d < 120*time.Millisecond {
 		d = 120 * time.Millisecond
 	}
-	if c.reliable && d < reliablePTO {
-		d = reliablePTO
+	if c.reliable {
+		if m := time.Duration(float64(reliablePTO) * c.relLossMul); d < m {
+			d = m
+		}
 	}
 	return d
 }
@@ -291,8 +352,10 @@ func (c *cc) lossTime() time.Duration {
 		rtt = c.latest
 	}
 	d := rtt + rtt/4 + 3*time.Millisecond
-	if c.reliable && d < reliableLossTime {
-		d = reliableLossTime
+	if c.reliable {
+		if m := time.Duration(float64(reliableLossTime) * c.relLossMul); d < m {
+			d = m
+		}
 	}
 	return d
 }

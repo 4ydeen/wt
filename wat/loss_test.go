@@ -1,12 +1,51 @@
 package wat
 
 import (
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// TestReliableLossV2 pins the 2.4.9 reliable rule: spurious retransmits (declared lost, later acked) are removed from
+// the congestion signal and stretch the loss timer; genuine loss cuts gently with a creeping ceiling, never to the floor.
+func TestReliableLossV2(t *testing.T) {
+	if !relV2 {
+		t.Skip("v1 forced")
+	}
+	// a burst of losses that all turn out spurious: no rate cut, and the loss timer stretches
+	c := newCC(10e6, 0.1e6, 80e6, 8*time.Millisecond)
+	c.reliable, c.minRate, c.hardMin = true, 8e6, 8e6
+	base := c.lossTime()
+	for i := 0; i < 20; i++ {
+		c.sentN, c.lostN, c.spuriousN = 200, 30, 30
+		if c.reliableLoss(c.sentN, c.lostN) {
+			t.Fatal("spurious retransmits were read as congestion")
+		}
+		c.sentN, c.lostN, c.spuriousN = 0, 0, 0
+	}
+	if c.rate != 10e6 {
+		t.Fatalf("rate moved on spurious loss: %.2f", c.rate/1e6)
+	}
+	if c.lossTime() <= base {
+		t.Fatalf("loss timer did not stretch: %v vs %v", c.lossTime(), base)
+	}
+	// genuine loss (nothing spurious): a gentle multiplicative cut, floored at hardMin, with a ceiling above it
+	g := newCC(40e6, 0.1e6, 80e6, 8*time.Millisecond)
+	g.reliable, g.minRate, g.hardMin = true, 8e6, 8e6
+	g.sentN, g.lostN, g.spuriousN = 200, 30, 0
+	if !g.reliableLoss(g.sentN, g.lostN) {
+		t.Fatal("genuine overload was ignored")
+	}
+	if g.rate < 31.9e6 || g.rate > 32.1e6 {
+		t.Fatalf("expected a ~20%% cut to ~32 MB/s, got %.2f", g.rate/1e6)
+	}
+	if g.ceiling < g.rate || g.floor() != 8e6 {
+		t.Fatalf("v2 should keep a ceiling above the rate and never drop the floor: ceiling %.2f floor %.2f", g.ceiling/1e6, g.floor()/1e6)
+	}
+}
 
 // Loss-aware ceiling (v1.8.0): see cc.go. Measured 2026-10-10 on the real path: past ~45k pps a deep queue builds
 // and the delay-only pacer ran 30-35 % of the wire as retransmissions.
@@ -181,6 +220,9 @@ func TestLossStepUnit(t *testing.T) {
 	if b.lossLimit() < 0.03 {
 		t.Fatalf("limit %.3f", b.lossLimit())
 	}
+	// the remaining assertions pin the legacy v1 reliable rule (v2 has its own test below)
+	relV2 = false
+	defer func() { relV2 = os.Getenv("WAT_REL_V1") == "" }()
 	// reliable carriers ignore a few late packets (a dead conn's tail) but cut on a burst of them, below minRate
 	r := newCC(10e6, 0.1e6, 80e6, 8*time.Millisecond)
 	r.reliable, r.minRate = true, 8e6

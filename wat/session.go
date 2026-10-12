@@ -1148,6 +1148,14 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 			}
 			continue
 		}
+		if sp.done && sp.lost && s.chooser == nil && s.cc.reliable && rs.contains(sp.pn) {
+			// Reliable single carrier (TCP pool/CDN): a packet we declared lost is now acked, so TCP delivered it
+			// late and our retransmit was spurious. Tell the pacer, so it discounts this from congestion loss and
+			// stretches its loss timer instead of resending what TCP will deliver.
+			sp.lost = false
+			s.cc.spuriousN++
+			continue
+		}
 		if sp.done || !rs.contains(sp.pn) {
 			continue
 		}

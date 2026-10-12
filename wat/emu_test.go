@@ -29,6 +29,7 @@ type emuWire struct {
 	qMax    time.Duration // queue limit as time at the link rate (netem: 1000 packets)
 	rtt     time.Duration
 	free    time.Time
+	stall   time.Duration // tcp model: how long a lost segment holds its connection (default: one RTT + 20 ms)
 	rnd     *rand.Rand
 	dropped int
 	stalled int
@@ -44,6 +45,19 @@ func newEmuWire(seed int64) *emuWire {
 	}
 	if n, _ := strconv.Atoi(os.Getenv("EMU_QMS")); n > 0 {
 		w.qMax = time.Duration(n) * time.Millisecond
+	}
+	// EMU_DELAY_MS (one way), EMU_LOSS (fraction) and EMU_STALL_MS model the CDN path seen from Iran (2026-10-12:
+	// ~100 ms RTT, a lossy last leg whose TCP retransmits hold a connection for an RTO): EMU_DELAY_MS=50
+	// EMU_LOSS=0.01 EMU_STALL_MS=300.
+	if n, _ := strconv.Atoi(os.Getenv("EMU_DELAY_MS")); n > 0 {
+		w.delay, w.rtt = time.Duration(n)*time.Millisecond, 2*time.Duration(n)*time.Millisecond
+	}
+	if n, err := strconv.ParseFloat(os.Getenv("EMU_LOSS"), 64); err == nil && n >= 0 && os.Getenv("EMU_LOSS") != "" {
+		w.loss = n
+	}
+	w.stall = w.rtt + 20*time.Millisecond
+	if n, _ := strconv.Atoi(os.Getenv("EMU_STALL_MS")); n > 0 {
+		w.stall = time.Duration(n) * time.Millisecond
 	}
 	return w
 }
@@ -143,7 +157,7 @@ func emuPipe(w *emuWire, src, dst net.Conn) {
 				if !ok { // lost or tail-dropped: delivered one retransmit RTT later, and everything behind it waits
 					w.mu.Lock()
 					w.stalled++
-					at = w.free.Add(w.delay + w.rtt + 20*time.Millisecond)
+					at = w.free.Add(w.delay + w.stall)
 					w.mu.Unlock()
 				}
 				if at.Before(prev) {
