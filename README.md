@@ -40,7 +40,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.7)
+## What's new (latest: 2.4.8)
 
 - **ICMP: bigger packets, a setting change (no update needed).** The Iran ⇄ Europe route passes full 1500-byte
   pings again. With `mtu: 1400` on **both** ends and the same 30 MB/s cap, Kharej resends 0.3-0.8 % of its packets
@@ -55,6 +55,10 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 
 Update **both** servers for every release below.
 
+- **2.4.8: less RAM per user connection.** Idle connections keep 4 KB copy buffers instead of 32 KB. Tip: if you
+  set `GOMEMLIMIT`, give it at least twice the tunnel's normal memory. An Iran server limited to 256 MiB spent most
+  of its CPU on memory cleanup (75-130 %). With 768 MiB it dropped to about 20 % (ICMP, ~200-300 connections,
+  2026-10-12).
 - **2.4.7: CDN connection health (did not fix the collapse, see above).** Each end now replaces a CDN connection
   that delivers far less than the others, and the tunnel no longer stays stuck at its lowest speed. Nothing changes
   for ICMP.

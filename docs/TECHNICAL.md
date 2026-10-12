@@ -789,6 +789,13 @@ separate processes added up.
 - **GC.** 2.4.0 to 2.4.5 set the GC target to 200 % unless `GOGC` was set. 2.4.6 uses Go's default (100 %) again:
   on a busy CDN tunnel 200 % let the heap reach about 1 GB for 400 MB of live data, and the GC itself took under
   0.1 % CPU. `GOGC` and `GOMEMLIMIT` still override it.
+- **`GOMEMLIMIT` needs room.** Set it to at least twice the tunnel's normal heap, or leave it unset. Close to the
+  heap, Go collects almost without pause: an Iran client limited to 256 MiB with a ~210-280 MB heap (ICMP, ~300
+  connections, 2.4.7) used 75-130 % CPU. With 768 MiB, the 2.4.8 client next to it used about 20 % CPU and 76 MB
+  RSS at ~200 connections (2026-10-12).
+- **Forwarding buffers (2.4.8).** The two copy buffers of each forwarded connection start at 4 KB and double, up to
+  32 KB, only while reads fill them. At ~1,300 connections the fixed 32 KB buffers were 41 MB of Kharej's 197 MB heap
+  and 20 MB of Iran's 214 MB.
 
 ### Memory with slow readers (2.4.3)
 
