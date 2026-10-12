@@ -40,16 +40,20 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.5)
+## What's new (latest: 2.4.6)
 
 Update **both** servers for every release below.
 
+- **2.4.6: RAM stays low.** Idle connections keep less memory and Go cleans up sooner. On a production CDN tunnel with
+  about 250 user connections, the Iran server went from about 1 GB on 2.4.5 to about 100 MB, and Kharej to about
+  100 MB. Speed unchanged.
 - **2.4.5: no more stuck CDN connections.** When one Cloudflare connection stalls, the tunnel now stops using it and
-  reconnects it, instead of losing packets into it. Fixes downloads dropping to a few MB/s and 1-second freezes.
+  reconnects it, instead of losing packets into it. Fixes downloads dropping to a few MB/s and 1-second freezes. In production, sustained downloads went from 30 to
+  43-45 MB/s on average, measured back to back with 2.4.3.
 - **2.4.4: CPU fix.** 2.4.3 made the sending server (Kharej, for downloads) burn CPU on connections whose users read
   slowly: 40-73 % per thread under load instead of 2-13 %. Fixed. Update right away if you are on 2.4.3.
-- **2.4.3: much less RAM.** Connections whose users read slowly no longer hold 4-8 MB each on both servers. A
-  production CDN tunnel went from about 800 MB to 75 MB per server.
+- **2.4.3: less RAM for slow users.** Connections whose users read slowly no longer hold 4-8 MB each on both servers
+  (the first step; 2.4.6 finishes the job).
 - **2.4.2: CDN downloads no longer collapse.** When Cloudflare's path is slower than the tunnel, the tunnel now backs
   off instead of flooding it. Sustained downloads stay fast (39 -> 50 MB/s average in the field), and the random
   half-second freezes are gone.
@@ -105,7 +109,8 @@ Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 
 ### CDN (Cloudflare): field numbers
 
-Real measurements, 2026-10-11, Iran → Cloudflare → Kharej, 2-vCPU servers, `wss` + ECH:
+Real measurements, Iran → Cloudflare → Kharej, 2-vCPU servers, `wss` + ECH. The first rows are from 2026-10-11 on a
+tunnel without users; the last row is production with real users on 2026-10-12:
 
 | Setup | Result |
 |---|---|
@@ -114,6 +119,7 @@ Real measurements, 2026-10-11, Iran → Cloudflare → Kharej, 2-vCPU servers, `
 | 6 sessions (2.3.0) | ~60 MB/s down |
 | 8 sessions (2.3.0) | peak 69 MB/s up |
 | 6 sessions (2.4.0) | 76.6 MB/s up |
+| 4 sessions (2.4.6), production, ~250 user connections | ~41 MB/s down sustained (28-50), 44-48 MB/s down and up to 82 MB/s up in speed tests, ~100 MB RAM per server |
 | ICMP tunnel on the same path (only ICMP passes directly there) | ~1.1 MB/s down, ~2.1 MB/s up |
 | Any CDN variant **without** ECH | did not connect at all |
 

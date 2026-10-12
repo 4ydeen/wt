@@ -823,6 +823,12 @@ streams are idle keep-alive connections, and 220 of them held about 190 MB on th
 2.4.5). The kept buffer is now at most 256 KB. `BenchmarkSessionBulk` on 2 CPUs measured 68.5 vs 68.9 MB/s, which is
 within noise.
 
+Field result, production CDN with about 250 user connections, 2026-10-12: Iran RSS went from 997 MB on 2.4.5 (22 min)
+to 79-100 MB on 2.4.6 (25-29 min, peak 207 MB), and Kharej from 415 MB (peak 551) to 75-103 MB (peak 276). Live heap
+was about 80 MB on each end. The 30 s download loop averaged 40.8 MB/s, within the time-of-day range of 2.4.5.
+Note that 2.4.3 had also looked fine at 26 minutes (75 MB) and grew to about 630 MB by 52 minutes; 2.4.6 has been
+checked up to 29 minutes.
+
 ## Pacing on TCP-based and CDN carriers
 
 TCP never drops a datagram by itself, so on `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc` the pacer judges delay
@@ -860,6 +866,10 @@ throttled the sender enough to hide it.
 - A connection stuck for more than 5 s while a healthy one exists is closed, and the client redials it.
 
 This is local to each end and changes nothing on the wire.
+
+Field result, production CDN, 2026-10-12, measured back to back the same morning: the 30 s download loop averaged
+30.4 MB/s on 2.4.3 and 42.9 / 44.7 MB/s on 2.4.5, at 2 and 21 minutes after the restart. Kharej showed no connection
+in backoff, and the p95 of a small request during the loop fell from 1114 ms to 269-549 ms.
 
 ## ICMP path limits and pacing
 
