@@ -206,6 +206,19 @@ func TestLossStepUnit(t *testing.T) {
 	if r.floor() != 8e6 {
 		t.Fatal("start-rate floor not restored")
 	}
+	// loss that goes on at the floor is not ours: after ~2 s of it the loss rule stands down for a while
+	f := newCC(10e6, 0.1e6, 80e6, 8*time.Millisecond)
+	f.reliable, f.minRate = true, 8e6
+	cuts := 0
+	for i := 0; i < 200; i++ {
+		f.sentN, f.lostN = 10, 5
+		if f.lossStep() {
+			cuts++
+		}
+	}
+	if f.lossOff == 0 || cuts > 30+relStuckTicks || f.floor() != 8e6 {
+		t.Fatalf("floor-stuck loss: cuts %d lossOff %d floor %.2f", cuts, f.lossOff, f.floor()/1e6)
+	}
 }
 
 // A shallow drop-tail buffer (6 ms at the link rate): the queue never grows enough for the delay rule to see it, the

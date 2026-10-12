@@ -306,3 +306,54 @@ func TestLeastQueuedSkipsStalled(t *testing.T) {
 		t.Fatal("no conn picked when every conn is stalled")
 	}
 }
+
+// A connection that delivers under half its share for three windows in a row is closed; even spreads, young
+// connections and idle pools never are.
+func TestJudgeSlow(t *testing.T) {
+	old := time.Now().Add(-time.Minute)
+	mk := func(n int) []*poolConn {
+		cs := make([]*poolConn, n)
+		for i := range cs {
+			cs[i] = &poolConn{born: old}
+		}
+		return cs
+	}
+	feed := func(cs []*poolConn, per ...uint64) {
+		for i, pc := range cs {
+			pc.rx.Add(per[i])
+		}
+	}
+	now := time.Now()
+	cs := mk(4)
+	for w := 0; w < 10; w++ {
+		feed(cs, 30, 25, 20, 28) // uneven but healthy
+		if pc := judgeSlow(cs, now); pc != nil {
+			t.Fatal("healthy pool: a connection was judged slow")
+		}
+	}
+	for w := 0; w < 10; w++ {
+		feed(cs, 2, 1, 0, 3) // idle
+		if pc := judgeSlow(cs, now); pc != nil {
+			t.Fatal("idle pool was judged")
+		}
+	}
+	var got *poolConn
+	for w := 1; w <= 3; w++ {
+		feed(cs, 60, 60, 5, 60)
+		got = judgeSlow(cs, now)
+		if w < 3 && got != nil {
+			t.Fatalf("closed after %d windows", w)
+		}
+	}
+	if got != cs[2] {
+		t.Fatal("slow connection not closed after three windows")
+	}
+	young := mk(4)
+	young[3].born = now
+	for w := 0; w < 5; w++ {
+		feed(young, 60, 60, 60, 0)
+		if judgeSlow(young, now) != nil {
+			t.Fatal("young connection judged")
+		}
+	}
+}

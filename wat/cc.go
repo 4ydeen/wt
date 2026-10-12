@@ -49,6 +49,8 @@ type cc struct {
 	sentN, lostN int     // tracked packets sent / declared lost in the current tick
 	hardMin      float64 // the configured floor; minRate may sit above it (reliable: the start rate)
 	lowTicks     int     // reliable: ticks left during which overload may cut below minRate, down to hardMin
+	stuckTicks   int     // reliable: loss cuts while already at the floor (reset once the rate climbs)
+	lossOff      int     // reliable: ticks left during which loss is not treated as overload
 	baseLoss     float64 // learned quiet-interval loss (EWMA, floor minBaseLoss)
 	lossPct      float64 // last judged interval's loss, 0..1 (stats)
 	ceiling      float64 // bytes per second; 0 = none
@@ -115,6 +117,13 @@ const (
 	relLossFrac = 20 // and at least 1/20 of the tick's sent packets
 	relLossCut  = 0.8
 	relLowTicks = 600 // ~30 s at 50 ms per tick, renewed by every cut
+
+	// Loss that goes on while the rate sits at the floor was not caused by our rate (field 2026-10-12, 2.4.6 after
+	// ~3 h: a few CDN connections delivered seconds late, half of all packets were resent, and every session sat at
+	// the 0.2 MB/s floor for good because each tick at the floor still saw losses). After relStuckTicks such cuts
+	// the loss rule stands down for relLossOff ticks and the delay rule alone sets the pace.
+	relStuckTicks = 40  // >= 2 s of cuts at the floor
+	relLossOff    = 600 // ~30 s
 )
 
 func (c *cc) reliableLoss(sent, lost int) bool {
@@ -124,8 +133,22 @@ func (c *cc) reliableLoss(sent, lost int) bool {
 	if sent+lost >= lossMinSent { // judged intervals only, like the datagram rule (2.4.2 kept a stale value)
 		c.lossPct = float64(lost) / float64(max(sent, lost))
 	}
+	atFloor := c.rate <= 1.5*c.hardMin
+	if !atFloor {
+		c.stuckTicks = 0
+	}
+	if c.lossOff > 0 {
+		c.lossOff--
+		return false
+	}
 	if lost < relLossMin || lost*relLossFrac < sent {
 		return false
+	}
+	if atFloor {
+		if c.stuckTicks++; c.stuckTicks >= relStuckTicks {
+			c.stuckTicks, c.lossOff, c.lowTicks = 0, relLossOff, 0
+			return false
+		}
 	}
 	c.rate *= relLossCut
 	if c.rate < c.hardMin {

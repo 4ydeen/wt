@@ -350,7 +350,7 @@ func TestEmu(t *testing.T) {
 		t.Cleanup(func() { cli.Close(); srv.Close() })
 		time.Sleep(300 * time.Millisecond)
 		emuRun(t, cli, srv)
-		t.Logf("wire stalls: up %d down %d, pool queue drops %d", up.stalled, down.stalled, poolDrops.Load())
+		t.Logf("wire stalls: up %d down %d, pool queue drops %d, slow conns closed %d", up.stalled, down.stalled, poolDrops.Load(), poolSlowKills.Load())
 	}
 }
 

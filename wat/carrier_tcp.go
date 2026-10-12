@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +100,11 @@ type poolConn struct {
 	done  chan struct{}
 	once  sync.Once
 	wbusy atomic.Int64 // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
+	rx    atomic.Uint64 // datagrams received
+	born  time.Time
+
+	rxMark  uint64 // owned by the pool's health check (judgeSlow)
+	lowWins int
 }
 
 // A pool connection whose socket write has been blocked this long is stalled: through a CDN, one edge connection can
@@ -117,7 +123,78 @@ func newPoolConn(c net.Conn) *poolConn {
 		tc.SetNoDelay(true)
 		setNotsentLowat(tc, poolLowat) // a stalled conn must block its writer, not swallow megabytes
 	}
-	return &poolConn{c: c, q: make(chan []byte, poolQueue), done: make(chan struct{})}
+	return &poolConn{c: c, q: make(chan []byte, poolQueue), done: make(chan struct{}), born: time.Now()}
+}
+
+// The sender spreads datagrams evenly over its pool connections, so each one should deliver about the same number.
+// Through a CDN, one connection's far leg can slow down while the sender's own socket to the edge stays clean: the
+// edge buffers, everything sent on that connection arrives seconds late, and the session resends it (field
+// 2026-10-12, 2.4.6 after ~3 h: about half of all packets resent with zero real loss, and the tunnel fell to ~1 MB/s).
+// The sender cannot see it, but the receiver can: once a second each end compares what every connection delivered,
+// and closes one that delivered under half the typical (upper-quartile) count for poolSlowWins seconds in a row. The
+// client redials it, through a fresh path. Works with any peer version: it only closes connections.
+const (
+	poolSlowEvery = time.Second
+	poolSlowWins  = 3
+	poolSlowMin   = 24 // datagrams per connection per window, on average, before anything is judged
+	poolSlowAge   = 3 * time.Second
+)
+
+var poolSlowKills atomic.Int64
+
+// PoolSlowKills is how many pool connections this process closed for delivering far below their share.
+func PoolSlowKills() int64 { return poolSlowKills.Load() }
+
+// judgeSlow takes one window's delivery counts and returns the connection to close, if any. Only the pool's health
+// check calls it, so rxMark and lowWins need no lock.
+func judgeSlow(conns []*poolConn, now time.Time) *poolConn {
+	type cnt struct {
+		pc *poolConn
+		d  uint64
+	}
+	var cs []cnt
+	var total uint64
+	for _, pc := range conns {
+		if pc == nil {
+			continue
+		}
+		v := pc.rx.Load()
+		d := v - pc.rxMark
+		pc.rxMark = v
+		if now.Sub(pc.born) < poolSlowAge {
+			pc.lowWins = 0
+			continue
+		}
+		cs = append(cs, cnt{pc, d})
+		total += d
+	}
+	if len(cs) < 3 || total < uint64(poolSlowMin*len(cs)) {
+		for _, c := range cs {
+			c.pc.lowWins = 0
+		}
+		return nil
+	}
+	ds := make([]uint64, len(cs))
+	for i, c := range cs {
+		ds[i] = c.d
+	}
+	slices.Sort(ds)
+	ref := ds[len(ds)*3/4]
+	var worst *poolConn
+	var wd uint64
+	for _, c := range cs {
+		if 2*c.d >= ref {
+			c.pc.lowWins = 0
+			continue
+		}
+		if c.pc.lowWins++; c.pc.lowWins >= poolSlowWins && (worst == nil || c.d < wd) {
+			worst, wd = c.pc, c.d
+		}
+	}
+	if worst != nil {
+		worst.lowWins = 0
+	}
+	return worst
 }
 
 // rawTCP finds the TCP socket under the TLS / WebSocket / gRPC / fragmenting wrappers (nil for an HTTP/2 stream).
@@ -253,6 +330,7 @@ func (pc *poolConn) readLoop(push func([]byte) bool) {
 		}
 		p := buf[r+2 : r+2+n : r+2+n]
 		r += 2 + n
+		pc.rx.Add(1)
 		if !push(p) {
 			return
 		}
@@ -422,7 +500,31 @@ func newSlotPoolClient(dial func(ctx context.Context, slot int) (net.Conn, error
 		c.wg.Add(1)
 		go c.slotLoop(i)
 	}
+	c.wg.Add(1)
+	go c.healthLoop()
 	return c, nil
+}
+
+// healthLoop closes a connection that delivers far below its share (see judgeSlow); its slot redials it.
+func (c *TCPPoolClient) healthLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(poolSlowEvery)
+	defer t.Stop()
+	conns := make([]*poolConn, len(c.slots))
+	for {
+		select {
+		case <-c.done:
+			return
+		case now := <-t.C:
+			for i := range c.slots {
+				conns[i] = c.slots[i].Load()
+			}
+			if pc := judgeSlow(conns, now); pc != nil {
+				poolSlowKills.Add(1)
+				pc.fail()
+			}
+		}
+	}
 }
 
 const (
@@ -664,9 +766,40 @@ func NewTCPPoolServer(addr string) (*TCPPoolServer, error) {
 func newPoolServer(ln net.Listener) *TCPPoolServer {
 	s := &TCPPoolServer{ln: ln, rx: make(chan rxPkt, poolRxQueue), done: make(chan struct{}),
 		pools: map[string]map[*poolConn]struct{}{}, all: map[net.Conn]struct{}{}}
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.acceptLoop()
+	go s.healthLoop()
 	return s
+}
+
+// healthLoop closes, per pool, a connection that delivers far below its share (see judgeSlow); the client redials.
+func (s *TCPPoolServer) healthLoop() {
+	defer s.wg.Done()
+	t := time.NewTicker(poolSlowEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case now := <-t.C:
+			s.mu.Lock()
+			pools := make([][]*poolConn, 0, len(s.pools))
+			for _, set := range s.pools {
+				conns := make([]*poolConn, 0, len(set))
+				for pc := range set {
+					conns = append(conns, pc)
+				}
+				pools = append(pools, conns)
+			}
+			s.mu.Unlock()
+			for _, cs := range pools {
+				if pc := judgeSlow(cs, now); pc != nil {
+					poolSlowKills.Add(1)
+					pc.fail()
+				}
+			}
+		}
+	}
 }
 
 // Addr is the bound address (useful with port 0).

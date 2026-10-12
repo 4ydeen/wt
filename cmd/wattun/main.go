@@ -457,7 +457,7 @@ func main() {
 					}(),
 					"dgram_sent": st.DgramSent, "dgram_recv": st.DgramRecv, "dgram_dropped_queue": st.DgramDropQueue,
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_flows": udpFlowsActive.Load(),
-					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(),
+					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(),
 				}
 				out["ports"] = portReg.snapshot(side)
 				var edges []wat.EdgeStat
