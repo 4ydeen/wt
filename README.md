@@ -40,19 +40,24 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new in 2.4
+## What's new (latest: 2.4.4)
 
-- **CDN mode through Cloudflare with ECH (2.2.x).** Tunnels survive SNI filtering. The manager finds working
-  Cloudflare IPs and the right TLS settings automatically.
-- **Several sessions per tunnel (2.3.0).** `sessions` (default 4 for TCP-type carriers) lets one tunnel use several
-  CPU cores and connections.
-- **Stream window auto-tuning (2.4.0).** Faster single downloads and uploads on high-latency paths.
-- **2.4.1 and 2.4.2 fixes.** TCP-based and CDN tunnels no longer slow to a crawl under real bursty traffic (2.4.1),
-  and no longer flood a CDN path that is slower than the tunnel's starting pace (2.4.2): sustained downloads stay
-  fast and the random half-second freezes are gone. **Update both ends.**
-- **Much less RAM (2.4.3, CPU fix in 2.4.4).** Connections whose users read slowly no longer hold 4-8 MB each on both servers: a
+Update **both** servers for every release below.
+
+- **2.4.4: CPU fix.** 2.4.3 made the sending server (Kharej, for downloads) burn CPU on connections whose users read
+  slowly: 40-73 % per thread under load instead of 2-13 %. Fixed. Update right away if you are on 2.4.3.
+- **2.4.3: much less RAM.** Connections whose users read slowly no longer hold 4-8 MB each on both servers. A
   production CDN tunnel went from about 800 MB to 75 MB per server.
-- **Easier to drive.** `wattun` alone opens the manager, and Auto mode tests every variant from one token.
+- **2.4.2: CDN downloads no longer collapse.** When Cloudflare's path is slower than the tunnel, the tunnel now backs
+  off instead of flooding it. Sustained downloads stay fast (39 -> 50 MB/s average in the field), and the random
+  half-second freezes are gone.
+- **2.4.1: no more crawling under real traffic.** TCP-based and CDN tunnels no longer slow to a crawl under bursty
+  web traffic.
+- **2.4.0: faster single downloads.** Stream windows tune themselves, so one download or upload is faster on
+  high-latency paths.
+
+Also new in 2.x: CDN mode through Cloudflare with ECH (2.2), several sessions per tunnel (2.3, default 4 for
+TCP-type carriers), `wattun` alone opens the manager, and Auto mode tests every variant from one token.
 
 ## Why WatTunnel: speed, CPU and comparisons
 
