@@ -411,6 +411,12 @@ Cloudflare: it speaks HTTP/1.1 to the origin except for gRPC. Avoid plain `ws` o
 | `ws` hangs at the Upgrade | Plain ws on an HTTP port. Move to `wss` on an HTTPS port. |
 | 403 from Cloudflare | A fronted SNI/Host mismatch. Keep `sni` and `host` the same domain. |
 | One entry in `edges` has `up: false` | That edge is dead. Auto-heal replaces it, or run `wattun cdn-tune NAME`. |
+| Works from some Iran servers or networks, fails on others | `peer` is the Kharej server's own IP, so the tunnel never goes through Cloudflare. It works only where that IP is reachable. Proxy a domain to Kharej (orange cloud), enter the domain as the Kharej address, or run `wattun cdn-tune NAME` to write Cloudflare edges into `peer`. Also check that `sni`/`host` is spelled exactly like the domain. |
+
+**Direct-IP warning (manager).** The `wss`, `grpc` and `h2` carriers dial `peer` and send `sni` as the TLS name, so
+with `peer` set to the origin's IP the connection goes straight to Kharej, not through Cloudflare, even when `sni`
+is the domain. When an Iran tunnel on one of those carriers is created with a bare IPv4 `peer` (not reverse, not set
+up through CDN tuning), the manager warns before creating it and suggests the domain or `cdn-tune`.
 
 ## UDP forwarding
 
@@ -729,6 +735,24 @@ metrics port, even if the port is in the allowlist.
 | `dgram_flows` | Active UDP flows. |
 | `dgram_rejected` | UDP flows refused (port not allowed). |
 | `dgram_flow_cap_drops` | Datagrams dropped at the flow cap. |
+| `pool_slow_closed` | Since 2.4.7, pool carriers. Pool connections this process closed for delivering far below their share (see [Stalled pool connections](#stalled-pool-connections-245)). |
+| `cc` | Since 2.4.10. Pacer diagnostics, see below. |
+
+**The `cc` object (2.4.10).** What held the sender back and why it slowed. Counters run since the start (summed over
+sessions); compare two reads to see what happens now.
+
+| Field | Meaning |
+|---|---|
+| `ticks` | 50 ms pacer ticks. |
+| `tok_limited`, `cwnd_limited`, `app_limited` | Ticks in which the sender was held by its pace (rate tokens), by its window, or had nothing to send. Mostly `app_limited` means the tunnel is not the bottleneck. |
+| `loss_cuts`, `delay_cuts` | Rate cuts caused by loss and by delay. Since 2.4.11 a reliable carrier (tcp/tls/ws/wss/h2/h2c/grpc) should show `delay_cuts` 0. |
+| `deep_trips` | Times the delay rule let the rate fall below the start rate (the 2.4.2 deep-queue signal). |
+| `lost`, `spurious` | Packets declared lost, and how many of them were acked later after all (the carrier's TCP delivered them late). |
+| `floor_bps` | The current rate floor, bytes per second. |
+| `cwnd` | The current window, bytes. |
+| `loss_time_ms`, `pto_ms` | The loss timer and the probe timeout now in use. |
+| `loss_timer_x` | Reliable carriers: how far the loss timer is stretched (1-8x) because retransmits kept turning out spurious. |
+| `win_blocked` | Streams that have data to send but no window from the peer right now (a gauge, not a counter). A high value means the receiving side reads slowly. |
 
 With `sessions` > 1 (client) the top-level numbers cover all sessions: counters, `rate_bps`, `ceiling_bps`, `streams`
 and `inflight` are sums, `srtt_ms` is the median of the live sessions, `min_rtt_ms` the smallest, `loss_pct` the
@@ -837,7 +861,22 @@ was about 80 MB on each end. The 30 s download loop averaged 40.8 MB/s, within t
 Note that 2.4.3 had also looked fine at 26 minutes (75 MB) and grew to about 630 MB by 52 minutes; 2.4.6 has been
 checked up to 29 minutes.
 
+### Streams whose connection closed (2.4.17)
+
+A stream used to be retired only once the local side had read every byte the peer sent. When the local connection
+closed while data was still buffered, or while the peer was still sending, that never happened: the stream stayed in
+the session with no connection behind it. Field, 2026-10-13 (CDN client after a load test): Iran kept 69-76 open
+streams with 0 TCP connections on the port, and RSS grew from 40 to 159 MB in 36 minutes.
+
+From 2.4.17 the forwarder closes the stream's receive side when its connection ends (`Stream.CloseRead`). Unread data
+is dropped, so it no longer blocks retirement. If the peer had not finished sending, the stream is reset, so the
+peer stops too. A cleanly closed connection is unchanged, and the send direction is never cut short. Both roles use
+the same forwarder, so update both ends. Nothing changes on the wire (`TestCloseReadReapsLingeringStream`).
+
 ## Pacing on TCP-based and CDN carriers
+
+Since 2.4.11 these carriers are paced by delivery rate, see [Delivery-rate pacing](#delivery-rate-pacing-2411); this
+section describes the delay pacer they used before (still used for ICMP and UDP, and with `WAT_REL_V1=1`).
 
 TCP never drops a datagram by itself, so on `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c` and `grpc` the pacer judges delay
 by each 50 ms interval's fastest sample and allows a third of the base RTT, because CDN edges and TCP buffering add
@@ -857,6 +896,26 @@ delay without any queue of ours.
   10 MB/s. Cloudflare buffered the excess until packets timed out. Sustained downloads fell from 40-50 to about
   10 MB/s, with 500 ms stalls (field measurement, 2026-10-12). The change is sender-side only and changes nothing on
   the wire. It matters most on Kharej, which sends the downloads, but update both ends.
+
+### Late delivery is not loss (2.4.9, 2.4.10)
+
+Through a CDN, TCP's own retransmits can delay a datagram past the tunnel's loss timer. The tunnel then resends a
+packet TCP was about to deliver, and both copies arrive. Field, 2026-10-12 (wss through Cloudflare): Kharej resent
+about half its packets while its TCP connections were clean, the 2.4.2 loss rule read that as congestion, and all four
+sessions sat at the floor (about 41 down to about 1 MB/s).
+
+- **2.4.9.** A packet declared lost and then acked anyway counts as *spurious*, and is removed from the loss signal.
+  While a tick's losses are mostly spurious (at least half), the loss timer stretches by 1.25x per tick, up to 8x,
+  and it shrinks back slowly once they are not. Real loss (at least 4 packets and 1/20 of a tick's packets, after the
+  spurious ones are removed) cuts the rate by 20 % and sets a ceiling that creeps back up, instead of dropping to
+  the floor.
+- **2.4.10.** 2.4.9 rarely matched a late ack, because the given-up packet was forgotten before its ack came back.
+  Given-up packets are now kept for 5 s, so the late ack is matched. 2.4.10 also added the `/stats` `cc` object
+  (see [Metrics](#metrics)).
+
+Reliable carriers only: ICMP and UDP keep the old rule. On an emulated CDN link resends fell from 6-12 % to about
+3 %. These two releases did not fix the field slowdown on their own: the `cc` counters showed the cause was delay
+cuts, which 2.4.11 removed. `WAT_REL_V1=1` restores the pre-2.4.9 rule.
 
 ### Delivery-rate pacing (2.4.11)
 
@@ -916,6 +975,12 @@ The two conditions were added separately and each alone was wrong: 2.4.14 gated 
 sender re-measure off noise (broke uploads); 2.4.15 gated on inflight only and so drained pool sessions every cycle
 (cost pool throughput). 2.4.16 requires both.
 
+**Field result, 2.4.16** (test CDN tunnel through Cloudflare, 2026-10-13). Pool sessions kept `srtt` at 109-116 ms
+against a 86 ms `minRTT` instead of drifting up over time, with no delay cuts. Pool speed tests: 22.6 and 32.4 MB/s
+up. A single connection: 24.4 MB/s down on a 28-32 ms Cloudflare edge, and 4.41 MB/s up where 2.4.14 had reset the
+stream. The slow single-connection results seen earlier (0.6-0.8 MB/s) were on an 84 ms edge, which is why the
+manager's edge scan matters.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the
@@ -932,6 +997,12 @@ throttled the sender enough to hide it.
 - A connection stuck for more than 5 s while a healthy one exists is closed, and the client redials it.
 
 This is local to each end and changes nothing on the wire.
+
+**2.4.7.** A connection can also stay writable but deliver little (a slow edge or path). Every second each end counts
+what every pool connection delivered. Once the pool has at least 3 connections older than 3 s and enough traffic to
+judge, a connection that delivered under half the typical count (the upper quartile) for 3 seconds in a row is
+closed, at most one per second, and the client redials it through a fresh path. `pool_slow_closed` in `/stats`
+counts these. It works with any peer version, because it only closes connections.
 
 Field result, production CDN, 2026-10-12, measured back to back the same morning: the 30 s download loop averaged
 30.4 MB/s on 2.4.3 and 42.9 / 44.7 MB/s on 2.4.5, at 2 and 21 minutes after the restart. Kharej showed no connection

@@ -31,8 +31,8 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 
 - **Works when only ping works.** Nine carriers in one session: `icmp`, `udp`, `tcp`, `tls`, `ws`, `wss`, `h2`,
   `h2c`, `grpc`. Bond several into one link, or use reverse mode when only one side can dial out.
-- **Fast on lossy links.** Pacing is delay-based, so random loss does not slow it down. Interactive traffic goes
-  ahead of bulk downloads.
+- **Fast on lossy links.** Random loss does not slow it down: ICMP and UDP are paced by delay, the TCP-based and
+  CDN carriers by the measured delivery rate. Interactive traffic goes ahead of bulk downloads.
 - **Survives SNI filtering.** Through Cloudflare with ECH, and the manager finds working edges by itself.
 - **One process, every port.** TCP and UDP, ports added or removed live without a restart, per-port stats and quotas.
 - **Light and secure.** About 40 MB of RAM for an ICMP tunnel. ChaCha20-Poly1305 with a pre-shared key, and unauthenticated packets get
@@ -40,7 +40,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.8)
+## What's new (latest: 2.4.17)
 
 - **ICMP: bigger packets, a setting change (no update needed).** The Iran ⇄ Europe route passes full 1500-byte
   pings again. With `mtu: 1400` on **both** ends and the same 30 MB/s cap, Kharej resends 0.3-0.8 % of its packets
@@ -50,7 +50,32 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
   the total of all ICMP tunnels on this route at about 30 MB/s or less: above that, the route inside Iran switches
   to a slow path for minutes. [Details](docs/TECHNICAL.md#icmp-path-limits-and-pacing).
 
-Update **both** servers for every release below.
+Update **both** servers for every release below. 2.4.9 to 2.4.16 were steps toward one fix for CDN tunnels that
+got slower over time; if you are on any of them, go straight to 2.4.17. ICMP and UDP tunnels behave exactly as in
+2.4.8 apart from the 2.4.17 fix.
+
+- **2.4.17: no more leftover connections.** When a user's connection closed while data was still on its way, the
+  tunnel kept it open inside. After a load test an Iran server kept 69-76 of them with no user behind them, and its
+  RAM grew from 40 to 159 MB in 36 minutes. They are now cleaned up as soon as the connection closes.
+- **2.4.16: CDN speed holds over time.** Final fix of the series below. On a test tunnel through Cloudflare
+  (2026-10-13) the round trip stayed at 109-116 ms against an 86 ms base instead of creeping up, speed tests reached
+  22.6-32.4 MB/s up, and a single connection did 24.4 MB/s down and 4.41 MB/s up.
+- **2.4.15: fixes uploads broken by 2.4.14**, whose single-connection uploads could stall and reset. Its own check
+  slowed multi-connection tunnels, which 2.4.16 fixes.
+- **2.4.12 to 2.4.14: the window stays bounded.** On a single busy CDN connection the tunnel's queue used to grow
+  without limit (base round trip measured at 550 ms instead of 108). It now drains briefly every 8 seconds to
+  measure the real base. 2.4.13 made the drain work; 2.4.14 and 2.4.15 limited it to when it is needed.
+- **2.4.11: CDN pacing by delivery rate.** TCP-based and CDN tunnels now set their speed from how fast data is
+  actually delivered, not from delay, which TCP itself makes jumpy. Before, a single CDN connection sat at about
+  1 MB/s with the line idle; on an emulated CDN link it went to 5-7 MB/s, and a parallel download from under 1 to
+  10-14 MB/s.
+- **2.4.10: diagnostics.** A `cc` block in `/stats` shows what holds the sender back (its pace, its window, or
+  nothing to send) and why it slowed down. [Fields](docs/TECHNICAL.md#metrics).
+- **2.4.9: late is not lost.** Through a CDN, TCP sometimes delivers a packet late; the tunnel used to resend it and
+  read that as congestion. Now it recognizes the late packet and waits longer before resending.
+- **Manager (no new version needed):** creating a `wss`, `grpc` or `h2` tunnel on Iran with the Kharej server's IP
+  as the address now warns you that it does not go through Cloudflare. Use your Cloudflare domain or run
+  `wattun cdn-tune NAME`.
 
 - **2.4.8: less RAM per user connection.** Idle connections keep 4 KB copy buffers instead of 32 KB. Tip: if you
   set `GOMEMLIMIT`, give it at least twice the tunnel's normal memory. An Iran server limited to 256 MiB spent most
@@ -127,7 +152,8 @@ Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 ### CDN (Cloudflare): field numbers
 
 Real measurements, Iran → Cloudflare → Kharej, 2-vCPU servers, `wss` + ECH. The first rows are from 2026-10-11 on a
-tunnel without users; the last row is production with real users on 2026-10-12.
+tunnel without users; the 2.4.6 row is production with real users on 2026-10-12; the 2.4.16 rows are a test tunnel
+on 2026-10-13.
 
 | Setup | Result |
 |---|---|
@@ -137,6 +163,8 @@ tunnel without users; the last row is production with real users on 2026-10-12.
 | 8 sessions (2.3.0) | peak 69 MB/s up |
 | 6 sessions (2.4.0) | 76.6 MB/s up |
 | 4 sessions (2.4.6), production, ~250 user connections | ~41 MB/s down sustained (28-50), 44-48 MB/s down and up to 82 MB/s up in speed tests, ~100 MB RAM per server |
+| 4 sessions (2.4.16), speed test | 22.6 and 32.4 MB/s up, round trip steady at 109-116 ms (base 86 ms) |
+| 1 connection (2.4.16), 28-32 ms Cloudflare edge | 24.4 MB/s down, 4.41 MB/s up |
 | ICMP tunnel on the same path (only ICMP passes directly there) | ~1.1 MB/s down, ~2.1 MB/s up |
 | Any CDN variant **without** ECH | did not connect at all |
 
@@ -295,7 +323,8 @@ For routes where only HTTPS to a CDN gets out, or the filter looks at the SNI.
 1. Put a domain on Cloudflare, with the proxy (orange cloud) on and SSL mode **Full**. For `grpc`, turn on gRPC in
    Cloudflare's Network settings if your plan shows that switch.
 2. In the Kharej wizard choose `wss` (or `grpc`) and enter the domain. `h2` does not work through Cloudflare, and
-   plain `ws` on HTTP ports can hang at the upgrade.
+   plain `ws` on HTTP ports can hang at the upgrade. Always use the domain, not the server's IP: with the IP the
+   tunnel bypasses Cloudflare and works only where that IP is reachable (the manager warns about this).
 3. On Iran, the manager finds the ECH config by itself and scans Cloudflare edge IPs for ones that really work for
    your domain. It then tests the Chrome fingerprint, ECH, plain TLS and ClientHello fragmentation, and writes the
    winner to the config.
@@ -383,6 +412,7 @@ Start with `wattun test NAME`. Then `systemctl status wattun@NAME` and `journalc
 | Iran can't ping Kharej, but Kharej can ping Iran (often one day yes, one day no) | One-way block. Switch both sides to [reverse ICMP](#reverse-mode). |
 | Works some days only | The route is filtered on the bad days. Keep auto-heal on and a second tunnel with another carrier as a backup. |
 | `tcp`, `tls` or `ws` never connect, or a CDN tunnel connects and then stalls | That carrier is filtered. Try `icmp`, or `wss` through Cloudflare, and run `wattun cdn-tune NAME full`. |
+| CDN tunnel works from some Iran servers or networks but not others | The Kharej address on Iran is a plain IP, so traffic is not going through Cloudflare. Use your Cloudflare domain (orange cloud) or run `wattun cdn-tune NAME`, and check the SNI is spelled exactly like the domain. |
 | Connected, but users can't open sites | Nothing listens on Kharej's `127.0.0.1:PORT`. |
 
 More (`address already in use`, `restart needed for KEY`, MTU, CDN errors):
