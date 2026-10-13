@@ -513,7 +513,16 @@ func (c *cc) probeRTT(now time.Time) {
 		return
 	}
 	if now.After(c.probeAt) {
-		c.draining, c.probeStart, c.probeLowAt = true, now, time.Time{}
+		c.probeAt = now.Add(probeRTTEvery) // re-arm whether or not we drain this time
+		// Only drain if a standing queue might be hiding the true base. When srtt is already near minRTT there is no
+		// queue to clear and minRTT is trustworthy: the guard in sample() only ever lets a *drained* sample raise
+		// minRTT, so it is never polluted high, and a base that DROPS is caught for free by normal min sampling. A base
+		// that rises shows up as srtt climbing above the (honest) minRTT, which trips this same test. Skipping the drain
+		// on a queue-free path is what keeps the pool, which runs at srtt ~ minRTT, from paying the drain's throughput
+		// cost; a single queued connection sits well above the threshold and still drains every cycle.
+		if c.srtt > c.minRTT+c.minRTT/2 {
+			c.draining, c.probeStart, c.probeLowAt = true, now, time.Time{}
+		}
 	}
 }
 

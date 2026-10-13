@@ -899,6 +899,13 @@ connection this holds `minRTT` at the true base and lets a lone stream fill ~90 
 heavy per-connection stalls is single-connection head-of-line blocking, which the production pool (8 connections)
 routes around.
 
+The drain only runs when it is needed (2.4.14): a cycle is skipped unless `srtt` is above `minRTT x 1.5`, i.e. a
+standing queue could be hiding the base. Because `sample` only ever lets a *drained* sample raise `minRTT`, the base
+is never polluted high, so a path that gets *faster* is caught for free by ordinary min-sampling and one that gets
+*slower* shows up as `srtt` climbing over the honest `minRTT` — which trips the same test. A pool session runs at
+`srtt ~ minRTT` and so almost never drains, paying none of its cost, while a single queued connection stays well above
+the threshold and drains every cycle.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the
