@@ -302,3 +302,83 @@ func TestRejectsForeignKey(t *testing.T) {
 		t.Fatalf("server accepted %d streams from a foreign key", n)
 	}
 }
+
+// streamCount reports how many streams the session still holds.
+func streamCount(s *Session) int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.streams) }
+
+// waitStreams waits (up to 5 s) for a session's stream count to reach want.
+func waitStreams(t *testing.T, s *Session, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if streamCount(s) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("stream count stayed at %d, want %d", streamCount(s), want)
+}
+
+// TestCloseReadReapsLingeringStream pins the stream-leak fix. A stream whose local reader stops while data is still
+// buffered (peer finished) -- or while the peer is still sending -- must be reaped by CloseRead, not held forever.
+// Before the fix the client kept such streams open with no local connection behind them (field 2026-10-13: Iran
+// stuck at 76 streams with zero established TCP on the load port).
+func TestCloseReadReapsLingeringStream(t *testing.T) {
+	// (a) peer sent everything and FIN'd, local reader consumed nothing.
+	t.Run("peer_finished_unread", func(t *testing.T) {
+		cli, srv, _, _ := newPair(t, 0, time.Millisecond, 10e6, Config{})
+		go func() {
+			ss, err := srv.Accept()
+			if err != nil {
+				return
+			}
+			ss.Write(pattern(200000, 3))
+			ss.CloseWrite()
+			readAll(ss) // drain our FIN side so the server stream can retire too
+		}()
+		st, _ := cli.OpenStream()
+		st.Write([]byte{0})
+		st.CloseWrite()
+		// wait until the peer's data+FIN is buffered but unread
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			cli.mu.Lock()
+			ok := st.eof && len(st.ready) > 0
+			cli.mu.Unlock()
+			if ok {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		cli.mu.Lock()
+		eof, ready := st.eof, len(st.ready)
+		cli.mu.Unlock()
+		if !eof || ready == 0 {
+			t.Fatalf("setup: want buffered-unread data with peer FIN, got eof=%v ready=%d", eof, ready)
+		}
+		st.CloseRead()
+		waitStreams(t, cli, 0) // the lingering stream must be reaped, not held
+	})
+
+	// (b) peer still sending, local reader gone: CloseRead must reset the stream so both ends reap.
+	t.Run("peer_sending_reset", func(t *testing.T) {
+		cli, srv, _, _ := newPair(t, 0, time.Millisecond, 10e6, Config{})
+		go func() {
+			ss, err := srv.Accept()
+			if err != nil {
+				return
+			}
+			for i := 0; i < 200; i++ { // keep sending; the reset will end it
+				if _, err := ss.Write(pattern(4096, byte(i))); err != nil {
+					return
+				}
+			}
+		}()
+		st, _ := cli.OpenStream()
+		st.Write([]byte{0})
+		waitStreams(t, cli, 1) // stream is open
+		st.CloseRead()         // reader gone while peer is still sending
+		waitStreams(t, cli, 0)
+		waitStreams(t, srv, 0) // the RST reaches the server and it reaps too
+	})
+}

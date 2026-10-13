@@ -66,6 +66,7 @@ type Stream struct {
 	peerFin  bool
 	peerFinO uint64
 	eof      bool
+	rdClosed bool // the local reader is gone: drop buffered data and let the stream finish without it
 
 	err  error
 	dead bool
@@ -303,9 +304,35 @@ func (s *Session) killStream(st *Stream, err error) {
 	st.wc.Broadcast()
 }
 
+// CloseRead abandons the receive side. The bridge calls it once the local connection is gone: any buffered-but-unread
+// data is dropped so it no longer blocks the stream from finishing, and if the peer is still sending (no FIN yet) the
+// stream is reset to stop it. Without this a stream whose local reader stopped with data still buffered -- common when
+// a client connection closes mid-transfer -- never satisfied maybeFinish's "ready drained" test and leaked (the Iran
+// client held streams with no local TCP behind them; field 2026-10-13).
+func (st *Stream) CloseRead() {
+	s := st.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st.dead || st.rdClosed {
+		return
+	}
+	st.rdClosed = true
+	st.ready, st.rroot = nil, nil
+	if !st.eof { // peer has not closed: we can take no more, so abort both directions
+		var f []byte
+		f = append(f, frRst)
+		f = appendUv(f, st.id)
+		s.ctrl = append(s.ctrl, f)
+		s.kick()
+		s.killStream(st, ErrReset)
+		return
+	}
+	st.maybeFinish() // peer already finished: drop what is left and retire once our own FIN is acked
+}
+
 // maybeFinish retires a stream once both directions are complete and drained.
 func (st *Stream) maybeFinish() {
-	if st.dead || !st.finAcked || st.sbase != st.finOff || !st.eof || len(st.ready) > 0 {
+	if st.dead || !st.finAcked || st.sbase != st.finOff || !st.eof || (!st.rdClosed && len(st.ready) > 0) {
 		return
 	}
 	s := st.s

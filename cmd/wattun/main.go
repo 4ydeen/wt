@@ -977,6 +977,7 @@ func bridge(c net.Conn, st *wat.Stream, tag string, ps *portStat, server bool) {
 	}()
 	wg.Wait()
 	c.Close()
+	st.CloseRead() // local conn is gone: drop any unread data so the stream reaps instead of lingering (no local TCP behind it)
 	dbg("%s done in %v: tcp->stream %d B (%v), stream->tcp %d B (%v)", tag, time.Since(t0).Round(time.Millisecond), up, upErr, down, downErr)
 }
 
