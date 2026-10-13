@@ -873,6 +873,11 @@ is dropped, so it no longer blocks retirement. If the peer had not finished send
 peer stops too. A cleanly closed connection is unchanged, and the send direction is never cut short. Both roles use
 the same forwarder, so update both ends. Nothing changes on the wire (`TestCloseReadReapsLingeringStream`).
 
+Field result, 2.4.17 (test CDN tunnel, 50-connection load, 2026-10-13): Iran held exactly 50 streams during the load
+(2.4.16 climbed from 60 to 91) and both ends dropped to 0 when it stopped, staying there for the 8 minutes checked.
+Iran RSS stayed at 33-43 MB during the load (2.4.16: 40 to 159 MB) and fell back to 32 MB afterwards. Throughput
+and RTT were unchanged.
+
 ## Pacing on TCP-based and CDN carriers
 
 Since 2.4.11 these carriers are paced by delivery rate, see [Delivery-rate pacing](#delivery-rate-pacing-2411); this
