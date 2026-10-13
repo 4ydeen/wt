@@ -1353,6 +1353,19 @@ wizard_iran() {
   [ -n "$bind" ] && [ "$bind" != 0.0.0.0 ] && summary_line "Bind" "$bind"
   [ -n "$mbps" ] && summary_line "Speed limit" "$mbps MB/s"
   [ "$fec" = auto ] && summary_line "FEC" auto
+  # wss/grpc/h2 are the "through Cloudflare" carriers. If the peer is a raw IP and no CDN edges were tuned in, Iran
+  # dials the origin directly (the domain is only an SNI/Host string), which works only where that IP is reachable
+  # from the user's network - the usual cause of "runs on some servers, not others". Flag it before creating.
+  case "$T_CARRIER" in
+    wss|grpc|h2)
+      if [ "$T_REV" != 1 ] && [ -z "$CT_DESC" ] && { ph=${T_PEER%%,*}; ipv4_ok "${ph%:*}"; }; then
+        echo
+        warn "peer is a direct IP (${ph%:*}) - this tunnel does NOT go through Cloudflare."
+        hint "A direct IP works only where it is reachable from Iran, so it fails on some networks."
+        hint "For Cloudflare: proxy a domain to this server (orange cloud) and enter that DOMAIN as the"
+        hint "Kharej address, or run  wattun-manager cdn-tune $name  after creating it."
+      fi ;;
+  esac
   echo
   confirm "Create this tunnel?" y || { warn "Nothing was created."; return 1; }
   echo
