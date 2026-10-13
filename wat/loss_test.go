@@ -384,3 +384,31 @@ func TestReliableProbeRTT(t *testing.T) {
 		t.Fatalf("minRTT climbed with the queue to %v (base was 100 ms); the BDP window would run away", c.minRTT)
 	}
 }
+
+// TestReliableProbeNoAppLimitedPollution pins the 2.4.15 fix: an app-limited reliable sender (little in flight, e.g.
+// the receive side of a transfer) must never raise minRTT from a high sample. Such a sender builds no queue of its
+// own, so a delayed sample is reverse-path or scheduling noise, not a base to re-measure from. Draining there once
+// polluted minRTT (field 2026-10-13: a client receiving a download saw minRTT jump 107 -> 545 ms and its next upload
+// collapsed). minRTT may still only fall.
+func TestReliableProbeNoAppLimitedPollution(t *testing.T) {
+	if !relV2 {
+		t.Skip("v1 forced")
+	}
+	c := newCC(5e6, 2e5, 80e6, 0)
+	c.reliable, c.maxPlain = true, 1400
+	now := time.Now()
+	c.sample(107*time.Millisecond, now) // true base
+	for k := 1; k <= 400; k++ {         // 20 s, well past the 10 s stale window
+		at := now.Add(time.Duration(k) * 50 * time.Millisecond)
+		c.inflight = 3000 // below the drain floor: nothing of ours is queued
+		c.sample(545*time.Millisecond, at)
+		c.limited, c.cwndLim, c.tokLim = false, false, false // app-limited
+		c.tick(at)
+	}
+	if c.draining {
+		t.Fatal("entered a drain while app-limited: there was no queue to clear")
+	}
+	if c.minRTT > 150*time.Millisecond {
+		t.Fatalf("an app-limited sample raised minRTT to %v (base 107 ms)", c.minRTT)
+	}
+}

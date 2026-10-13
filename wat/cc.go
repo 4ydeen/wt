@@ -514,13 +514,14 @@ func (c *cc) probeRTT(now time.Time) {
 	}
 	if now.After(c.probeAt) {
 		c.probeAt = now.Add(probeRTTEvery) // re-arm whether or not we drain this time
-		// Only drain if a standing queue might be hiding the true base. When srtt is already near minRTT there is no
-		// queue to clear and minRTT is trustworthy: the guard in sample() only ever lets a *drained* sample raise
-		// minRTT, so it is never polluted high, and a base that DROPS is caught for free by normal min sampling. A base
-		// that rises shows up as srtt climbing above the (honest) minRTT, which trips this same test. Skipping the drain
-		// on a queue-free path is what keeps the pool, which runs at srtt ~ minRTT, from paying the drain's throughput
-		// cost; a single queued connection sits well above the threshold and still drains every cycle.
-		if c.srtt > c.minRTT+c.minRTT/2 {
+		// Drain only when this sender actually has a queue of its own to clear, i.e. it is holding real data in flight.
+		// An app-limited sender -- the receive side of a transfer, or an idle session -- sits at or below the floor
+		// already, builds no queue, and so its RTT samples are reverse-path or scheduling noise, never a base we may
+		// re-measure from. Draining (and the minRTT raise it enables in sample()) there would pull minRTT up to that
+		// noise: field 2026-10-13 showed a client's minRTT jump 107 -> 545 ms while it was only receiving a download,
+		// which then wrecked its next upload. Entering only above the floor also means the minRTT raise can fire solely
+		// after a genuine drain down from a real queue.
+		if c.inflight > 2*c.drainFloor() {
 			c.draining, c.probeStart, c.probeLowAt = true, now, time.Time{}
 		}
 	}
