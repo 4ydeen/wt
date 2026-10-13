@@ -899,15 +899,22 @@ connection this holds `minRTT` at the true base and lets a lone stream fill ~90 
 heavy per-connection stalls is single-connection head-of-line blocking, which the production pool (8 connections)
 routes around.
 
-The drain only runs when this sender has a queue of its own to clear (2.4.15): a cycle is entered only when inflight is
-above twice the drain floor. An **app-limited** sender -- the receive side of a transfer, or an idle session -- sits at
-or below the floor already and builds no queue, so a delayed RTT sample of its is reverse-path or scheduling noise,
-never a base to re-measure from. Draining there would raise `minRTT` to that noise: the field (2026-10-13) caught a
-client's `minRTT` jump from 107 to 545 ms *while it was only receiving a download*, which then wrecked its next upload
-(the window there sized from a 545 ms base queued to a 5 s `srtt` and the stream reset). Gating on real inflight also
-means the `minRTT` raise in `sample` can fire only after a genuine drain down from a real queue. (2.4.14 instead gated
-on `srtt > minRTT x 1.5`; that skipped the drain on a queue-free path but did not stop an app-limited sender from
-re-measuring off noise, so 2.4.15 gates on inflight, which fixes both.)
+A drain cycle is entered only when a standing queue of our own could be hiding the base, which takes **both** of two
+conditions (2.4.16):
+
+- **inflight above twice the drain floor** -- this sender is holding a real queue. An app-limited sender (the receive
+  side of a transfer, or an idle session) sits at the floor, builds no queue, and its delayed samples are reverse-path
+  or scheduling noise, never a base to re-measure from. Draining there once raised a client's `minRTT` from 107 to
+  545 ms *while it was only receiving a download* and wrecked its next upload (the window sized from a 545 ms base
+  queued to a 5 s `srtt` and the stream reset; field 2026-10-13). Requiring inflight above the floor also means the
+  `minRTT` raise in `sample` can fire only after a genuine drain down from a real queue.
+- **`srtt` above `minRTT x 1.5`** -- there is actually a queue to clear. A pool session runs at `srtt ~ minRTT` (its
+  many connections keep each one's queue shallow and `minRTT` fresh), so it skips the drain and its throughput dip; a
+  single queued connection sits far above and drains every cycle.
+
+The two conditions were added separately and each alone was wrong: 2.4.14 gated on `srtt` only and let an app-limited
+sender re-measure off noise (broke uploads); 2.4.15 gated on inflight only and so drained pool sessions every cycle
+(cost pool throughput). 2.4.16 requires both.
 
 ### Stalled pool connections (2.4.5)
 

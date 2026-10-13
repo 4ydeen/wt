@@ -514,14 +514,16 @@ func (c *cc) probeRTT(now time.Time) {
 	}
 	if now.After(c.probeAt) {
 		c.probeAt = now.Add(probeRTTEvery) // re-arm whether or not we drain this time
-		// Drain only when this sender actually has a queue of its own to clear, i.e. it is holding real data in flight.
-		// An app-limited sender -- the receive side of a transfer, or an idle session -- sits at or below the floor
-		// already, builds no queue, and so its RTT samples are reverse-path or scheduling noise, never a base we may
-		// re-measure from. Draining (and the minRTT raise it enables in sample()) there would pull minRTT up to that
-		// noise: field 2026-10-13 showed a client's minRTT jump 107 -> 545 ms while it was only receiving a download,
-		// which then wrecked its next upload. Entering only above the floor also means the minRTT raise can fire solely
-		// after a genuine drain down from a real queue.
-		if c.inflight > 2*c.drainFloor() {
+		// Drain only when a standing queue of our own could be hiding the base RTT. Two conditions, both needed:
+		//   - inflight above twice the floor: this sender is holding a real queue. An app-limited sender -- the receive
+		//     side of a transfer, or an idle session -- sits at the floor, builds no queue, and its delayed samples are
+		//     reverse-path or scheduling noise, not a base to re-measure from. Draining there once raised a client's
+		//     minRTT from 107 to 545 ms while it was only downloading and wrecked its next upload (field 2026-10-13).
+		//   - srtt well above minRTT: there is actually a queue to clear. The pool runs at srtt ~ minRTT (its many
+		//     connections keep the per-connection queue shallow and minRTT fresh), so it skips the drain and its
+		//     throughput dip; a single queued connection sits far above and drains every cycle.
+		// Requiring inflight above the floor also means the minRTT raise in sample() fires only after a genuine drain.
+		if c.inflight > 2*c.drainFloor() && c.srtt > c.minRTT+c.minRTT/2 {
 			c.draining, c.probeStart, c.probeLowAt = true, now, time.Time{}
 		}
 	}
