@@ -131,7 +131,7 @@ const relCwndStall = 500 * time.Millisecond
 
 var relCwndMinRTT = os.Getenv("WAT_CWND_MINRTT") != ""
 
-// relLossCuts: whether a reliable carrier still cuts its rate on timed-out packets (WAT_REL_LOSSCUT=1; default off since
+// relLossCuts: whether a direct reliable carrier still cuts its rate on timed-out packets (WAT_REL_LOSSCUT=1; off since
 // 2.4.18). TCP does the congestion control on these carriers and never drops a datagram, so a "loss" is a datagram
 // held up behind a TCP retransmit, a dead connection or a full local queue, and the delivery-rate pace plus the BDP
 // window already bound what we put in flight. The cut is also judged too early: a late ack proves a loss spurious only
@@ -371,7 +371,7 @@ func (c *cc) reliableLossV2(sent, lost int) bool {
 	if sent+real >= lossMinSent {
 		c.lossPct = float64(real) / float64(max(sent, real))
 	}
-	if !relLossCuts || real < relLossMin || real*relLossFrac < sent {
+	if (c.direct && !relLossCuts) || real < relLossMin || real*relLossFrac < sent {
 		if c.ceiling > 0 { // quiet tick: let the ceiling creep up, then release it at the max
 			c.ceiling *= ceilingGrowth
 			if c.ceiling >= c.maxRate {
@@ -615,7 +615,7 @@ func (c *cc) cwnd() int {
 			// sockets', and those push back, so allow about a second of delivery and let TCP set the pace.
 			w = max(w, c.maxBW*relDirectWin.Seconds())
 		}
-		if !relCwndMinRTT && c.srtt > c.minRTT {
+		if c.direct && !relCwndMinRTT && c.srtt > c.minRTT { // CDN tunnels keep the 2.4.17 window (not field-tested there)
 			// Packets also wait behind TCP's own retransmits: a pool connection stalled in recovery holds everything
 			// queued on it, so a datagram's real time in flight is srtt, not minRTT. A window of 3x maxBW x minRTT then
 			// caps delivery at 3 x minRTT / srtt of the path, and maxBW (measured through that cap) can never grow

@@ -483,7 +483,8 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
 | `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
-| `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 200 for udp, tcp, tls, ws, wss, h2, h2c and grpc (2.3.0; before, 16 for every carrier, which capped a pool carrier at 16 MB/s, and the server's value caps the download). See "ICMP path limits and pacing". |
+| `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp, tcp, tls, ws, wss, h2, h2c and grpc since 2.4.18 (200 from 2.3.0; before that 16 for every carrier; the server's value caps the download). See "ICMP path limits and pacing". |
+| `tcp-cc` | `bbr` | both | Since 2.4.18, Linux. TCP congestion control set on every pool socket (tcp, tls, ws, wss, h2, h2c, grpc). BBR does not back off on random loss; the kernel default (cubic) halves its window on every lost segment. `system` keeps the kernel default. Each end sets it for what it sends. `tcp_cc` in `/stats` shows what the kernel accepted (falls back to the default if the `tcp_bbr` module is missing). |
 | `sessions` | 1 | client | Independent sessions to the server, 1 to 16 (2.3.0, client only; the server is unchanged). See "Several sessions". |
 | `icmp-type` | `echo` | both | ICMP carrier: `echo`, `timestamp`, `info` or `mask`. Both ends must match. |
 | `loss-ceiling` | false | both | Opt-in loss-aware ceiling for the pacer (see "ICMP path limits and pacing"). Off = delay only. |
@@ -627,7 +628,8 @@ Every flag can also be a config key. Flags win over the file.
 | `-lanes N` | 4 | ICMP identifiers. |
 | `-conns N` | 8 | Pool connections. |
 | `-mtu N` | 0 | Datagram cap. |
-| `-max-mbps F` | 0 | Pace ceiling per direction and session; 0 = 16 with icmp, 200 otherwise (2.3.0). |
+| `-max-mbps F` | 0 | Pace ceiling per direction and session; 0 = 16 with icmp, 1250 otherwise (2.4.18; 200 from 2.3.0). |
+| `-tcp-cc NAME` | `bbr` | Pool sockets' TCP congestion control, Linux (2.4.18). `system` keeps the kernel default. |
 | `-sessions N` | 1 | Client: N independent sessions, udp and the pool carriers only (2.3.0, server unchanged). |
 | `-icmp-type T` | `echo` | ICMP carrier: `echo`, `timestamp`, `info`, `mask` (both ends the same). |
 | `-loss-ceiling` | off | Pacer: also cut the rate when loss jumps far above its learned baseline (opt-in). |
@@ -730,11 +732,17 @@ metrics port, even if the port is in the allowlist.
 | `retrans` | Retransmitted packets. |
 | `fec_sent`, `fec_recovered` | FEC parity packets sent; packets rebuilt from parity. |
 | `send_errors` | Carrier send failures. |
+| `ack_late` | Since 2.4.18, reliable carriers. Received packets that only a late ACK reported (they arrived below the newest 64 ranges, see [Direct pools (2.4.18)](#direct-pools-2418)). |
+| `dup_recv`, `rx_too_old` | Since 2.4.18. Packets dropped on receive as already seen, and as older than the replay window (131072 packets on reliable carriers). `rx_too_old` above 0 means data was lost and resent. |
 | `dgram_sent`, `dgram_recv` | UDP datagrams. |
 | `dgram_dropped_queue`, `dgram_dropped_size`, `dgram_dropped_rx` | UDP drops: queue full, too big, bad on receive. |
 | `dgram_flows` | Active UDP flows. |
 | `dgram_rejected` | UDP flows refused (port not allowed). |
 | `dgram_flow_cap_drops` | Datagrams dropped at the flow cap. |
+| `tcp_cc` | Since 2.4.18. The congestion control the kernel set on pool sockets. |
+| `pool_drops` | Since 2.4.18. Packets dropped because a pool connection's queue was full (should stay 0; the session waits instead). |
+| `pool_conn_deaths` | Since 2.4.18. Pool connections that died (both ends count their own). |
+| `pool_conns` | Since 2.4.18. One entry per open pool connection, oldest first: `age_s`, `tx` and `rx` (datagrams), `queue`, `stalled_ms` (how long its current socket write has been blocked). Uneven `tx` deltas show a skewed spread. |
 | `pool_slow_closed` | Since 2.4.7, pool carriers. Pool connections this process closed for delivering far below their share (see [Stalled pool connections](#stalled-pool-connections-245)). |
 | `cc` | Since 2.4.10. Pacer diagnostics, see below. |
 
@@ -752,6 +760,7 @@ sessions); compare two reads to see what happens now.
 | `cwnd` | The current window, bytes. |
 | `loss_time_ms`, `pto_ms` | The loss timer and the probe timeout now in use. |
 | `loss_timer_x` | Reliable carriers: how far the loss timer is stretched (1-8x) because retransmits kept turning out spurious. |
+| `pool_full` | Since 2.4.18. Ticks in which the session held back because every pool connection's queue was full (the pool's backpressure). |
 | `win_blocked` | Streams that have data to send but no window from the peer right now (a gauge, not a counter). A high value means the receiving side reads slowly. |
 
 With `sessions` > 1 (client) the top-level numbers cover all sessions: counters, `rate_bps`, `ceiling_bps`, `streams`
@@ -985,6 +994,53 @@ against a 86 ms `minRTT` instead of drifting up over time, with no delay cuts. P
 up. A single connection: 24.4 MB/s down on a 28-32 ms Cloudflare edge, and 4.41 MB/s up where 2.4.14 had reset the
 stream. The slow single-connection results seen earlier (0.6-0.8 MB/s) were on an 84 ms edge, which is why the
 manager's edge scan matters.
+
+### Direct pools (2.4.18)
+
+A pool carrier with no CDN in between (`tcp` or `tls` direct, or any pool carrier with `reverse`) is "direct": the
+only queues are the pool's and the kernel's, and both push back. 2.4.18 changes how such a tunnel sends; CDN tunnels
+(ws/wss/h2/grpc direct to a CDN edge) keep the 2.4.17 behaviour except where noted. Field results, reverse tcp,
+Kharej → Iran (the direction with heavy random loss, 3-14 % kernel retransmits), 200 MB per run:
+
+| Change | Before | After |
+|---|---|---|
+| BBR on pool sockets (`tcp-cc`) | upload 12 MB/s | upload 47-56 MB/s |
+| Late ACKs | download 8 streams 30.5, 16 streams 27.8 MB/s; 61-82k resends | 49-51 and 64.7 MB/s; 0-1.7k resends |
+| Warm tunnel, 16 conns, 32 streams | | 68.9-73.8 MB/s |
+
+Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connections 127 MB/s.
+
+- **BBR.** The kernel default cubic halves a connection's window on every lost segment, and on this path loss is
+  random, not congestion: 8 raw cubic connections moved 2.5 MB/s, 8 BBR ones 78. Pool sockets now ask for BBR
+  (`tcp-cc`). Local to each end.
+- **Late ACKs** (receiver only). A stalled pool connection leaves a hole for every packet it carries. An ACK frame
+  names only the newest 64 received ranges, so those packets, arriving later and lower, were never acked and the
+  sender resent them all: resends grew with the stream count. Each ACK now first carries a frame with the received
+  packets the main frame leaves out, with a one-hour ack delay so no sender version takes an RTT sample or declares
+  a loss from it. Works against any peer version; only the receiver of a direction needs 2.4.18.
+  `WAT_NO_LATEACK=1` turns it off.
+- **Replay window** 16384 → 131072 packets on reliable carriers (a 1 MB ring per session): at 32 connections a
+  connection in loss recovery outlasted the old window and its delivered packets were dropped as replays.
+- **Pool backpressure.** A full pool queue used to drop the packet silently (the session resent it after its loss
+  timer). The session now waits while every connection's queue holds 16 packets or more (`pool_full`;
+  `WAT_POOL_BACKLOG` sets the depth, `WAT_NO_BACKLOG=1` restores the old behaviour).
+- **Window and timers.** A direct session's window is one second of delivery rather than 3 bandwidth-delay
+  products, it skips the minRTT drain, and the pool keeps slow connections (TCP recovering is not a slow path).
+  When a pool connection dies, its unacked packets are resent at once instead of after the loss timer.
+  `WAT_NO_DIRECT=1` turns direct mode off.
+- **Startup.** A direct session paces at 2.5x its delivery estimate until the estimate stops growing (a fresh
+  tunnel's first 200 MB ran at 42-45 MB/s, the next at 53-71).
+- **Pinning.** Each stream rides one pool connection, assigned round-robin, as separate TCP connections would; a
+  packet with interactive data takes the least queued connection, so ping under a full download stayed at the
+  38-40 ms base. Resent data goes on any connection. `WAT_NO_PIN=1` sprays every packet instead (about the same
+  speed in the field).
+- **Loss cuts off.** A direct pool no longer cuts its rate on loss (TCP's loss is not ours; `WAT_REL_LOSSCUT=1`
+  restores it), and its window also covers 2 x srtt (`WAT_CWND_MINRTT=1` turns that off). CDN tunnels keep the
+  2.4.17 rules for both.
+- **Speed test** takes `streams=N` (1-32, default 8): `/speedtest?dir=down&mb=200&streams=16`. One stream rides one
+  pool connection now, so a single-stream test shows one connection's speed.
+- **More connections.** `conns: 16` beat 8 on this path (73.8 against 51 MB/s); 32 fell to 26 MB/s from loss
+  bursts. Both ends update for the full gain; the pool's own sending changes are local to each end.
 
 ### Stalled pool connections (2.4.5)
 

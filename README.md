@@ -40,7 +40,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.17)
+## What's new (latest: 2.4.18)
 
 - **ICMP: bigger packets, a setting change (no update needed).** The Iran ⇄ Europe route passes full 1500-byte
   pings again. With `mtu: 1400` on **both** ends and the same 30 MB/s cap, Kharej resends 0.3-0.8 % of its packets
@@ -53,6 +53,14 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 Update **both** servers for every release below. 2.4.9 to 2.4.16 were steps toward one fix for CDN tunnels that
 got slower over time; if you are on any of them, go straight to 2.4.17. ICMP and UDP tunnels behave exactly as in
 2.4.8 apart from the 2.4.17 fix.
+
+- **2.4.18: TCP pool tunnels 2-4x faster.** For tcp, tls and every reverse pool carrier (no CDN in between). On the
+  Iran ⇄ Europe test pair (reverse tcp), uploads went from 12 to 47-56 MB/s and downloads from ~20-30 to 49-51
+  MB/s with 8 connections and up to 69-74 MB/s with `conns: 16`. Ping under a full download stayed at the 38-40 ms
+  base. Pool sockets now use BBR (`tcp-cc`), which does not slow down on the random loss of this route; packets
+  that arrived late through a stalled connection are now acknowledged instead of being sent again (61-82k
+  needless resends per 200 MB fell to under 2k). `conns: 16` is worth trying; 32 was slower. `/stats` gained
+  per-connection counters (`pool_conns`). [Details](docs/TECHNICAL.md#direct-pools-2418)
 
 - **2.4.17: no more leftover connections.** When a user's connection closed while data was still on its way, the
   tunnel kept it open inside. After a load test an Iran server kept 69-76 of them with no user behind them, and its
