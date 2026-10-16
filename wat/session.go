@@ -30,7 +30,7 @@ const (
 	sendStage     = 256 << 10 // Write may buffer this much beyond the peer's window (stream.go writeCap)
 	slowWinMin    = 256 << 10 // a lagging reader's window floor (stream.go tuneSlow)
 	slowWinRTTs   = 2
-	// keepBuf is the largest drained buffer a stream keeps for reuse (each direction). Field 2026-10-12: at 1 MB, 220
+	// keepBuf is the largest drained send buffer a stream keeps for reuse (the receive side uses pooled chunks). Field 2026-10-12: at 1 MB, 220
 	// mostly idle streams pinned ~190 MB on the receiving end.
 	keepBuf      = 256 << 10
 	prioBytes    = 64 << 10 // streams that sent less than this go first (interactive traffic)

@@ -53,8 +53,7 @@ type Stream struct {
 	// receive side
 	rnext    uint64
 	segs     []seg
-	ready    []byte
-	rroot    []byte    // backing array of ready, same idea
+	ready    rdQueue   // in-order bytes Read has not taken yet
 	slowWin  uint64    // >0: the smaller window advertised while the local reader lags (tuneSlow)
 	shrunkAt time.Time // last time onAcked gave back an oversized send buffer
 	slowAt   time.Time
@@ -242,29 +241,17 @@ func (st *Stream) Read(b []byte) (int, error) {
 	s := st.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for len(st.ready) == 0 && !st.eof && st.err == nil {
+	for st.ready.n == 0 && !st.eof && st.err == nil {
 		st.rc.Wait()
 	}
-	if len(st.ready) == 0 {
+	if st.ready.n == 0 {
 		if st.err != nil {
 			return 0, st.err
 		}
 		st.maybeFinish()
 		return 0, io.EOF
 	}
-	n := copy(b, st.ready)
-	st.ready = st.ready[n:]
-	if w := st.slowWin; w > 0 && cap(st.rroot) > 1<<20 && uint64(cap(st.rroot)) > 2*w && uint64(len(st.ready)) <= w {
-		nb := make([]byte, len(st.ready), 2*w) // lagging reader (tuneSlow): give back the big buffer
-		copy(nb, st.ready)
-		st.rroot, st.ready = nb[:0], nb
-	}
-	if len(st.ready) == 0 {
-		if cap(st.rroot) > keepBuf { // keep a working buffer (re-growing it from zero after every drain cost ~10 % CPU at 100 MB/s)
-			st.rroot = nil
-		}
-		st.ready = nil
-	}
+	n := st.ready.read(b)
 	st.consumed += uint64(n)
 	st.tuneWindow()
 	st.tuneSlow(time.Now())
@@ -330,7 +317,7 @@ func (st *Stream) CloseRead() {
 		return
 	}
 	st.rdClosed = true
-	st.ready, st.rroot = nil, nil
+	st.ready.reset()
 	if !st.eof { // peer has not closed: we can take no more, so abort both directions
 		var f []byte
 		f = append(f, frRst)
@@ -345,7 +332,7 @@ func (st *Stream) CloseRead() {
 
 // maybeFinish retires a stream once both directions are complete and drained.
 func (st *Stream) maybeFinish() {
-	if st.dead || !st.finAcked || st.sbase != st.finOff || !st.eof || (!st.rdClosed && len(st.ready) > 0) {
+	if st.dead || !st.finAcked || st.sbase != st.finOff || !st.eof || (!st.rdClosed && st.ready.n > 0) {
 		return
 	}
 	s := st.s
@@ -563,30 +550,81 @@ func (st *Stream) makeRoom(n int) {
 	if cap(st.sbuf)-live >= n {
 		return
 	}
-	if cap(st.sroot) >= live+n {
+	// Move the live bytes to the front only when the acked front is at least half their size, so each byte is moved
+	// about twice at most. A buffer kept just at the cap moved all its live bytes for every write when the front had
+	// freed a little: 56 % of the sending end's copying on a download (field profile 2026-10-16). It grows instead,
+	// up to twice the cap, which leaves room for the front to free up.
+	if gap := cap(st.sroot) - cap(st.sbuf); cap(st.sroot) >= live+n && gap >= live/2 {
 		copy(st.sroot[:live], st.sbuf)
 		st.sbuf = st.sroot[:live]
 		return
 	}
-	nb := make([]byte, live, max(min(2*(live+n), st.sendCap()), live+n, 4096)) // doubling, but not past the cap
+	nb := make([]byte, live, max(min(2*(live+n), 2*st.sendCap()), live+n, 4096)) // doubling, but not past twice the cap
 	copy(nb, st.sbuf)
 	st.sroot, st.sbuf = nb, nb
 }
 
-// appendReady adds in-order bytes for Read. When Read has drained ready, the next bytes start again at the front of
-// the same backing array instead of allocating a new one per packet.
-//
-// When the end of the backing array is reached while Read has consumed its front, the unread bytes move back to the
-// front instead of growing a new array (same idea as makeRoom on the send side).
-func (st *Stream) appendReady(data []byte) {
-	old := st.ready
-	if len(old) == 0 {
-		old = st.rroot[:0]
-	} else if cap(old)-len(old) < len(data) && cap(st.rroot) >= len(old)+len(data) {
-		old = st.rroot[:copy(st.rroot[:len(old)], old)]
+// appendReady adds in-order bytes for Read.
+func (st *Stream) appendReady(data []byte) { st.ready.write(data) }
+
+// rdQueue holds received in-order bytes as a queue of pooled 64 KB chunks (2.5.1). It was one contiguous slice that
+// was dropped after each drain and re-grown by doubling, with the unread bytes moved to the front whenever the end
+// was reached: on the Iran end of a download those copies, the zeroing of the new arrays and the GC behind them were
+// ~25 % of the tunnel's CPU (field profile 2026-10-16, 16 streams). Now each byte is copied once in and once out, no
+// array grows, and a drained or idle stream holds no memory.
+type rdQueue struct {
+	ch []*[rdChunk]byte
+	r  int // read offset in ch[0]
+	w  int // write offset in the last chunk
+	n  int // unread bytes
+}
+
+const rdChunk = 64 << 10
+
+var rdPool = sync.Pool{New: func() any { return new([rdChunk]byte) }}
+
+func (q *rdQueue) write(p []byte) {
+	for len(p) > 0 {
+		if len(q.ch) == 0 || q.w == rdChunk {
+			q.ch = append(q.ch, rdPool.Get().(*[rdChunk]byte))
+			q.w = 0
+		}
+		c := copy(q.ch[len(q.ch)-1][q.w:], p)
+		q.w += c
+		q.n += c
+		p = p[c:]
 	}
-	st.ready = append(old, data...)
-	if cap(old)-len(old) < len(data) { // append moved to a new backing array (it starts at its front)
-		st.rroot = st.ready[:0]
+}
+
+func (q *rdQueue) read(b []byte) int {
+	t := 0
+	for t < len(b) && q.n > 0 {
+		end := rdChunk
+		if len(q.ch) == 1 {
+			end = q.w
+		}
+		c := copy(b[t:], q.ch[0][q.r:end])
+		t += c
+		q.r += c
+		q.n -= c
+		if q.r == end {
+			if len(q.ch) == 1 { // drained: keep nothing
+				q.reset()
+				break
+			}
+			rdPool.Put(q.ch[0])
+			q.ch[0] = nil
+			q.ch = q.ch[1:]
+			q.r = 0
+		}
 	}
+	return t
+}
+
+func (q *rdQueue) reset() {
+	for _, c := range q.ch {
+		rdPool.Put(c)
+	}
+	clear(q.ch)
+	*q = rdQueue{ch: q.ch[:0]}
 }

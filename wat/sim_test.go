@@ -343,7 +343,7 @@ func TestCloseReadReapsLingeringStream(t *testing.T) {
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
 			cli.mu.Lock()
-			ok := st.eof && len(st.ready) > 0
+			ok := st.eof && st.ready.n > 0
 			cli.mu.Unlock()
 			if ok {
 				break
@@ -351,7 +351,7 @@ func TestCloseReadReapsLingeringStream(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		cli.mu.Lock()
-		eof, ready := st.eof, len(st.ready)
+		eof, ready := st.eof, st.ready.n
 		cli.mu.Unlock()
 		if !eof || ready == 0 {
 			t.Fatalf("setup: want buffered-unread data with peer FIN, got eof=%v ready=%d", eof, ready)

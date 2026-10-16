@@ -96,7 +96,7 @@ func TestSlowReaderBuffersBounded(t *testing.T) {
 		if time.Since(t0) > next {
 			next += time.Second
 			cli.mu.Lock()
-			t.Logf("t=%v unread %.2f MB win %.2f MB rrootcap %.2f", time.Since(t0).Round(time.Second), float64(st.rnext-st.consumed)/1e6, float64(st.slowWin)/1e6, float64(cap(st.rroot))/1e6)
+			t.Logf("t=%v unread %.2f MB win %.2f MB ready %.2f", time.Since(t0).Round(time.Second), float64(st.rnext-st.consumed)/1e6, float64(st.slowWin)/1e6, float64(st.ready.n)/1e6)
 			cli.mu.Unlock()
 		}
 	}
