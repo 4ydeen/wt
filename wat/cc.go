@@ -60,6 +60,7 @@ type cc struct {
 
 	// diagnostics (2.4.10, /stats "cc"): what held the sender back, per tick, and why the rate was cut
 	tokLim, cwndLim bool // set by build during the current tick
+	heldLim         bool // set by build: the carrier's send queues were full (Backlogger)
 	diag            CCDiag
 
 	// delivery-rate pacer for reliable carriers (2.4.11). TCP underneath does its own congestion control and injects
@@ -166,6 +167,7 @@ type CCDiag struct {
 	Ticks, TokLimited, CwndLimited, AppLimited uint64 // ticks; app-limited: nothing waiting to be sent
 	LossCuts, DelayCuts, DeepTrips             uint64 // DeepTrips: the delay rule let the rate fall below the start rate
 	Lost, Spurious                             uint64 // declared lost; of those, acked later after all
+	PoolFull                                   uint64 // ticks held back by the carrier's full send queues (2.4.18)
 }
 
 func (d *CCDiag) add(o CCDiag) {
@@ -178,6 +180,7 @@ func (d *CCDiag) add(o CCDiag) {
 	d.DeepTrips += o.DeepTrips
 	d.Lost += o.Lost
 	d.Spurious += o.Spurious
+	d.PoolFull += o.PoolFull
 }
 
 // AddPacer folds b's pacer diagnostics into a: counters and gauges (floor, window) add up across sessions, and the
@@ -406,6 +409,8 @@ func (c *cc) tick(now time.Time) {
 	c.tickAt = now
 	c.diag.Ticks++
 	switch {
+	case c.heldLim:
+		c.diag.PoolFull++
 	case c.cwndLim:
 		c.diag.CwndLimited++
 	case c.tokLim:
@@ -413,8 +418,8 @@ func (c *cc) tick(now time.Time) {
 	case !c.limited:
 		c.diag.AppLimited++
 	}
-	busy := c.cwndLim || c.tokLim
-	c.tokLim, c.cwndLim = false, false
+	busy := c.cwndLim || c.tokLim || c.heldLim
+	c.tokLim, c.cwndLim, c.heldLim = false, false, false
 	cut := c.lossStep()
 	if cut {
 		c.diag.LossCuts++

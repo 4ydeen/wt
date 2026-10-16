@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -155,6 +156,8 @@ type Session struct {
 	copier    bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
 	outFree   chan []byte
 	batcher   BatchSender // nil: send one datagram at a time
+	backlog   Backlogger  // nil: the carrier has no send queues of its own to report
+	held      bool        // this pump round: the carrier's send queues are full, no new data
 	bp        [][]byte
 	bl        []int
 	spFree    []*sentPkt
@@ -258,6 +261,9 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		s.replayWin = reliableReplayWin // paths of different delay put packets thousands of numbers behind each other
 	}
 	s.rxRing = make([]uint64, s.replayWin)
+	if b, ok := pio.(Backlogger); ok && !noBacklog {
+		s.backlog = b
+	}
 	if b, ok := pio.(BatchSender); ok && !isChooser(pio) && batchWanted(pio) {
 		s.batcher = b // the multipath chooser has its own Send and never implements BatchSender
 	}
@@ -478,7 +484,9 @@ func (s *Session) pump() {
 		now := time.Now()
 		dt := now.Sub(last)
 		last = now
+		held := s.backlog != nil && s.backlog.Backlogged() // the carrier's own lock: asked outside ours
 		s.mu.Lock()
+		s.held = held
 		s.now = now
 		s.cc.refill(dt)
 		s.timers(now)
@@ -553,13 +561,16 @@ func (s *Session) nextLane() int {
 	return s.lanes[s.laneRR%len(s.lanes)]
 }
 
+// noBacklog (WAT_NO_BACKLOG=1) ignores the carrier's Backlogger, the pre-2.4.18 behaviour, for an A/B.
+var noBacklog = os.Getenv("WAT_NO_BACKLOG") != ""
+
 func (s *Session) build(now time.Time) (outPkt, bool) {
 	const none = -1
 	if len(s.probeQ) > 0 {
 		return s.buildProbe(now), true
 	}
 	needAck := s.ackPend > 0 && (s.ackPend >= 6 || now.Sub(s.ackSince) >= 2*time.Millisecond)
-	canData := s.cc.tokens > 0 && s.inflight < s.cc.cwnd()
+	canData := s.cc.tokens > 0 && s.inflight < s.cc.cwnd() && !s.held
 	needBoot := s.cfg.Server && s.cfg.Boot != 0 && now.Sub(s.bootAt) >= time.Second
 	if !canData && !needAck && !s.wantPing && len(s.ctrl) == 0 && !needBoot {
 		if s.hasWork() {
@@ -699,7 +710,9 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 
 // noteLimit records what held the sender back this tick (diagnostics).
 func (s *Session) noteLimit() {
-	if s.inflight >= s.cc.cwnd() {
+	if s.held {
+		s.cc.heldLim = true
+	} else if s.inflight >= s.cc.cwnd() {
 		s.cc.cwndLim = true
 	} else if s.cc.tokens <= 0 {
 		s.cc.tokLim = true

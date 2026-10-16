@@ -42,6 +42,14 @@ type BatchSender interface {
 	SendBatch(ps [][]byte, lanes []int) error
 }
 
+// Backlogger is the optional interface of a PacketIO with send queues of its own (the pool carriers, 2.4.18): it
+// reports when they are full, so the session holds new data back instead of handing over packets the carrier would
+// drop. Without it the session sends exactly as before.
+type Backlogger interface{ Backlogged() bool }
+
+// RawBacklogger is the RawIO counterpart, per destination; the server's per-session IO turns it into a Backlogger.
+type RawBacklogger interface{ BackloggedTo(dst net.Addr) bool }
+
 // RawBatchSender is the server-side equivalent: one destination, several datagrams.
 type RawBatchSender interface {
 	SendBatchTo(ps [][]byte, lanes []int, dst net.Addr) error

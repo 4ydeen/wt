@@ -144,8 +144,18 @@ type emuChunk struct {
 	b  []byte
 }
 
+// EMU_CONNQ bounds how many ~MSS chunks one connection holds in flight (default 8192, i.e. effectively unbounded). A
+// real TCP socket stops taking data once cwnd plus its unsent low-water mark are used, so a stalled connection pushes
+// back on the pool's writer; ~400 models a 100 MB/s, 40 ms path split over 8 connections.
+func emuConnQ() int {
+	if n, _ := strconv.Atoi(os.Getenv("EMU_CONNQ")); n > 0 {
+		return n
+	}
+	return 8192
+}
+
 func emuPipe(w *emuWire, src, dst net.Conn) {
-	q := make(chan emuChunk, 8192)
+	q := make(chan emuChunk, emuConnQ())
 	go func() { // reader: timestamp every ~MSS chunk
 		defer close(q)
 		buf := make([]byte, 1448)

@@ -26,11 +26,11 @@ func (r *ReverseListenIO) Send(p []byte, path int) error {
 }
 
 func (r *ReverseListenIO) Recv() ([]byte, int, net.Addr, error) { return r.ps.Recv() }
-func (r *ReverseListenIO) SetPeer(net.Addr)                       {}
-func (r *ReverseListenIO) Close() error                           { return r.ps.Close() }
+func (r *ReverseListenIO) SetPeer(net.Addr)                     {}
+func (r *ReverseListenIO) Close() error                         { return r.ps.Close() }
 
 // Conns reports how many dialed-in connections are up; Addr is the bound address.
-func (r *ReverseListenIO) Conns() int      { return r.ps.Conns() }
+func (r *ReverseListenIO) Conns() int     { return r.ps.Conns() }
 func (r *ReverseListenIO) Addr() net.Addr { return r.ps.Addr() }
 
 // ReverseDialRaw is the RawIO of the session server when it dials the pool out: one pool, one fixed source address.
@@ -48,6 +48,9 @@ func (r *ReverseDialRaw) Close() error { return r.c.Close() }
 // Conns reports how many outbound connections are up.
 func (r *ReverseDialRaw) Conns() int { return r.c.Conns() }
 
-// Both reverse wrappers carry the pool's profile.
+// Both reverse wrappers report the pool's backlog and carry its profile.
+func (r *ReverseListenIO) Backlogged() bool            { return r.ps.BackloggedTo(poolAddr{key: reverseKey}) }
+func (r *ReverseDialRaw) BackloggedTo(_ net.Addr) bool { return r.c.Backlogged() }
+
 func (r *ReverseListenIO) Profile() Profile { return r.ps.Profile() }
 func (r *ReverseDialRaw) Profile() Profile  { return r.c.Profile() }

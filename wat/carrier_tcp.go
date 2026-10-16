@@ -375,6 +375,39 @@ func (pc *poolConn) fill(buf *[]byte, r, w *int, need int) (int, bool) {
 	return 0, true
 }
 
+// poolBacklog is the queue depth at which a pool counts as full: past it Send would soon drop.
+const poolBacklog = poolQueue / 2
+
+// backlogged reports whether even the least-queued usable conn already holds poolBacklog packets. Over a lossy path
+// the pool's TCP connections stall in their own retransmits, their sockets stop taking data, and the queues fill;
+// before 2.4.18 the session kept sending, Send dropped the overflow, and each drop came back as a "loss" ~400 ms later
+// (field 2026-10-16, Kharej -> Iran: 61k such losses in 4x200 MB, ~20 MB/s where bare TCP did 78). Holding new data
+// while the queues are full turns those drops into backpressure. No conn at all is not a backlog: the session keeps
+// its old behaviour while the pool (re)connects.
+func backlogged(conns []*poolConn) bool {
+	now := time.Now().UnixNano()
+	best, anyQ, n := 1<<30, 1<<30, 0
+	for _, pc := range conns {
+		if pc == nil {
+			continue
+		}
+		n++
+		l := len(pc.q)
+		anyQ = min(anyQ, l)
+		if pc.stalledFor(now) > poolStall {
+			continue
+		}
+		best = min(best, l)
+	}
+	if n == 0 {
+		return false
+	}
+	if best == 1<<30 { // every conn is stalled: judge by the shortest queue, as leastQueued does
+		best = anyQ
+	}
+	return best >= poolBacklog
+}
+
 // leastQueued picks the live conn with the shortest queue; start rotates so ties spread.
 func leastQueued(conns []*poolConn, start int) *poolConn {
 	now := time.Now().UnixNano()
@@ -701,6 +734,15 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 	return nil
 }
 
+// Backlogged reports whether the pool's send queues are full (Backlogger).
+func (c *TCPPoolClient) Backlogged() bool {
+	conns := make([]*poolConn, len(c.slots))
+	for i := range c.slots {
+		conns[i] = c.slots[i].Load()
+	}
+	return backlogged(conns)
+}
+
 // Clone returns a new pool client to the same peer(s) with the same dial function, and with it the same TLS engine
 // (fingerprint, ECH state and cache) and the same per-address health, but its own connections and its own random
 // pool id, so the server sees an independent pool. The clone's slot i dials as slot i+slotOffset of the original
@@ -950,6 +992,24 @@ func (s *TCPPoolServer) SendTo(p []byte, lane int, dst net.Addr) error {
 	}
 	return nil // no live conn or full queue: dropped, the session repairs it
 }
+
+// BackloggedTo reports whether the pool behind dst has its send queues full (RawBacklogger).
+func (s *TCPPoolServer) BackloggedTo(dst net.Addr) bool {
+	a, ok := dst.(poolAddr)
+	if !ok {
+		return false
+	}
+	s.mu.Lock()
+	conns := make([]*poolConn, 0, len(s.pools[a.key]))
+	for pc := range s.pools[a.key] {
+		conns = append(conns, pc)
+	}
+	s.mu.Unlock()
+	return backlogged(conns)
+}
+
+// PoolDrops counts packets dropped because every pool queue was full (process-wide).
+func PoolDrops() int64 { return poolDrops.Load() }
 
 func (s *TCPPoolServer) Profile() Profile { return poolProfile }
 

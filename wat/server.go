@@ -71,6 +71,16 @@ func (b *subIO) Send(p []byte, lane int) error {
 	return b.srv.raw.SendTo(p, lane, v.(net.Addr))
 }
 
+// Backlogged asks the server's RawIO whether this session's destination has its send queues full.
+func (b *subIO) Backlogged() bool {
+	rb, ok := b.srv.raw.(RawBacklogger)
+	if !ok {
+		return false
+	}
+	v := b.peer.Load()
+	return v != nil && rb.BackloggedTo(v.(net.Addr))
+}
+
 func (b *subIO) Recv() ([]byte, int, net.Addr, error) {
 	if b.prev != nil {
 		b.srv.putBuf(b.prev)
