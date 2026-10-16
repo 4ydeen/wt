@@ -530,3 +530,27 @@ func TestLateAck(t *testing.T) {
 		t.Fatalf("late ACK took an RTT sample: srtt %v -> %v", srtt, snd.cc.srtt)
 	}
 }
+
+// A direct carrier paces at relStartGain until its estimate stops growing while busy; idle time does not end startup.
+func TestDirectStartup(t *testing.T) {
+	c := newCC(8e6, 0.1e6, 1250e6, 8*time.Millisecond)
+	c.reliable, c.direct = true, true
+	c.maxBW, c.minRTT, c.srtt, c.maxPlain = 10e6, 40*time.Millisecond, 200*time.Millisecond, 4096
+	now := time.Now()
+	c.bwAt, c.delLast = now, 0
+	c.tickReliable(now, false, false)
+	for i := 1; i <= 40; i++ { // two seconds idle
+		c.tickReliable(now.Add(time.Duration(i)*50*time.Millisecond), false, false)
+	}
+	if c.grown || c.rate < relStartGain*10e6*0.99 {
+		t.Fatalf("idle ended startup: grown %v rate %.1f MB/s", c.grown, c.rate/1e6)
+	}
+	busyFrom := now.Add(2 * time.Second)
+	for i := 0; i < 20; i++ { // busy, estimate flat at 10 MB/s for a second (> 3 srtt)
+		c.delivered += 500e3
+		c.tickReliable(busyFrom.Add(time.Duration(i)*50*time.Millisecond), false, true)
+	}
+	if !c.grown || c.rate > relBWGain*c.maxBW*1.01 {
+		t.Fatalf("flat busy estimate kept startup: grown %v rate %.1f MB/s maxBW %.1f", c.grown, c.rate/1e6, c.maxBW/1e6)
+	}
+}

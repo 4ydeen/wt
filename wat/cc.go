@@ -76,6 +76,9 @@ type cc struct {
 	bwLen     int
 	bwBusy    bool    // the current measurement interval had at least one busy tick
 	maxBW     float64 // windowed-max delivery rate (bytes/s); 0 until the first sample
+	grown     bool    // direct startup over: the estimate stopped growing (BBR's full-pipe check)
+	growBW    float64 // estimate at the last 25 % step
+	growAt    time.Time
 
 	// PROBE_RTT (reliable): a single deeply-queued connection never delivers a drained RTT sample, so minRTT would
 	// climb with its own queue and the BDP window with it (field 2026-10-13: minRTT rose to 550 ms from a real 108,
@@ -93,6 +96,13 @@ const (
 	// relBWGain: pace this far above the estimate, to keep probing for more. 1.5 since 2.4.18 (was 1.2): on a lossy
 	// path each TCP connection's retransmit stalls make delivery lumpy, and 1.2 climbed too slowly to ever fill it.
 	relBWGain  = 1.5
+	// relStartGain: a direct carrier paces this far above the estimate until the estimate stops growing by 25 % within
+	// relStartWait (at least 3 srtt). Each step waits a whole srtt for its delivery sample, and with TCP's retransmit
+	// stalls srtt is 150-250 ms, so at 1.5x a fresh tunnel took seconds to fill: a first 200 MB download ran at 42-45
+	// MB/s and the next on the same tunnel at 53-71 (field 2026-10-16, reverse tcp, 8-16 connections). The pool's own
+	// backpressure (Backlogger) holds the session once its queues fill, so the higher gain cannot flood a connection.
+	relStartGain = 2.5
+	relStartWait = 500 * time.Millisecond
 	relCwndBDP = 3 // inflight ceiling, in bandwidth-delay products
 )
 
@@ -518,7 +528,16 @@ func (c *cc) tickReliable(now time.Time, cut, busy bool) {
 		}
 		return
 	}
-	target := relBWGain * c.maxBW
+	gain := relBWGain
+	if c.direct && !c.grown {
+		gain = relStartGain
+		if c.maxBW >= 1.25*c.growBW || !busy { // idle time does not count: a tunnel sits idle before its first transfer
+			c.growBW, c.growAt = max(c.growBW, c.maxBW), now
+		} else if now.Sub(c.growAt) > max(relStartWait, 3*c.srtt) {
+			c.grown = true
+		}
+	}
+	target := gain * c.maxBW
 	if c.ceiling > 0 && target > c.ceiling { // a recent real-loss cut caps the probe until the ceiling creeps back up
 		target = c.ceiling
 	}

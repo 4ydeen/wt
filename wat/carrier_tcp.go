@@ -103,6 +103,7 @@ type poolConn struct {
 	once  sync.Once
 	wbusy atomic.Int64 // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
 	rx    atomic.Uint64 // datagrams received
+	tx    atomic.Uint64 // datagrams handed to the socket
 	born  time.Time
 
 	rxMark  uint64 // owned by the pool's health check (judgeSlow)
@@ -145,7 +146,36 @@ func newPoolConn(c net.Conn) *poolConn {
 			poolTCPCCInUse.Store(&cc)
 		}
 	}
-	return &poolConn{c: c, q: make(chan []byte, poolQueue), done: make(chan struct{}), born: time.Now()}
+	pc := &poolConn{c: c, q: make(chan []byte, poolQueue), done: make(chan struct{}), born: time.Now()}
+	poolLive.Store(pc, struct{}{})
+	return pc
+}
+
+// poolLive holds every open pool connection of the process, for PoolConnStats.
+var poolLive sync.Map
+
+// PoolConnInfo is one pool connection as /stats shows it: datagrams sent and received since it opened, its send
+// queue, and how long its current socket write has been blocked.
+type PoolConnInfo struct {
+	AgeS      float64 `json:"age_s"`
+	Tx        uint64  `json:"tx"`
+	Rx        uint64  `json:"rx"`
+	Queue     int     `json:"queue"`
+	StalledMs int64   `json:"stalled_ms"`
+}
+
+// PoolConnStats lists the open pool connections, oldest first.
+func PoolConnStats() []PoolConnInfo {
+	var pcs []*poolConn
+	poolLive.Range(func(k, _ any) bool { pcs = append(pcs, k.(*poolConn)); return true })
+	slices.SortFunc(pcs, func(a, b *poolConn) int { return a.born.Compare(b.born) })
+	now := time.Now()
+	out := make([]PoolConnInfo, len(pcs))
+	for i, pc := range pcs {
+		out[i] = PoolConnInfo{now.Sub(pc.born).Seconds(), pc.tx.Load(), pc.rx.Load(), len(pc.q),
+			pc.stalledFor(now.UnixNano()).Milliseconds()}
+	}
+	return out
 }
 
 // The sender spreads datagrams evenly over its pool connections, so each one should deliver about the same number.
@@ -271,6 +301,7 @@ func (pc *poolConn) fail() {
 		poolConnDeaths.Add(1)
 		close(pc.done)
 		pc.c.Close()
+		poolLive.Delete(pc)
 	})
 }
 
@@ -318,6 +349,7 @@ func (pc *poolConn) writeLoop() {
 				}
 				_, err := bw.Write(p)
 				putPkt(p) // bufio has copied it (or written it through)
+				pc.tx.Add(1)
 				if err != nil {
 					pc.fail()
 					return

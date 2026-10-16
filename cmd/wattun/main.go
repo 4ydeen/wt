@@ -471,7 +471,7 @@ func main() {
 					}(),
 					"dgram_sent": st.DgramSent, "dgram_recv": st.DgramRecv, "dgram_dropped_queue": st.DgramDropQueue,
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_flows": udpFlowsActive.Load(),
-					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(), "pool_conn_deaths": wat.PoolConnDeaths(), "pool_drops": wat.PoolDrops(), "tcp_cc": wat.PoolTCPCCInUse(),
+					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(), "pool_conn_deaths": wat.PoolConnDeaths(), "pool_drops": wat.PoolDrops(), "tcp_cc": wat.PoolTCPCCInUse(), "pool_conns": wat.PoolConnStats(),
 				}
 				out["cc"] = map[string]any{ // pacer diagnostics (2.4.10): what held the sender back, and why it slowed
 					"ticks": st.CC.Ticks, "tok_limited": st.CC.TokLimited, "cwnd_limited": st.CC.CwndLimited,
