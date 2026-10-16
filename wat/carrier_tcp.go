@@ -112,6 +112,23 @@ type poolConn struct {
 // backoff 8, 5 MB Send-Q). Its own queue looks empty because the kernel holds the data, so leastQueued kept picking
 // it and every packet sent there was lost for 400+ ms. Stalled conns are skipped while a healthy one exists, and
 // closed (the client redials) once stuck for poolStallKill.
+// PoolTCPCC is the TCP congestion control set on every pool socket (2.4.18, `tcp-cc`; "" keeps the kernel default).
+// The kernel default (cubic) halves a connection's window on every loss, and on the Iran path random loss is not
+// congestion. Field 2026-10-16 (reverse tcp, 8 conns, 40 ms): ~20 MB/s per tunnel, far below
+// what one session moves on one core. BBR paces by measured bandwidth and RTT and does not back off on random loss.
+// Local to each end: the sender of a direction decides, so set it on both.
+var PoolTCPCC = "bbr"
+
+var poolTCPCCInUse atomic.Pointer[string]
+
+// PoolTCPCCInUse is the congestion control the last pool socket ended up with ("" = no pool socket yet / not Linux).
+func PoolTCPCCInUse() string {
+	if p := poolTCPCCInUse.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 const (
 	poolStall     = 300 * time.Millisecond
 	poolStallKill = 5 * time.Second
@@ -122,6 +139,9 @@ func newPoolConn(c net.Conn) *poolConn {
 	if tc := rawTCP(c); tc != nil {
 		tc.SetNoDelay(true)
 		setNotsentLowat(tc, poolLowat) // a stalled conn must block its writer, not swallow megabytes
+		if cc := setCongestion(tc, PoolTCPCC); cc != "" {
+			poolTCPCCInUse.Store(&cc)
+		}
 	}
 	return &poolConn{c: c, q: make(chan []byte, poolQueue), done: make(chan struct{}), born: time.Now()}
 }

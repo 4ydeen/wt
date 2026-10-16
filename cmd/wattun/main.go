@@ -53,7 +53,7 @@ func main() {
 	bind := flag.String("bind", "0.0.0.0", "client: listen address")
 	offset := flag.Int("port-offset", 0, "client: add this to every listen port (second slot)")
 	lanes := flag.Int("lanes", 4, "client: ICMP identifiers to stripe over")
-	maxMB := flag.Float64("max-mbps", 0, "pace ceiling, MB/s per direction, per session (0 = the carrier default: 16 when icmp is among the carriers, 200 for udp|tcp|tls|ws|wss|h2|h2c|grpc; 2.3.0, before: 16 for all)")
+	maxMB := flag.Float64("max-mbps", 0, "pace ceiling, MB/s per direction, per session (0 = the carrier default: 16 when icmp is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp|tcp|tls|ws|wss|h2|h2c|grpc; 2.4.18, before: 200; 2.3.0, before: 16 for all)")
 	slackMs := flag.Int("slack-ms", 8, "tolerated RTT growth before slowing down, ms")
 	metrics := flag.String("metrics", "", "serve JSON stats on this address (e.g. 127.0.0.1:19700)")
 	allowLo := flag.Int("allow-min", 1, "server: lowest target port a client may ask for")
@@ -69,6 +69,7 @@ func main() {
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
 	conns := flag.Int("conns", wat.DefaultPoolConns, "client, tcp/tls carrier: connections in the pool")
+	tcpCC := flag.String("tcp-cc", wat.PoolTCPCC, "tcp|tls|ws|wss|h2|h2c|grpc: TCP congestion control set on every pool socket, Linux (bbr ignores random loss, the kernel default cubic halves the window on it; 'system' keeps the kernel default; 2.4.18, before: system)")
 	nSess := flag.Int("sessions", 1, "client: independent sessions to the server (1-16), each with its own -conns pool, pacer and session id; new TCP streams go to the least loaded live one, UDP flows stick to one, /speedtest uses all; udp|tcp|tls|ws|wss|h2|h2c|grpc only (not icmp, bonded carriers or -reverse); each counts against the server's 32-session limit (client only, 2.3.0; server unchanged)")
 	tlsCert := flag.String("tls-cert", "", "server, tls carrier: certificate file (empty = self-signed in memory)")
 	tlsKey := flag.String("tls-key", "", "server, tls carrier: private key file")
@@ -126,6 +127,9 @@ func main() {
 		}
 	}
 	debugOn = *debug
+	if wat.PoolTCPCC = *tcpCC; *tcpCC == "system" || *tcpCC == "" {
+		wat.PoolTCPCC = ""
+	}
 	wat.SetLossCeiling(*lossCeil)
 	if _, _, ok := wat.ICMPTypes(*icmpType); !ok {
 		log.Fatalf("-icmp-type must be echo, timestamp, info or mask, got %q", *icmpType)
@@ -176,7 +180,7 @@ func main() {
 		}
 	}
 	if *maxMB <= 0 { // carrier default: the ICMP path keeps its measured 16 MB/s, the others are not capped by it
-		*maxMB = 200
+		*maxMB = 1250 // 10 Gbit: no practical cap (2.4.18, before: 200)
 		if seen["icmp"] {
 			*maxMB = 16
 		}
@@ -457,7 +461,7 @@ func main() {
 					}(),
 					"dgram_sent": st.DgramSent, "dgram_recv": st.DgramRecv, "dgram_dropped_queue": st.DgramDropQueue,
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_flows": udpFlowsActive.Load(),
-					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(),
+					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(), "tcp_cc": wat.PoolTCPCCInUse(),
 				}
 				out["cc"] = map[string]any{ // pacer diagnostics (2.4.10): what held the sender back, and why it slowed
 					"ticks": st.CC.Ticks, "tok_limited": st.CC.TokLimited, "cwnd_limited": st.CC.CwndLimited,
