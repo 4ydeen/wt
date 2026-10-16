@@ -1086,6 +1086,33 @@ CPU is percent of one core for the tunnel process; both hosts have 2 cores. Befo
 up 49-55. Upload tripled. Download did not move: there the Iran end receives, decrypts and acks everything on about
 one core, so its receive path is the next limit.
 
+### Cheaper stream buffers (2.5.1)
+
+A CPU profile of the Iran end during a 16-stream download (2026-10-16) put about 25 % of the tunnel's CPU into its
+receive buffers. Each stream kept its in-order bytes in one slice that was dropped whenever the reader caught up
+and then re-grown by doubling, with the unread bytes moved to the front whenever the end was reached. The copies,
+the zeroing of every new array and the GC behind them did most of the work. The sending end (Kharej) had the same
+pattern in its send buffer: a buffer at its size cap moved all its unacked bytes for every write once the front had
+freed a little (17 % of its CPU).
+
+- Received in-order bytes now sit in a queue of pooled 64 KB chunks. Each byte is copied once in and once out,
+  nothing grows, and a drained or idle stream holds no receive memory.
+- The send buffer moves its live bytes to the front only when the acked front is at least half their size;
+  otherwise it grows, up to twice its cap.
+
+Both are local to each end and change nothing on the wire. Field A/B on the same Iran and Kharej servers, a test
+reverse tcp tunnel (16 connections, BBR) beside the production one, 16 streams, 200 MB per run:
+
+| Run | 2.5.0 | 2.5.1 |
+|---|---|---|
+| 1 | 57.5 MB/s | 64.8 MB/s |
+| 2 | 66.6 MB/s | 116.0 MB/s |
+| 3 | 70.9 MB/s | 106.0 MB/s |
+
+An earlier 2.5.0 set gave 53.4, 61.1 and 60.5 MB/s. Iran RSS during the 2.5.1 runs stayed at 149-161 MB (2.5.0:
+77-197 MB). The Iran box itself was near saturation, mostly in kernel and softirq time, so the next gains need
+fewer system calls per byte rather than less Go work.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the

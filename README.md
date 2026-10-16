@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.5.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.5.1-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -40,7 +40,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.5.0)
+## What's new (latest: 2.5.1)
 
 - **ICMP: bigger packets, a setting change (no update needed).** The Iran ⇄ Europe route passes full 1500-byte
   pings again. With `mtu: 1400` on **both** ends and the same 30 MB/s cap, Kharej resends 0.3-0.8 % of its packets
@@ -54,6 +54,11 @@ Update **both** servers for every release below. 2.4.9 to 2.4.16 were steps towa
 got slower over time; if you are on any of them, go straight to 2.4.17. ICMP and UDP tunnels behave exactly as in
 2.4.8 apart from the 2.4.17 fix.
 
+- **2.5.1: faster download.** The receiving end kept re-growing and re-copying each stream's buffer, which took
+  about a quarter of the tunnel's CPU on a 2-core Iran server during a download. Received data now goes into reused
+  64 KB chunks, and the sending side no longer copies its whole buffer on every write. Same Iran server, reverse tcp,
+  16 connections, 16 streams: download **65-116 MB/s, was 53-71**, and memory stays flat (149-161 MB). Update the
+  Iran server for the download gain and the Kharej server for its sending side; mixed versions work.
 - **2.5.0: one tunnel is no longer capped near 50-60 MB/s.** On a direct TCP pool (tcp, tls, or any reverse pool)
   one session spent its time on bookkeeping: every acknowledgement walked every packet in flight. It now touches only
   the packets each acknowledgement covers, sends 16 KB datagrams instead of 4 KB, and acknowledges less often. In the
@@ -179,9 +184,11 @@ tunnel stayed at the route's 38-43 ms during the 2.4.18 and 2.5.0 runs.
 | 2.4.18, 16 connections, 32 streams | 69-74 MB/s | |
 | 2.5.0, 16 connections, production tunnel with ~400 users, 16 streams | 53.3 MB/s | **149.7 MB/s** |
 | 2.5.0, same, 8 streams | 37.9 MB/s | 101.7 MB/s |
+| 2.5.0, 16 connections, test tunnel next to production, 16 streams | 53-71 MB/s | |
+| **2.5.1**, same test tunnel, 16 streams | **65-116 MB/s** | |
 
-In 2.5.0 the download is bound by the Iran server's CPU (the receiving tunnel used 103-117 % of one of its two
-cores), not by the route.
+In 2.5.0 the download was bound by the Iran server's CPU (the receiving tunnel used 103-117 % of one of its two
+cores), not by the route. 2.5.1 removed a large part of that cost.
 
 ### CDN (Cloudflare): field numbers
 
