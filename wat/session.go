@@ -65,7 +65,7 @@ type Config struct {
 	// could buffer in between. The only queues are our pool's and the sockets', which push back (Backlogger), so the
 	// session lets TCP set the pace: a window of about a second of delivery and a long loss timer (2.4.18, see cc.go).
 	Direct bool
-	Logf       func(string, ...any)
+	Logf   func(string, ...any)
 }
 
 type Stats struct {
@@ -80,6 +80,7 @@ type Stats struct {
 	// datagrams (UDP forwarding)
 	DgramSent, DgramRecv                       uint64
 	DgramDropQueue, DgramDropSize, DgramDropRx uint64
+	DgramFragmented, DgramReassembled          uint64 // datagrams sent in pieces / rebuilt from pieces (2.4.19)
 	FecSent, FecRecovered                      uint64
 	CeilingBps, LossPct                        float64 // loss-aware soft ceiling (0 = none); last judged interval loss in percent
 
@@ -188,7 +189,9 @@ type Session struct {
 	dq      [][]byte // encoded frDgram frames waiting to go out (unreliable, bounded)
 	dqBytes int
 	dgIn    chan Datagram
-	dbuf    []byte // scratch: datagram frames chosen for the packet being built
+	fragID  uint64               // next id for a fragmented datagram
+	reasm   map[fragKey]*fragBuf // datagrams being rebuilt from pieces
+	dbuf    []byte               // scratch: datagram frames chosen for the packet being built
 
 	// multipath (nil/empty for every single-carrier PacketIO)
 	chooser  PathChooser
@@ -1268,6 +1271,14 @@ func (s *Session) parse(b []byte, now time.Time) (eliciting bool) {
 			}
 			eliciting = true // acked, so the sender's pacing/inflight accounting releases the packet
 			s.onDgram(flow, int(port), data)
+		case frDgramFrag:
+			flow, port, id, idx, cnt, n := r.uv(), r.uv(), r.uv(), r.uv(), r.uv(), r.uv()
+			data := r.take(n)
+			if r.err != nil || port > 65535 || cnt < 2 || cnt > dgramFragMax || idx >= cnt {
+				return
+			}
+			eliciting = true
+			s.onDgramFrag(flow, int(port), id, int(idx), int(cnt), data, now)
 		case frFec:
 			if s.onFec(r, now) {
 				eliciting = true

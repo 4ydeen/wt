@@ -161,7 +161,7 @@ func TestDgramQueueFullAndOversize(t *testing.T) {
 		t.Fatal("MaxDatagram payload rejected for a reason other than a full queue")
 	}
 	before := cli.Stats().DgramDropSize
-	if cli.SendDatagram(1<<62, 65535, make([]byte, 700)) {
+	if cli.SendDatagram(1<<62, 65535, make([]byte, cli.MaxDatagram()+1)) {
 		t.Fatal("oversize datagram accepted")
 	}
 	if cli.Stats().DgramDropSize != before+1 {
@@ -228,3 +228,30 @@ func TestInteractiveDuringDgramFlood(t *testing.T) {
 	}
 }
 
+// A datagram bigger than one packet (WireGuard's ~1450 bytes over the 640-byte default) arrives whole, both ways.
+func TestDgramFragmented(t *testing.T) {
+	cli, srv, _, _ := newPair(t, 0, 5*time.Millisecond, 10e6, Config{})
+	for _, c := range []struct {
+		from, to *Session
+		size     int
+	}{{cli, srv, 1452}, {srv, cli, 4000}, {cli, srv, 300}} {
+		p := make([]byte, c.size)
+		for i := range p {
+			p[i] = byte(i * 7)
+		}
+		if !c.from.SendDatagram(5, 51820, p) {
+			t.Fatalf("%d bytes refused", c.size)
+		}
+		select {
+		case d := <-c.to.Datagrams():
+			if d.Port != 51820 || d.Flow != 5 || string(d.Data) != string(p) {
+				t.Fatalf("%d bytes: got %d bytes port %d flow %d", c.size, len(d.Data), d.Port, d.Flow)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%d-byte datagram never arrived", c.size)
+		}
+	}
+	if cli.Stats().DgramFragmented != 1 || cli.Stats().DgramReassembled != 1 || srv.Stats().DgramReassembled != 1 {
+		t.Fatalf("fragment counters: cli %+v srv %+v", cli.Stats(), srv.Stats())
+	}
+}
