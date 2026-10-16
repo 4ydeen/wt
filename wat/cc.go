@@ -61,6 +61,7 @@ type cc struct {
 	// diagnostics (2.4.10, /stats "cc"): what held the sender back, per tick, and why the rate was cut
 	tokLim, cwndLim bool // set by build during the current tick
 	heldLim         bool // set by build: the carrier's send queues were full (Backlogger)
+	direct          bool // reliable carrier with no CDN in between (Config.Direct): TCP paces, see cwnd/lossTime
 	diag            CCDiag
 
 	// delivery-rate pacer for reliable carriers (2.4.11). TCP underneath does its own congestion control and injects
@@ -93,6 +94,21 @@ const (
 	relBWGain  = 1.5
 	relCwndBDP = 3 // inflight ceiling, in bandwidth-delay products
 )
+
+// Direct reliable carriers (Config.Direct): window in seconds of delivery, and the loss timer / PTO floors. A datagram
+// there is lost only when its connection dies; anything sooner is TCP recovering, and resending it only duplicates
+// (field 2026-10-16: 6-70k resends per 200 MB, most never proven spurious).
+const (
+	relDirectWin      = time.Second
+	relDirectLossTime = 2 * time.Second
+	relDirectPTO      = 2500 * time.Millisecond
+)
+
+// relCwndStall bounds how far above the base RTT srtt may size the reliable window (2.4.18); WAT_CWND_MINRTT=1 sizes
+// it from minRTT only, as before, for an A/B.
+const relCwndStall = 500 * time.Millisecond
+
+var relCwndMinRTT = os.Getenv("WAT_CWND_MINRTT") != ""
 
 // relLossCuts: whether a reliable carrier still cuts its rate on timed-out packets (WAT_REL_LOSSCUT=1; default off since
 // 2.4.18). TCP does the congestion control on these carriers and never drops a datagram, so a "loss" is a datagram
@@ -542,7 +558,8 @@ func (c *cc) probeRTT(now time.Time) {
 		//     connections keep the per-connection queue shallow and minRTT fresh), so it skips the drain and its
 		//     throughput dip; a single queued connection sits far above and drains every cycle.
 		// Requiring inflight above the floor also means the minRTT raise in sample() fires only after a genuine drain.
-		if c.inflight > 2*c.drainFloor() && c.srtt > c.minRTT+c.minRTT/2 {
+		// A direct carrier's window does not hang on minRTT (cwnd), so it has nothing to re-measure.
+		if !c.direct && c.inflight > 2*c.drainFloor() && c.srtt > c.minRTT+c.minRTT/2 {
 			c.draining, c.probeStart, c.probeLowAt = true, now, time.Time{}
 		}
 	}
@@ -559,7 +576,28 @@ func (c *cc) cwnd() int {
 		if c.draining { // PROBE_RTT: hold inflight to a few packets so the queue drains and the base RTT can be read
 			return c.drainFloor()
 		}
-		return int(bdp*relCwndBDP) + 40*c.maxPlain
+		w := bdp * relCwndBDP
+		if c.direct {
+			// Direct TCP between the servers: a datagram also waits behind its connection's own retransmits, so its
+			// real time in flight is far above minRTT, and a BDP window capped the whole session at ~22 MB/s on the
+			// lossy Kharej -> Iran path (field 2026-10-16: cwnd-limited whether 1 or 4 streams ran, bare TCP on the
+			// same 8 connections 78 MB/s). With no CDN buffer to fill, our only queues are the pool's and the
+			// sockets', and those push back, so allow about a second of delivery and let TCP set the pace.
+			w = max(w, c.maxBW*relDirectWin.Seconds())
+		}
+		if !relCwndMinRTT && c.srtt > c.minRTT {
+			// Packets also wait behind TCP's own retransmits: a pool connection stalled in recovery holds everything
+			// queued on it, so a datagram's real time in flight is srtt, not minRTT. A window of 3x maxBW x minRTT then
+			// caps delivery at 3 x minRTT / srtt of the path, and maxBW (measured through that cap) can never grow
+			// (field 2026-10-16, Kharej -> Iran, 6-14 % TCP retransmits: ~22 MB/s per session whether 1 or 4 streams
+			// ran, cwnd-limited, where bare TCP on the same 8 connections did 78). Cover 2 x srtt as well, with srtt
+			// counted at most relCwndStall above the base so a queue of our own cannot inflate the window without
+			// bound (the 2.4.12 runaway; backpressure from the pool also bounds that queue now).
+			if w2 := 2 * c.maxBW * min(c.srtt, c.minRTT+relCwndStall).Seconds(); w2 > w {
+				w = w2
+			}
+		}
+		return int(w) + 40*c.maxPlain
 	}
 	rtt := c.srtt
 	// reliable: srtt includes our own queue in the TCP buffers, so a window sized from it grows with the queue it
@@ -588,6 +626,9 @@ func (c *cc) pto() time.Duration {
 		if m := time.Duration(float64(reliablePTO) * c.relLossMul); d < m {
 			d = m
 		}
+		if c.direct && d < relDirectPTO {
+			d = relDirectPTO
+		}
 	}
 	return d
 }
@@ -601,6 +642,9 @@ func (c *cc) lossTime() time.Duration {
 	if c.reliable {
 		if m := time.Duration(float64(reliableLossTime) * c.relLossMul); d < m {
 			d = m
+		}
+		if c.direct && d < relDirectLossTime {
+			d = relDirectLossTime
 		}
 	}
 	return d

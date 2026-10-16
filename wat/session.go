@@ -58,6 +58,10 @@ type Config struct {
 	Hedge      bool          // send young packets twice on different lanes (costs ~8% extra packets)
 	FEC        bool          // adaptive XOR parity after bursts of small packets (both ends must enable it; see fec.go)
 	Bond       PathTimings   // multipath health/probe timings (server side; zero = production values)
+	// Direct: the reliable carrier runs straight between the two servers (reverse mode, or tcp/tls), with no CDN that
+	// could buffer in between. The only queues are our pool's and the sockets', which push back (Backlogger), so the
+	// session lets TCP set the pace: a window of about a second of delivery and a long loss timer (2.4.18, see cc.go).
+	Direct bool
 	Logf       func(string, ...any)
 }
 
@@ -250,6 +254,7 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		winSlack: uint64(hi - overhead),
 	}
 	s.cc.reliable = prof.Reliable
+	s.cc.direct = prof.Reliable && cfg.Direct && !noDirect
 	if prof.Reliable && cfg.MinBps == 2e5 && cfg.InitBps > s.cc.minRate { // default floor: never pace a TCP pool below its start rate
 		s.cc.minRate = min(cfg.InitBps, cfg.MaxBps)
 	}
@@ -560,6 +565,9 @@ func (s *Session) nextLane() int {
 	s.laneRR++
 	return s.lanes[s.laneRR%len(s.lanes)]
 }
+
+// noDirect (WAT_NO_DIRECT=1) ignores Config.Direct, for an A/B.
+var noDirect = os.Getenv("WAT_NO_DIRECT") != ""
 
 // noBacklog (WAT_NO_BACKLOG=1) ignores the carrier's Backlogger, the pre-2.4.18 behaviour, for an A/B.
 var noBacklog = os.Getenv("WAT_NO_BACKLOG") != ""

@@ -342,6 +342,8 @@ func main() {
 	cfg := wat.Config{
 		Server: server, Key: k, Paths: *lanes, MaxBps: *maxMB * 1e6, Slack: time.Duration(*slackMs) * time.Millisecond,
 		Logf: log.Printf, Hedge: *hedge, FEC: *fecMode == "auto", MaxPayload: *mtu,
+		// no CDN can sit in a reverse pool (Kharej dials Iran's IP) or in front of raw tcp/tls: TCP paces (2.4.18)
+		Direct: len(names) == 1 && (*reverse && poolCarriers[names[0]] || names[0] == "tcp" || names[0] == "tls"),
 	}
 	var tun *tunnel
 	var srv *wat.Server

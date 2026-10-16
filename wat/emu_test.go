@@ -366,7 +366,8 @@ func TestEmu(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv := NewServer(Config{Key: key, MaxPayload: emuMTU(), InitBps: emuInit(), MaxBps: emuMax()}, ps)
+		direct := os.Getenv("EMU_DIRECT") != ""
+		srv := NewServer(Config{Key: key, MaxPayload: emuMTU(), InitBps: emuInit(), MaxBps: emuMax(), Direct: direct}, ps)
 		addr := ps.Addr().String()
 		if mode == "tcp" {
 			addr = emuProxy(t, addr, up, down)
@@ -379,7 +380,7 @@ func TestEmu(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cli, err := NewSession(Config{Key: key, MaxPayload: emuMTU(), InitBps: emuInit(), MaxBps: emuMax(), Slack: emuSlack()}, pc)
+		cli, err := NewSession(Config{Key: key, MaxPayload: emuMTU(), InitBps: emuInit(), MaxBps: emuMax(), Slack: emuSlack(), Direct: direct}, pc)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -423,3 +423,34 @@ func TestReliableProbeNoAppLimitedPollution(t *testing.T) {
 		t.Fatalf("an app-limited sample raised minRTT to %v (base 107 ms)", c.minRTT)
 	}
 }
+
+// A direct reliable carrier (Config.Direct, 2.4.18) lets TCP pace: its window covers about a second of delivery, not
+// a few minRTT, its loss timer waits for TCP's own recovery, and it never drains to re-measure minRTT.
+func TestDirectWindowAndLossTimer(t *testing.T) {
+	mk := func(direct bool) cc {
+		c := newCC(10e6, 0.1e6, 1250e6, 8*time.Millisecond)
+		c.reliable, c.direct = true, direct
+		c.maxBW, c.minRTT, c.srtt, c.maxPlain = 50e6, 40*time.Millisecond, 60*time.Millisecond, 4096
+		return c
+	}
+	cdn, dir := mk(false), mk(true)
+	if w := dir.cwnd(); w < int(50e6*relDirectWin.Seconds()) {
+		t.Fatalf("direct window %d < %v of delivery", w, relDirectWin)
+	}
+	if dir.cwnd() <= cdn.cwnd() {
+		t.Fatalf("windows: direct %d, cdn %d", dir.cwnd(), cdn.cwnd())
+	}
+	if dir.lossTime() < relDirectLossTime || dir.pto() < relDirectPTO {
+		t.Fatalf("direct loss timer %v / pto %v below the floors", dir.lossTime(), dir.pto())
+	}
+	if cdn.lossTime() >= relDirectLossTime {
+		t.Fatalf("non-direct loss timer stretched to %v", cdn.lossTime())
+	}
+	dir.inflight = 1 << 24
+	dir.srtt = 200 * time.Millisecond
+	dir.probeAt = time.Now().Add(-time.Second)
+	dir.probeRTT(time.Now())
+	if dir.draining {
+		t.Fatal("a direct carrier entered the minRTT drain")
+	}
+}
