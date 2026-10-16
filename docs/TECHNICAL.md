@@ -785,13 +785,15 @@ The process also logs a stats line every 10 seconds when something moves (it inc
 
 ### Speed test (1.8.1)
 
-On a client, `GET /speedtest?dir=down|up&mb=N` (on the `metrics` address, N 1 to 256, default 10) moves N MB through
+On a client, `GET /speedtest?dir=down|up&mb=N` (on the `metrics` address, default 10) moves N MB through
 the live session and returns `{"dir","bytes","seconds","mb_per_s","mbit_per_s","ok","error"}`. The stream asks the
 server for target port 0, which the server answers itself (it sends or absorbs the bytes), so no test service or
 extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or newer.
 `wattun test NAME` runs it 10 MB each way. Since 2.3.0 the answer also has `"sessions"`: with `sessions` > 1 the
 test opens one stream on every live session at once, each moving its share of N MB, and reports the total over the
-wall time.
+wall time. N is split between the streams, and each stream carries at most 256 MB, so N is capped at
+256 × `streams` (2.5.1; before, any N above 256 fell back to 10 MB). A larger N gives a longer run, which helps when
+sampling CPU: 16 streams at 100 MB/s move 200 MB in 2 s.
 
 ### Several sessions (2.3.0)
 

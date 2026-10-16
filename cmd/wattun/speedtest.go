@@ -216,11 +216,11 @@ func speedTestHandler(tun *tunnel) http.HandlerFunc {
 		if err != nil || mb < 1 {
 			mb = 10
 		}
-		mb = min(mb, speedTestMaxMB)
 		streams, err := strconv.Atoi(r.URL.Query().Get("streams"))
 		if err != nil || streams < 1 || streams > 32 {
 			streams = 8
 		}
+		mb = min(mb, speedTestMaxMB*streams) // the server's cap is per stream, and mb is split between the streams
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(runSpeedTest(tun, dir, uint64(mb)<<20, streams))
 	}
