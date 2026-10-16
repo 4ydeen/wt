@@ -316,7 +316,14 @@ func emuInit() float64 { n, _ := strconv.ParseFloat(os.Getenv("EMU_INIT"), 64); 
 
 func emuSlack() time.Duration { n, _ := strconv.Atoi(os.Getenv("EMU_SLACK")); return time.Duration(n) * time.Millisecond }
 
-func emuMax() float64 { n, _ := strconv.ParseFloat(os.Getenv("EMU_MAX"), 64); return n * 1e6 }
+// emuMax is the pace ceiling for both ends (EMU_MAX MB/s); default 1250, the wattun default for non-ICMP carriers
+// (the session's own default of 16 would cap the emulated link far below its rate).
+func emuMax() float64 {
+	if n, _ := strconv.ParseFloat(os.Getenv("EMU_MAX"), 64); n > 0 {
+		return n * 1e6
+	}
+	return 1250e6
+}
 
 func emuMTU() int { n, _ := strconv.Atoi(os.Getenv("EMU_MTU")); return n }
 
@@ -349,7 +356,7 @@ func TestEmu(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv := NewServer(Config{Key: key, MaxPayload: emuMTU(), InitBps: emuInit()}, ps)
+		srv := NewServer(Config{Key: key, MaxPayload: emuMTU(), InitBps: emuInit(), MaxBps: emuMax()}, ps)
 		addr := ps.Addr().String()
 		if mode == "tcp" {
 			addr = emuProxy(t, addr, up, down)

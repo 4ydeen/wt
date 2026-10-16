@@ -32,7 +32,18 @@ func TestReliableLossV2(t *testing.T) {
 	if c.lossTime() <= base {
 		t.Fatalf("loss timer did not stretch: %v vs %v", c.lossTime(), base)
 	}
-	// genuine loss (nothing spurious): a gentle multiplicative cut, floored at hardMin, with a ceiling above it
+	// genuine loss (nothing spurious): no cut by default since 2.4.18, TCP below does the congestion control
+	d := newCC(40e6, 0.1e6, 80e6, 8*time.Millisecond)
+	d.reliable, d.minRate, d.hardMin = true, 8e6, 8e6
+	if relLossCuts {
+		t.Skip("WAT_REL_LOSSCUT set")
+	}
+	if d.reliableLoss(200, 30) || d.rate != 40e6 {
+		t.Fatalf("loss cut a reliable carrier by default: rate %.2f", d.rate/1e6)
+	}
+	// with WAT_REL_LOSSCUT: a gentle multiplicative cut, floored at hardMin, with a ceiling above it
+	relLossCuts = true
+	defer func() { relLossCuts = false }()
 	g := newCC(40e6, 0.1e6, 80e6, 8*time.Millisecond)
 	g.reliable, g.minRate, g.hardMin = true, 8e6, 8e6
 	g.sentN, g.lostN, g.spuriousN = 200, 30, 0

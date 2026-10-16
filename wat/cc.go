@@ -84,11 +84,25 @@ type cc struct {
 	inflight   int       // bytes in flight, mirrored from the session so the drain knows when the queue is empty
 }
 
-const (
-	bwWin      = 10   // delivery-rate window, samples of >= 1 RTT each (~1 s): its max is the capacity estimate
-	relBWGain  = 1.20 // pace this far above the estimate, to keep probing for more
-	relCwndBDP = 3    // inflight ceiling, in bandwidth-delay products
+const bwWin = 10 // delivery-rate window, samples of >= 1 RTT each (~1 s): its max is the capacity estimate
 
+const (
+	// relBWGain: pace this far above the estimate, to keep probing for more. 1.5 since 2.4.18 (was 1.2): on a lossy
+	// path each TCP connection's retransmit stalls make delivery lumpy, and 1.2 climbed too slowly to ever fill it.
+	relBWGain  = 1.5
+	relCwndBDP = 3 // inflight ceiling, in bandwidth-delay products
+)
+
+// relLossCuts: whether a reliable carrier still cuts its rate on timed-out packets (WAT_REL_LOSSCUT=1; default off since
+// 2.4.18). TCP does the congestion control on these carriers and never drops a datagram, so a "loss" is a datagram
+// held up behind a TCP retransmit, a dead connection or a full local queue, and the delivery-rate pace plus the BDP
+// window already bound what we put in flight. The cut is also judged too early: a late ack proves a loss spurious only
+// after the tick that cut. On the Kharej->Iran path (heavy random loss, BBR underneath) the cuts held a session at
+// ~20 MB/s while bare TCP on the same 8 connections did 78 (field 2026-10-16); on the emulated version of that path
+// removing them took 16 parallel downloads from 8-15 to 35-45 MB/s.
+var relLossCuts = os.Getenv("WAT_REL_LOSSCUT") != ""
+
+const (
 	probeRTTEvery = 8 * time.Second        // enter PROBE_RTT this often (< the 10 s minRTT window, so minRTT never goes stale-high)
 	probeRTTHold  = 200 * time.Millisecond // once inflight reaches the floor, hold there this long (or 1x minRTT) to sample
 	probeRTTMax   = 4 * time.Second        // give up a drain that never reaches the floor (e.g. a wedged connection)
@@ -317,7 +331,7 @@ func (c *cc) reliableLossV2(sent, lost int) bool {
 	if sent+real >= lossMinSent {
 		c.lossPct = float64(real) / float64(max(sent, real))
 	}
-	if real < relLossMin || real*relLossFrac < sent {
+	if !relLossCuts || real < relLossMin || real*relLossFrac < sent {
 		if c.ceiling > 0 { // quiet tick: let the ceiling creep up, then release it at the max
 			c.ceiling *= ceilingGrowth
 			if c.ceiling >= c.maxRate {

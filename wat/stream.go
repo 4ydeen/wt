@@ -63,6 +63,8 @@ type Stream struct {
 	win      uint64 // window this end advertises beyond consumed: streamWindow, auto-tuned upward (see tuneWindow)
 	tuneAt   time.Time
 	tuneRx   uint64 // rnext at the start of the current measuring epoch
+	rhigh    uint64 // highest stream offset received so far, in order or not (tuneWindow: did the sender hit our edge?)
+	tuneEdge bool   // rhigh reached the advertised edge during the current measuring epoch
 	peerFin  bool
 	peerFinO uint64
 	eof      bool
@@ -196,11 +198,19 @@ func (st *Stream) tuneWindow() {
 		return
 	}
 	got := st.rnext - st.tuneRx
-	st.tuneAt, st.tuneRx = now, st.rnext
-	if st.win >= maxStreamWin || got < st.win/2 || st.rnext-st.consumed > st.win/4 {
+	edge := st.tuneEdge
+	st.tuneAt, st.tuneRx, st.tuneEdge = now, st.rnext, false
+	// Grow when the sender filled half the window in one RTT, or when it ran into the advertised edge at all. The
+	// second case is a lossy multi-connection path (2.4.18): one connection stalled in a TCP retransmit holds the
+	// in-order point back while the others fill the window with out-of-order data, so in-order arrivals per RTT never
+	// reach half the window and a 4 MB window capped one stream at ~18 MB/s on an emulated 100 MB/s path.
+	if st.win >= maxStreamWin || (got < st.win/2 && !edge) || st.rnext-st.consumed > st.win/4 {
 		return
 	}
-	nw := min(2*got, 2*st.win, maxStreamWin)
+	nw := min(max(2*got, st.win), 2*st.win, maxStreamWin)
+	if edge {
+		nw = min(2*st.win, maxStreamWin)
+	}
 	if nw <= st.win || s.winExtra+(nw-st.win) > maxSessionWin {
 		return
 	}
@@ -481,6 +491,12 @@ func (st *Stream) appendFrame(p []byte, off uint64, n int, fin bool) []byte {
 
 // insert stores received bytes without overlap, then delivers whatever became contiguous.
 func (st *Stream) insert(off uint64, data []byte) {
+	if end := off + uint64(len(data)); end > st.rhigh {
+		st.rhigh = end
+		if end+st.win/8 >= st.advMax {
+			st.tuneEdge = true
+		}
+	}
 	if off == st.rnext && len(st.segs) == 0 && len(data) > 0 { // in order, nothing buffered: no copy into a segment first
 		st.appendReady(data)
 		st.rnext += uint64(len(data))
