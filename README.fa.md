@@ -388,8 +388,20 @@ curl -s '127.0.0.1:19750/speedtest?dir=down&mb=10'   # built-in speed test (clie
 ```bash
 git clone https://github.com/JohnWatsoon/WatTunnel && cd WatTunnel
 go test ./...
-sh build.sh                     # dist/wattun-linux-amd64 and -arm64, each with a .sha256
+sh build.sh                     # dist/wattun-linux-amd64, -arm64 and wattun-windows-amd64.exe, each with a .sha256
 sudo bash install.sh            # installs the binary you just built
+```
+
+<div dir="rtl">
+
+### ویندوز
+
+از نسخه‌ی ۲٫۴٫۱۹ هر نسخه یک فایل `wattun-windows-amd64.exe` هم دارد. این فقط خود موتور تونل است، بدون نصب‌کننده و بدون منوی `wattun`؛ پس آن را با یک فایل تنظیمات یا با فلگ‌ها اجرا می‌کنید. همه‌ی روش‌های اتصال به‌جز ICMP کار می‌کنند، چون ICMP به سوکت خام لینوکس نیاز دارد. سر دیگر تونل می‌تواند همان نصب معمولی روی لینوکس باشد.
+
+</div>
+
+```
+wattun-windows-amd64.exe -config C:\wattun\iran.yml
 ```
 
 <div dir="rtl">

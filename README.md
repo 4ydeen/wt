@@ -433,9 +433,15 @@ Go 1.26 or newer:
 ```bash
 git clone https://github.com/JohnWatsoon/WatTunnel && cd WatTunnel
 go test ./...
-sh build.sh                     # dist/wattun-linux-amd64 and -arm64, each with a .sha256
+sh build.sh                     # dist/wattun-linux-amd64, -arm64 and wattun-windows-amd64.exe, each with a .sha256
 sudo bash install.sh            # installs the binary you just built
 ```
+
+### Windows
+
+Since 2.4.19 every release also has `wattun-windows-amd64.exe`. It is the engine only: no installer and no `wattun`
+menu, so you run it with a config file (`wattun-windows-amd64.exe -config C:\wattun\iran.yml`) or with flags. All
+carriers except ICMP work (ICMP needs a Linux raw socket). The other end can be a normal Linux install.
 
 Issues and pull requests are welcome. A change that makes the ICMP path slower won't be merged.
 

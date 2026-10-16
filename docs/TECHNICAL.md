@@ -79,6 +79,10 @@ flags (or with a first argument that does not start with `-`, such as `wattun au
 `status` or `auto-ip NAME IP`) hands over to `/usr/local/bin/wattun-manager`, which still works by its own name.
 Engine usage (flags starting with `-`) is unchanged.
 
+**Windows (2.4.19).** Releases include `wattun-windows-amd64.exe`, the engine alone (no installer, no manager): run it
+with `-config FILE` or flags, as a client or a server. Every carrier but ICMP works; `icmp` needs a Linux raw socket
+and fails at start. `tcp-cc` is ignored (BBR is set only on Linux). Use Windows paths in the config file.
+
 ## Quick start
 
 ### By hand, ICMP
