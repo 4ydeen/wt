@@ -1043,20 +1043,30 @@ CARRIER=''
 pick_carrier() { # [auto] : with "auto" (Kharej wizard) the first choice is the auto carrier
   local t i n opts=() descs=()
   if [ "${1:-}" = auto ]; then
-    opts+=(auto); descs+=("${BOLD}auto (recommended)${RST}: test every connection type from Iran and keep the best")
+    opts+=(auto); descs+=("${BOLD}Auto (recommended)${RST}: this server accepts every type; the Iran server tests them all and
+        keeps the best. Later, on the Iran server, you can switch to another type or join several (tunnel page, m).")
   fi
   opts+=(icmp udp tcp tls wss ws grpc h2)
-  descs+=("icmp  only ping gets through (the usual case on filtered routes)" "udp   UDP works; lowest latency"
-    "tcp   plain TCP works" "tls   looks like HTTPS" "wss   WebSocket over TLS; works behind Cloudflare or a CDN"
-    "ws    WebSocket without TLS (CDN on port 80, or a proxy that does TLS)" "grpc  gRPC, for CDNs that allow it" "h2    HTTP/2")
+  descs+=("icmp  ping packets; works when everything else is blocked (the usual case on filtered routes)"
+    "udp   fastest and lowest latency, if UDP passes" "tcp   plain TCP, if TCP passes"
+    "tls   TCP that looks like a normal HTTPS site" "wss   WebSocket over TLS; works behind Cloudflare or another CDN"
+    "ws    WebSocket without TLS (CDN on port 80, or a proxy that adds TLS)" "grpc  gRPC, for CDNs that allow it" "h2    HTTP/2")
   n=${#opts[@]}
   if [ "$NONINTERACTIVE" = 1 ]; then
     CARRIER=${NI_CARRIER:-${opts[0]}}
     for t in "${opts[@]}"; do [ "$t" = "$CARRIER" ] && { echo "  carrier: $CARRIER"; return 0; }; done
     err "Carrier '$CARRIER' is not available here (use: ${opts[*]})"; return 1
   fi
-  say "  ${BOLD}Carrier${RST}: how the two servers talk to each other"
-  for ((i=0; i<n; i++)); do say "    ${CYN}$((i+1))${RST} ${descs[$i]}"; done
+  say "  ${BOLD}Connection type${RST}: how the two servers talk to each other"
+  for ((i=0; i<n; i++)); do
+    case "${opts[$i]}" in
+      icmp) [ "${opts[0]}" = auto ] && say "  ${GRY}Or choose one type yourself (fixed; to change it later, make a new tunnel):${RST}"
+            say "   ${GRY}Gets through the strictest filters${RST}" ;;
+      udp) say "   ${GRY}Fast and simple, if your route lets them through${RST}" ;;
+      tls) say "   ${GRY}Looks like web traffic: harder to block, and the only kind a CDN carries${RST}" ;;
+    esac
+    say "    ${CYN}$((i+1))${RST} ${descs[$i]}"
+  done
   for t in 1 2 3; do
     printf '  %s?%s Press a number %s[1 = %s]%s ' "$CYN" "$RST" "$GRY" "${opts[0]}" "$RST"
     key_read
@@ -2014,7 +2024,8 @@ at_choose() { # rc 0 = chosen (T_* ready), 1 = cancelled
       best) AT_SEL=("$best") ;;
       bond) [ "${#bond[@]}" -ge 2 ] || { err "--pick bond needs two or more working direct carriers (only ${#bond[@]} work)"; return 1; }
             AT_SEL=("${bond[@]}") ;;
-      ''|*[!0-9]*) err "--pick must be best, bond or a row number of the table"; return 1 ;;
+      *,*) at_rows "$NI_PICK" || return 1 ;;
+      ''|*[!0-9]*) err "--pick must be best, bond, a row number of the table, or several joined with commas (1,3)"; return 1 ;;
       *) if [ "$NI_PICK" -ge 1 ] && [ "$NI_PICK" -le "$n" ]; then AT_SEL=("${AT_RANK[$((NI_PICK-1))]}")
          else err "--pick $NI_PICK: the table has $n working row(s)"; return 1; fi ;;
     esac
@@ -2025,24 +2036,70 @@ at_choose() { # rc 0 = chosen (T_* ready), 1 = cancelled
   echo
   printf '  %s use the best (%s%s%s, %s/%s MB/s)\n' "$(key_label Enter)" "$BOLD" "${AV_LABEL[$best]}" "$RST" "$bd" "$bu"
   [ "${#bond[@]}" -ge 2 ] && printf '  %s bond all working direct carriers (%d: survives any one being blocked)\n' "$(key_label b)" "${#bond[@]}"
-  [ "$n" -gt 1 ] && printf '  %s pick another from the table   ' "$(key_label "1-$n")"
-  printf '%s cancel\n' "$(key_label q)"
+  [ "$n" -gt 1 ] && printf '  %s pick another from the table\n' "$(key_label "1-$n")"
+  [ "$n" -gt 1 ] && printf '  %s custom: join the rows you choose into one tunnel (it keeps working while any of them passes)\n' "$(key_label c)"
+  at_failed >/dev/null && printf '  %s use a type that failed the test anyway\n' "$(key_label f)"
+  printf '  %s cancel\n' "$(key_label q)"
   for t in 1 2 3 4 5; do
     printf '  %s?%s Choice %s[Enter]%s ' "$CYN" "$RST" "$GRY" "$RST"
     key_read
     case "$KEY" in
       enter) AT_SEL=("$best") ;;
       b|B) if [ "${#bond[@]}" -ge 2 ]; then AT_SEL=("${bond[@]}"); else echo; warn "Bonding needs two or more working direct carriers."; continue; fi ;;
+      c|C) [ "$n" -gt 1 ] || { echo; warn "Only one type works, so there is nothing to join."; continue; }
+         echo; at_custom || continue ;;
+      f|F) echo; at_force || continue ;;
       [1-9]) num=$KEY
          if [ "$n" -gt 9 ]; then printf '%s' "$KEY"; IFS= read -r -t 5 rest || true; num="$KEY$rest"; fi
          if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$n" ]; then AT_SEL=("${AT_RANK[$((num-1))]}")
          else echo; warn "No row $num."; continue; fi ;;
       q|Q|esc) echo; return 1 ;;
-      *) echo; warn "Press Enter, b, a row number or q."; continue ;;
+      *) echo; warn "Press Enter, b, c, f, a row number or q."; continue ;;
     esac
-    echo; at_to_t; return 0
+    case "$KEY" in c|C|f|F) ;; *) echo ;; esac
+    at_to_t; return 0
   done
   return 1
+}
+at_rows() { # "1 3 4" or "1,3,4" (rows of the table) -> AT_SEL ; rc 1 with a message when a row is unusable
+  local r i c seen=' ' cars=' '
+  AT_SEL=()
+  for r in ${1//,/ }; do
+    if ! [[ "$r" =~ ^[0-9]+$ ]] || [ "$r" -lt 1 ] || [ "$r" -gt "${#AT_RANK[@]}" ]; then err "No row $r in the table."; return 1; fi
+    i=${AT_RANK[$((r-1))]}
+    case "$seen" in *" $i "*) continue ;; esac
+    seen+="$i "
+    AT_SEL+=("$i")
+  done
+  [ "${#AT_SEL[@]}" -ge 1 ] || { err "Enter at least one row number."; return 1; }
+  [ "${#AT_SEL[@]}" -eq 1 ] && return 0
+  for i in "${AT_SEL[@]}"; do
+    if [ "${AV_KIND[$i]}" = r ]; then err "${AV_LABEL[$i]} is a reverse connection; it cannot be joined with others. Pick it alone."; return 1; fi
+    c=${AV_CAR[$i]}
+    case "$cars" in *" $c "*) err "Two rows use $c; a joined tunnel can use each type once."; return 1 ;; esac
+    cars+="$c "
+  done
+}
+at_custom() { # interactive: choose rows to join -> AT_SEL
+  ask "Rows to join, e.g. 1 3 4 (Enter = cancel)" ""
+  [ -n "$REPLY_V" ] || return 1
+  at_rows "$REPLY_V"
+}
+at_failed() { # prints the indices of variants that failed the test ; rc 1 when none did
+  local i any=1
+  for ((i=0; i<${#AV_LABEL[@]}; i++)); do [ "${AR_OK[$i]}" = 1 ] || { echo "$i"; any=0; }; done
+  return $any
+}
+at_force() { # interactive: pick a variant that failed the test -> AT_SEL
+  local f=() i k=0
+  mapfile -t f < <(at_failed)
+  [ "${#f[@]}" -gt 0 ] || { warn "Every type passed the test."; return 1; }
+  warn "These failed the test. The tunnel will likely not connect until the route lets them through."
+  for i in "${f[@]}"; do k=$((k+1)); printf '    %s%d%s %-24s %s%s%s\n' "$CYN" "$k" "$RST" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"; done
+  ask "Number (Enter = cancel)" ""
+  [ -n "$REPLY_V" ] || return 1
+  if ! [[ "$REPLY_V" =~ ^[0-9]+$ ]] || [ "$REPLY_V" -lt 1 ] || [ "$REPLY_V" -gt "$k" ]; then warn "No number $REPLY_V."; return 1; fi
+  AT_SEL=("${f[$((REPLY_V-1))]}")
 }
 at_none() { # nothing worked
   local i tried=''
@@ -2125,9 +2182,14 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   echo
   auto_test || { err "Could not prepare the test (is $AUTO_RUN writable?)."; return 1; }
   at_rank; auto_refine
-  if [ "${#AT_RANK[@]}" -eq 0 ]; then echo; at_none; return 1; fi
-  at_table
-  at_choose || { warn "No change."; [ "$NONINTERACTIVE" = 1 ] && return 1; return 0; }
+  if [ "${#AT_RANK[@]}" -eq 0 ]; then
+    echo; at_none
+    { [ "$NONINTERACTIVE" != 1 ] && echo && confirm "Use one of the types that failed anyway?" n && at_force; } || return 1
+    at_to_t
+  else
+    at_table
+    at_choose || { warn "No change."; [ "$NONINTERACTIVE" = 1 ] && return 1; return 0; }
+  fi
   if [ "$AT_SEL_KEY" = "$cur" ]; then ok "'$n' already uses $AT_SEL_LABEL."; return 0; fi
   confirm "Switch '$n' to $AT_SEL_LABEL? (open connections drop)" y || { warn "No change."; return 0; }
   auto_apply "$n"
@@ -3139,6 +3201,28 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
   return 0
 }
 
+change_type() { # name : one place to change how the two servers connect, whatever kind of tunnel this is
+  local n=$1 c; c=$(cfg "$n" carrier)
+  echo
+  if [ "$(role "$n")" = Iran ]; then
+    if [ -f "$CONF/$n.auto" ]; then
+      hint "Every type is tested again; pick any that works, join several (c), or force one that failed (f)."
+      auto_test_cmd "$n"; return
+    fi
+    say "  Current: ${BOLD}$c${RST}. This tunnel was made with a fixed-type token, so the Kharej side decides the type."
+    hint "1. On the Kharej server, make a new tunnel and choose Auto ($SELF, n, Kharej, 1); Kharej then accepts every type."
+    hint "2. Paste its token here with t. From then on, m on this page tests every type and lets you switch any time."
+    return 0
+  fi
+  if is_auto_kharej "$n"; then
+    say "  This is an ${BOLD}Auto${RST} tunnel: it accepts every connection type at once."
+    hint "Choose the type on the Iran server: its tunnel page, m. It can switch, or join several types into one tunnel."
+    return 0
+  fi
+  say "  Current: ${BOLD}$c${RST}, fixed when the tunnel was made."
+  hint "To switch freely: make a new tunnel here with Auto ($SELF, n, Kharej, 1), paste its token on the Iran server,"
+  hint "then delete this one. After that the type is chosen and changed on the Iran side (tunnel page, m)."
+}
 tunnel_page() {
   local n=$1 r run
   while :; do
@@ -3152,6 +3236,7 @@ tunnel_page() {
     printf '  %sPorts%s       %s edit port mappings\n' "$BOLD" "$RST" "$(key_label p)"
     if [ "$r" = Kharej ]; then printf '  %sConnection%s  %s show token   %s new key + token   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label k)" "$(key_label o)"
     else printf '  %sConnection%s  %s paste new token   %s change Kharej address   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label a)" "$(key_label o)"; fi
+    printf '              %s change connection type (icmp, udp, tcp, CDN... or several at once)\n' "$(key_label m)"
     printf '  %sService%s     %s restart  %s %s  %s start at boot on/off  %s edit file\n' "$BOLD" "$RST" "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
     printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label x)" "$(key_label b)"
     key_read
@@ -3167,6 +3252,7 @@ tunnel_page() {
       k) [ "$r" = Kharej ] && { page "New key" "$n"; run_flow change_key "$n"; pause; } ;;
       a) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
       o) run_flow adv_menu "$n" ;;
+      m) page "Connection type" "$n"; run_flow change_type "$n"; pause ;;
       r) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; sleep 1; fi ;;
       s) echo
          if [ "$run" = active ]; then systemctl stop "${WAT_PREFIX}@$n" 2>/dev/null; ok "Stopped (it still starts at boot if enabled)."; sleep 1
@@ -3441,7 +3527,7 @@ ni_parse() {
       --max-mbps) v_mbps "$v" || return 1; NI_MBPS=$v ;;
       --token) v_token "$v" || return 1; NI_TOKEN=$v ;;
       --map) [ -n "$v" ] || { err "--map needs a list such as 39901:18999,8443:443"; return 1; }; NI_MAP=$v ;;
-      --pick) case "$v" in best|bond) NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond or a row number (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
+      --pick) case "$v" in best|bond) NI_PICK=$v ;; *,*) [[ "$v" =~ ^[0-9]+(,[0-9]+)+$ ]] || { err "--pick: rows joined with commas, such as 1,3 (got '$v')"; return 1; }; NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond, a row number or rows such as 1,3 (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
       --sessions) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$v))" -ge 1 ] || { err "--sessions: use a number of sessions, 1 or more (got '$v')"; return 1; }; NI_SESSIONS=$((10#$v)) ;;
     esac
   done
@@ -3488,9 +3574,9 @@ or NONINTERACTIVE=1). Plain output, errors on stderr, exit code 0 = done, 1 = fa
          [--sni HOST] [--cdn-domain D] [--ports 18999,2000,53/udp] [--max-mbps N] --yes
          creates and starts the Kharej tunnel; the last lines are TUNNEL=NAME and TOKEN=wat1:...
          (--addr skips the public-IP detection; --cdn-domain is for auto; --listen/--path/--sni/--max-mbps for the others)
-  iran --token TOKEN --map 39901:18999[,8443:443] [--name NAME] [--pick best|bond|N] [--sessions N] [--max-mbps N] --yes
+  iran --token TOKEN --map 39901:18999[,8443:443] [--name NAME] [--pick best|bond|N|N,N...] [--sessions N] [--max-mbps N] --yes
          creates and starts the Iran tunnel. Auto token: runs the test, --pick chooses a row (default best, bond = all
-         working direct carriers). CDN token: automatic CDN tuning. Ends with LINK=up|down and TUNNEL=NAME; exit 1 if down.
+         working direct carriers, 1,3 = join those rows). CDN token: automatic CDN tuning. Ends with LINK=up|down and TUNNEL=NAME; exit 1 if down.
          --sessions N writes "sessions: N" (only with wattun 2.3.0 or newer; otherwise it is ignored with a warning)
   cdn-tune NAME [full] --yes      apply the best CDN variant without asking
   auto-test NAME --yes            re-test an auto Iran tunnel, switch to --pick (default best) without asking

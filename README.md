@@ -318,9 +318,12 @@ no reverse mode. Details, certificates, and what to keep in mind:
 Not sure what works on your route? Pick `auto` as the carrier in the Kharej wizard. One bonded tunnel listens on every
 carrier at once and prints one token. Paste it on Iran, and the manager tests each variant (direct, then through
 Cloudflare if you gave a domain, then reverse) with a short speed test, in about 2 to 3 minutes. It shows a table
-ranked by download plus upload: **Enter** uses the best, **b** bonds the working ones, **1-N** picks one.
+ranked by download plus upload: **Enter** uses the best, **b** bonds the working ones, **1-N** picks one, **c**
+joins the rows you choose (for example 1 3 4) into one tunnel, and **f** uses a type that failed the test anyway.
 
-Re-run it with `wattun auto-test NAME`. If the reverse side cannot learn Iran's IP, run `wattun auto-ip NAME IRAN_IP`
+To change the type later, open the Iran tunnel's page and press **m** (change connection type), or run
+`wattun auto-test NAME`; it tests everything again and offers the same choices. The running tunnel is not touched
+until you choose. If the reverse side cannot learn Iran's IP, run `wattun auto-ip NAME IRAN_IP`
 on Kharej. Auto-heal can switch to another working carrier by itself. Kharej needs 2.1.0 or newer. Details:
 [docs/TECHNICAL.md#auto-mode](docs/TECHNICAL.md#auto-mode).
 
