@@ -37,7 +37,10 @@ const (
 	replayWin    = 1024
 	// A pool of TCP connections reorders by a whole head-of-line stall (60-100 ms of packets, ~1900 at 640 B and
 	// 12 MB/s); a window of 1024 turned every late packet after a stall into a "replay" and dropped it (measured).
-	reliableReplayWin = 16384
+	// 16384 was ~0.3-0.7 s at 30-70 MB/s: a connection in a few rounds of TCP loss recovery outlasted it, and the data
+	// it then delivered was dropped as a replay and resent (field 2026-10-16, 32 connections: 2005 such packets per
+	// 200 MB). 131072 (a 1 MB ring) covers ~4 s at 125 MB/s with 4 KB packets.
+	reliableReplayWin = 131072
 	maxStreams        = 8192
 	ipIcmpHdr         = 28
 )
@@ -168,7 +171,8 @@ type Session struct {
 	batcher   BatchSender // nil: send one datagram at a time
 	backlog   Backlogger  // nil: the carrier has no send queues of its own to report
 	held      bool        // this pump round: the carrier's send queues are full, no new data
-	pin       bool        // direct pool: send each packet on its first stream's own connection (PinLane)
+	pin       bool        // direct pool: send each packet on its first stream's own connection (PinLaneBase+slot)
+	pinNext   int         // next stream's connection slot: round-robin, so 8 streams over 8 connections use all 8
 	deaths    uint64      // pool connection deaths already handled (PoolConnDeaths), pool carriers only
 	bp        [][]byte
 	bl        []int
@@ -670,7 +674,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 		}
 	}
 	prioSeen, bulkSeen := false, false
-	pinID, pinned := uint64(0), false
+	pinSlot, pinned := 0, false
 	p := s.plainBuf[:0]
 	sp := s.newSent()
 	if needBoot {
@@ -722,7 +726,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 			}
 			np, sent, fit := st.emit(p, sp, room-len(p))
 			if sent && !pinned {
-				pinID, pinned = st.id, true
+				pinSlot, pinned = st.pin, true
 			}
 			if isBulk {
 				s.bulk.charge(st, len(np)-len(p))
@@ -768,8 +772,8 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 			}
 		}
 	}
-	if s.pin && pinned && !sp.rtx {
-		lane = PinLane(pinID)
+	if s.pin && pinned && !sp.rtx && !prioSeen { // interactive data takes the least queued connection, not a bulk one's
+		lane = PinLaneBase + pinSlot
 	}
 	out, pn := s.seal(p)
 	size := len(out) + ipIcmpHdr

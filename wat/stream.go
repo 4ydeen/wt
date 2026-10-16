@@ -27,8 +27,9 @@ type seg struct {
 
 // Stream is one reliable, ordered byte stream (one TCP connection) inside a Session.
 type Stream struct {
-	s  *Session
-	id uint64
+	s   *Session
+	id  uint64
+	pin int // direct pool: the stream's connection slot, handed out round-robin (Session.pinNext)
 
 	rc, wc *sync.Cond // readers / writers wait on these (both guarded by s.mu)
 
@@ -78,6 +79,8 @@ func (s *Session) newStream(id uint64) *Stream {
 	st := &Stream{s: s, id: id, peerMax: streamWindow, advMax: streamWindow, win: streamWindow}
 	st.rc = sync.NewCond(&s.mu)
 	st.wc = sync.NewCond(&s.mu)
+	st.pin = s.pinNext
+	s.pinNext = (s.pinNext + 1) % (1 << 20)
 	s.streams[id] = st
 	return st
 }
