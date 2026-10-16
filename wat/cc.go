@@ -101,15 +101,18 @@ const (
 // (field 2026-10-16: 6-70k resends per 200 MB, most never proven spurious).
 const relDirectWin = time.Second
 
-// WAT_DIRECT_LOSS_MS overrides the direct loss timer floor (the PTO floor stays 500 ms above it), for field A/Bs.
+// WAT_DIRECT_LOSS_MS sets a loss timer floor for direct carriers (the PTO floor 500 ms above it), for field A/Bs. Off
+// by default: a 2 s floor was measured slower than the normal timer (field 2026-10-16, Kharej -> Iran: 2 s ~12 MB/s,
+// 500 ms ~20, normal ~25), because a hole behind a stalled connection is repaired faster by an early resend on
+// another connection than by waiting for TCP's own recovery.
 var relDirectLossTime, relDirectPTO = directLossTimes()
 
 func directLossTimes() (time.Duration, time.Duration) {
-	lt := 2 * time.Second
 	if n, err := strconv.Atoi(os.Getenv("WAT_DIRECT_LOSS_MS")); err == nil && n > 0 {
-		lt = time.Duration(n) * time.Millisecond
+		lt := time.Duration(n) * time.Millisecond
+		return lt, lt + 500*time.Millisecond
 	}
-	return lt, lt + 500*time.Millisecond
+	return 0, 0
 }
 
 // relCwndStall bounds how far above the base RTT srtt may size the reliable window (2.4.18); WAT_CWND_MINRTT=1 sizes

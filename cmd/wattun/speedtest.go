@@ -16,6 +16,10 @@ package main
 // With -sessions N (2.3.0) the test runs one stream on every live session at once, each moving its share of the
 // size, and reports the total over the wall time ("sessions" says how many took part). The server side is unchanged:
 // it only ever sees ordinary speed-test streams.
+//
+// streams=N (2.4.18, 1-32, default 8) runs N streams on every session, the way real users load a tunnel with many
+// connections. On a direct pool each stream rides one TCP connection (stream pinning), so a single stream shows what
+// one connection does and N streams what the tunnel does. streams=1 is the pre-2.4.18 single-stream test.
 
 import (
 	"encoding/binary"
@@ -96,28 +100,36 @@ type speedResult struct {
 	OK       bool    `json:"ok"`
 	Error    string  `json:"error,omitempty"`
 	Sessions int     `json:"sessions"` // sessions the test ran on in parallel (2.3.0)
+	Streams  int     `json:"streams"`  // streams per session (2.4.18)
 }
 
-// runSpeedTest moves size bytes in one direction through every live session of tun at once (size split between
-// them) and times the whole.
-func runSpeedTest(tun *tunnel, dir string, size uint64) speedResult {
+// runSpeedTest moves size bytes in one direction through every live session of tun at once, streams streams on
+// each (size split between them all), and times the whole.
+func runSpeedTest(tun *tunnel, dir string, size uint64, streams int) speedResult {
 	list := tun.live()
+	streams = max(streams, 1)
 	if len(list) == 0 {
-		return speedResult{Dir: dir, Bytes: size, Error: "tunnel is not connected", Sessions: len(tun.list)}
+		return speedResult{Dir: dir, Bytes: size, Error: "tunnel is not connected", Sessions: len(tun.list), Streams: streams}
 	}
-	if len(list) == 1 {
+	if len(list) == 1 && streams == 1 {
 		r := speedOne(list[0], dir, size)
-		r.Sessions = 1
+		r.Sessions, r.Streams = 1, 1
 		return r
 	}
-	part := size / uint64(len(list))
-	parts := make([]speedResult, len(list))
+	var jobs []*wat.Session
+	for _, s := range list {
+		for range streams {
+			jobs = append(jobs, s)
+		}
+	}
+	part := size / uint64(len(jobs))
+	parts := make([]speedResult, len(jobs))
 	var wg sync.WaitGroup
 	t0 := time.Now()
-	for i, s := range list {
+	for i, s := range jobs {
 		n := part
 		if i == 0 {
-			n += size - part*uint64(len(list)) // the remainder
+			n += size - part*uint64(len(jobs)) // the remainder
 		}
 		wg.Add(1)
 		go func() {
@@ -126,10 +138,10 @@ func runSpeedTest(tun *tunnel, dir string, size uint64) speedResult {
 		}()
 	}
 	wg.Wait()
-	res := speedResult{Dir: dir, Bytes: size, Sessions: len(list)}
+	res := speedResult{Dir: dir, Bytes: size, Sessions: len(list), Streams: streams}
 	for i, p := range parts {
 		if !p.OK {
-			res.Error = fmt.Sprintf("session %d of %d: %s", i+1, len(list), p.Error)
+			res.Error = fmt.Sprintf("stream %d of %d: %s", i+1, len(jobs), p.Error)
 			return res
 		}
 	}
@@ -204,7 +216,11 @@ func speedTestHandler(tun *tunnel) http.HandlerFunc {
 		if err != nil || mb < 1 || mb > speedTestMaxMB {
 			mb = 10
 		}
+		streams, err := strconv.Atoi(r.URL.Query().Get("streams"))
+		if err != nil || streams < 1 || streams > 32 {
+			streams = 8
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(runSpeedTest(tun, dir, uint64(mb)<<20))
+		json.NewEncoder(w).Encode(runSpeedTest(tun, dir, uint64(mb)<<20, streams))
 	}
 }

@@ -436,6 +436,7 @@ func (st *Stream) emit(p []byte, sp *sentPkt, room int) (np []byte, sent, fit bo
 		st.retx = st.retx[1:]
 		p = st.appendFrame(p, off, n, f.fin)
 		sp.frames = append(sp.frames, frameRef{st.id, off, n, f.fin})
+		sp.rtx = true
 		return p, true, true
 	}
 	end := st.sbase + uint64(len(st.sbuf))

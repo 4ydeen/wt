@@ -384,6 +384,34 @@ func (pc *poolConn) fill(buf *[]byte, r, w *int, need int) (int, bool) {
 	return 0, true
 }
 
+// Stream pinning (2.4.18, direct pools). A session that sends with a lane of PinLaneBase or more asks the pool to
+// put the packet on connection (lane-PinLaneBase) mod n, so each stream rides one TCP connection, the way separate
+// TCP connections would. Striping every stream over every connection made each stream, and so the whole session,
+// wait on whichever connection was stalled in a TCP retransmit: on the lossy Kharej -> Iran path a session moved
+// ~20-25 MB/s whether 1, 4 or 8 streams ran, while 8 bare TCP connections moved 78 (field 2026-10-16). A pinned
+// connection that is write-stalled or half full falls back to the least-queued one. Other lanes are ignored, as before.
+const PinLaneBase = 1 << 24
+
+// PinLane is the lane that pins a packet to stream id's connection.
+func PinLane(id uint64) int { return PinLaneBase + int((id*0x9E3779B97F4A7C15)>>40) }
+
+// pinnedConn returns the pinned connection for lane, or nil when lane does not pin or that connection cannot take it.
+func pinnedConn(conns []*poolConn, lane int) *poolConn {
+	if lane < PinLaneBase || len(conns) == 0 {
+		return nil
+	}
+	pc := conns[(lane-PinLaneBase)%len(conns)]
+	if pc == nil || len(pc.q) >= poolBacklog || pc.stalledFor(time.Now().UnixNano()) > poolStall {
+		return nil
+	}
+	select {
+	case <-pc.done:
+		return nil
+	default:
+	}
+	return pc
+}
+
 // poolBacklog is the queue depth at which a pool counts as full: past it Send would soon drop.
 const poolBacklog = poolQueue / 2
 
@@ -741,7 +769,11 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 	for i := range c.slots {
 		conns[i] = c.slots[i].Load()
 	}
-	if pc := leastQueued(conns, int(c.rr.Add(1))); pc != nil {
+	pc := pinnedConn(conns, path)
+	if pc == nil {
+		pc = leastQueued(conns, int(c.rr.Add(1)))
+	}
+	if pc != nil {
 		pc.enqueue(append(getPkt(len(p))[:0], p...)) // full queue: drop, the session repairs it
 	}
 	return nil
@@ -1014,7 +1046,15 @@ func (s *TCPPoolServer) SendTo(p []byte, lane int, dst net.Addr) error {
 		conns = append(conns, pc)
 	}
 	s.mu.Unlock()
-	if pc := leastQueued(conns, int(s.rr.Add(1))); pc != nil {
+	var pc *poolConn
+	if lane >= PinLaneBase { // a stable order, so a stream keeps its connection (map order is random)
+		slices.SortFunc(conns, func(a, b *poolConn) int { return a.born.Compare(b.born) })
+		pc = pinnedConn(conns, lane)
+	}
+	if pc == nil {
+		pc = leastQueued(conns, int(s.rr.Add(1)))
+	}
+	if pc != nil {
 		pc.enqueue(append(getPkt(len(p))[:0], p...))
 	}
 	return nil // no live conn or full queue: dropped, the session repairs it

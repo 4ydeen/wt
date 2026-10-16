@@ -124,7 +124,7 @@ func TestMultiSessionSpeedTestUsesAll(t *testing.T) {
 		before[i] = s.Stats().BytesIn
 	}
 	const size = 6 << 20
-	res := runSpeedTest(tun, "down", size)
+	res := runSpeedTest(tun, "down", size, 1)
 	if !res.OK || res.Sessions != 3 || res.Bytes != size || res.MBps <= 0 {
 		t.Fatalf("speed test: %+v", res)
 	}
@@ -133,12 +133,12 @@ func TestMultiSessionSpeedTestUsesAll(t *testing.T) {
 			t.Errorf("session %d received %d bytes, want about %d (a third)", i, got, size/3)
 		}
 	}
-	if up := runSpeedTest(tun, "up", 3<<20); !up.OK || up.Sessions != 3 {
+	if up := runSpeedTest(tun, "up", 3<<20, 1); !up.OK || up.Sessions != 3 {
 		t.Fatalf("upload speed test: %+v", up)
 	}
 	// One session: exactly the single-stream test of earlier versions, plus "sessions": 1.
 	one := newMultiRig(t, 1, 0, newAllow("", ""))
-	if r := runSpeedTest(one, "down", 1<<20); !r.OK || r.Sessions != 1 {
+	if r := runSpeedTest(one, "down", 1<<20, 1); !r.OK || r.Sessions != 1 {
 		t.Fatalf("single-session speed test: %+v", r)
 	}
 }

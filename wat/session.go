@@ -97,6 +97,7 @@ type sentPkt struct {
 	lane   int  // path it was sent on (the ICMP lane, or the bond path)
 	done   bool // acked or declared lost
 	lost   bool // declared lost (bond: a late ack still proves the path alive)
+	rtx    bool // carries resent stream data (a pinned pool sends it on any connection, not the stream's own)
 }
 
 type outPkt struct {
@@ -162,6 +163,7 @@ type Session struct {
 	batcher   BatchSender // nil: send one datagram at a time
 	backlog   Backlogger  // nil: the carrier has no send queues of its own to report
 	held      bool        // this pump round: the carrier's send queues are full, no new data
+	pin       bool        // direct pool: send each packet on its first stream's own connection (PinLane)
 	deaths    uint64      // pool connection deaths already handled (PoolConnDeaths), pool carriers only
 	bp        [][]byte
 	bl        []int
@@ -256,6 +258,7 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	}
 	s.cc.reliable = prof.Reliable
 	s.cc.direct = prof.Reliable && cfg.Direct && !noDirect
+	s.pin = s.cc.direct && !noPin
 	if prof.Reliable && cfg.MinBps == 2e5 && cfg.InitBps > s.cc.minRate { // default floor: never pace a TCP pool below its start rate
 		s.cc.minRate = min(cfg.InitBps, cfg.MaxBps)
 	}
@@ -589,6 +592,9 @@ func (s *Session) repairAfterDeath(now time.Time) {
 	s.compact()
 }
 
+// noPin (WAT_NO_PIN=1) stripes direct pools' stream data over every connection again, for an A/B.
+var noPin = os.Getenv("WAT_NO_PIN") != ""
+
 // noDirect (WAT_NO_DIRECT=1) ignores Config.Direct, for an A/B.
 var noDirect = os.Getenv("WAT_NO_DIRECT") != ""
 
@@ -617,6 +623,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 		}
 	}
 	prioSeen, bulkSeen := false, false
+	pinID, pinned := uint64(0), false
 	p := s.plainBuf[:0]
 	sp := s.newSent()
 	if needBoot {
@@ -661,6 +668,9 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 				prioSeen = true
 			}
 			np, sent, fit := st.emit(p, sp, room-len(p))
+			if sent && !pinned {
+				pinID, pinned = st.id, true
+			}
 			if isBulk {
 				s.bulk.charge(st, len(np)-len(p))
 			}
@@ -704,6 +714,9 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 				sp.ctrl = append(sp.ctrl, pingFrame)
 			}
 		}
+	}
+	if s.pin && pinned && !sp.rtx {
+		lane = PinLane(pinID)
 	}
 	out, pn := s.seal(p)
 	size := len(out) + ipIcmpHdr

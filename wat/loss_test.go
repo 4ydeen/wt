@@ -425,7 +425,7 @@ func TestReliableProbeNoAppLimitedPollution(t *testing.T) {
 }
 
 // A direct reliable carrier (Config.Direct, 2.4.18) lets TCP pace: its window covers about a second of delivery, not
-// a few minRTT, its loss timer waits for TCP's own recovery, and it never drains to re-measure minRTT.
+// a few minRTT, it keeps the normal loss timer (a longer one measured slower), and it never drains to re-measure minRTT.
 func TestDirectWindowAndLossTimer(t *testing.T) {
 	mk := func(direct bool) cc {
 		c := newCC(10e6, 0.1e6, 1250e6, 8*time.Millisecond)
@@ -440,11 +440,8 @@ func TestDirectWindowAndLossTimer(t *testing.T) {
 	if dir.cwnd() <= cdn.cwnd() {
 		t.Fatalf("windows: direct %d, cdn %d", dir.cwnd(), cdn.cwnd())
 	}
-	if dir.lossTime() < relDirectLossTime || dir.pto() < relDirectPTO {
-		t.Fatalf("direct loss timer %v / pto %v below the floors", dir.lossTime(), dir.pto())
-	}
-	if cdn.lossTime() >= relDirectLossTime {
-		t.Fatalf("non-direct loss timer stretched to %v", cdn.lossTime())
+	if relDirectLossTime == 0 && (dir.lossTime() != cdn.lossTime() || dir.pto() != cdn.pto()) {
+		t.Fatalf("direct timers changed without WAT_DIRECT_LOSS_MS: %v/%v vs %v/%v", dir.lossTime(), dir.pto(), cdn.lossTime(), cdn.pto())
 	}
 	dir.inflight = 1 << 24
 	dir.srtt = 200 * time.Millisecond
