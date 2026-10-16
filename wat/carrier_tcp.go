@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -412,8 +414,19 @@ func pinnedConn(conns []*poolConn, lane int) *poolConn {
 	return pc
 }
 
-// poolBacklog is the queue depth at which a pool counts as full: past it Send would soon drop.
-const poolBacklog = poolQueue / 2
+// poolBacklog is the queue depth at which a pool counts as full (Backlogger) and a pinned connection as busy. It is
+// short on purpose: the session's loss timer starts when a packet is built, so time spent in our own queue counts as
+// flight time. With half of the 256-packet queue (2.4.18 first cut) a packet waited 512 KB per connection before
+// even reaching its socket; at a few MB/s per connection that alone neared the 400 ms timer, and with the socket and
+// TCP's own recovery on top ~45 % of a download was resent (field 2026-10-16, Kharej -> Iran, 8 streams: srtt
+// 165-220 ms over a 38 ms base). 16 packets (64 KB at the default MTU) plus the socket's 128 KB unsent low-water mark
+// keep every connection busy while the rest waits in the session, where no timer runs. WAT_POOL_BACKLOG overrides it.
+var poolBacklog = func() int {
+	if n, err := strconv.Atoi(os.Getenv("WAT_POOL_BACKLOG")); err == nil && n > 0 && n <= poolQueue {
+		return n
+	}
+	return 16
+}()
 
 // backlogged reports whether even the least-queued usable conn already holds poolBacklog packets. Over a lossy path
 // the pool's TCP connections stall in their own retransmits, their sockets stop taking data, and the queues fill;
