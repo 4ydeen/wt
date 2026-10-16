@@ -451,3 +451,82 @@ func TestDirectWindowAndLossTimer(t *testing.T) {
 		t.Fatal("a direct carrier entered the minRTT drain")
 	}
 }
+
+// A pool connection that stalls leaves a hole per packet it carries, far more than one ACK frame's 64 ranges. Its
+// packets arriving late must still be acked once, by a late-ACK frame, and a sender must neither take an RTT sample
+// from that frame nor declare anything lost by it.
+func TestLateAck(t *testing.T) {
+	rcv := profSession(t, poolProfile, Config{})
+	rcv.mu.Lock()
+	recv := func(pn uint64) { // the bookkeeping of the receive path
+		rcv.rxRanges.add(pn, pn+1)
+		rcv.rxRanges.trim(rcv.rxKeep)
+		rcv.rxSince = append(rcv.rxSince, pn)
+	}
+	reported := rangeSet{}
+	ack := func() {
+		p := rcv.appendLateAck(nil, time.Now())
+		p = appendAck(p, rcv.rxRanges, 0, rcv.ackMax)
+		r := &reader{b: p}
+		for len(r.b) > 0 {
+			if r.byte() != frAck {
+				t.Fatal("not an ACK frame")
+			}
+			_, _, rs := parseAck(r)
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+			for _, x := range rs {
+				reported.add(x.lo, x.hi)
+			}
+		}
+	}
+	for pn := uint64(0); pn < 4000; pn += 2 { // the odd packets ride a stalled connection
+		recv(pn)
+		if pn%12 == 0 {
+			ack()
+		}
+	}
+	for pn := uint64(1); pn < 4000; pn += 2 {
+		recv(pn)
+		if pn%11 == 0 {
+			ack()
+		}
+	}
+	for i := 0; i < 100 && len(rcv.rxLate)+len(rcv.rxSince) > 0; i++ {
+		ack()
+	}
+	rcv.mu.Unlock()
+	for pn := uint64(1); pn < 4000; pn += 2 {
+		if !reported.contains(pn) {
+			t.Fatalf("late packet %d never acked (late acks %d)", pn, rcv.stats.AckLate)
+		}
+	}
+	if rcv.stats.AckLate == 0 {
+		t.Fatal("AckLate not counted")
+	}
+
+	snd := profSession(t, poolProfile, Config{})
+	snd.mu.Lock()
+	defer snd.mu.Unlock()
+	now := time.Now()
+	for pn := uint64(0); pn < 10; pn++ {
+		sp := snd.newSent()
+		sp.pn, sp.at, sp.size = pn, now.Add(-10*time.Second), 1000
+		snd.sent = append(snd.sent, sp)
+		snd.inflight += sp.size
+	}
+	srtt := snd.cc.srtt
+	snd.onAck(5, lateAckDelay*time.Microsecond, rangeSet{{5, 6}}, now)
+	if !snd.sent[5].done || snd.sent[5].lost {
+		t.Fatal("late ACK did not deliver packet 5")
+	}
+	for i, sp := range snd.sent {
+		if i != 5 && sp.done {
+			t.Fatalf("late ACK declared packet %d lost", i)
+		}
+	}
+	if snd.cc.srtt != srtt {
+		t.Fatalf("late ACK took an RTT sample: srtt %v -> %v", srtt, snd.cc.srtt)
+	}
+}

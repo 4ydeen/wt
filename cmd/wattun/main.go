@@ -459,7 +459,7 @@ func main() {
 				st := stats()
 				out := map[string]any{
 					"pkts_out": st.PktsOut, "pkts_in": st.PktsIn, "bytes_out": st.BytesOut, "bytes_in": st.BytesIn,
-					"fec_sent": st.FecSent, "fec_recovered": st.FecRecovered, "retrans": st.Retrans, "send_errors": st.Dropped, "rate_bps": st.RateBps,
+					"fec_sent": st.FecSent, "fec_recovered": st.FecRecovered, "retrans": st.Retrans, "send_errors": st.Dropped, "ack_late": st.AckLate, "dup_recv": st.RxDup, "rx_too_old": st.RxTooOld, "rate_bps": st.RateBps,
 					"ceiling_bps": st.CeilingBps, "loss_pct": st.LossPct,
 					"srtt_ms": float64(st.SRTT) / 1e6, "min_rtt_ms": float64(st.MinRTT) / 1e6,
 					"streams": st.Streams, "inflight": st.Inflight, "alive": alive(), "last_rx_age_ms": rxAge(), "version": wat.Version, "draining": srv != nil && srv.Draining(),

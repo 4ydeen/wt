@@ -68,6 +68,8 @@ type Config struct {
 type Stats struct {
 	PktsOut, PktsIn, BytesOut, BytesIn uint64
 	Retrans, Dropped                   uint64
+	AckLate                            uint64 // packets acked only by a late-ACK frame (older than the newest 64 ranges)
+	RxDup, RxTooOld                    uint64 // packets dropped as already received / older than the replay window
 	RateBps                            float64
 	SRTT, MinRTT                       time.Duration
 	Streams                            int
@@ -129,6 +131,9 @@ type Session struct {
 	ackMax    int // SACK ranges per ACK frame (the wire format allows 64)
 	rxKeep    int // received ranges remembered
 	rxRanges  rangeSet
+	rxSince   []uint64 // reliable: packet numbers received since the last ACK (lateAck reports the ones it leaves out)
+	rxLate    rangeSet // reliable: received packets no ACK has reported yet, below the newest ackMax ranges
+	lateAck   bool
 	rxAt      time.Time
 	ackPend   int
 	ackSince  time.Time
@@ -265,6 +270,7 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	s.replayWin, s.ackMax, s.rxKeep = replayWin, 20, 64
 	if prof.Reliable { // pool reordering leaves a hole per stalled connection's packets: track and report more of them
 		s.replayWin, s.ackMax, s.rxKeep = reliableReplayWin, 64, 512
+		s.lateAck = !noLateAck
 	}
 	if ch, ok := pio.(PathChooser); ok && ch.NumPaths() > 0 {
 		s.replayWin = reliableReplayWin // paths of different delay put packets thousands of numbers behind each other
@@ -601,6 +607,47 @@ var noDirect = os.Getenv("WAT_NO_DIRECT") != ""
 // noBacklog (WAT_NO_BACKLOG=1) ignores the carrier's Backlogger, the pre-2.4.18 behaviour, for an A/B.
 var noBacklog = os.Getenv("WAT_NO_BACKLOG") != ""
 
+// Late ACKs. A reliable pool reorders across its connections: while one connection stalls, every packet it carries
+// is a hole between the other connections' packets, and an ACK frame names only the newest 64 ranges (the receiver
+// remembers 512). The stalled packets arrive later, below that window, so before this no ACK ever reported them and
+// the sender's loss timer resent them all, and the more connections the more resends. Now each ACK first carries a
+// frame with the received packets the main frame leaves out. Its delay is lateAckDelay, so a sender of any version
+// takes no RTT sample from it and declares nothing lost by it (loss needs age > lossTime + delay); it only marks
+// those packets delivered. Needs only the receiving end updated. WAT_NO_LATEACK=1 turns it off for an A/B.
+const (
+	lateAckDelay = 3600e6 // µs
+	lateSinceMax = 16384  // received packet numbers kept between two ACKs
+	lateKeep     = 4096   // late ranges waiting for an ACK
+)
+
+var noLateAck = os.Getenv("WAT_NO_LATEACK") != ""
+
+// appendLateAck moves the packets received since the last ACK that the main frame will not cover into rxLate and
+// encodes the newest of them as a late-ACK frame; what does not fit goes out with the next ACK.
+func (s *Session) appendLateAck(p []byte, now time.Time) []byte {
+	var cut uint64
+	if n := len(s.rxRanges); n > s.ackMax {
+		cut = s.rxRanges[n-s.ackMax].lo
+	}
+	for _, pn := range s.rxSince {
+		if pn < cut {
+			s.rxLate.add(pn, pn+1)
+		}
+	}
+	s.rxSince = s.rxSince[:0]
+	if len(s.rxLate) == 0 {
+		return p
+	}
+	s.rxLate.trim(lateKeep)
+	n := min(s.ackMax, len(s.rxLate), max(1, (s.maxPlain/4-24)/8))
+	p = appendAck(p, s.rxLate, lateAckDelay, n)
+	for _, r := range s.rxLate[len(s.rxLate)-n:] {
+		s.stats.AckLate += r.hi - r.lo
+	}
+	s.rxLate = s.rxLate[:len(s.rxLate)-n]
+	return p
+}
+
 func (s *Session) build(now time.Time) (outPkt, bool) {
 	const none = -1
 	if len(s.probeQ) > 0 {
@@ -632,9 +679,15 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 		s.bootAt = now
 	}
 	if needAck {
+		if s.lateAck {
+			p = s.appendLateAck(p, now)
+		}
 		delay := uint64(now.Sub(s.rxAt) / time.Microsecond)
 		p = appendAck(p, s.rxRanges, delay, s.ackMax)
 		s.ackPend = 0
+		if len(s.rxLate) > 0 { // more than one frame's worth left: the next ACK goes out within 2 ms
+			s.ackPend, s.ackSince = 1, now
+		}
 	}
 	for len(s.ctrl) > 0 && len(p)+len(s.ctrl[0]) <= s.maxPlain {
 		p = append(p, s.ctrl[0]...)
@@ -885,7 +938,7 @@ func (s *Session) pathAcked(acked []*sentPkt, largest uint64, delay time.Duratio
 	for _, sp := range acked {
 		var r time.Duration
 		if sp.lane >= 0 && sp.lane < len(s.pcc) && s.smpBuf[sp.lane] == sp {
-			if r = now.Sub(sp.at); sp.pn == largest {
+			if r = now.Sub(sp.at); sp.pn == largest || delay >= lateAckDelay*time.Microsecond/2 { // a late ACK: no sample
 				r -= delay
 			}
 			if r > 0 {
@@ -1081,6 +1134,13 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	}
 	s.mu.Lock()
 	dup := s.rxDup(pn)
+	if dup {
+		if s.rxLargest-pn >= s.replayWin {
+			s.stats.RxTooOld++
+		} else {
+			s.stats.RxDup++
+		}
+	}
 	s.mu.Unlock()
 	if dup {
 		return
@@ -1104,6 +1164,9 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	s.rxRing[pn%s.replayWin] = pn + 1
 	s.rxRanges.add(pn, pn+1)
 	s.rxRanges.trim(s.rxKeep)
+	if s.lateAck && len(s.rxSince) < lateSinceMax {
+		s.rxSince = append(s.rxSince, pn)
+	}
 	if s.fec != nil {
 		s.fecKeep(pn, plain)
 	}

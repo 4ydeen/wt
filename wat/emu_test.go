@@ -318,7 +318,7 @@ func emuRun(t *testing.T, cli *Session, srv *Server) {
 	t.Logf("single %.2f MB/s | 16x2MB %.2f MB/s | small-req p50 %v p95 %v | server pkts %d retrans %d (%.1f%%) rate %.1f MB/s srtt %v min %v",
 		single, par, lat[len(lat)/2], lat[len(lat)*95/100], ss.PktsOut, ss.Retrans, 100*float64(ss.Retrans)/float64(max(ss.PktsOut, 1)),
 		ss.RateBps/1e6, ss.SRTT, ss.MinRTT)
-	t.Logf("server out %d client in %d (bytes %d vs %d)", ss.PktsOut, cs.PktsIn, ss.BytesOut, cs.BytesIn)
+	t.Logf("server out %d client in %d (bytes %d vs %d), client late-acked %d dup %d too-old %d", ss.PktsOut, cs.PktsIn, ss.BytesOut, cs.BytesIn, cs.AckLate, cs.RxDup, cs.RxTooOld)
 	t.Logf("server cc %+v floor %.1f MB/s cwnd %d losstime %v x%.2f winblocked %d", ss.CC, ss.FloorBps/1e6, ss.Cwnd, ss.LossTime, ss.RelLossMul, ss.WinBlocked)
 }
 
