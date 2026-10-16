@@ -60,7 +60,9 @@ got slower over time; if you are on any of them, go straight to 2.4.17. ICMP and
   field, 4 separate tunnels together already moved 136-143 MB/s down and 173 up while one moved 49-60. Also new:
   WireGuard and other big UDP packets pass every carrier (split and rebuilt inside the tunnel), traffic totals
   survive restarts, a Windows binary (`wattun-windows-amd64.exe`, no ICMP), and **m** on a tunnel's page changes
-  its connection type or joins several. Update both ends.
+  its connection type or joins several. Update both ends. Measured in production (reverse tcp, 16 connections,
+  ~400 user connections on the same tunnel): **upload 149.7 MB/s (~1.2 Gbit), was 49-55**; download 53 MB/s, now
+  limited by the Iran server's CPU (2 cores) and the next thing we work on.
 - **2.4.18: TCP pool tunnels 2-4x faster.** For tcp, tls and every reverse pool carrier (no CDN in between). On the
   Iran ⇄ Europe test pair (reverse tcp), uploads went from 12 to 47-56 MB/s and downloads from ~20-30 to 49-51
   MB/s with 8 connections and up to 69-74 MB/s with `conns: 16`. Ping under a full download stayed at the 38-40 ms
@@ -163,6 +165,23 @@ Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 | WireGuard over pingtunnel | WireGuard inside one pingtunnel UDP session | 0.25 - 2.7 MB/s | Flat ceiling of a single pingtunnel process |
 | pingtunnel | One process per port | ~0.5 MB/s under load | Each process reads every ICMP packet, so the CPU saturates |
 | ptunnel-ng | One ICMP proxy per port | ~20 KB/s | Last resort only |
+
+### TCP tunnels (tcp, tls, reverse): field numbers
+
+Iran ⇄ Europe, 2-vCPU servers, reverse `tcp` (Kharej dials Iran), 200 MB speed tests, October 2026. Ping through the
+tunnel stayed at the route's 38-43 ms during the 2.4.18 and 2.5.0 runs.
+
+| Setup | Download | Upload |
+|---|---|---|
+| Plain TCP, no tunnel, 16 connections (the route's ceiling) | 243 MB/s | 448 MB/s |
+| 2.4.17, 8 connections (test tunnel) | ~20-30 MB/s | 12 MB/s |
+| 2.4.18, 8 connections | 49-53 MB/s | 47-56 MB/s |
+| 2.4.18, 16 connections, 32 streams | 69-74 MB/s | |
+| 2.5.0, 16 connections, production tunnel with ~400 users, 16 streams | 53.3 MB/s | **149.7 MB/s** |
+| 2.5.0, same, 8 streams | 37.9 MB/s | 101.7 MB/s |
+
+In 2.5.0 the download is bound by the Iran server's CPU (the receiving tunnel used 103-117 % of one of its two
+cores), not by the route.
 
 ### CDN (Cloudflare): field numbers
 

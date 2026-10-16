@@ -1071,6 +1071,19 @@ tunnel with 16 connections still 49-60. The limit was the session's own work, on
 
 All three are local to the sending or receiving end; mixed versions work. Update both ends for the full gain.
 
+Field result (2026-10-16, production reverse tcp tunnel, 16 connections, ~400 user connections, srtt 41-43 ms):
+
+| Run (200 MB) | MB/s | Kharej CPU | Iran CPU |
+|---|---|---|---|
+| down, 8 streams | 37.9 | 28 % | 103 % |
+| up, 8 streams | 101.7 | 63 % | 124 % |
+| down, 16 streams | 53.3 | 34 % | 117 % |
+| up, 16 streams | 149.7 | 67 % | 134 % |
+
+CPU is percent of one core for the tunnel process; both hosts have 2 cores. Before (2.4.18, 16 streams): down 49-58,
+up 49-55. Upload tripled. Download did not move: there the Iran end receives, decrypts and acks everything on about
+one core, so its receive path is the next limit.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the
