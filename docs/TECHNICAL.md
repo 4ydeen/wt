@@ -428,6 +428,11 @@ same session. Datagrams are not retransmitted and are dropped when a queue is fu
 - The server only forwards to UDP ports that are listed as `/udp`. A TCP-only list allows no UDP.
 - Idle flows are closed after `udp-idle` (default 60 s).
 - Both ends need wattun 1.2.0 or newer.
+- Big datagrams (2.4.19): a datagram larger than one tunnel packet (about 1350 bytes on udp, 590 on the default
+  icmp) is sent in up to 64 pieces and rebuilt on the other end, so WireGuard's default MTU 1420 works. Both ends
+  need 2.4.19; with an older end such datagrams are dropped (`dgram_dropped_size`): set `MTU = 1280` in WireGuard on
+  udp or icmp `mtu: 1400`, or about 550 on the default icmp. Losing one piece loses the datagram, so on a lossy path
+  a smaller WireGuard MTU still does better.
 
 ```yaml
 ports:
@@ -667,10 +672,13 @@ parity packet, and an older peer stops parsing at the unknown frame, which sits 
 
 Both ends count traffic per port (client: the public port users connect to; server: the target port) and expose it
 live in `/stats` under `ports` and on a cheap `/ports` endpoint (needs `-metrics`). Counters are cumulative since
-process start.
+process start. Since 2.4.19 the `*_total` and `conns_all_time` fields also keep counting across restarts: they are
+saved to `<config>.totals.json` every 30 s and on shutdown (with `-config` only). Delete that file to start them from
+zero.
 
 ```json
-{"20001": {"bytes_up": 0, "bytes_down": 0, "conns_total": 0, "conns_active": 0, "udp_flows_active": 0,
+{"20001": {"bytes_up": 0, "bytes_down": 0, "bytes_up_total": 0, "bytes_down_total": 0,
+  "conns_total": 0, "conns_all_time": 0, "conns_active": 0, "udp_flows_active": 0,
   "dgram_up": 0, "dgram_down": 0, "errors": 0, "refused": 0,
   "rate_bps_up": 0, "rate_bps_down": 0, "peak_bps_up": 0, "peak_bps_down": 0,
   "rate_limit_bps": 0, "quota_limit": 0, "quota_used": 0, "quota_exceeded": false}}
@@ -728,7 +736,9 @@ metrics port, even if the port is in the allowlist.
 | `ceiling_bps` | Loss-aware soft ceiling in bytes per second (0 = none active). |
 | `loss_pct` | Loss in the last judged 50 ms interval, percent (0 until 50 packets were sent in one). |
 | `inflight` | Unacknowledged bytes. |
-| `pkts_out`, `pkts_in`, `bytes_out`, `bytes_in` | Totals. |
+| `pkts_out`, `pkts_in`, `bytes_out`, `bytes_in` | Totals since the process started. |
+| `bytes_out_total`, `bytes_in_total` | Since 2.4.19. Wire bytes across restarts (saved in `<config>.totals.json`); the manager shows these. |
+| `dgram_fragmented`, `dgram_reassembled` | Since 2.4.19. UDP datagrams too big for one packet that were sent in pieces / rebuilt from pieces (needs 2.4.19 on both ends; an older peer drops the pieces). |
 | `retrans` | Retransmitted packets. |
 | `fec_sent`, `fec_recovered` | FEC parity packets sent; packets rebuilt from parity. |
 | `send_errors` | Carrier send failures. |
@@ -1139,6 +1149,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 | `listen tcp ...: address already in use` | Another process owns the port. `ss -ltnp \| grep :PORT`. Never start a test on a port a live instance uses; test ports should be 10811 or higher. |
 | `restart needed for KEY` in the log | You changed a key other than `ports:`. Only `ports:` is hot-reloaded. Do a handover. |
 | Config does not apply | A parse error keeps the old config. The log says `config FILE: line N: ...`. |
+| WireGuard (or another UDP VPN) connects, small apps like Telegram work, web pages do not | Its packets are bigger than one tunnel packet. Update both ends to 2.4.19 (big datagrams are split), or set `MTU = 1280` in WireGuard (udp carrier, or icmp with `mtu: 1400`). `dgram_dropped_size` in `/stats` rising confirms it. |
 | Slow, high CPU on Iran | Two cores saturate under many processes. Run one instance, not one per port. Check `retrans` and `send_errors` in `/stats`. Lower `max-mbps` only if the link is rate limited. |
 | Time or clocks | Authentication does not compare clocks. A server restart starts its packet numbers from the current time so a nonce is never reused, so keep NTP on and never set a server clock back. |
 | Foreign traffic on the listener | Expected. Strangers' packets fail authentication and are dropped. |

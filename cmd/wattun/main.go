@@ -420,6 +420,7 @@ func main() {
 	}
 	if *cfgPath != "" {
 		portReg.loadQuota(*cfgPath + ".quota.json")
+		portReg.loadTotals(*cfgPath+".totals.json", func() (uint64, uint64) { st := stats(); return st.BytesIn, st.BytesOut })
 	}
 	if fileCfg != nil {
 		portReg.applyLimits(fileCfg.Limits)
@@ -457,7 +458,9 @@ func main() {
 			}
 			mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 				st := stats()
+				inTot, outTot := portReg.sessionTotals(st.BytesIn, st.BytesOut)
 				out := map[string]any{
+					"bytes_in_total": inTot, "bytes_out_total": outTot,
 					"pkts_out": st.PktsOut, "pkts_in": st.PktsIn, "bytes_out": st.BytesOut, "bytes_in": st.BytesIn,
 					"fec_sent": st.FecSent, "fec_recovered": st.FecRecovered, "retrans": st.Retrans, "send_errors": st.Dropped, "ack_late": st.AckLate, "dup_recv": st.RxDup, "rx_too_old": st.RxTooOld, "rate_bps": st.RateBps,
 					"ceiling_bps": st.CeilingBps, "loss_pct": st.LossPct,

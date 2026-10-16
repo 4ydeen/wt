@@ -145,6 +145,7 @@ type portStat struct {
 	dgUp, dgDown, errs, refused                           atomic.Int64
 	rateUp, rateDown, peakUp, peakDown                    atomic.Int64
 	lastUp, lastDown                                      int64 // ticker goroutine only
+	baseUp, baseDown, baseConns                           int64 // totals from before the last restart (set once at creation)
 	qused, quota, rateLim                                 atomic.Int64
 	bUp, bDown                                            atomic.Pointer[bucket]
 
@@ -295,6 +296,13 @@ type registry struct {
 	limits map[int]limitSpec
 	loaded map[int]int64 // quota usage read from the state file
 	path   string        // quota state file ("" = no persistence)
+
+	// Lifetime totals (2.4.19): bytes and connections per port and the session's wire bytes, kept across restarts in
+	// totPath. /ports and /stats report base + what this process counted.
+	totPath  string
+	tot      map[string][3]int64 // "c:20001" -> up, down, conns; "session" -> in, out, 0
+	sess     func() (in, out uint64)
+	sessBase [2]int64
 }
 
 var portReg = newRegistry()
@@ -314,6 +322,9 @@ func (r *registry) getLocked(k string, port int) *portStat {
 	if p == nil {
 		p = &portStat{port: port}
 		p.qused.Store(r.loaded[port])
+		if t, ok := r.tot[k]; ok {
+			p.baseUp, p.baseDown, p.baseConns = t[0], t[1], t[2]
+		}
 		if ls, ok := r.limits[port]; ok {
 			p.setLimit(ls)
 		}
@@ -355,8 +366,63 @@ func (r *registry) loadQuota(path string) {
 	r.mu.Unlock()
 }
 
-// save writes quota usage atomically (tmp file + rename).
+// loadTotals reads the lifetime totals; sess reports this process's session bytes for the "session" entry.
+func (r *registry) loadTotals(path string, sess func() (in, out uint64)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.totPath, r.sess, r.tot = path, sess, map[string][3]int64{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if json.Unmarshal(b, &r.tot) != nil {
+		log.Printf("traffic totals %s: unreadable, starting from zero", path)
+		r.tot = map[string][3]int64{}
+		return
+	}
+	t := r.tot["session"]
+	r.sessBase = [2]int64{t[0], t[1]}
+}
+
+// sessionTotals is the session's wire bytes in and out since the totals file was started.
+func (r *registry) sessionTotals(in, out uint64) (int64, int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessBase[0] + int64(in), r.sessBase[1] + int64(out)
+}
+
+// saveTotals writes the lifetime totals atomically (tmp file + rename).
+func (r *registry) saveTotals() {
+	r.mu.Lock()
+	if r.totPath == "" {
+		r.mu.Unlock()
+		return
+	}
+	m := make(map[string][3]int64, len(r.tot)+len(r.stats))
+	for k, v := range r.tot {
+		m[k] = v
+	}
+	for k, p := range r.stats {
+		m[k] = [3]int64{p.baseUp + p.bytesUp.Load(), p.baseDown + p.bytesDown.Load(), p.baseConns + p.connsTotal.Load()}
+	}
+	path, sess, base := r.totPath, r.sess, r.sessBase
+	r.mu.Unlock()
+	if sess != nil {
+		in, out := sess()
+		m["session"] = [3]int64{base[0] + int64(in), base[1] + int64(out), 0}
+	}
+	b, _ := json.Marshal(m)
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		if err := os.Rename(tmp, path); err != nil {
+			log.Printf("traffic totals: %v", err)
+		}
+	}
+}
+
+// save writes quota usage and the lifetime totals atomically (tmp file + rename).
 func (r *registry) save() {
+	r.saveTotals()
 	if r.path == "" {
 		return
 	}
@@ -442,7 +508,9 @@ func (r *registry) snapshot(side string) map[string]any {
 		}
 		out[strconv.Itoa(p.port)] = map[string]any{
 			"bytes_up": p.bytesUp.Load(), "bytes_down": p.bytesDown.Load(),
-			"conns_total": p.connsTotal.Load(), "conns_active": p.connsActive.Load(),
+			"bytes_up_total": p.baseUp + p.bytesUp.Load(), "bytes_down_total": p.baseDown + p.bytesDown.Load(),
+			"conns_total": p.connsTotal.Load(), "conns_all_time": p.baseConns + p.connsTotal.Load(),
+			"conns_active":     p.connsActive.Load(),
 			"udp_flows_active": p.udpFlows.Load(), "dgram_up": p.dgUp.Load(), "dgram_down": p.dgDown.Load(),
 			"errors": p.errs.Load(), "refused": p.refused.Load(),
 			"rate_bps_up": p.rateUp.Load(), "rate_bps_down": p.rateDown.Load(),

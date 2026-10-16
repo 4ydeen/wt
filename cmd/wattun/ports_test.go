@@ -247,3 +247,30 @@ func TestLimitsConfigAndHotReload(t *testing.T) {
 	writeCfg(t, path, "mode: client\nlimits:\n", 3)
 	waitFor(t, "limit removal", 3*time.Second, func() bool { return st.rateLim.Load() == 0 && st.bUp.Load() == nil && st.quota.Load() == 0 })
 }
+
+// Lifetime totals survive a restart: a new registry loads what the old one saved and reports base + new traffic.
+func TestTotalsPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.totals.json")
+	a := newRegistry()
+	a.loadTotals(path, func() (uint64, uint64) { return 1000, 2000 })
+	p := a.get("c", 20001)
+	p.add(true, 300)
+	p.add(false, 700)
+	p.connsTotal.Add(2)
+	a.save()
+
+	b := newRegistry()
+	b.loadTotals(path, func() (uint64, uint64) { return 10, 20 })
+	q := b.get("c", 20001)
+	q.add(true, 5)
+	m := b.snapshot("c")["20001"].(map[string]any)
+	if m["bytes_up_total"] != int64(305) || m["bytes_down_total"] != int64(700) || m["conns_all_time"] != int64(2) {
+		t.Fatalf("totals after restart: %v", m)
+	}
+	if m["bytes_up"] != int64(5) {
+		t.Fatalf("live counter should start at zero: %v", m["bytes_up"])
+	}
+	if in, out := b.sessionTotals(10, 20); in != 1010 || out != 2020 {
+		t.Fatalf("session totals %d/%d", in, out)
+	}
+}
