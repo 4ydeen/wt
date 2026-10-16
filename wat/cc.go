@@ -2,6 +2,7 @@ package wat
 
 import (
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -98,11 +99,18 @@ const (
 // Direct reliable carriers (Config.Direct): window in seconds of delivery, and the loss timer / PTO floors. A datagram
 // there is lost only when its connection dies; anything sooner is TCP recovering, and resending it only duplicates
 // (field 2026-10-16: 6-70k resends per 200 MB, most never proven spurious).
-const (
-	relDirectWin      = time.Second
-	relDirectLossTime = 2 * time.Second
-	relDirectPTO      = 2500 * time.Millisecond
-)
+const relDirectWin = time.Second
+
+// WAT_DIRECT_LOSS_MS overrides the direct loss timer floor (the PTO floor stays 500 ms above it), for field A/Bs.
+var relDirectLossTime, relDirectPTO = directLossTimes()
+
+func directLossTimes() (time.Duration, time.Duration) {
+	lt := 2 * time.Second
+	if n, err := strconv.Atoi(os.Getenv("WAT_DIRECT_LOSS_MS")); err == nil && n > 0 {
+		lt = time.Duration(n) * time.Millisecond
+	}
+	return lt, lt + 500*time.Millisecond
+}
 
 // relCwndStall bounds how far above the base RTT srtt may size the reliable window (2.4.18); WAT_CWND_MINRTT=1 sizes
 // it from minRTT only, as before, for an A/B.

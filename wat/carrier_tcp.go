@@ -256,8 +256,17 @@ func (w timedWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// poolConnDeaths counts pool connections that went down, process-wide. Whatever was queued on one or still in its
+// socket is gone, so a session polls this and resends its old unacked packets at once (Session.timers) instead of
+// waiting out the loss timer.
+var poolConnDeaths atomic.Uint64
+
+// PoolConnDeaths is how many pool connections closed or failed in this process.
+func PoolConnDeaths() uint64 { return poolConnDeaths.Load() }
+
 func (pc *poolConn) fail() {
 	pc.once.Do(func() {
+		poolConnDeaths.Add(1)
 		close(pc.done)
 		pc.c.Close()
 	})
@@ -464,6 +473,7 @@ type TCPPoolClient struct {
 	rr     atomic.Uint32
 	once   sync.Once
 
+	keepSlow   atomic.Bool                // never close a connection for delivering below its share (SetKeepSlow)
 	maxBackoff atomic.Int64               // cap of the redial backoff in ns (0: poolBackoffMax)
 	logf       atomic.Pointer[dialLogger] // optional, see SetDialLog
 	logMu      sync.Mutex
@@ -569,6 +579,9 @@ func (c *TCPPoolClient) healthLoop() {
 		case <-c.done:
 			return
 		case now := <-t.C:
+			if c.keepSlow.Load() {
+				continue
+			}
 			for i := range c.slots {
 				conns[i] = c.slots[i].Load()
 			}
@@ -734,6 +747,9 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 	return nil
 }
 
+// SetKeepSlow turns off the slow-connection check for a direct path (see TCPPoolServer.SetKeepSlow).
+func (c *TCPPoolClient) SetKeepSlow(v bool) { c.keepSlow.Store(v) }
+
 // Backlogged reports whether the pool's send queues are full (Backlogger).
 func (c *TCPPoolClient) Backlogged() bool {
 	conns := make([]*poolConn, len(c.slots))
@@ -755,6 +771,7 @@ func (c *TCPPoolClient) Clone(slotOffset int) (*TCPPoolClient, error) {
 		return nil, err
 	}
 	n.ps, n.tlsFn = c.ps, c.tlsFn
+	n.keepSlow.Store(c.keepSlow.Load())
 	n.maxBackoff.Store(c.maxBackoff.Load())
 	if l := c.logf.Load(); l != nil {
 		n.logf.Store(l)
@@ -814,7 +831,14 @@ type TCPPoolServer struct {
 	pools map[string]map[*poolConn]struct{}
 	all   map[net.Conn]struct{} // every accepted conn, so Close also reaches ones still in their hello
 	merge atomic.Bool           // reverse mode: every conn joins one pool whatever its hello id says
+	keep  atomic.Bool           // never close a connection for delivering below its share (SetKeepSlow)
 }
+
+// SetKeepSlow turns off the slow-connection check (2.4.7) for a direct path (2.4.18). It exists for a CDN edge whose
+// far leg slows down; on a direct but lossy path every connection's delivery swings with its own TCP retransmits
+// (field 2026-10-16, Kharej -> Iran: 2 to 209 Mbit/s per connection in one sample), and closing one throws away
+// everything queued on it.
+func (s *TCPPoolServer) SetKeepSlow(v bool) { s.keep.Store(v) }
 
 // NewTCPPoolServer listens on addr (":4443").
 func NewTCPPoolServer(addr string) (*TCPPoolServer, error) {
@@ -855,6 +879,9 @@ func (s *TCPPoolServer) healthLoop() {
 			}
 			s.mu.Unlock()
 			for _, cs := range pools {
+				if s.keep.Load() {
+					break
+				}
 				if pc := judgeSlow(cs, now); pc != nil {
 					poolSlowKills.Add(1)
 					pc.fail()

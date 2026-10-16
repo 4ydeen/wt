@@ -162,6 +162,7 @@ type Session struct {
 	batcher   BatchSender // nil: send one datagram at a time
 	backlog   Backlogger  // nil: the carrier has no send queues of its own to report
 	held      bool        // this pump round: the carrier's send queues are full, no new data
+	deaths    uint64      // pool connection deaths already handled (PoolConnDeaths), pool carriers only
 	bp        [][]byte
 	bl        []int
 	spFree    []*sentPkt
@@ -566,6 +567,28 @@ func (s *Session) nextLane() int {
 	return s.lanes[s.laneRR%len(s.lanes)]
 }
 
+// repairAfterDeath resends, at once, every unacked packet older than twice the smoothed RTT: when a pool connection
+// dies, whatever was queued on it or still in its socket never arrives, and the stream behind each hole would stall
+// for the whole loss timer (2 s on a direct carrier). Packets that were on healthy connections are usually acked by
+// then; the few still in flight are sent twice, once per death.
+func (s *Session) repairAfterDeath(now time.Time) {
+	age := 2 * s.cc.srtt
+	if age < 150*time.Millisecond {
+		age = 150 * time.Millisecond
+	}
+	for i := s.sentHead; i < len(s.sent); i++ {
+		sp := s.sent[i]
+		if sp.done {
+			continue
+		}
+		if now.Sub(sp.at) < age {
+			break
+		}
+		s.lose(sp)
+	}
+	s.compact()
+}
+
 // noDirect (WAT_NO_DIRECT=1) ignores Config.Direct, for an A/B.
 var noDirect = os.Getenv("WAT_NO_DIRECT") != ""
 
@@ -894,6 +917,12 @@ func (s *Session) pathAcked(acked []*sentPkt, largest uint64, delay time.Duratio
 func (s *Session) timers(now time.Time) {
 	s.cc.inflight = s.inflight // PROBE_RTT drains until this reaches its floor
 	s.cc.tick(now)
+	if s.backlog != nil && s.cc.reliable { // a pool connection died: what it held is gone, resend old packets now
+		if d := poolConnDeaths.Load(); d != s.deaths {
+			s.deaths = d
+			s.repairAfterDeath(now)
+		}
+	}
 	if s.sentHead < len(s.sent) {
 		pto := s.cc.pto()
 		for i := s.sentHead; i < len(s.sent); i++ {
