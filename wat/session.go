@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ const (
 	// it then delivered was dropped as a replay and resent (field 2026-10-16, 32 connections: 2005 such packets per
 	// 200 MB). 131072 (a 1 MB ring) covers ~4 s at 125 MB/s with 4 KB packets.
 	reliableReplayWin = 131072
+	directMTU         = 16 << 10 // default datagram size on a direct pool (2.5.0)
 	maxStreams        = 8192
 	ipIcmpHdr         = 28
 )
@@ -80,7 +82,7 @@ type Stats struct {
 	// datagrams (UDP forwarding)
 	DgramSent, DgramRecv                       uint64
 	DgramDropQueue, DgramDropSize, DgramDropRx uint64
-	DgramFragmented, DgramReassembled          uint64 // datagrams sent in pieces / rebuilt from pieces (2.4.19)
+	DgramFragmented, DgramReassembled          uint64 // datagrams sent in pieces / rebuilt from pieces (2.5.0)
 	FecSent, FecRecovered                      uint64
 	CeilingBps, LossPct                        float64 // loss-aware soft ceiling (0 = none); last judged interval loss in percent
 
@@ -134,6 +136,7 @@ type Session struct {
 	replayWin uint64
 	ackMax    int // SACK ranges per ACK frame (the wire format allows 64)
 	rxKeep    int // received ranges remembered
+	ackEvery  int // ack after this many ack-eliciting packets (or 2 ms)
 	rxRanges  rangeSet
 	rxSince   []uint64 // reliable: packet numbers received since the last ACK (lateAck reports the ones it leaves out)
 	rxLate    rangeSet // reliable: received packets no ACK has reported yet, below the newest ackMax ranges
@@ -244,6 +247,11 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		if prof.MTU > 0 {
 			cfg.MaxPayload = prof.MTU
 		}
+		if cfg.Direct && prof.Reliable && prof.MaxMTU >= directMTU {
+			// A direct pool has no CDN or middlebox to fit: 16 KB datagrams cut the packets, acks and seals per byte
+			// by 4 against the 4 KB default (2.5.0). Any peer version reads them (the pool frame takes up to 64 KB).
+			cfg.MaxPayload = directMTU
+		}
 	}
 	cfg.MaxPayload = min(max(cfg.MaxPayload, MinPayload), hi)
 	if cfg.Logf == nil {
@@ -274,10 +282,11 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	if prof.Reliable && cfg.MinBps == 2e5 && cfg.InitBps > s.cc.minRate { // default floor: never pace a TCP pool below its start rate
 		s.cc.minRate = min(cfg.InitBps, cfg.MaxBps)
 	}
-	s.replayWin, s.ackMax, s.rxKeep = replayWin, 20, 64
+	s.replayWin, s.ackMax, s.rxKeep, s.ackEvery = replayWin, 20, 64, 6
 	if prof.Reliable { // pool reordering leaves a hole per stalled connection's packets: track and report more of them
 		s.replayWin, s.ackMax, s.rxKeep = reliableReplayWin, 64, 512
 		s.lateAck = !noLateAck
+		s.ackEvery = 16 // TCP below never loses a datagram: fewer acks, less work for both ends (2.5.0); 2 ms still bounds it
 	}
 	if ch, ok := pio.(PathChooser); ok && ch.NumPaths() > 0 {
 		s.replayWin = reliableReplayWin // paths of different delay put packets thousands of numbers behind each other
@@ -660,7 +669,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	if len(s.probeQ) > 0 {
 		return s.buildProbe(now), true
 	}
-	needAck := s.ackPend > 0 && (s.ackPend >= 6 || now.Sub(s.ackSince) >= 2*time.Millisecond)
+	needAck := s.ackPend > 0 && (s.ackPend >= s.ackEvery || now.Sub(s.ackSince) >= 2*time.Millisecond)
 	canData := s.cc.tokens > 0 && s.inflight < s.cc.cwnd() && !s.held
 	needBoot := s.cfg.Server && s.cfg.Boot != 0 && now.Sub(s.bootAt) >= time.Second
 	if !canData && !needAck && !s.wantPing && len(s.ctrl) == 0 && !needBoot {
@@ -1316,35 +1325,15 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 	var newly int
 	var rtt time.Duration
 	acked := s.ackBuf[:0]
-	for i := s.sentHead; i < len(s.sent); i++ {
-		sp := s.sent[i]
-		if sp.done && sp.lost && s.chooser != nil && rs.contains(sp.pn) {
-			sp.lost = false // declared lost too early (a slow path): the ack still tells the path is alive and how slow
-			s.pathSample(sp.lane, now.Sub(sp.at), now)
-			if s.fb != nil {
-				s.fb.OnAck(sp.lane, now.Sub(sp.at), 0)
-			}
-			continue
-		}
-		if sp.done || !rs.contains(sp.pn) {
-			continue
-		}
-		sp.done = true
-		if s.fec != nil && len(sp.frames) > 0 {
-			s.fec.onAck()
-		}
-		if s.chooser != nil {
-			acked = append(acked, sp)
-		}
-		s.inflight -= sp.size
-		newly += sp.size
-		for _, f := range sp.frames {
-			if st := s.streams[f.sid]; st != nil {
-				st.onAcked(f)
-			}
-		}
-		if sp.pn == largest {
-			rtt = now.Sub(sp.at) - delay
+	// Visit only the packets the ack covers: s.sent is in packet-number order, so each range is a binary search and a
+	// short walk. Walking everything in flight on every ack cost O(inflight) per ack, which at a second of delivery
+	// in flight (a direct pool) capped one session near 50-60 MB/s on one core while 4 sessions together moved 140+
+	// (field 2026-10-16).
+	live := s.sent[s.sentHead:]
+	for _, r := range rs {
+		j := sort.Search(len(live), func(k int) bool { return live[k].pn >= r.lo })
+		for ; j < len(live) && live[j].pn < r.hi; j++ {
+			s.ackOne(live[j], largest, delay, now, &newly, &rtt, &acked)
 		}
 	}
 	if len(s.lostRing) > 0 {
@@ -1357,6 +1346,45 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 		}
 		s.ackBuf = acked[:0]
 	}
+	s.afterAck(largest, delay, newly, rtt, now)
+}
+
+// ackOne marks one packet an ack covers as delivered.
+func (s *Session) ackOne(sp *sentPkt, largest uint64, delay time.Duration, now time.Time, newly *int, rtt *time.Duration, acked *[]*sentPkt) {
+	{
+		if sp.done && sp.lost && s.chooser != nil {
+			sp.lost = false // declared lost too early (a slow path): the ack still tells the path is alive and how slow
+			s.pathSample(sp.lane, now.Sub(sp.at), now)
+			if s.fb != nil {
+				s.fb.OnAck(sp.lane, now.Sub(sp.at), 0)
+			}
+			return
+		}
+		if sp.done {
+			return
+		}
+		sp.done = true
+		if s.fec != nil && len(sp.frames) > 0 {
+			s.fec.onAck()
+		}
+		if s.chooser != nil {
+			*acked = append(*acked, sp)
+		}
+		s.inflight -= sp.size
+		*newly += sp.size
+		for _, f := range sp.frames {
+			if st := s.streams[f.sid]; st != nil {
+				st.onAcked(f)
+			}
+		}
+		if sp.pn == largest {
+			*rtt = now.Sub(sp.at) - delay
+		}
+	}
+}
+
+// afterAck feeds the pacer and declares losses once an ack's packets are marked.
+func (s *Session) afterAck(largest uint64, delay time.Duration, newly int, rtt time.Duration, now time.Time) {
 	s.cc.inflight = s.inflight // post-ack, so the PROBE_RTT drain-floor guard in sample() sees the current queue
 	s.cc.onDelivered(newly)
 	if rtt > 0 {
@@ -1380,6 +1408,8 @@ func (s *Session) onAck(largest uint64, delay time.Duration, rs rangeSet, now ti
 		}
 		if (largest-sp.pn >= 4 && !s.cc.reliable) || now.Sub(sp.at) > lt+delay {
 			s.lose(sp)
+		} else if s.cc.reliable {
+			break // reliable loss is by age only, and s.sent is in send order: everything after is younger
 		}
 	}
 	s.compact()

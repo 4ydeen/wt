@@ -11,12 +11,12 @@ import "time"
 // Nothing is sent unless SendDatagram is called, so existing deployments see no wire change; but both ends must be
 // upgraded before any udp port is configured, or the old end silently discards every datagram.
 //
-// Fragments (2.4.19). A datagram bigger than one packet used to be dropped (dgram_dropped_size): WireGuard's default
+// Fragments (2.5.0). A datagram bigger than one packet used to be dropped (dgram_dropped_size): WireGuard's default
 // 1420 MTU makes ~1450-byte UDP packets, more than the udp carrier's ~1350 and the default icmp's ~590, so a VPN
 // over the tunnel opened small things (Telegram) but no web page. Now such a datagram goes out as up to dgramFragMax
 // frDgramFrag pieces, each the last frame of its packet, and the receiver rebuilds it; one lost piece loses the
-// datagram, like IP fragmentation. A peer older than 2.4.19 drops the pieces, exactly as it dropped the datagram
-// before, so mixed versions lose nothing they had; both ends need 2.4.19 for big datagrams to pass.
+// datagram, like IP fragmentation. A peer older than 2.5.0 drops the pieces, exactly as it dropped the datagram
+// before, so mixed versions lose nothing they had; both ends need 2.5.0 for big datagrams to pass.
 
 const (
 	dgramQueueMax   = 512     // datagrams waiting to be sent

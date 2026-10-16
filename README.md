@@ -40,7 +40,7 @@ Full reference (every config key, flag, `/stats` field): [docs/TECHNICAL.md](doc
 - **Easy to run.** One-line installer, a one-paste connection token, a multi-tunnel dashboard, a connection doctor,
   auto-heal, update and rollback.
 
-## What's new (latest: 2.4.18)
+## What's new (latest: 2.5.0)
 
 - **ICMP: bigger packets, a setting change (no update needed).** The Iran ⇄ Europe route passes full 1500-byte
   pings again. With `mtu: 1400` on **both** ends and the same 30 MB/s cap, Kharej resends 0.3-0.8 % of its packets
@@ -54,6 +54,13 @@ Update **both** servers for every release below. 2.4.9 to 2.4.16 were steps towa
 got slower over time; if you are on any of them, go straight to 2.4.17. ICMP and UDP tunnels behave exactly as in
 2.4.8 apart from the 2.4.17 fix.
 
+- **2.5.0: one tunnel is no longer capped near 50-60 MB/s.** On a direct TCP pool (tcp, tls, or any reverse pool)
+  one session spent its time on bookkeeping: every acknowledgement walked every packet in flight. It now touches only
+  the packets each acknowledgement covers, sends 16 KB datagrams instead of 4 KB, and acknowledges less often. In the
+  field, 4 separate tunnels together already moved 136-143 MB/s down and 173 up while one moved 49-60. Also new:
+  WireGuard and other big UDP packets pass every carrier (split and rebuilt inside the tunnel), traffic totals
+  survive restarts, a Windows binary (`wattun-windows-amd64.exe`, no ICMP), and **m** on a tunnel's page changes
+  its connection type or joins several. Update both ends.
 - **2.4.18: TCP pool tunnels 2-4x faster.** For tcp, tls and every reverse pool carrier (no CDN in between). On the
   Iran ⇄ Europe test pair (reverse tcp), uploads went from 12 to 47-56 MB/s and downloads from ~20-30 to 49-51
   MB/s with 8 connections and up to 69-74 MB/s with `conns: 16`. Ping under a full download stayed at the 38-40 ms
@@ -442,7 +449,7 @@ sudo bash install.sh            # installs the binary you just built
 
 ### Windows
 
-Since 2.4.19 every release also has `wattun-windows-amd64.exe`. It is the engine only: no installer and no `wattun`
+Since 2.5.0 every release also has `wattun-windows-amd64.exe`. It is the engine only: no installer and no `wattun`
 menu, so you run it with a config file (`wattun-windows-amd64.exe -config C:\wattun\iran.yml`) or with flags. All
 carriers except ICMP work (ICMP needs a Linux raw socket). The other end can be a normal Linux install.
 

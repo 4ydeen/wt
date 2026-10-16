@@ -79,7 +79,7 @@ flags (or with a first argument that does not start with `-`, such as `wattun au
 `status` or `auto-ip NAME IP`) hands over to `/usr/local/bin/wattun-manager`, which still works by its own name.
 Engine usage (flags starting with `-`) is unchanged.
 
-**Windows (2.4.19).** Releases include `wattun-windows-amd64.exe`, the engine alone (no installer, no manager): run it
+**Windows (2.5.0).** Releases include `wattun-windows-amd64.exe`, the engine alone (no installer, no manager): run it
 with `-config FILE` or flags, as a client or a server. Every carrier but ICMP works; `icmp` needs a Linux raw socket
 and fails at start. `tcp-cc` is ignored (BBR is set only on Linux). Use Windows paths in the config file.
 
@@ -432,9 +432,9 @@ same session. Datagrams are not retransmitted and are dropped when a queue is fu
 - The server only forwards to UDP ports that are listed as `/udp`. A TCP-only list allows no UDP.
 - Idle flows are closed after `udp-idle` (default 60 s).
 - Both ends need wattun 1.2.0 or newer.
-- Big datagrams (2.4.19): a datagram larger than one tunnel packet (about 1350 bytes on udp, 590 on the default
+- Big datagrams (2.5.0): a datagram larger than one tunnel packet (about 1350 bytes on udp, 590 on the default
   icmp) is sent in up to 64 pieces and rebuilt on the other end, so WireGuard's default MTU 1420 works. Both ends
-  need 2.4.19; with an older end such datagrams are dropped (`dgram_dropped_size`): set `MTU = 1280` in WireGuard on
+  need 2.5.0; with an older end such datagrams are dropped (`dgram_dropped_size`): set `MTU = 1280` in WireGuard on
   udp or icmp `mtu: 1400`, or about 550 on the default icmp. Losing one piece loses the datagram, so on a lossy path
   a smaller WireGuard MTU still does better.
 
@@ -676,7 +676,7 @@ parity packet, and an older peer stops parsing at the unknown frame, which sits 
 
 Both ends count traffic per port (client: the public port users connect to; server: the target port) and expose it
 live in `/stats` under `ports` and on a cheap `/ports` endpoint (needs `-metrics`). Counters are cumulative since
-process start. Since 2.4.19 the `*_total` and `conns_all_time` fields also keep counting across restarts: they are
+process start. Since 2.5.0 the `*_total` and `conns_all_time` fields also keep counting across restarts: they are
 saved to `<config>.totals.json` every 30 s and on shutdown (with `-config` only). Delete that file to start them from
 zero.
 
@@ -741,8 +741,8 @@ metrics port, even if the port is in the allowlist.
 | `loss_pct` | Loss in the last judged 50 ms interval, percent (0 until 50 packets were sent in one). |
 | `inflight` | Unacknowledged bytes. |
 | `pkts_out`, `pkts_in`, `bytes_out`, `bytes_in` | Totals since the process started. |
-| `bytes_out_total`, `bytes_in_total` | Since 2.4.19. Wire bytes across restarts (saved in `<config>.totals.json`); the manager shows these. |
-| `dgram_fragmented`, `dgram_reassembled` | Since 2.4.19. UDP datagrams too big for one packet that were sent in pieces / rebuilt from pieces (needs 2.4.19 on both ends; an older peer drops the pieces). |
+| `bytes_out_total`, `bytes_in_total` | Since 2.5.0. Wire bytes across restarts (saved in `<config>.totals.json`); the manager shows these. |
+| `dgram_fragmented`, `dgram_reassembled` | Since 2.5.0. UDP datagrams too big for one packet that were sent in pieces / rebuilt from pieces (needs 2.5.0 on both ends; an older peer drops the pieces). |
 | `retrans` | Retransmitted packets. |
 | `fec_sent`, `fec_recovered` | FEC parity packets sent; packets rebuilt from parity. |
 | `send_errors` | Carrier send failures. |
@@ -1056,6 +1056,21 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
 - **More connections.** `conns: 16` beat 8 on this path (73.8 against 51 MB/s); 32 fell to 26 MB/s from loss
   bursts. Both ends update for the full gain; the pool's own sending changes are local to each end.
 
+### One session, no longer capped (2.5.0)
+
+Field 2026-10-16, after the route's MSS fix: raw TCP Kharej → Iran did 167 MB/s on 8 connections, 243 on 16 and
+314 on 32, and 4 independent reverse tcp tunnels (4 connections each) together 136-143 MB/s down and 173 up, but one
+tunnel with 16 connections still 49-60. The limit was the session's own work, on one core:
+
+- **Acks.** Every ack walked every packet in flight, and a direct pool keeps a second of delivery in flight. Now each
+  ack range is a binary search into the sent list, and the reliable loss check stops at the first packet young enough
+  (packets are in send order).
+- **16 KB datagrams** on direct pools by default (was 4 KB): a quarter of the packets, seals and ack entries per byte.
+  `mtu` still overrides it. Older peers read them.
+- **Fewer acks** on reliable carriers: after 16 packets instead of 6 (the 2 ms bound is unchanged).
+
+All three are local to the sending or receiving end; mixed versions work. Update both ends for the full gain.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the
@@ -1153,7 +1168,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 | `listen tcp ...: address already in use` | Another process owns the port. `ss -ltnp \| grep :PORT`. Never start a test on a port a live instance uses; test ports should be 10811 or higher. |
 | `restart needed for KEY` in the log | You changed a key other than `ports:`. Only `ports:` is hot-reloaded. Do a handover. |
 | Config does not apply | A parse error keeps the old config. The log says `config FILE: line N: ...`. |
-| WireGuard (or another UDP VPN) connects, small apps like Telegram work, web pages do not | Its packets are bigger than one tunnel packet. Update both ends to 2.4.19 (big datagrams are split), or set `MTU = 1280` in WireGuard (udp carrier, or icmp with `mtu: 1400`). `dgram_dropped_size` in `/stats` rising confirms it. |
+| WireGuard (or another UDP VPN) connects, small apps like Telegram work, web pages do not | Its packets are bigger than one tunnel packet. Update both ends to 2.5.0 (big datagrams are split), or set `MTU = 1280` in WireGuard (udp carrier, or icmp with `mtu: 1400`). `dgram_dropped_size` in `/stats` rising confirms it. |
 | Slow, high CPU on Iran | Two cores saturate under many processes. Run one instance, not one per port. Check `retrans` and `send_errors` in `/stats`. Lower `max-mbps` only if the link is rate limited. |
 | Time or clocks | Authentication does not compare clocks. A server restart starts its packet numbers from the current time so a nonce is never reused, so keep NTP on and never set a server clock back. |
 | Foreign traffic on the listener | Expected. Strangers' packets fail authentication and are dropped. |

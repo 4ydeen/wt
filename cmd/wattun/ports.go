@@ -297,7 +297,7 @@ type registry struct {
 	loaded map[int]int64 // quota usage read from the state file
 	path   string        // quota state file ("" = no persistence)
 
-	// Lifetime totals (2.4.19): bytes and connections per port and the session's wire bytes, kept across restarts in
+	// Lifetime totals (2.5.0): bytes and connections per port and the session's wire bytes, kept across restarts in
 	// totPath. /ports and /stats report base + what this process counted.
 	totPath  string
 	tot      map[string][3]int64 // "c:20001" -> up, down, conns; "session" -> in, out, 0
