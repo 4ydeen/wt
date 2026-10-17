@@ -1113,6 +1113,19 @@ An earlier 2.5.0 set gave 53.4, 61.1 and 60.5 MB/s. Iran RSS during the 2.5.1 ru
 77-197 MB). The Iran box itself was near saturation, mostly in kernel and softirq time, so the next gains need
 fewer system calls per byte rather than less Go work.
 
+Production, 2026-10-17, the same reverse tcp tunnel as the 2.5.0 table above (16 connections, ~155-200 user
+streams at the same time). CPU is percent of one core for the tunnel process, averaged over the run:
+
+| Run | MB/s | srtt | Kharej CPU | Iran CPU |
+|---|---|---|---|---|
+| down, 8 streams, 200 MB | 122.3 | 40 ms | 44 % | 94 % |
+| up, 8 streams, 200 MB | 140.7 | 39 ms | 56 % | 96 % |
+| down, 16 streams, 200 MB | 157.0 | 51 ms | 58 % | 89 % |
+| up, 16 streams, 200 MB | 276.1 | 43 ms | 72 % | 132 % |
+| down, 16 streams, 2048 MB | 194.6 | 48 ms | 59 % | 128 % |
+
+Against 2.5.0 on the same tunnel (down 53.3, up 149.7 at 16 streams): download about 3x, upload about 1.8x.
+
 ### Stalled pool connections (2.4.5)
 
 Through a CDN, one edge connection can sit in TCP retransmit backoff for tens of seconds with megabytes queued in the

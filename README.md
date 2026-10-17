@@ -57,8 +57,10 @@ got slower over time; if you are on any of them, go straight to 2.4.17. ICMP and
 - **2.5.1: faster download.** The receiving end kept re-growing and re-copying each stream's buffer, which took
   about a quarter of the tunnel's CPU on a 2-core Iran server during a download. Received data now goes into reused
   64 KB chunks, and the sending side no longer copies its whole buffer on every write. Same Iran server, reverse tcp,
-  16 connections, 16 streams: download **65-116 MB/s, was 53-71**, and memory stays flat (149-161 MB). Update the
-  Iran server for the download gain and the Kharej server for its sending side; mixed versions work.
+  16 connections, 16 streams: download **65-116 MB/s, was 53-71**, and memory stays flat (149-161 MB). On the
+  production tunnel (~200 user connections at the same time): **download 157 MB/s, was 53, and 195 MB/s (~1.6 Gbit)
+  on a 2 GB run; upload 276 MB/s, was 150**, ping through the tunnel 43-51 ms. Update the Iran server for the
+  download gain and the Kharej server for its sending side; mixed versions work.
 - **2.5.0: one tunnel is no longer capped near 50-60 MB/s.** On a direct TCP pool (tcp, tls, or any reverse pool)
   one session spent its time on bookkeeping: every acknowledgement walked every packet in flight. It now touches only
   the packets each acknowledgement covers, sends 16 KB datagrams instead of 4 KB, and acknowledges less often. In the
@@ -186,9 +188,13 @@ tunnel stayed at the route's 38-43 ms during the 2.4.18 and 2.5.0 runs.
 | 2.5.0, same, 8 streams | 37.9 MB/s | 101.7 MB/s |
 | 2.5.0, 16 connections, test tunnel next to production, 16 streams | 53-71 MB/s | |
 | **2.5.1**, same test tunnel, 16 streams | **65-116 MB/s** | |
+| **2.5.1**, production tunnel, 8 streams | 122.3 MB/s | 140.7 MB/s |
+| **2.5.1**, production tunnel, 16 streams | **157.0 MB/s** | **276.1 MB/s** |
+| **2.5.1**, production tunnel, 16 streams, 2 GB | **194.6 MB/s** | |
 
 In 2.5.0 the download was bound by the Iran server's CPU (the receiving tunnel used 103-117 % of one of its two
-cores), not by the route. 2.5.1 removed a large part of that cost.
+cores), not by the route. 2.5.1 removed a large part of that cost: on the same production tunnel the download went
+from 53 to 157 MB/s, and to 195 MB/s on a 2 GB run (Iran 128 % of one core, Kharej 59 %).
 
 ### CDN (Cloudflare): field numbers
 
