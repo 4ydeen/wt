@@ -11,8 +11,11 @@ Version: see `wat/version.go` (`wattun -version`).
 ## Contents
 
 1. [Why it exists](#why-it-exists)
+   - [Field numbers](#field-numbers)
+   - [Resource usage: idle, RAM, CPU and bandwidth](#resource-usage-idle-ram-cpu-and-bandwidth)
 2. [Install](#install)
 3. [Quick start](#quick-start)
+   - [Managing tunnels](#managing-tunnels)
 4. [Carriers](#carriers)
 5. [Bonding](#bonding)
 6. [Reverse mode](#reverse-mode)
@@ -26,7 +29,8 @@ Version: see `wat/version.go` (`wattun -version`).
 12. [Troubleshooting](#troubleshooting)
 13. [Security model](#security-model)
 14. [Build and test](#build-and-test)
-15. [License and attribution](#license-and-attribution)
+15. [Release history](#release-history)
+16. [License and attribution](#license-and-attribution)
 
 ## Why it exists
 
@@ -72,6 +76,237 @@ where WatTunnel wins, because GOST cannot repair loss as fast. The h2, h2c, wss 
 tests but are not in this benchmark. TCP and UDP to Kharej are blocked on the production path, so those carriers are
 proven on loopback and simulated links only.
 
+## Field numbers
+
+Everything here was measured on real Iran ⇄ Europe servers (2 vCPU each), except where marked emulated. Run
+`wattun test NAME` to measure your own route.
+
+### TCP tunnels (tcp, tls, reverse)
+
+Reverse `tcp` (Kharej dials Iran), October 2026, 200 MB speed tests unless noted.
+
+Ping through the tunnel:
+
+- 2.4.18 and 2.5.0 runs: the route's own 38-43 ms.
+- 2.5.1 runs: 40-51 ms.
+
+| Setup | Download | Upload |
+|---|---|---|
+| Plain TCP, no tunnel, 8 connections | 167 MB/s | |
+| Plain TCP, no tunnel, 16 connections (the route's ceiling) | 243 MB/s | 448 MB/s |
+| Plain TCP, no tunnel, 32 connections | 314 MB/s | |
+| 2.4.17, 8 connections (test tunnel) | ~20-30 MB/s | 12 MB/s |
+| 2.4.18, 8 connections | 49-53 MB/s | 47-56 MB/s |
+| 2.4.18, 16 connections, 32 streams | 69-74 MB/s | |
+| 4 separate 2.4.18 tunnels at once | 136-143 MB/s | 173 MB/s |
+| 2.5.0, 16 connections, production tunnel with ~400 users, 16 streams | 53.3 MB/s | 149.7 MB/s |
+| 2.5.0, same, 8 streams | 37.9 MB/s | 101.7 MB/s |
+| 2.5.0, 16 connections, test tunnel next to production, 16 streams | 53-71 MB/s | |
+| 2.5.1, same test tunnel, 16 streams | 65-116 MB/s | |
+| 2.5.1, production tunnel, 8 streams | 122.3 MB/s | 140.7 MB/s |
+| **2.5.1, production tunnel, 16 streams** | **157.0 MB/s** | **276.1 MB/s** |
+| **2.5.1, production tunnel, 16 streams, 2 GB** | **194.6 MB/s** | |
+
+- **2.5.0:** the download was limited by the Iran server's CPU, not the route. The receiving tunnel used 103-117 % of one of its two cores.
+- **2.5.1:** removed a large part of that CPU cost (see [Cheaper stream buffers](#cheaper-stream-buffers-251)). Its download reaches 80 % of what plain, unencrypted TCP gets on the same route with 16 connections.
+
+### ICMP (real filtered route, October 2026)
+
+Real VLESS (xray) traffic went through each tunnel, on the same servers and the same route. WatTunnel numbers are
+from version 1.8.0.
+
+| | WatTunnel 1.8.0 | GOST v3 ICMP |
+|---|---|---|
+| Peak throughput | **~33 MB/s**, the route's maximum | 1.6 - 5.4 MB/s |
+| Single connection | **~25 MB/s** | 1.0 - 1.6 MB/s |
+| Latency p50 (route's raw RTT is ~40 ms) | **40 - 45 ms**, close to zero added | ~51 ms |
+| CPU per MB moved (Iran side) | **0.026 CPU-s** | 0.15 - 0.20 CPU-s (**6 - 7x more**) |
+| RAM | **~40 MB** | 50 - 70 MB |
+| 120 short TLS requests, 24 parallel | **120 / 120 ok** | - |
+
+The route caps at about 50 - 55k ICMP packets per second (~33 MB/s), and WatTunnel fills it. In production, a single
+process carries 250 - 300 real clients.
+
+With 1400-byte packets (`mtu: 1400` on both ends, 2026-10-12, same route, 30 MB/s cap), a single speed test gave:
+
+- **27.5 MB/s down, 26 MB/s up.**
+- 0.3-0.8 % of packets resent (3-5 % at 640 bytes).
+- Ping 41 ms under load.
+
+Before you raise the MTU, check the route:
+
+- `ping -M do -s 1372 PEER_IP` must get replies.
+- `ip route get PEER_IP` must not show `mtu lock 680`.
+
+Keep the total of all ICMP tunnels on the route at about 30 MB/s or less (see [ICMP path limits](#icmp-path-limits-and-pacing)).
+
+Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
+
+| Tool | How it works | Throughput measured | Notes |
+|---|---|---|---|
+| **WatTunnel** | Own ICMP transport, one process, 4 lanes, AEAD, batched I/O | **up to ~33 MB/s** | Every port in one process, ~40 MB RAM |
+| GOST v3 ICMP | QUIC over ICMP | 1.6 - 5.4 MB/s | 6 - 7x the CPU per MB |
+| BackPack (tuned) | ICMP transport | ~6.1 MB/s | Latency p50 102 ms / p95 198 ms |
+| Hans | IP-over-ICMP tun device | 1.1 - 3.8 MB/s | Needs a C++ build on both servers |
+| WireGuard over pingtunnel | WireGuard inside one pingtunnel UDP session | 0.25 - 2.7 MB/s | Flat ceiling of a single pingtunnel process |
+| pingtunnel | One process per port | ~0.5 MB/s under load | Each process reads every ICMP packet, so the CPU saturates |
+| ptunnel-ng | One ICMP proxy per port | ~20 KB/s | Last resort only |
+
+### CDN (Cloudflare)
+
+Iran → Cloudflare → Kharej, `wss` + ECH. The rows come from three sets of runs:
+
+- 2.3.0 and 2.4.0 rows: 2026-10-11, a tunnel with no users.
+- 2.4.6 row: production with real users, 2026-10-12.
+- 2.4.16 rows: a test tunnel, 2026-10-13.
+
+| Setup | Result |
+|---|---|
+| 1 session (2.3.0) | ~19 MB/s down |
+| 4 sessions (2.3.0) | ~52 MB/s down, ~51 MB/s up |
+| 6 sessions (2.3.0) | ~60 MB/s down |
+| 8 sessions (2.3.0) | peak 69 MB/s up |
+| 6 sessions (2.4.0) | 76.6 MB/s up |
+| 4 sessions (2.4.6), production, ~250 user connections | ~41 MB/s down sustained (28-50), 44-48 MB/s down and up to 82 MB/s up in speed tests, ~100 MB RAM per server |
+| 4 sessions (2.4.16), speed test | 22.6 and 32.4 MB/s up, round trip steady at 109-116 ms (base 86 ms) |
+| 1 connection (2.4.16), 28-32 ms Cloudflare edge | 24.4 MB/s down, 4.41 MB/s up |
+| ICMP tunnel on the same path (only ICMP passes directly there) | ~1.1 MB/s down, ~2.1 MB/s up |
+| Any CDN variant **without** ECH | did not connect at all |
+
+Competitors' CDN speeds were not measured on this route, so there is only a feature comparison:
+
+| | WatTunnel | Typical manual CDN setup (a ws/grpc proxy behind Cloudflare, configured by hand) |
+|---|:-:|:-:|
+| Cloudflare carriers (`ws`/`wss`/`grpc`) | ✅ | ✅ |
+| ECH against SNI filtering, config fetched automatically | ✅ | ❌ by hand |
+| Automatic scan for working Cloudflare IPs | ✅ | ❌ by hand |
+| Automatic choice of TLS fingerprint / ECH / fragmentation by speed test | ✅ | ❌ by hand |
+| Several sessions per tunnel, spread over several Cloudflare IPs | ✅ (default 4) | ❌ by hand |
+| Ports added or removed without a restart | ✅ | depends on the tool |
+| Auto-heal re-tests and replaces dead Cloudflare IPs | ✅ | ❌ |
+
+### What usual tools do on a filtered route
+
+| Problem on a filtered route | What usual tools do | What WatTunnel does |
+|---|---|---|
+| TCP and UDP are cut after a few packets | Tunnel dies or flaps | Rides ICMP, which isn't cut |
+| 0.2–2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
+| Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default, up to 1400 where the route allows |
+| SNI filtering of CDN domains | Blocked right after the handshake | Cloudflare with ECH; edges and TLS settings are found automatically |
+| One process per port | Server CPU saturates | One process for all ports, batched syscalls |
+| Changing ports | Restart drops every user | `ports:` list is hot-reloaded every 3 s |
+| Link silently dies | You find out from your users | Live status, connection doctor, auto-heal |
+
+### Feature comparison
+
+| | WatTunnel | GOST | pingtunnel | Hans | ptunnel-ng |
+|---|:-:|:-:|:-:|:-:|:-:|
+| ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Cloudflare/CDN with ECH | ✅ | - | ❌ | ❌ | ❌ |
+| Auto mode: one token tests every variant | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Loss-tolerant (delay-based) pacing | ✅ | ❌ | ❌ | ❌ | ❌ |
+| All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
+| Add or remove ports without restart | ✅ | ❌ | ❌ | - | ❌ |
+| UDP port forwarding | ✅ | ✅ | ⚠️ | ✅ | ❌ |
+| Built-in encryption | ✅ AEAD | ✅ | ⚠️ | ⚠️ | ❌ |
+| Adaptive FEC | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Reverse mode (TCP-based carriers) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Reverse ICMP (Kharej pings, Iran keeps the ports) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Single static binary, no dependencies | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Guided manager, token pairing, auto-heal | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+On a clean emulated link (20 ms each way, 0.2 % loss, 100 Mbit):
+
+- Every tunnel reaches line rate.
+- GOST uses a little less CPU.
+- WatTunnel halves small-request latency (p50 43 ms vs 83 ms), because it sends interactive streams first.
+
+See [Loopback A/B against GOST](#loopback-ab-against-gost-emulated-link-2026-10-09).
+
+## Resource usage: idle, RAM, CPU and bandwidth
+
+### Idle tunnel
+
+These figures are for a connected tunnel with no users and no traffic. They come from a 5-minute run of 2.5.1 on a
+local udp pair and a local tcp pair, measured on 2026-10-17. Both pairs showed the same session-level numbers. These local pairs ran on Windows. The engine is the same Go code on
+Linux, where an idle Iran tunnel measured 32 MB of RSS after a load test (see RAM in production below).
+
+| | Iran (client) | Kharej (server) |
+|---|---|---|
+| Packets sent | 0.5 per second | 1.5 per second |
+| Tunnel bytes sent | 16 B/s | 61 B/s |
+| CPU | 0.15-0.2 % of one core | 0.13 % of one core |
+| RAM (working set, no users) | 10-16 MB | 10-17 MB |
+
+The idle traffic comes from three sources:
+
+- **Iran:** a keepalive ping goes out after 2 seconds with nothing else sent.
+- **Kharej:** it acknowledges each ping. It also sends a restart marker once a second, so that Iran notices quickly
+  when Kharej restarts.
+- **Both:** every packet carries 32 bytes of header and authentication tag.
+
+Wire bytes per carrier, computed from the measured packet rate (2 packets per second in total) and each carrier's
+own headers:
+
+| Carrier | Extra per packet | Idle traffic, both directions | Per day | Per 30 days |
+|---|---|---|---|---|
+| `udp` | 28 B (IP + UDP) | ~133 B/s | ~11.5 MB | ~345 MB |
+| `icmp` | 28 B (IP + ICMP) | ~133 B/s | ~11.5 MB | ~345 MB |
+| `icmp` reverse | same, plus 4 empty knocks every 5 s, and the kernel's answers to them | ~180 B/s | ~16 MB | ~470 MB |
+| TCP-based (`tcp`, `tls`, `ws`...) | 2 B frame + TCP/IP headers, plus TCP's own acks and keepalives | a few hundred B/s | under ~35 MB | under ~1 GB |
+
+The TCP-based row is an upper estimate, not a measurement. TCP adds its own packets, and their number depends on
+`conns` and the kernel's keepalive settings.
+
+An idle tunnel therefore costs about as much as a few kilobytes of a web page per minute. The 30-second dead-link
+timeout and the reconnect logic need no extra traffic.
+
+### RAM in production
+
+| Tunnel | Load | RSS |
+|---|---|---|
+| ICMP, 1.8.0 | 250-300 real clients | ~40 MB |
+| ICMP, 2.4.8, Iran | ~200 connections | 76 MB |
+| CDN (`wss`), 2.4.6 | ~250 user connections | Iran 79-100 MB, Kharej 75-103 MB |
+| CDN test tunnel, 2.4.17, Iran | 50-connection load, then idle | 33-43 MB, 32 MB after |
+| Reverse tcp, 2.5.0, Iran | 455 streams plus a 16-stream download | 113 MB, rising to 280 MB during the download |
+| Reverse tcp, 2.5.1, Iran | 16-stream download on a test tunnel | 149-161 MB, flat |
+
+If you set `GOMEMLIMIT`, give it at least twice the tunnel's normal memory. See [Memory with slow readers](#memory-with-slow-readers-243).
+
+### CPU in production
+
+| Tunnel | Load | CPU (percent of one core) |
+|---|---|---|
+| ICMP, 1.8.0, Iran | per MB moved | 0.026 CPU-s (GOST ICMP: 0.15-0.20) |
+| Reverse tcp, 2.5.1 | 195 MB/s download (2 GB run) | Iran 128 %, Kharej 59 % |
+| Reverse tcp, 2.5.1 | 276 MB/s upload | Iran 132 %, Kharej 72 % |
+| Reverse tcp, 2.5.1 | 122 MB/s download, 8 streams | Iran 94 %, Kharej 44 % |
+
+### Bandwidth overhead under load
+
+This is how many bytes the tunnel adds on top of what your users move. It was measured with 2.5.1 on the same local
+pairs: a 512 MB transfer each way, 8 streams, and no loss. Tunnel bytes include the 32-byte header and tag of every
+packet and the frame headers.
+
+| Carrier | Packet size | Tunnel bytes per payload byte | Acks back (share of payload) | With the carrier's own headers |
+|---|---|---|---|---|
+| `udp` | ~1,394 B | +2.95 % | 0.43-0.51 % (one ack per ~7 packets) | ~+5.0 % forward, ~0.8 % back |
+| `tcp` (direct pool) | ~16,380 B | +0.25 % | 0.03 % (one ack per ~13 packets) | +0.25 %, plus TCP/IP headers (~3 % at a 1500-byte MTU, the same as any TCP connection) |
+| `icmp`, `mtu: 1400` | ~1,400 B | ~+3 % | ~0.5 % | ~+5 % |
+| `icmp`, default 640 | 640 B | ~+6.5 % | ~0.5 % | ~+11 % |
+
+- **Measured:** the `udp` and `tcp` rows.
+- **Computed:** the `icmp` rows. They use the same ~40 bytes per packet measured on `udp` (32 header and tag, plus the
+  frame header) and 28 bytes of IP and ICMP header.
+
+On a lossy route, add the resent packets. `/stats` counts them in `retrans`; at `mtu: 1400` on the Iran ⇄ Europe ICMP
+route, Kharej resent 0.3-0.8 % of its packets.
+
+To check your own tunnel, compare `bytes_out` in `/stats` with the user traffic in `/ports`.
+
 ## Install
 
 Use the installer and the `wattun` menu described in the main [README](../README.md). Running `wattun` with no
@@ -114,6 +349,95 @@ systemctl enable --now wattun@iran
 
 Check: `curl -s 127.0.0.1:19700/stats` on Kharej shows `"alive": true` once Iran connects.
 Do not start a second instance on a port that a live one already uses (see [Troubleshooting](#troubleshooting)).
+
+## Managing tunnels
+
+Run `wattun` for the dashboard of all tunnels (`wattun-manager` still works). Keys:
+
+- A tunnel's number: manage that tunnel.
+- `n`: new tunnel.
+- `m`: live monitor.
+- `u`: update.
+- `s`: settings (rollback, uninstall, auto-heal).
+- `q`: quit.
+
+A tunnel's page has:
+
+- diagnose and speed test
+- logs
+- the port-mapping editor
+- the token
+- advanced settings
+- change connection type (**m**)
+- restart and delete
+
+When a link is down, the doctor names the likely cause.
+
+```bash
+wattun                 # dashboard
+wattun new kharej      # new tunnel (kharej or iran); do Kharej first
+wattun status          # one line per tunnel
+wattun monitor         # live dashboard
+wattun ports NAME      # edit the port mappings of a tunnel
+wattun test NAME       # connection doctor + speed test
+wattun speedtest NAME  # speed test only (10 MB each way)
+wattun logs NAME       # follow the log
+wattun token NAME      # print the Kharej token
+wattun auto-test NAME  # re-run the Auto mode test
+wattun cdn-tune NAME   # re-tune a Cloudflare tunnel
+wattun auto-ip NAME IP # tell an auto tunnel Iran's IP (on Kharej)
+wattun update | rollback | help
+```
+
+**Config.** Each tunnel is `/etc/wattun/NAME.yml`, run by systemd as `wattun@NAME`. The keys are the flag names. Only
+the `ports:` list reloads live (within 3 seconds). Any other change needs `systemctl restart wattun@NAME`.
+
+```yaml
+# /etc/wattun/iran.yml
+mode: client
+key-file: /etc/wattun/iran.key
+carrier: icmp
+peer: 203.0.113.10
+metrics: 127.0.0.1:19750
+ports:
+  - 443          # users connect to Iran :443, delivered to Kharej 127.0.0.1:443
+  - 8443:443     # users connect to Iran :8443, delivered to Kharej 127.0.0.1:443
+  - 53/udp
+  - 5353:53/udp
+```
+
+On Kharej, `ports:` is an allowlist of target ports. Leave it out to allow any port. Every key: [Config file](#config-file).
+
+**Auto-heal.** A systemd timer (`wattun-heal`) restarts an Iran tunnel whose link has been down for 3 minutes.
+
+- It turns on automatically for Iran tunnels. To turn it off: `wattun` → `s` → `h`.
+- It never restarts a tunnel you stopped yourself.
+
+**Monitoring.** Each tunnel serves a small HTTP API on `127.0.0.1` only. Never expose it.
+
+```bash
+curl -s 127.0.0.1:19750/stats       # alive, last_rx_age_ms, srtt_ms, rate_bps, loss_pct, streams, sessions, bytes...
+curl -s 127.0.0.1:19750/ports       # traffic per port
+curl -s '127.0.0.1:19750/speedtest?dir=down&mb=10'   # built-in speed test (client side)
+```
+
+To judge a link's health, use `last_rx_age_ms` rather than ping. Fields: [Metrics](#metrics).
+
+**Choosing a connection type by hand.**
+
+| Your situation | Use | Notes |
+|---|---|---|
+| Only ping passes | `icmp` | Needs root. `icmp-type` can be `echo`, `timestamp`, `info` or `mask`. |
+| UDP works | `udp` | Lowest latency and CPU. |
+| Plain TCP works | `tcp` | A pool of connections. |
+| Traffic should look like HTTPS | `tls` | TLS 1.3. Set `tls-pin` to pin the certificate. |
+| Through a CDN | `wss` or `grpc` | See [CDN tuning](#cdn-tuning). `ws`/`h2c` are for a CDN on port 80 or a proxy that handles TLS. |
+| Iran can't ping Kharej, but Kharej can ping Iran | `icmp` + reverse | Kharej sends the pings, Iran answers. |
+| Iran can't reach Kharej's TCP port, but Kharej can reach Iran | TCP-type carrier + reverse | Iran listens, Kharej dials. |
+| Don't know | `auto` | See [Auto mode](#auto-mode). |
+| Must survive any one carrier being blocked | Bonding, e.g. `carrier: icmp+udp+tcp` | See [Bonding](#bonding). |
+
+If the route cuts TCP in both directions, only ICMP (and reverse ICMP) will work.
 
 ## Carriers
 
@@ -184,6 +508,11 @@ Not with `udp`. Put `reverse: true` on both ends.
 
 Anyone who connects to the listening side can only occupy one of 64 capped slots. Their packets fail authentication
 and are dropped.
+
+**With the manager.** For a new tunnel, pick reverse in the Kharej wizard's advanced settings: the token carries it.
+To switch an existing tunnel, update both servers first. On **Kharej** run `wattun`, open the tunnel, press `o`
+(advanced) and `d` (direction), enter Iran's IP and confirm the restart. On **Iran** use the same keys and confirm.
+Then run `wattun test NAME` on Kharej.
 
 ### Reverse ICMP
 
@@ -359,6 +688,21 @@ once per 30 minutes). It switches to another working variant only when the curre
 with 2.0.x ones for normal tunnels.
 
 ## CDN tuning
+
+**Setup.** Use this on routes where only HTTPS to a CDN gets out, or where the filter looks at the SNI.
+
+1. Put a domain on Cloudflare with the proxy on (orange cloud) and SSL mode **Full**. For `grpc`, also turn on gRPC
+   in Cloudflare's Network settings, if your plan shows that switch.
+2. In the Kharej wizard, choose `wss` (or `grpc`) and enter the domain.
+   - `h2` does not work through Cloudflare.
+   - Plain `ws` on HTTP ports can hang at the upgrade.
+   - Always use the domain, not the server's IP. With the IP, the tunnel bypasses Cloudflare and works only where
+     that IP is reachable. The manager warns about this.
+3. On Iran, the manager finds the ECH config by itself and scans Cloudflare edge IPs for ones that work for your
+   domain. It then tests the Chrome fingerprint, ECH, plain TLS and ClientHello fragmentation, and writes the
+   winner to the config.
+4. Use several `sessions` (default 4) to fill the pipe. Re-tune any time with `wattun cdn-tune NAME`. Auto-heal
+   replaces dead edges.
 
 Since 2.2.0, client (Iran) side only. Kharej and the wire format are unchanged, so any 2.x Kharej works.
 
@@ -1214,6 +1558,12 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 
 | Symptom | Cause and fix |
 |---|---|
+| Where to start | `wattun test NAME`, then `systemctl status wattun@NAME` and `journalctl -u wattun@NAME -f`. |
+| `DISCONNECTED`, or the log says `no reply from the server` | Different key or carrier on the two sides: paste the token again on Iran. For ICMP, check that Iran can ping Kharej, and run the doctor. |
+| Works some days only | The route is filtered on the bad days. Keep auto-heal on and a second tunnel with another carrier as a backup. |
+| CDN tunnel works from some Iran servers or networks but not others | The Kharej address on Iran is a plain IP, so traffic is not going through Cloudflare. Use your Cloudflare domain (orange cloud) or run `wattun cdn-tune NAME`, and check the SNI is spelled exactly like the domain. |
+| A CDN tunnel connects and then stalls | Run `wattun cdn-tune NAME full`. |
+| Connected, but users can't open sites | Nothing listens on Kharej's `127.0.0.1:PORT`. |
 | `alive: false` on both ends, no errors | Wrong key, or the carrier is filtered. Compare the key files (`sha256sum`). Try `ping` between the servers: ICMP must pass. |
 | Iran cannot ping Kharej, Kharej can ping Iran (often one day on, one day off) | A one-way block on Iran's own pings. Use `reverse: true` on both ends with `icmp` (see Reverse ICMP). |
 | ICMP works with small pings but the tunnel stalls | MTU. Go back to the default 640 on both ends, then test larger sizes with `ping -M do -s SIZE <peer>` before raising `mtu` again. |
@@ -1243,7 +1593,8 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
   the session. Set `tls-pin` to also reject a wrong certificate.
 - **What none of this hides.** The server's address, the volume and timing of packets, and the fact that ICMP or the
   carrier is in use. WatTunnel is not an anonymity tool.
-- **Protect the key file.** `chmod 600`, and do not put the key on the command line (`ps` shows it). 
+- **Protect the key file.** `chmod 600`, and do not put the key on the command line (`ps` shows it). The manager
+  keeps `/etc/wattun` at mode `700` and key files at `600`. **The token contains the key**, so share it privately.
 - **Metrics.** Keep `metrics` on `127.0.0.1`. pprof is on the same address.
 
 ## Build and test
@@ -1258,6 +1609,74 @@ Layout: `wat/` is the library (session, congestion control, streams, carriers), 
 `cmd/wprobe` a path probe. Bump `wat/version.go` for every shipped change, and
 rebuild `dist/` (`sh build.sh`). A change that is slower on ICMP is not
 shipped.
+
+## Release history
+
+Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
+toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
+
+- **2.5.1: faster download.** The receiving end kept re-growing and re-copying each stream's buffer. On a 2-core Iran
+  server, that took about a quarter of the tunnel's CPU during a download. Received data now goes into reused 64 KB
+  chunks, and the sending side no longer copies its whole buffer on every write.
+  - Test tunnel: download went from 53-71 to 65-116 MB/s, and memory stayed flat (149-161 MB).
+  - Production tunnel: download went from 53 to 157 MB/s, and to 195 MB/s (~1.6 Gbit) on a 2 GB run. Upload went
+    from 150 to 276 MB/s.
+  - `/speedtest` accepts `mb` up to 256 × `streams`.
+  - Mixed versions work. [Details](#cheaper-stream-buffers-251)
+- **2.5.0: one tunnel is no longer capped near 50-60 MB/s.** On a direct TCP pool (tcp, tls, or any reverse pool),
+  every acknowledgement walked every packet in flight. Now each acknowledgement touches only the packets it covers.
+  The pool also sends 16 KB datagrams instead of 4 KB, and acknowledges less often.
+  - Production: upload went from 49-55 to 149.7 MB/s. Download stayed at 53 MB/s, limited by the Iran CPU (fixed in
+    2.5.1).
+  - Also new: WireGuard and other big UDP packets pass every carrier (split and rebuilt inside the tunnel), traffic
+    totals survive restarts, a Windows binary (`wattun-windows-amd64.exe`, no ICMP), and **m** on a tunnel's page
+    changes its connection type or joins several.
+  - [Details](#one-session-no-longer-capped-250)
+- **ICMP: bigger packets, a setting change (no update needed).** Since 2026-10-12 the Iran ⇄ Europe route passes full
+  1500-byte pings again. Set `mtu: 1400` on **both** ends and keep the same 30 MB/s cap:
+  - Kharej resends 0.3-0.8 % of its packets instead of 3-5 %.
+  - Download went from 22-24 to 27.5 MB/s, and upload from 21-22 to 26 MB/s.
+  - Ping stayed at ~41 ms under load.
+  - [Details](#icmp-path-limits-and-pacing)
+- **2.4.18: TCP pool tunnels 2-4x faster.** For tcp, tls and every reverse pool carrier (no CDN in between).
+  - On the reverse tcp test pair, upload went from 12 to 47-56 MB/s. Download went from ~20-30 to 49-51 MB/s with 8
+    connections, and up to 69-74 MB/s with `conns: 16`.
+  - Pool sockets use BBR (`tcp-cc`).
+  - Packets that arrive late are acknowledged instead of sent again: needless resends per 200 MB fell from 61-82k
+    to under 2k.
+  - `/stats` gained `pool_conns`.
+  - [Details](#direct-pools-2418)
+- **2.4.17: no more leftover connections.** When a user's connection closed while data was still on its way, the
+  tunnel kept it open inside. After a load test, an Iran server held 69-76 of them, and its RAM grew from 40 to
+  159 MB in 36 minutes. They are now cleaned up when the connection closes.
+- **2.4.16: CDN speed holds over time.** On a test tunnel through Cloudflare, the round trip stayed at 109-116 ms
+  against an 86 ms base, and speed tests reached 22.6-32.4 MB/s up.
+- **2.4.15:** fixes single-connection uploads that 2.4.14 could stall and reset.
+- **2.4.12 to 2.4.14: the window stays bounded.** On a busy CDN connection, the tunnel's queue used to grow without
+  limit: it measured a 550 ms base round trip instead of 108. It now drains briefly every 8 seconds to measure the
+  real base.
+- **2.4.11: CDN pacing by delivery rate.** On an emulated CDN link, a single connection went from about 1 MB/s to
+  5-7 MB/s.
+- **2.4.10: diagnostics.** A `cc` block in `/stats` shows what holds the sender back.
+- **2.4.9: late is not lost.** A packet that TCP delivers late through a CDN is no longer resent and read as
+  congestion.
+- **Manager:** when you create a `wss`, `grpc` or `h2` tunnel on Iran with the Kharej server's IP as the address,
+  the manager warns that the traffic does not go through Cloudflare.
+- **2.4.8: less RAM per user connection.** Idle connections keep 4 KB copy buffers instead of 32 KB. If you set
+  `GOMEMLIMIT`, give it at least twice the tunnel's normal memory.
+- **2.4.7: CDN connection health.** A CDN connection that delivers far less than the others is replaced.
+- **2.4.6: RAM stays low.** On a production CDN tunnel with about 250 user connections, the Iran server went from
+  about 1 GB to about 100 MB.
+- **2.4.5: no more stuck CDN connections.** Sustained production downloads went from 30 to 43-45 MB/s.
+- **2.4.4: CPU fix** for 2.4.3, which burned 40-73 % per thread on slow readers.
+- **2.4.3: less RAM for slow users.**
+- **2.4.2: CDN downloads no longer collapse.** Sustained downloads went from 39 to 50 MB/s on average.
+- **2.4.1:** TCP-based and CDN tunnels no longer slow to a crawl under bursty web traffic.
+- **2.4.0:** stream windows tune themselves.
+- **2.3:** several sessions per tunnel (default 4 for TCP-type carriers).
+- **2.2:** CDN mode through Cloudflare with ECH.
+- **2.1:** Auto mode.
+- **2.0:** reverse ICMP.
 
 ## License and attribution
 
