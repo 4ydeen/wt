@@ -1,4 +1,4 @@
-# WatTunnel
+﻿# WatTunnel
 
 WatTunnel (`wattun`) is a tunnel. It forwards TCP and UDP ports from one server (Iran) to another (Kharej)
 over a link that is filtered. It is one static Go binary, one process, and it needs no other tool.
@@ -78,7 +78,7 @@ proven on loopback and simulated links only.
 
 ## Field numbers
 
-Everything here was measured on real Iran ⇄ Europe servers (2 vCPU each), except where marked emulated. Run
+Everything here was measured on real Iran â‡„ Europe servers (2 vCPU each), except where marked emulated. Run
 `wattun test NAME` to measure your own route.
 
 ### TCP tunnels (tcp, tls, reverse)
@@ -154,7 +154,7 @@ Against other ICMP tunnels on the same route (WatTunnel 1.8.0):
 
 ### CDN (Cloudflare)
 
-Iran → Cloudflare → Kharej, `wss` + ECH. The rows come from three sets of runs:
+Iran â†’ Cloudflare â†’ Kharej, `wss` + ECH. The rows come from three sets of runs:
 
 - 2.3.0 and 2.4.0 rows: 2026-10-11, a tunnel with no users.
 - 2.4.6 row: production with real users, 2026-10-12.
@@ -177,20 +177,20 @@ Competitors' CDN speeds were not measured on this route, so there is only a feat
 
 | | WatTunnel | Typical manual CDN setup (a ws/grpc proxy behind Cloudflare, configured by hand) |
 |---|:-:|:-:|
-| Cloudflare carriers (`ws`/`wss`/`grpc`) | ✅ | ✅ |
-| ECH against SNI filtering, config fetched automatically | ✅ | ❌ by hand |
-| Automatic scan for working Cloudflare IPs | ✅ | ❌ by hand |
-| Automatic choice of TLS fingerprint / ECH / fragmentation by speed test | ✅ | ❌ by hand |
-| Several sessions per tunnel, spread over several Cloudflare IPs | ✅ (default 4) | ❌ by hand |
-| Ports added or removed without a restart | ✅ | depends on the tool |
-| Auto-heal re-tests and replaces dead Cloudflare IPs | ✅ | ❌ |
+| Cloudflare carriers (`ws`/`wss`/`grpc`) | âœ… | âœ… |
+| ECH against SNI filtering, config fetched automatically | âœ… | âŒ by hand |
+| Automatic scan for working Cloudflare IPs | âœ… | âŒ by hand |
+| Automatic choice of TLS fingerprint / ECH / fragmentation by speed test | âœ… | âŒ by hand |
+| Several sessions per tunnel, spread over several Cloudflare IPs | âœ… (default 4) | âŒ by hand |
+| Ports added or removed without a restart | âœ… | depends on the tool |
+| Auto-heal re-tests and replaces dead Cloudflare IPs | âœ… | âŒ |
 
 ### What usual tools do on a filtered route
 
 | Problem on a filtered route | What usual tools do | What WatTunnel does |
 |---|---|---|
 | TCP and UDP are cut after a few packets | Tunnel dies or flaps | Rides ICMP, which isn't cut |
-| 0.2–2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
+| 0.2â€“2 % random loss | TCP-style congestion control halves the speed on every loss | Delay-based pacing treats loss as noise, not congestion |
 | Small MTU (~680 bytes) | Fragmentation and black-holed packets | 640-byte datagrams by default, up to 1400 where the route allows |
 | SNI filtering of CDN domains | Blocked right after the handshake | Cloudflare with ECH; edges and TLS settings are found automatically |
 | One process per port | Server CPU saturates | One process for all ports, batched syscalls |
@@ -201,21 +201,21 @@ Competitors' CDN speeds were not measured on this route, so there is only a feat
 
 | | WatTunnel | GOST | pingtunnel | Hans | ptunnel-ng |
 |---|:-:|:-:|:-:|:-:|:-:|
-| ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
-| UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Cloudflare/CDN with ECH | ✅ | - | ❌ | ❌ | ❌ |
-| Auto mode: one token tests every variant | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Loss-tolerant (delay-based) pacing | ✅ | ❌ | ❌ | ❌ | ❌ |
-| All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
-| Add or remove ports without restart | ✅ | ❌ | ❌ | - | ❌ |
-| UDP port forwarding | ✅ | ✅ | ⚠️ | ✅ | ❌ |
-| Built-in encryption | ✅ AEAD | ✅ | ⚠️ | ⚠️ | ❌ |
-| Adaptive FEC | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Reverse mode (TCP-based carriers) | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Reverse ICMP (Kharej pings, Iran keeps the ports) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Single static binary, no dependencies | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Guided manager, token pairing, auto-heal | ✅ | ❌ | ❌ | ❌ | ❌ |
+| ICMP carrier | âœ… | âœ… | âœ… | âœ… | âœ… |
+| UDP / TCP / TLS / WS / gRPC carriers | âœ… | âœ… | âŒ | âŒ | âŒ |
+| Cloudflare/CDN with ECH | âœ… | - | âŒ | âŒ | âŒ |
+| Auto mode: one token tests every variant | âœ… | âŒ | âŒ | âŒ | âŒ |
+| Loss-tolerant (delay-based) pacing | âœ… | âŒ | âŒ | âŒ | âŒ |
+| All ports in one process | âœ… | âœ… | âŒ | âœ… (tun) | âŒ |
+| Add or remove ports without restart | âœ… | âŒ | âŒ | - | âŒ |
+| UDP port forwarding | âœ… | âœ… | âš ï¸ | âœ… | âŒ |
+| Built-in encryption | âœ… AEAD | âœ… | âš ï¸ | âš ï¸ | âŒ |
+| Adaptive FEC | âœ… | âŒ | âŒ | âŒ | âŒ |
+| Per-port traffic stats and quotas | âœ… | âŒ | âŒ | âŒ | âŒ |
+| Reverse mode (TCP-based carriers) | âœ… | âœ… | âŒ | âŒ | âŒ |
+| Reverse ICMP (Kharej pings, Iran keeps the ports) | âœ… | âŒ | âŒ | âŒ | âŒ |
+| Single static binary, no dependencies | âœ… | âœ… | âœ… | âŒ | âŒ |
+| Guided manager, token pairing, auto-heal | âœ… | âŒ | âŒ | âŒ | âŒ |
 
 On a clean emulated link (20 ms each way, 0.2 % loss, 100 Mbit):
 
@@ -302,7 +302,7 @@ packet and the frame headers.
 - **Computed:** the `icmp` rows. They use the same ~40 bytes per packet measured on `udp` (32 header and tag, plus the
   frame header) and 28 bytes of IP and ICMP header.
 
-On a lossy route, add the resent packets. `/stats` counts them in `retrans`; at `mtu: 1400` on the Iran ⇄ Europe ICMP
+On a lossy route, add the resent packets. `/stats` counts them in `retrans`; at `mtu: 1400` on the Iran â‡„ Europe ICMP
 route, Kharej resent 0.3-0.8 % of its packets.
 
 To check your own tunnel, compare `bytes_out` in `/stats` with the user traffic in `/ports`.
@@ -410,7 +410,7 @@ On Kharej, `ports:` is an allowlist of target ports. Leave it out to allow any p
 
 **Auto-heal.** A systemd timer (`wattun-heal`) restarts an Iran tunnel whose link has been down for 3 minutes.
 
-- It turns on automatically for Iran tunnels. To turn it off: `wattun` → `s` → `h`.
+- It turns on automatically for Iran tunnels. To turn it off: `wattun` â†’ `s` â†’ `h`.
 - It never restarts a tunnel you stopped yourself.
 
 **Monitoring.** Each tunnel serves a small HTTP API on `127.0.0.1` only. Never expose it.
@@ -460,61 +460,61 @@ Rules for every non-ICMP carrier: the client dials `peer` as `host:port`, and th
 
 ### Fake-SNI desync (`fake-sni`, 2.6.0)
 
-For routes where TCP passes but the censor classifies every flow by the TLS ClientHello SNI and kills
+For routes where TCP passes but the path filter classifies every flow by the TLS ClientHello SNI and stops
 non-allowlisted ones (the 2026 whitelisting). The client completes a normal TCP handshake, then injects one raw
 packet: a TLS ClientHello with an allowlisted SNI (`mci.ir` and similar) and a sequence number below the stream
 start. A DPI that reassembles flows without checking the TCP window reads that hello and marks the flow
 "TLS to an allowed site"; the server's kernel sees an old duplicate and answers with a plain duplicate ACK, so
 the relay then carries the session's own encrypted datagrams as if they were that connection's application
-data. `fake-mode: ttl` instead gives the fake a TTL that expires at the censor's hop (`fake-ttl`), so it never
+data. `fake-mode: ttl` instead gives the marker a TTL that expires at the filtering hop (`fake-ttl`), so it never
 leaves Iran's network at all.
 
 Since 2.7.0 the injector watches the wire (AF_PACKET) for every pool connection from the moment dial returns:
-it anchors the fake to the handshake's final ACK when it observed the SYN/SYN-ACK, to the first outbound data
-segment otherwise, and a NAT that rewrites sequence numbers uniformly no longer misfires (the fake follows the
+it anchors the marker packet to the handshake's final ACK when it observed the SYN/SYN-ACK, to the first outbound data
+segment otherwise, and a NAT that rewrites sequence numbers uniformly no longer misfires (the marker follows the
 rewrite). Works on the `tcp`, `tls`, `wss`, `h2` and `grpc` carriers. `fake-ttl: 0` (the default) calibrates
-itself: the peer's inbound TTL is learned from its SYN-ACK, the fake goes out one hop short of the server.
+itself: the peer's inbound TTL is learned from its SYN-ACK, the marker goes out one hop short of the server.
 
 Client-side only, Linux only, needs CAP_NET_RAW (the icmp carrier's requirement); the server needs no change
 and no new version. Two caveats from field reports of the same trick in other tools: it died where the ISP's
 NAT normalizes sequence numbers before the DPI (some ASNs, not all), and the allowlisted SNI itself must be
 reachable from your ISP. If connections stop passing data right after the handshake, your path is one of the
-normalizing ones — fall back to `tls` with `sni` set to an allowlisted name and `tls-frag`, or ECH.
+normalizing ones â€” fall back to `tls` with `sni` set to an allowlisted name and `tls-frag`, or ECH.
 
 ## Fake-SNI desync (whitelisting survival)
 
 For the SNI-checked whitelist regime (Iran 2026): the filter forwards TCP to an allowlisted IP only when the
 TLS ClientHello on that flow carries an allowlisted SNI, and it does not check TCP sequence numbers. Both facts
-together are the desync: the client opens its real pool connection, then injects ONE raw packet next to it that
-carries a fake ClientHello with an allowlisted SNI (`mci.ir` worked in the field) — crafted so the server never
+together are the desync: the client opens its real pool connection, then injects ONE extra raw packet next to it that
+carries an extra ClientHello with an allowlisted SNI (`mci.ir` worked in the field) â€” crafted so the server never
 accepts it, while the DPI, reassembling without window checks, reads it as the flow's first flight. From then on
 the session's own encrypted datagrams ride the flow, classified as TLS application data to the allowed site.
 
 - `fake-sni: mci.ir` on the client, `carrier: tls` (or `tcp`, `wss`, `h2`, `grpc` since 2.7.0). Linux +
   CAP_NET_RAW, like the icmp carrier.
-- `fake-mode: seq` (default): the fake's sequence number is `ISN+1-len(fake)`, below the stream start. The
+- `fake-mode: seq` (default): the marker's sequence number is `ISN+1-len(marker)`, below the stream start. The
   server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI. A NAT
-  that rewrites sequence numbers uniformly shifts the fake with it (2.7.0), so only non-uniform normalization
+  that rewrites sequence numbers uniformly shifts the marker with it (2.7.0), so only non-uniform normalization
   breaks this mode.
-- `fake-mode: ttl` + `fake-ttl: N`: the fake dies at the censor's hop and never reaches the server at all. N is
+- `fake-mode: ttl` + `fake-ttl: N`: the marker expires at the filtering hop and never reaches the server at all. N is
   the hop count of the DPI box minus one: find it with `traceroute` to your server, then test downward.
   `fake-ttl: 0` (2.7.0) auto-calibrates from the server's inbound TTL. Some ISPs normalize TTLs; there `seq`
   works better.
-- `fake-mode: sum` (2.7.1): the fake is an in-window duplicate of the first data segment — same sequence and
-  ack numbers, valid window — but with a deliberately damaged TCP checksum. The DPI's reassembler reads it
+- `fake-mode: sum` (2.7.1): the marker is an in-window duplicate of the first data segment â€” same sequence and
+  ack numbers, valid window â€” but with a deliberately damaged TCP checksum. The DPI's reassembler reads it
   (it parses before checksumming); every server kernel drops it at checksum validation, so the flow stays
-  clean. This defeats censors that DO check TCP sequence numbers, where `seq` fails. Caveats: it needs a real
+  clean. This holds against filters that DO check TCP sequence numbers, where `seq` fails. Caveats: it needs a real
   data segment to mirror (fires with the first outbound data, not the handshake's final ACK), and it dies
   behind a NAT that validates checksums (Linux routers with `nf_conntrack_checksum=1` plus an INVALID-drop
   rule; ISPs usually pass bad checksums). The damage is `(checksum ^ 1) - 1`, so no off-by-one coincidence
   repairs it.
-- The server needs NO changes and no update: it never sees the fake packet. Only the client needs 2.6.0.
+- The server needs NO changes and no update: it never sees the marker packet. Only the client needs 2.6.0.
 - Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
   REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
   reassemble the first segment.
 
 What it does not survive: a NAT on the route that fully validates checksums and sequence numbers before the DPI
-(some ISPs moved to this after the first bypass wave — then no client-side trick helps, only ICMP/CDN routes),
+(some ISPs moved to this after the first filtering wave â€” then no client-side trick helps, only ICMP/CDN routes),
 and allowlists enforced purely by destination IP, where no SNI is read at all.
 
 ```yaml
@@ -528,31 +528,31 @@ fp: chrome
 key-file: /etc/wattun/key
 ```
 
-### Full blackout: the domestic relay chain (no new code)
+### Full restricted routing: the domestic relay chain (no new code)
 
-For the hard blackout scenario (foreign IPs unreachable from Iran, only domestic traffic passes) the recipe is a
-two-hop chain of two normal tunnels — no WatTunnel changes needed, both hops are stock wattun since 2.0:
+For the hard restricted-routing scenario (foreign IPs unreachable from Iran, only domestic traffic passes) the recipe is a
+two-hop chain of two normal tunnels â€” no WatTunnel changes needed, both hops are stock wattun since 2.0:
 
 1. **Get a domestic relay**: any Iranian VPS / a friend's server / a cheap "Iran location" cloud instance whose
    IP is reachable from your users' ISPs while foreign IPs are cut. It only needs to be able to reach the
    Kharej server; everything on it is private.
-2. **Hop 1 — Kharej side (mode: server)**: run the normal Kharej setup on the REAL server (as always), but
+2. **Hop 1 â€” Kharej side (mode: server)**: run the normal Kharej setup on the REAL server (as always), but
    instead of giving Iran the Kharej token, run a second wattun as a CLIENT on the domestic relay, pointed at
-   Kharej over a carrier that still passes from the relay (the relay sits inside Iran and dials out — whatever
+   Kharej over a carrier that still passes from the relay (the relay sits inside Iran and dials out â€” whatever
    passes from it: `tcp`, `tls`+`sni`, `wss`+CDN, or `icmp` when only ICMP passes).
    `/etc/wattun/relay-out.yml`: `mode: client`, `carrier: tls`, `peer: KHAREJ_IP:443`, the same `key-file` as
    Kharej's config, `ports:` mirroring the services (or `ports: [0]`-style full maps as usual).
-3. **Hop 2 — Iran side (mode: server→client flip)**: on the domestic relay also run a wattun SERVER that accepts
+3. **Hop 2 â€” Iran side (mode: serverâ†’client flip)**: on the domestic relay also run a wattun SERVER that accepts
    the users' connections, whose `ports:`/forwarding targets point at `127.0.0.1` of the relay's client from
-   hop 1. Iran connects to the relay's IP with any carrier that passes Iran→relay (domestic traffic is rarely
+   hop 1. Iran connects to the relay's IP with any carrier that passes Iranâ†’relay (domestic traffic is rarely
    filtered).
-4. Iran users now reach Kharej through relay-in (server) → relay-out (client) → Kharej. The relay forwards
+4. Iran users now reach Kharej through relay-in (server) â†’ relay-out (client) â†’ Kharej. The relay forwards
    encrypted datagrams twice; it never sees plaintext (both hops are AEAD sessions under your key).
 
 Costs and caveats: the relay's bandwidth caps the chain (double-encryption costs ~nothing CPU-wise on modern
-VPSes, but the relay's uplink is the bottleneck); each hop adds its RTT (~relay↔Kharej latency dominates);
-and the relay is a single point of failure — keep the direct token as a fallback and re-run `auto-test` on
-Iran when the blackout lifts. wattun-manager does not automate this chain yet: set both relay configs up by
+VPSes, but the relay's uplink is the bottleneck); each hop adds its RTT (~relayâ†”Kharej latency dominates);
+and the relay is a single point of failure â€” keep the direct token as a fallback and re-run `auto-test` on
+Iran when the restriction lifts. wattun-manager does not automate this chain yet: set both relay configs up by
 hand (or run `wattun-manager` twice on the relay, with `WAT_PREFIX=relay1` / `WAT_PREFIX=relay2` sandboxes so
 the two installs do not collide).
 
@@ -640,7 +640,7 @@ the streams and which ports are published do not change.
   ```
 
   wattun's replies are raw-socket sends and are not limited. Ordinary pings to Iran are still answered. Measured
-  after the change: 15.9 – 18.2 MB/s each way. Since 2.1.1 the manager applies this by itself, without a question, when reverse is turned on for an Iran
+  after the change: 15.9 â€“ 18.2 MB/s each way. Since 2.1.1 the manager applies this by itself, without a question, when reverse is turned on for an Iran
   tunnel and restores the old values when the last one is gone. `icmp_ratelimit` applies to every type in the
   mask, so destination-unreachable and time-exceeded messages also go from 1 to 10 per second per destination.
   `net.ipv4.icmp_echo_ignore_all=1` also works (the tunnel still receives its packets), but then Iran answers no
@@ -649,7 +649,7 @@ the streams and which ports are published do not change.
   tunnel request comes from Kharej's IP, so a plain `ping` from Kharej competes with the tunnel for that budget and
   loses packets while traffic flows (measured 4/6 and 1/3 received during a speed test). Use `last_rx_age_ms` from
   `/stats` instead (see Metrics).
-- In `wattun`: Kharej setup → advanced settings → reverse, or for an existing tunnel Advanced settings →
+- In `wattun`: Kharej setup â†’ advanced settings â†’ reverse, or for an existing tunnel Advanced settings â†’
   `d` on both sides. The token carries the flag (field 8), so a fresh Iran setup picks it up.
 
 ### Reverse pool carriers
@@ -707,11 +707,11 @@ ports:
 
 In `wattun`:
 
-- New tunnel: Kharej setup → advanced settings → reverse. It asks for Iran's IPv4, and the carrier port P you chose
+- New tunnel: Kharej setup â†’ advanced settings â†’ reverse. It asks for Iran's IPv4, and the carrier port P you chose
   becomes the port Iran listens on. The token carries the flag, so Iran picks it up when you paste it.
-- Existing tunnel: open it → `o` (advanced settings) → `d` (direction), on Kharej first, then on Iran.
+- Existing tunnel: open it â†’ `o` (advanced settings) â†’ `d` (direction), on Kharej first, then on Iran.
 - On Iran the manager opens P/tcp in the firewall. Kharej needs no open port.
-- Diagnose: on Kharej it tests a TCP connection Kharej → Iran on P. On Iran it checks that P is listening.
+- Diagnose: on Kharej it tests a TCP connection Kharej â†’ Iran on P. On Iran it checks that P is listening.
 
 **When it does not help.** Reverse only changes who dials. If the route cuts TCP in both directions, it does not
 matter who opens the connection. Field result on one real Iran-Kharej path (measured 2026-10-10): reverse `tcp`
@@ -774,7 +774,7 @@ then CDN (if a domain was given), then reverse. Each variant is a throw-away cli
 reverse dialer backoff made most of them fail with "no link in 8 s" before). Nothing is published; temp files are in `/run/wattun-auto`. Reverse test ports are opened in the
 firewall only during their probe. Since 2.1.1 the manager opens ufw/firewalld ports without a confirm, Kharej does not
 ask which ports Iran may reach (all are allowed; restrict later in the port editor), and Iran enables auto-heal by
-itself (off: `wattun` → `s` → `h`). The table is ranked by download plus upload (ties: lower RTT) and accepts Enter (best), `b` (bond the working carriers), `1`-`N`
+itself (off: `wattun` â†’ `s` â†’ `h`). The table is ranked by download plus upload (ties: lower RTT) and accepts Enter (best), `b` (bond the working carriers), `1`-`N`
 (one variant) and `q`. The normal wizard continues at port mapping. The token is saved in `/etc/wattun/NAME.auto`.
 
 **Auto-heal.** After two failed restart cycles on an auto tunnel, `wattun-manager heal` starts a re-test (1 MB, at most
@@ -794,7 +794,7 @@ with 2.0.x ones for normal tunnels.
 2. In the Kharej wizard, choose `wss` (or `grpc`) and enter the domain.
    - `h2` does not work through Cloudflare.
    - Plain `ws` on HTTP ports can hang at the upgrade.
-   - Always use the domain, not the server's IP. With the IP, the tunnel bypasses Cloudflare and works only where
+   - Always use the domain, not the server's IP. With the IP, the tunnel skips Cloudflare and works only where
      that IP is reachable. The manager warns about this.
 3. On Iran, the manager finds the ECH config by itself and scans Cloudflare edge IPs for ones that work for your
    domain. It then tests the Chrome fingerprint, ECH, plain TLS and ClientHello fragmentation, and writes the
@@ -830,7 +830,7 @@ domain) it runs, without questions:
    variants (plain, fragmentation) only if it does not. Through Cloudflare only `wss` and `grpc` are tested.
 4. Write the winner (`fp`, `ech`, `tls-frag`, `peer`) into the config and restart.
 
-In Auto mode this is part of the CDN phase; the table labels look like `wss · chrome · 3 edges`.
+In Auto mode this is part of the CDN phase; the table labels look like `wss Â· chrome Â· 3 edges`.
 `wattun cdn-tune NAME [full]` repeats the tuning at any time. Auto-heal refreshes dead edges.
 
 **DoH behaviour (2.2.1).** `ech: auto` looks up the domain's HTTPS record by racing all four DoH servers (1.1.1.1,
@@ -960,9 +960,9 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. Since 2.2.0. |
 | `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
-| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp, tls, wss, h2 and grpc carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, a TTL that dies at the censor, or a bad checksum), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
-| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). `sum` (2.7.1): the fake mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it — the mode for censors that check sequence numbers. Since 2.6.0. |
-| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the fake one hop short of the server. Unused by `seq` and `sum`. Since 2.6.0. |
+| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp, tls, wss, h2 and grpc carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives it (wrong sequence number, a TTL that expires at the filtering hop, or a bad checksum), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
+| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the marker carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the marker carries a small TTL and expires at the filtering hop (needs `fake-ttl`). `sum` (2.7.1): the marker mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it â€” the mode for filters that check sequence numbers. Since 2.6.0. |
+| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the marker packet: one more than the distance to the filtering DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the marker one hop short of the server. Unused by `seq` and `sum`. Since 2.6.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
 
@@ -1239,7 +1239,7 @@ extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or 
 `wattun test NAME` runs it 10 MB each way. Since 2.3.0 the answer also has `"sessions"`: with `sessions` > 1 the
 test opens one stream on every live session at once, each moving its share of N MB, and reports the total over the
 wall time. N is split between the streams, and each stream carries at most 256 MB, so N is capped at
-256 × `streams` (2.5.1; before, any N above 256 fell back to 10 MB). A larger N gives a longer run, which helps when
+256 Ã— `streams` (2.5.1; before, any N above 256 fell back to 10 MB). A larger N gives a longer run, which helps when
 sampling CPU: 16 streams at 100 MB/s move 200 MB in 2 s.
 
 ### Several sessions (2.3.0)
@@ -1463,7 +1463,7 @@ manager's edge scan matters.
 A pool carrier with no CDN in between (`tcp` or `tls` direct, or any pool carrier with `reverse`) is "direct": the
 only queues are the pool's and the kernel's, and both push back. 2.4.18 changes how such a tunnel sends; CDN tunnels
 (ws/wss/h2/grpc direct to a CDN edge) keep the 2.4.17 behaviour except where noted. Field results, reverse tcp,
-Kharej → Iran (the direction with heavy random loss, 3-14 % kernel retransmits), 200 MB per run:
+Kharej â†’ Iran (the direction with heavy random loss, 3-14 % kernel retransmits), 200 MB per run:
 
 | Change | Before | After |
 |---|---|---|
@@ -1482,7 +1482,7 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
   packets the main frame leaves out, with a one-hour ack delay so no sender version takes an RTT sample or declares
   a loss from it. Works against any peer version; only the receiver of a direction needs 2.4.18.
   `WAT_NO_LATEACK=1` turns it off.
-- **Replay window** 16384 → 131072 packets on reliable carriers (a 1 MB ring per session): at 32 connections a
+- **Replay window** 16384 â†’ 131072 packets on reliable carriers (a 1 MB ring per session): at 32 connections a
   connection in loss recovery outlasted the old window and its delivered packets were dropped as replays.
 - **Pool backpressure.** A full pool queue used to drop the packet silently (the session resent it after its loss
   timer). The session now waits while every connection's queue holds 16 packets or more (`pool_full`;
@@ -1507,7 +1507,7 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
 
 ### One session, no longer capped (2.5.0)
 
-Field 2026-10-16, after the route's MSS fix: raw TCP Kharej → Iran did 167 MB/s on 8 connections, 243 on 16 and
+Field 2026-10-16, after the route's MSS fix: raw TCP Kharej â†’ Iran did 167 MB/s on 8 connections, 243 on 16 and
 314 on 32, and 4 independent reverse tcp tunnels (4 connections each) together 136-143 MB/s down and 173 up, but one
 tunnel with 16 connections still 49-60. The limit was the session's own work, on one core:
 
@@ -1719,30 +1719,30 @@ Update **both** servers for every release, unless an entry says otherwise. Versi
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
 - **2.7.1: fake-SNI `sum` mode, probe fix, manager support.** Three client-side fake-SNI changes, server
-  unchanged, no wire format changed. (1) New `fake-mode: sum`: the fake mirrors the first data segment in-window
-  (same seq/ack) with a damaged TCP checksum — for censors that validate TCP sequence numbers, where `seq`
-  fails; server kernels drop the fake at checksum validation. Dies behind checksum-validating NATs. (2) Fixed a
+  unchanged, no wire format changed. (1) New `fake-mode: sum`: the marker mirrors the first data segment in-window
+  (same seq/ack) with a damaged TCP checksum â€” for filters that validate TCP sequence numbers, where `seq`
+  fails; server kernels drop the marker at checksum validation. Dies behind checksum-validating NATs. (2) Fixed a
   probe off-by-one: the ISN probe (`TCP_REPAIR`) reports SND.NXT = ISN+1 right after the handshake, and `Wrap`
-  announced it as the ISN, putting the `seq`-mode fake one sequence number too high (the server would have seen
+  announced it as the ISN, putting the `seq`-mode marker one sequence number too high (the server would have seen
   it as in-window). The tests pinned the wrong relation too; both are corrected. (3) `wattun-manager` now offers
   fake-sni in the Iran wizard and Advanced settings (`--fake-sni/--fake-mode/--fake-ttl` unattended).
   - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival).
 
-- **2.7.0: fake-SNI hardened, more carriers.** The fake-SNI desync (2.6.0) now anchors the fake to the first
+- **2.7.0: fake-SNI hardened, more carriers.** The fake-SNI desync (2.6.0) now anchors the marker packet to the first
   outbound packet it can observe (handshake final ACK or first data segment) instead of requiring the sniffer to
-  have seen the whole handshake — the 2.6.0 sniffer only fired when the SYN landed after `Wrap` announced the
+  have seen the whole handshake â€” the 2.6.0 sniffer only fired when the SYN landed after `Wrap` announced the
   connection, so on most dial orders it silently timed out unclassified. The injector also follows a NAT that
-  rewrites sequence numbers uniformly (the fake stays below the stream start as the server sees it), auto-learns
+  rewrites sequence numbers uniformly (the marker stays below the stream start as the server sees it), auto-learns
   the TTL for `fake-mode: ttl` (`fake-ttl: 0`, the default, calibrates from the peer's SYN-ACKs), and now applies
   to the `wss`, `h2` and `grpc` carriers too. Client-side only, Linux + CAP_NET_RAW; the server is unchanged and
   no wire format changed.
   - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival).
 
-- **2.6.0: fake-SNI desync for whitelisting blackouts.** When a censor allowlists flows by their TLS ClientHello
+- **2.6.0: fake-SNI desync for the permit-list regime.** When a filter permit-lists flows by their TLS ClientHello
   name (the 2026 whitelisting, where only a handful of Iranian sites' HTTPS passes), the tcp and tls carriers can
-  now inject one raw fake ClientHello carrying an allowlisted SNI right after the TCP handshake of every pool
-  connection. The DPI classifies the flow as TLS to an allowed site; the server never receives the fake (it
-  carries a sequence number below the stream start, or a TTL that dies at the censor's hop), so the session flows
+  now inject one raw extra ClientHello carrying an allowlisted SNI right after the TCP handshake of every pool
+  connection. The DPI classifies the flow as TLS to an allowed site; the server never receives the marker (it
+  carries a sequence number below the stream start, or a TTL that expires at the filtering hop), so the session flows
   on as if it were that TLS connection. Only the Iran client needs the new version (client-side only, Linux, needs
   CAP_NET_RAW like the icmp carrier); the Kharej server is unchanged and no wire format changed.
   - New client keys: `fake-sni`, `fake-mode` (`seq`, default | `ttl`), `fake-ttl`.
@@ -1756,7 +1756,7 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   - Test tunnel: download went from 53-71 to 65-116 MB/s, and memory stayed flat (149-161 MB).
   - Production tunnel: download went from 53 to 157 MB/s, and to 195 MB/s (~1.6 Gbit) on a 2 GB run. Upload went
     from 150 to 276 MB/s.
-  - `/speedtest` accepts `mb` up to 256 × `streams`.
+  - `/speedtest` accepts `mb` up to 256 Ã— `streams`.
   - Mixed versions work. [Details](#cheaper-stream-buffers-251)
 - **2.5.0: one tunnel is no longer capped near 50-60 MB/s.** On a direct TCP pool (tcp, tls, or any reverse pool),
   every acknowledgement walked every packet in flight. Now each acknowledgement touches only the packets it covers.
@@ -1767,7 +1767,7 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
     totals survive restarts, a Windows binary (`wattun-windows-amd64.exe`, no ICMP), and **m** on a tunnel's page
     changes its connection type or joins several.
   - [Details](#one-session-no-longer-capped-250)
-- **ICMP: bigger packets, a setting change (no update needed).** Since 2026-10-12 the Iran ⇄ Europe route passes full
+- **ICMP: bigger packets, a setting change (no update needed).** Since 2026-10-12 the Iran â‡„ Europe route passes full
   1500-byte pings again. Set `mtu: 1400` on **both** ends and keep the same 30 MB/s cap:
   - Kharej resends 0.3-0.8 % of its packets instead of 3-5 %.
   - Download went from 22-24 to 27.5 MB/s, and upload from 21-22 to 26 MB/s.

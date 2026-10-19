@@ -1,10 +1,10 @@
-<div align="center">
+﻿<div align="center">
 
 <img src="docs/img/banner.jpg" alt="WatTunnel: stay connected, even when only ping gets through" width="100%">
 
-# 🪁 WatTunnel
+# ðŸª WatTunnel
 
-**Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
+**Encrypted Iran â†” Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
 [![Release](https://img.shields.io/badge/release-v2.7.1-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -13,7 +13,7 @@
 [![Telegram Channel](https://img.shields.io/badge/Channel-@WatxDev-26A5E4?style=flat-square&logo=telegram)](https://t.me/WatxDev)
 [![Telegram](https://img.shields.io/badge/Contact-@watxox-26A5E4?style=flat-square&logo=telegram)](https://t.me/watxox)
 
-**English** · [فارسی](README.fa.md)
+**English** Â· [ÙØ§Ø±Ø³ÛŒ](README.fa.md)
 
 </div>
 
@@ -23,13 +23,13 @@ WatTunnel connects an **Iran** server (where your users connect) to a **Kharej**
 and forwards any TCP or UDP port between them. One static binary, no dependencies, and a menu that sets everything
 up from one pasted token. It rides whatever your route lets through: `icmp` (ping), `udp`, `tcp`, `tls`, `ws`,
 `wss`, `h2`, `h2c`, `grpc`, Cloudflare with ECH, reverse mode, several of them bonded into one tunnel, or
-fake-SNI desync (`fake-sni`) when the censor allowlists flows by their TLS name (2.6.0; since 2.7.0 on the wss,
+fake-SNI desync (`fake-sni`) when the route permit-lists flows by their TLS name (2.6.0; since 2.7.0 on the wss,
 h2 and grpc carriers too, with automatic TTL calibration and NAT-sequence follow, and since 2.7.1 a checksum
-mode for censors that validate sequence numbers).
+mode for routes that validate sequence numbers).
 
 ## Speed
 
-Measured on real Iran ⇄ Europe servers (2 vCPU each), October 2026. Ping is the round trip through the tunnel while
+Measured on real Iran â‡„ Europe servers (2 vCPU each), October 2026. Ping is the round trip through the tunnel while
 it is fully loaded; the route's own ping is about 40 ms.
 
 | Connection type | Download | Upload | Ping under load |
@@ -61,16 +61,16 @@ users.
 
 | | WatTunnel | GOST | pingtunnel | Hans | ptunnel-ng |
 |---|:-:|:-:|:-:|:-:|:-:|
-| ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
-| UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Cloudflare/CDN with ECH | ✅ | - | ❌ | ❌ | ❌ |
-| One token tests every connection type for you | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Loss does not slow it down (delay-based pacing) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
-| Add or remove ports without a restart | ✅ | ❌ | ❌ | - | ❌ |
-| Reverse mode / reverse ICMP | ✅ / ✅ | ✅ / ❌ | ❌ | ❌ | ❌ |
-| Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Guided menu, auto-heal, update and rollback | ✅ | ❌ | ❌ | ❌ | ❌ |
+| ICMP carrier | âœ… | âœ… | âœ… | âœ… | âœ… |
+| UDP / TCP / TLS / WS / gRPC carriers | âœ… | âœ… | âŒ | âŒ | âŒ |
+| Cloudflare/CDN with ECH | âœ… | - | âŒ | âŒ | âŒ |
+| One token tests every connection type for you | âœ… | âŒ | âŒ | âŒ | âŒ |
+| Loss does not slow it down (delay-based pacing) | âœ… | âŒ | âŒ | âŒ | âŒ |
+| All ports in one process | âœ… | âœ… | âŒ | âœ… (tun) | âŒ |
+| Add or remove ports without a restart | âœ… | âŒ | âŒ | - | âŒ |
+| Reverse mode / reverse ICMP | âœ… / âœ… | âœ… / âŒ | âŒ | âŒ | âŒ |
+| Per-port traffic stats and quotas | âœ… | âŒ | âŒ | âŒ | âŒ |
+| Guided menu, auto-heal, update and rollback | âœ… | âŒ | âŒ | âŒ | âŒ |
 
 On a clean, unfiltered link every tunnel reaches line rate and GOST uses a little less CPU; WatTunnel still halves
 small-request latency there (43 ms vs 83 ms) because interactive traffic goes first.
@@ -133,11 +133,11 @@ wat1:aWNtcHwyMDMuMC4xMTMuMTB8a1E3...
 `443, 8443:443, 53/udp` (`8443:443` means users connect to Iran port 8443 and reach Kharej port 443).
 
 ```
-  ✔ Writing key and config
-  ✔ Starting wattun@iran
-  ✔ CONNECTED (RTT 41.3 ms)
+  âœ” Writing key and config
+  âœ” Starting wattun@iran
+  âœ” CONNECTED (RTT 41.3 ms)
 
-  users ──► Iran :8443 ══ tcp ══► Kharej ──► 127.0.0.1:443
+  users â”€â”€â–º Iran :8443 â•â• tcp â•â•â–º Kharej â”€â”€â–º 127.0.0.1:443
 ```
 
 Done. Users connect to the Iran server's IP, and Kharej forwards only to its own `127.0.0.1`.
@@ -166,15 +166,15 @@ If you already know what your route allows, you can pick a type yourself in step
 ## More
 
 Everything else is in [docs/TECHNICAL.md](docs/TECHNICAL.md):
-[reverse mode](docs/TECHNICAL.md#reverse-mode) ·
-[auto mode](docs/TECHNICAL.md#auto-mode) ·
-[Cloudflare / CDN](docs/TECHNICAL.md#cdn-tuning) ·
-[bonding](docs/TECHNICAL.md#bonding) ·
-[managing tunnels](docs/TECHNICAL.md#managing-tunnels) ·
-[config file](docs/TECHNICAL.md#config-file) ·
-[monitoring](docs/TECHNICAL.md#metrics) ·
-[troubleshooting](docs/TECHNICAL.md#troubleshooting) ·
-[security](docs/TECHNICAL.md#security-model) ·
+[reverse mode](docs/TECHNICAL.md#reverse-mode) Â·
+[auto mode](docs/TECHNICAL.md#auto-mode) Â·
+[Cloudflare / CDN](docs/TECHNICAL.md#cdn-tuning) Â·
+[bonding](docs/TECHNICAL.md#bonding) Â·
+[managing tunnels](docs/TECHNICAL.md#managing-tunnels) Â·
+[config file](docs/TECHNICAL.md#config-file) Â·
+[monitoring](docs/TECHNICAL.md#metrics) Â·
+[troubleshooting](docs/TECHNICAL.md#troubleshooting) Â·
+[security](docs/TECHNICAL.md#security-model) Â·
 [Windows and building from source](docs/TECHNICAL.md#build-and-test)
 
 - Telegram channel (news and releases): [@WatxDev](https://t.me/WatxDev), developer: [@watxox](https://t.me/watxox)
