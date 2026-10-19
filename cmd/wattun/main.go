@@ -70,6 +70,7 @@ func main() {
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
 	conns := flag.Int("conns", wat.DefaultPoolConns, "client, tcp/tls carrier: connections in the pool")
+	poolRotate := flag.String("pool-rotate", "0", "client, pool carriers (tcp|tls|ws|wss|h2|grpc): recycle each healthy pool connection after this long, so no flow shows a months-stable lifetime; accepts 30m, 4h or seconds; jittered +/-40% per connection so the redials never line up; 0 = off (2.8.0, client only)")
 	tcpCC := flag.String("tcp-cc", wat.PoolTCPCC, "tcp|tls|ws|wss|h2|h2c|grpc: TCP congestion control set on every pool socket, Linux (bbr ignores random loss, the kernel default cubic halves the window on it; 'system' keeps the kernel default; 2.4.18, before: system)")
 	nSess := flag.Int("sessions", 1, "client: independent sessions to the server (1-16), each with its own -conns pool, pacer and session id; new TCP streams go to the least loaded live one, UDP flows stick to one, /speedtest uses all; udp|tcp|tls|ws|wss|h2|h2c|grpc only (not icmp, bonded carriers or -reverse); each counts against the server's 32-session limit (client only, 2.3.0; server unchanged)")
 	tlsCert := flag.String("tls-cert", "", "server, tls carrier: certificate file (empty = self-signed in memory)")
@@ -83,7 +84,7 @@ func main() {
 	echCache := flag.String("ech-cache", "", "client, with -ech auto: file keeping the last good ECH config across restarts, used at once on start while DoH refreshes in the background (2.2.3; empty = off)")
 	tlsFrag := flag.Int("tls-frag", 0, "client, tls|wss|h2|grpc carriers: split the TLS ClientHello into N-byte TCP segments, 0 = off (client only, 2.2.0; server unchanged)")
 	fakeSNI := flag.String("fake-sni", "", "client, tcp|tls|wss|h2|grpc carriers: track every outgoing TCP handshake on the wire and inject a fake TLS ClientHello carrying this allowlisted SNI right after it, so the DPI classifies the flow as TLS to an allowed site; the server never sees the fake (raw socket, Linux, like the ICMP carrier; client only, 2.6.0; server unchanged)")
-	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl N or 0 = calibrate it from the server's replies); sum = valid window, bad TCP checksum, the server's kernel drops the fake (fails behind NATs that validate checksums)")
+	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl N or 0 = calibrate it from the server's replies); sum = valid window, bad TCP checksum, the server's kernel drops the fake (fails behind NATs that validate checksums); seqsum = both markers per connection, ~1 ms apart (experimental, 2.8.0)")
 	fakeTTL := flag.Int("fake-ttl", 0, "client, with -fake-sni -fake-mode ttl: hop count of the fake packet, 1 more than the distance to the censor's DPI box, 1 less than the distance to the server; 0 = calibrate from the server's replies (unused by the seq and sum modes)")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
@@ -197,6 +198,10 @@ func main() {
 	}
 	if *tlsFrag < 0 || *tlsFrag > 1<<14 {
 		log.Fatalf("-tls-frag must be 0..16384, got %d", *tlsFrag)
+	}
+	rotateD, err := time.ParseDuration(*poolRotate)
+	if err != nil || rotateD < 0 {
+		log.Fatalf("-pool-rotate must be a duration (30m, 4h, 90s) or 0, got %q", *poolRotate)
 	}
 	// attachFakeSNI wires the -fake-sni desync layer into a pool client's dial path (tcp, tls and the TLS-based
 	// HTTP carriers, client only). No-op without -fake-sni; a fatal error when the layer cannot start (no raw
@@ -334,6 +339,9 @@ func main() {
 		}
 		if pc != nil {
 			tlsPools = append(tlsPools, pc)
+			if rotateD > 0 && !server { // churn (2.8.0): client pools only
+				pc.SetRotate(rotateD, 0)
+			}
 		}
 		if len(names) == 1 && (*reverse || carrier == "tcp" || carrier == "tls") { // direct path (Config.Direct)
 			if pc != nil {

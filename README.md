@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <img src="docs/img/banner.jpg" alt="WatTunnel: stay connected, even when only ping gets through" width="100%">
 
@@ -6,7 +6,7 @@
 
 **Encrypted Iran â†” Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.7.1-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.8.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -25,7 +25,8 @@ up from one pasted token. It rides whatever your route lets through: `icmp` (pin
 `wss`, `h2`, `h2c`, `grpc`, Cloudflare with ECH, reverse mode, several of them bonded into one tunnel, or
 fake-SNI desync (`fake-sni`) when the route permit-lists flows by their TLS name (2.6.0; since 2.7.0 on the wss,
 h2 and grpc carriers too, with automatic TTL calibration and NAT-sequence follow, and since 2.7.1 a checksum
-mode for routes that validate sequence numbers).
+mode for routes that validate sequence numbers), and optional `pool-rotate` churn so no single connection shows
+a months-stable lifetime (2.8.0).
 
 ## Speed
 

@@ -1,4 +1,4 @@
-﻿# WatTunnel
+# WatTunnel
 
 WatTunnel (`wattun`) is a tunnel. It forwards TCP and UDP ports from one server (Iran) to another (Kharej)
 over a link that is filtered. It is one static Go binary, one process, and it needs no other tool.
@@ -500,14 +500,20 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   the hop count of the DPI box minus one: find it with `traceroute` to your server, then test downward.
   `fake-ttl: 0` (2.7.0) auto-calibrates from the server's inbound TTL. Some ISPs normalize TTLs; there `seq`
   works better.
-- `fake-mode: sum` (2.7.1): the marker is an in-window duplicate of the first data segment â€” same sequence and
-  ack numbers, valid window â€” but with a deliberately damaged TCP checksum. The DPI's reassembler reads it
+- `fake-mode: sum` (2.7.1): the marker is an in-window duplicate of the first data segment — same sequence and
+  ack numbers, valid window — but with a deliberately damaged TCP checksum. The DPI's reassembler reads it
   (it parses before checksumming); every server kernel drops it at checksum validation, so the flow stays
   clean. This holds against filters that DO check TCP sequence numbers, where `seq` fails. Caveats: it needs a real
   data segment to mirror (fires with the first outbound data, not the handshake's final ACK), and it dies
   behind a NAT that validates checksums (Linux routers with `nf_conntrack_checksum=1` plus an INVALID-drop
-  rule; ISPs usually pass bad checksums). The damage is `(checksum ^ 1) - 1`, so no off-by-one coincidence
-  repairs it.
+  rule; ISPs usually pass bad checksums). (2.8.0 fix: the old damage formula `(checksum ^ 1) - 1` collapsed to
+  the unchanged value for every even checksum — half the markers shipped valid, and the server would have taken
+  their payload as real data. It is now `checksum - 1`, or `- 2` when that would wrap to the valid fold.)
+- `fake-mode: seqsum` (2.8.0, experimental): BOTH markers per connection — the below-window seq fake first,
+  the in-window bad-checksum mirror about a millisecond later (the GoodbyeDPI wrong-seq + wrong-chksum double
+  fake). A filter must discard both correctly to miss the SNI: window-junk dropping alone does not stop the sum
+  marker, checksum dropping alone does not stop the seq marker. Inherits sum's caveats (data segment needed,
+  checksum-validating NATs) plus seq's (a uniform NAT rewrite is followed, a non-uniform one defeats marker 1).
 - The server needs NO changes and no update: it never sees the marker packet. Only the client needs 2.6.0.
 - Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
   REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
@@ -935,6 +941,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
 | `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
+| `pool-rotate` | 0 (off) | client (pool carriers: tcp, tls, ws, wss, h2, grpc) | Recycle each healthy pool connection after this long (`30m`, `4h`), so no single flow shows a months-stable lifetime; each connection's actual budget is jittered ±40 % and re-rolled on every recycle, so redials never line up into a detectable period. The session resends anything in flight, so the cost is one redial on one connection at a time. 0 = off. Since 2.8.0. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
 | `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp, tcp, tls, ws, wss, h2, h2c and grpc since 2.4.18 (200 from 2.3.0; before that 16 for every carrier; the server's value caps the download). See "ICMP path limits and pacing". |
 | `tcp-cc` | `bbr` | both | Since 2.4.18, Linux. TCP congestion control set on every pool socket (tcp, tls, ws, wss, h2, h2c, grpc). BBR does not back off on random loss; the kernel default (cubic) halves its window on every lost segment. `system` keeps the kernel default. Each end sets it for what it sends. `tcp_cc` in `/stats` shows what the kernel accepted (falls back to the default if the `tcp_bbr` module is missing). |
@@ -961,7 +968,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
 | `fake-sni` | empty (off) | client | Fake-SNI desync, tcp, tls, wss, h2 and grpc carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives it (wrong sequence number, a TTL that expires at the filtering hop, or a bad checksum), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
-| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the marker carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the marker carries a small TTL and expires at the filtering hop (needs `fake-ttl`). `sum` (2.7.1): the marker mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it â€” the mode for filters that check sequence numbers. Since 2.6.0. |
+| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the marker carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the marker carries a small TTL and expires at the filtering hop (needs `fake-ttl`). `sum` (2.7.1): the marker mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it — the mode for filters that check sequence numbers. `seqsum` (2.8.0, experimental): both the seq and the sum marker per connection, ~1 ms apart. Since 2.6.0. |
 | `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the marker packet: one more than the distance to the filtering DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the marker one hop short of the server. Unused by `seq` and `sum`. Since 2.6.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
@@ -1718,6 +1725,16 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.8.0: connection churn, dual-marker mode, checksum fix.** Client-side only, server unchanged, no wire
+  format changed. (1) New `pool-rotate`: recycle each healthy pool connection after a jittered lifetime budget
+  (±40 % per connection, re-rolled on every recycle), so no single flow shows a months-stable lifetime to a
+  behavioral classifier — the field's strongest detection tell after raw volume. (2) New `fake-mode: seqsum`
+  (experimental): both the seq and the sum marker per connection, ~1 ms apart, so a filter must discard both
+  correctly. (3) Fixed the sum-marker checksum damage: the old `(checksum ^ 1) - 1` formula is an identity for
+  every even checksum, so about half of the sum-mode markers shipped with a fully VALID checksum and the server
+  would have accepted their payload as real stream data (flow corruption). It is now `checksum - 1` with a wrap
+  guard. **If you run `fake-mode: sum` on 2.7.x, update the client.**
+  - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival) · [pool-rotate](#the-flags-and-config-keys).
 - **2.7.1: fake-SNI `sum` mode, probe fix, manager support.** Three client-side fake-SNI changes, server
   unchanged, no wire format changed. (1) New `fake-mode: sum`: the marker mirrors the first data segment in-window
   (same seq/ack) with a damaged TCP checksum â€” for filters that validate TCP sequence numbers, where `seq`

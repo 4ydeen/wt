@@ -192,6 +192,8 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *[][]byte) {
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "ttl", TTL: ttl}
 	case "sum":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "sum"}
+	case "seqsum":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "seqsum"}
 	}
 	var p [4]byte
 	copy(p[:], net.ParseIP("10.8.0.1").To4())
@@ -578,5 +580,79 @@ func TestDesyncSumModeLate(t *testing.T) {
 	seq := binary.BigEndian.Uint32((*sent)[0][24:])
 	if seq != isn+1-uint32(len(tr.hello)) {
 		t.Fatalf("sum late fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
+	}
+}
+
+// TestDesyncSeqSumSendsBoth: seqsum sends TWO markers per connection — the below-window seq fake first, then
+// the in-window mirror with a damaged checksum ~1 ms later. Both must be present, in order, both carrying the
+// allowlisted SNI, one with valid checksum below the window and one in-window with an invalid one.
+func TestDesyncSeqSumSendsBoth(t *testing.T) {
+	tr, sent := desyncTestTracker("seqsum", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(7000), uint32(900)
+	tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // bare ACK: no fire yet (needs the data segment to mirror)
+	if tr.fired() != 0 {
+		t.Fatal("seqsum fired on a bare ACK")
+	}
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 80), 64))
+	if tr.fired() != 1 {
+		t.Fatal("seqsum did not fire on the data segment")
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("seqsum sent %d markers, want 2", len(*sent))
+	}
+	// marker 1: below-window seq, VALID checksum (plain seq fake). fakePacket built it correctly and seqsum
+	// sent it unmodified — recompute and require equality.
+	m1 := (*sent)[0]
+	if got := binary.BigEndian.Uint32(m1[24:]); got != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("seqsum marker1 seq %d, want %d (below stream start)", got, isn+1-uint32(len(tr.hello)))
+	}
+	stored1 := binary.BigEndian.Uint16(m1[20+16:])
+	binary.BigEndian.PutUint16(m1[20+16:], 0)
+	if good := tcpChecksum(m1[20:], k.srcIP[:], k.dstIP[:]); good != stored1 {
+		t.Fatalf("seqsum marker1 checksum %04x, want the VALID value %04x", stored1, good)
+	}
+	// marker 2: in-window seq (the data segment's own), DAMAGED checksum
+	m2 := (*sent)[1]
+	if got := binary.BigEndian.Uint32(m2[24:]); got != isn+1 {
+		t.Fatalf("seqsum marker2 seq %d, want %d (in-window mirror)", got, isn+1)
+	}
+	stored2 := binary.BigEndian.Uint16(m2[20+16:])
+	binary.BigEndian.PutUint16(m2[20+16:], 0)
+	if good := tcpChecksum(m2[20:], k.srcIP[:], k.dstIP[:]); good == stored2 {
+		t.Fatalf("seqsum marker2 carries a VALID checksum %04x (must be damaged)", good)
+	}
+	// both carry the same allowlisted SNI payload
+	for i, m := range [][]byte{m1, m2} {
+		if string(m[40:]) != string(tr.hello) {
+			t.Fatalf("seqsum marker%d payload is not the fake hello", i+1)
+		}
+	}
+}
+
+// TestDesyncSeqSumLateFiresBoth: the late path (unknown ISN) fires the dual marker off the first data segment.
+func TestDesyncSeqSumLateFiresBoth(t *testing.T) {
+	tr, sent := desyncTestTracker("seqsum", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(41000), uint32(70)
+	ch := tr.announce(k, 0, false)
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 40), 64))
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("seqsum late fake never fired")
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("seqsum late sent %d markers, want 2", len(*sent))
+	}
+	if got := binary.BigEndian.Uint32((*sent)[0][24:]); got != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("seqsum late marker1 seq %d, want %d", got, isn+1-uint32(len(tr.hello)))
+	}
+	if got := binary.BigEndian.Uint32((*sent)[1][24:]); got != isn+1 {
+		t.Fatalf("seqsum late marker2 seq %d, want %d (in-window)", got, isn+1)
 	}
 }

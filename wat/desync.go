@@ -52,7 +52,8 @@ func tcpChecksum(th, src, dst []byte) uint16 {
 // DesyncConfig tunes the fake-SNI layer of the tcp, tls, wss, h2 and grpc carriers.
 type DesyncConfig struct {
 	SNI  string // allowlisted server name the fake ClientHello carries
-	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL) or "sum" (valid window, bad checksum)
+	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL), "sum" (valid window, bad checksum)
+	             // or "seqsum" (both markers per connection, ~1 ms apart; experimental, 2.8.0)
 	TTL  int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
 }
 
@@ -62,9 +63,9 @@ func validateDesync(cfg DesyncConfig) error {
 		return fmt.Errorf("wat: desync: empty SNI")
 	}
 	switch cfg.Mode {
-	case "", "seq", "ttl", "sum":
+	case "", "seq", "ttl", "sum", "seqsum":
 	default:
-		return fmt.Errorf("wat: -fake-mode must be seq, ttl or sum, got %q", cfg.Mode)
+		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum or seqsum, got %q", cfg.Mode)
 	}
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
@@ -391,10 +392,11 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	switch {
 	case c.isnKnown:
 		// early: fire on the handshake's final ACK or the first data flight, whichever comes first.
-		// sum mode stays for the first DATA segment: its fake is a valid-window duplicate of that segment, so it
-		// needs the segment's real seq/ack to be identical to the real flight (bare ACKs have nothing to mirror).
+		// sum/seqsum modes stay for the first DATA segment: their fake is a valid-window duplicate of that
+		// segment, so it needs the segment's real seq/ack to be identical to the real flight (bare ACKs have
+		// nothing to mirror).
 		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 {
-			if t.cfg.Mode == "sum" {
+			if sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"; sumMode {
 				if payload == 0 {
 					return // wait for the data segment to mirror
 				}
@@ -405,7 +407,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	default:
 		// late: the first outbound data segment is the anchor (its seq IS the stream start)
 		if payload > 0 && ackf && !syn {
-			if t.cfg.Mode == "sum" {
+			if t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" {
 				t.sumSeq = seq
 			}
 			t.fireLocked(out, c, seq, ackv)
@@ -439,7 +441,8 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 	// validation; a DPI that parses before checksumming reads the SNI. NATs that validate checksums
 	// (nf_conntrack_checksum=1 + an INVALID-drop FORWARD rule) kill this mode; ISPs usually pass (zapret's
 	// documented field observation).
-	if t.cfg.Mode == "sum" {
+	sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"
+	if sumMode {
 		base = t.sumSeq
 	}
 	// seq = base - len(fake): the fake lands exactly below the stream start. The server holds snd_una at the
@@ -451,13 +454,37 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		close(ch)
 	}
 	if t.send != nil {
+		if t.cfg.Mode == "seqsum" {
+			// dual marker (2.8.0): the below-window seq fake first, then the in-window bad-checksum mirror
+			// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
+			// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
+			// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
+			t.send(fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello))
+			pkt := fakePacket(k, base, ack, ttl, t.hello)
+			damageChecksum(pkt)
+			t.send(pkt)
+			return
+		}
 		pkt := fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello)
 		if t.cfg.Mode == "sum" {
-			// the checksum was computed correctly by fakePacket; damage it in one reserved bit + flip, the
-			// GoodbyeDPI way (checksum - 1), so no off-by-one coincidence can repair it
-			s := binary.BigEndian.Uint16(pkt[20+16:])
-			binary.BigEndian.PutUint16(pkt[20+16:], (s^1)-1)
+			// the checksum was computed correctly by fakePacket; damage it so no off-by-one coincidence
+			// can repair it (see damageChecksum)
+			damageChecksum(pkt)
 		}
 		t.send(pkt)
 	}
+}
+
+// damageChecksum rewrites a valid TCP checksum into an invalid one, unconditionally: s-1, but when that would
+// wrap to 0xffff (a VALID fold: the internet checksum of a correct packet is 0xffff by definition) it goes to
+// s-2 instead. The 2.7.1 formula (s^1)-1 was an IDENTITY for every even s — (s+1)-1 = s — so on average every
+// second sum-marker shipped with a fully valid checksum and the server would have accepted its payload as real
+// stream data. Found by the sum-mode test flaking with ~50 % frequency (the SNI random bytes decide the parity).
+func damageChecksum(pkt []byte) {
+	s := binary.BigEndian.Uint16(pkt[20+16:])
+	d := s - 1
+	if d == 0xffff {
+		d = s - 2
+	}
+	binary.BigEndian.PutUint16(pkt[20+16:], d)
 }

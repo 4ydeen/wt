@@ -1,4 +1,4 @@
-﻿# RESEARCH-3: field status after the 2026 filter upgrades â€” what changed, what is new, what fits WatTunnel
+# RESEARCH-3: field status after the 2026 filter upgrades â€” what changed, what is new, what fits WatTunnel
 
 Status: research round 3 for branch `dev` (after 2.7.0/2.7.1). Trigger: patterniha's announcement
 (two new SNI-Spoofing methods tested successfully against the *updated* filter of every network he
@@ -121,11 +121,12 @@ allowlist; WatTunnel's `auto` carrier test and manager's variant ranking are the
 1. **Adopt connection-lifetime/volume churn in the pool layer (cheap, high value, zero wire
    change).** Mirror Hedioum's budgets: recycle a pool connection after N minutes / N GB (client-
    side only, e.g. `pool-rotate: 30m/4GB`), staggered per connection, so no flow looks like a
-   months-long TLS pipe. Directly addresses the #628 pattern (throughput â†’ probe â†’ block
-   domain+IP) and #649's field rule. Speed cost â‰ˆ 0 (redial at a chosen moment). This is the best
-   speed-per-effort item on the list.
+   months-long TLS pipe. Directly addresses the #628 pattern (throughput → probe → block
+   domain+IP) and #649's field rule. Speed cost ≈ 0 (redial at a chosen moment). This is the best
+   speed-per-effort item on the list. **Implemented in 2.8.0**: `pool-rotate` (time budget only,
+   byte axis reserved in the API), ±40 % jitter per connection, re-rolled every recycle.
 2. **A Bale/WebRTC-style carrier as the permit-list-proof fallback (new code, medium-large).** Not
-   for speed (~6.5â€“13 Mbps) but for the regime nothing else survives: carry the session's
+   for speed (~6.5–13 Mbps) but for the regime nothing else survives: carry the session's
    datagrams over a Bale Meet (or other whitelisted SFU) VP8/DataChannel via headless Pion, as a
    `carrier: bale` option client-side only. Android viability via VpnService+tun2socks is solved
    by the fork we'd learn from. Mark clearly: third-party dependency, terms-of-service and
@@ -134,7 +135,11 @@ allowlist; WatTunnel's `auto` carrier test and manager's variant ranking are the
 3. **Keep hardening fake-SNI, expect the countermove to be behavioral, not packet-shaped.** The
    seq/sum/ttl modes hold while the filter checks fields; the #628 pattern suggests pairing
    fake-SNI with item 1's churn and with `sni`+`fp` on the real hello (already supported) so the
-   real flow also looks like TLS-to-allowed-site end-to-end.
+   real flow also looks like TLS-to-allowed-site end-to-end. **2.8.0 adds `fake-mode: seqsum`**
+   (both markers per connection, ~1 ms apart) and **fixes the sum-marker checksum damage**: the
+   2.7.1 formula `(checksum ^ 1) - 1` is an identity for every even checksum, so ~half of the
+   sum-mode markers shipped with a fully valid checksum and the server would have accepted their
+   payload as real data (flow corruption). Now `checksum - 1` with a valid-fold guard.
 4. **Do NOT invest in more fragmentation of the real ClientHello.** #640/#628 show the upgraded
    DPI reassembles; our `tls-frag` stays as-is for un-upgraded segments.
 5. **QUIC/H3: still NO** (blocked in the field; QUIC SNI filtering exists in Russia and is
@@ -151,10 +156,15 @@ self-description), they need raw sockets (hence no non-root Android), and one sh
 exe with a SOCKS/port listener (127.0.0.1:40443). The commented-out `wrong_checksum` branch (with
 `ipv4.ident + 1` next to it) and zapret's variant taxonomy bound the plausible space: variants of
 checksum/seq/ident/IP-fragment variants on the marker, likely combined (two markers per
-connection, the GoodbyeDPI `--wrong-seq + --wrong-chksum` double-marker pattern). If both were
+connection, the GoodbyeDPI `--wrong-seq + --wrong-chksum` double-marker pattern, which 2.8.0's
+`fake-mode: seqsum` implements). If both were
 "tested successfully against the updated filter of every network", the differentiator is likely
-**combining variants and IP-layer fragmentation of the marker itself** â€” the marker is discarded
-by the server anyway, so fragmenting it costs nothing and defeats DPI marker-reassembly. That is
+**combining variants and IP-layer fragmentation of the marker itself**. One correction to an
+earlier draft of this section: fragmenting the marker is NOT free — if the filter's rule is
+"fragmented TLS hello → treat the flow as blocked" (the #640 behavior), a fragmented marker tags
+the very flow it was meant to save; gate it behind a path probe and default off. The rest stands:
+the marker is discarded
+by the server anyway, so fragmenting it defeats DPI marker-reassembly of the fake itself. That is
 a cheap experiment worth a `fake-mode`/`fake-frag` knob in our injector (send the marker as 2â€“3
 IP fragments), but it is a variant of what we have, not a new class; treat as item 3's optional
 extension after field tests confirm fake-SNI is being read-then-dropped (the failure signature
