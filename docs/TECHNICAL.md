@@ -469,6 +469,12 @@ the relay then carries the session's own encrypted datagrams as if they were tha
 data. `fake-mode: ttl` instead gives the fake a TTL that expires at the censor's hop (`fake-ttl`), so it never
 leaves Iran's network at all.
 
+Since 2.7.0 the injector watches the wire (AF_PACKET) for every pool connection from the moment dial returns:
+it anchors the fake to the handshake's final ACK when it observed the SYN/SYN-ACK, to the first outbound data
+segment otherwise, and a NAT that rewrites sequence numbers uniformly no longer misfires (the fake follows the
+rewrite). Works on the `tcp`, `tls`, `wss`, `h2` and `grpc` carriers. `fake-ttl: 0` (the default) calibrates
+itself: the peer's inbound TTL is learned from its SYN-ACK, the fake goes out one hop short of the server.
+
 Client-side only, Linux only, needs CAP_NET_RAW (the icmp carrier's requirement); the server needs no change
 and no new version. Two caveats from field reports of the same trick in other tools: it died where the ISP's
 NAT normalizes sequence numbers before the DPI (some ASNs, not all), and the allowlisted SNI itself must be
@@ -484,12 +490,16 @@ carries a fake ClientHello with an allowlisted SNI (`mci.ir` worked in the field
 accepts it, while the DPI, reassembling without window checks, reads it as the flow's first flight. From then on
 the session's own encrypted datagrams ride the flow, classified as TLS application data to the allowed site.
 
-- `fake-sni: mci.ir` on the client, `carrier: tls` (or `tcp`). Linux + CAP_NET_RAW, like the icmp carrier.
+- `fake-sni: mci.ir` on the client, `carrier: tls` (or `tcp`, `wss`, `h2`, `grpc` since 2.7.0). Linux +
+  CAP_NET_RAW, like the icmp carrier.
 - `fake-mode: seq` (default): the fake's sequence number is `ISN+1-len(fake)`, below the stream start. The
-  server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI.
+  server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI. A NAT
+  that rewrites sequence numbers uniformly shifts the fake with it (2.7.0), so only non-uniform normalization
+  breaks this mode.
 - `fake-mode: ttl` + `fake-ttl: N`: the fake dies at the censor's hop and never reaches the server at all. N is
-  the hop count of the DPI box minus one: find it with `traceroute` to your server, then test downward. Some
-  ISPs normalize TTLs; there `seq` works better.
+  the hop count of the DPI box minus one: find it with `traceroute` to your server, then test downward.
+  `fake-ttl: 0` (2.7.0) auto-calibrates from the server's inbound TTL. Some ISPs normalize TTLs; there `seq`
+  works better.
 - The server needs NO changes and no update: it never sees the fake packet. Only the client needs 2.6.0.
 - Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
   REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
@@ -916,10 +926,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
 | `fake-sni` | empty (off) | client | Fake-SNI desync, tcp and tls carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, or a TTL that dies at the censor), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
 | `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). Since 2.6.0. |
-| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Read it off a traceroute to the server. Since 2.6.0. |
-| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp and tls carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, or a TTL that dies at the censor), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
-| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). Since 2.6.0. |
-| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Set it to the traceroute hop count of the DPI minus one. Since 2.6.0. |
+| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the fake one hop short of the server. Since 2.6.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
 
@@ -1674,6 +1681,16 @@ shipped.
 
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
+
+- **2.7.0: fake-SNI hardened, more carriers.** The fake-SNI desync (2.6.0) now anchors the fake to the first
+  outbound packet it can observe (handshake final ACK or first data segment) instead of requiring the sniffer to
+  have seen the whole handshake — the 2.6.0 sniffer only fired when the SYN landed after `Wrap` announced the
+  connection, so on most dial orders it silently timed out unclassified. The injector also follows a NAT that
+  rewrites sequence numbers uniformly (the fake stays below the stream start as the server sees it), auto-learns
+  the TTL for `fake-mode: ttl` (`fake-ttl: 0`, the default, calibrates from the peer's SYN-ACKs), and now applies
+  to the `wss`, `h2` and `grpc` carriers too. Client-side only, Linux + CAP_NET_RAW; the server is unchanged and
+  no wire format changed.
+  - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival).
 
 - **2.6.0: fake-SNI desync for whitelisting blackouts.** When a censor allowlists flows by their TLS ClientHello
   name (the 2026 whitelisting, where only a handful of Iranian sites' HTTPS passes), the tcp and tls carriers can

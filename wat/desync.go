@@ -1,19 +1,24 @@
 package wat
 
-// Fake-SNI desync (client side, Linux only, desync_linux.go): after the kernel finishes the TCP handshake, a raw
-// packet carrying a fake TLS ClientHello with an allowlisted SNI is injected next to the real flow. The DPI reads
-// it and marks the flow as TLS to an allowlisted site; the server never accepts it (out-of-window seq, or a TTL
-// that expires at the censor's hop), so the relay then carries the session's own encrypted datagrams, which the
-// DPI now passes as TLS application data. Server-side changes: none. Reverse-engineered from tools that kept
-// working through the 2026 whitelisting (patterniha/SNI-Spoofing's wrong-seq method; see docs/TECHNICAL.md).
+// Fake-SNI desync (client side; the raw-socket half is desync_linux.go). Right after a pool connection's TCP
+// handshake completes, a raw packet carrying a fake TLS ClientHello with an allowlisted SNI is injected next to
+// the real flow. A DPI that classifies flows by parsing the first TLS flight reads the fake and marks the flow as
+// TLS to an allowlisted site; the real server drops the fake (out-of-window sequence number, or a TTL that dies at
+// the censor's hop), so the relay then carries the session's own encrypted datagrams, which the DPI passes as TLS
+// application data. Server-side changes: none. Reverse-engineered from patterniha/SNI-Spoofing (wrong-seq method,
+// January 2026 whitelisting; see FAKE-SNI-DESIGN.md) with the trigger handling generalised after zapret's
+// zero-stage/second-stage split: the fake can also be sent alongside (not only before) the real first flight.
 //
-// This file holds the OS-independent parts so they are testable everywhere.
+// This file holds the OS-independent parts so the state machine is testable everywhere: the handshake tracker, the
+// fake packet builder and the shared checksum helpers.
 
 import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 )
 
 // htons swaps byte order for the socket option calls that take a network-order constant.
@@ -44,11 +49,27 @@ func tcpChecksum(th, src, dst []byte) uint16 {
 	return csum(append(ph, th...))
 }
 
-// DesyncConfig tunes the fake-SNI layer of the tcp and tls carriers.
+// DesyncConfig tunes the fake-SNI layer of the tcp, tls, wss, h2 and grpc carriers.
 type DesyncConfig struct {
 	SNI  string // allowlisted server name the fake ClientHello carries
 	Mode string // "seq" (wrong sequence number, default) or "ttl" (small TTL, packet dies at the DPI hop)
-	TTL  int    // ttl mode: hop count of the fake packet (required for ttl mode; seq mode ignores it)
+	TTL  int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
+}
+
+// validateDesync checks a DesyncConfig the same way on every OS (NewDesync calls it before anything else).
+func validateDesync(cfg DesyncConfig) error {
+	if cfg.SNI == "" {
+		return fmt.Errorf("wat: desync: empty SNI")
+	}
+	switch cfg.Mode {
+	case "", "seq", "ttl":
+	default:
+		return fmt.Errorf("wat: -fake-mode must be seq or ttl, got %q", cfg.Mode)
+	}
+	if cfg.TTL < 0 || cfg.TTL > 255 {
+		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
+	}
+	return nil
 }
 
 // FakeClientHello builds a minimal TLS 1.2-format ClientHello carrying sni. The censor only parses it for the
@@ -64,18 +85,18 @@ func FakeClientHello(sni string) []byte {
 	ext = append(ext, sniB...)
 	// supported_groups (secp256r1) and signature_algorithms (ecdsa_secp256r1_sha256): a TLS 1.2 ECDHE-ECDSA
 	// handshake needs both, and a real parser checks them before the cipher choice.
-	ext = append(ext, 0, 0x0a, 0, 6, 0, 4, 0, 0x17, 0, 0x18)  // groups: x25519, secp256r1
-	ext = append(ext, 0, 0x0d, 0, 4, 0, 2, 0x04, 0x03)        // sigalgs: ecdsa_secp256r1_sha256
+	ext = append(ext, 0, 0x0a, 0, 6, 0, 4, 0, 0x17, 0, 0x18) // groups: x25519, secp256r1
+	ext = append(ext, 0, 0x0d, 0, 4, 0, 2, 0x04, 0x03)       // sigalgs: ecdsa_secp256r1_sha256
 
 	body := make([]byte, 0, 64+len(ext))
 	body = append(body, 0x03, 0x03) // client version 1.2 in the clear, like every real ClientHello
 	var rnd [32]byte
 	_, _ = rand.Read(rnd[:])
 	body = append(body, rnd[:]...)
-	body = append(body, 0)                                 // session id length 0
-	body = append(body, 0, 4, 0xc0, 0x2b, 0xc0, 0x23)      // ECDHE-ECDSA-AES128-GCM-SHA256 / -AES128-SHA256
-	body = append(body, 1, 0)                              // compression: null
-	body = append(body, byte(len(ext)>>8), byte(len(ext))) // extensions length
+	body = append(body, 0)                            // session id length 0
+	body = append(body, 0, 4, 0xc0, 0x2b, 0xc0, 0x23) // ECDHE-ECDSA-AES128-GCM-SHA256 / -AES128-SHA256
+	body = append(body, 1, 0)                         // compression: null
+	body = append(body, byte(len(ext)>>8), byte(len(ext)))
 	body = append(body, ext...)
 
 	hs := append([]byte{1, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}, body...)
@@ -136,20 +157,279 @@ func parseSNIOf(rec []byte) (string, error) {
 
 // desyncPeerIP extracts the IP of a host:port peer (empty when unresolvable).
 func desyncPeerIP(peer string) string {
-	h, _, err := net.SplitHostPort(peer)
+	ip, _ := desyncPeerHostPort(peer)
+	return ip
+}
+
+// desyncPeerHostPort splits a host:port peer into its IPv4 address and port (best effort, like desyncPeerIP).
+func desyncPeerHostPort(peer string) (ip, port string) {
+	h, p, err := net.SplitHostPort(peer)
 	if err != nil {
-		h = peer
+		h, p = peer, ""
 	}
-	if ip := net.ParseIP(h); ip != nil {
-		return h
+	if v := net.ParseIP(h); v != nil {
+		return h, p
 	}
 	if addrs, err := net.LookupHost(h); err == nil && len(addrs) > 0 {
 		for _, a := range addrs {
-			if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
-				return a
+			if v := net.ParseIP(a); v != nil && v.To4() != nil {
+				return a, p
 			}
 		}
-		return addrs[0]
+		return addrs[0], p
 	}
-	return ""
+	return "", p
+}
+
+// desyncKey is one connection's outgoing 4-tuple (src = us). Inbound frames match the reversed key.
+type desyncKey struct {
+	srcIP [4]byte
+	dstIP [4]byte
+	srcPt uint16
+	dstPt uint16
+}
+
+// fakePacket builds the IPv4+TCP+payload packet of one fake ClientHello. Pure: the same inputs build the same
+// packet, so the tests pin it byte for byte (seq arithmetic, TTL, ack, checksum).
+func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
+	pkt := make([]byte, 20+20+len(hello))
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	pkt[6] = 0x40 // Don't Fragment
+	pkt[8] = byte(ttl)
+	pkt[9] = 6 // TCP
+	copy(pkt[12:16], k.srcIP[:])
+	copy(pkt[16:20], k.dstIP[:])
+	th := pkt[20:]
+	binary.BigEndian.PutUint16(th[0:], k.srcPt)
+	binary.BigEndian.PutUint16(th[2:], k.dstPt)
+	binary.BigEndian.PutUint32(th[4:], seq)
+	binary.BigEndian.PutUint32(th[8:], ack)
+	th[12] = 0x50
+	th[13] = 0x18 // PSH|ACK
+	binary.BigEndian.PutUint16(th[14:], 0xffff)
+	copy(th[20:], hello)
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
+	return pkt
+}
+
+// parseEthIPv4 returns the IPv4 packet carried by an ethernet frame, or nil (not IPv4 / truncated).
+func parseEthIPv4(frame []byte) []byte {
+	if len(frame) < 14+20 || binary.BigEndian.Uint16(frame[12:]) != 0x0800 {
+		return nil
+	}
+	if ip := frame[14:]; ip[0]>>4 == 4 {
+		return ip
+	}
+	return nil
+}
+
+// desyncTracker is the portable handshake state machine of the fake-SNI layer. The Linux injector feeds it every
+// IPv4 packet of the wire (as raw IP byte slices, no ethernet header); tests feed it synthetic handshakes.
+//
+// Two trigger paths cover every dial order, because Wrap can only register a connection after dial returns and
+// the SYN/SYN-ACK may already be gone by then:
+//
+//	early: Wrap knows the ISN (read off the socket with the TCP_REPAIR probe, or from a re-SYN on a tracked
+//	       key). The fake fires on the first outbound segment at or after the stream start: the final ACK of
+//	       the handshake, or the first data segment if that already went out. The fake precedes (or rides
+//	       next to) the real first flight.
+//	late:  the ISN is unknown (probe unavailable). The fake fires on the first outbound DATA segment seen on
+//	       the announced key, its own sequence number derived from that segment's: same-segment-bundle
+//	       desync, the zapret "disorder"/"fake,split" family. The real ClientHello is already on the wire,
+//	       so this needs the classifier not to re-read the flow after it accepted the fake — the documented
+//	       behaviour of the allowlist middleboxes of January 2026.
+//
+// Inbound SYN-ACKs of a tracked key cross-check the ack against the ISN: a NAT that rewrote our sequence numbers
+// updates it, so the fake still lands below the stream start as the server sees it (seq mode's known failure
+// becomes survivable when the shift is uniform). The inbound TTL of the peer is learned from any SYN-ACK from
+// the peer IP, which is what calibrates -fake-mode ttl with -fake-ttl 0.
+type desyncTracker struct {
+	cfg       DesyncConfig
+	peerIP    [4]byte
+	hello     []byte
+	send      func(pkt []byte) // set by the injector (raw socket) or a test (collector); nil = drop
+	logf      func(string, ...any)
+	mu        sync.Mutex
+	conns     map[desyncKey]*desyncConn
+	wait      map[desyncKey]chan struct{} // closed by fire, waited on by Wrap
+	peerTTLv  uint8
+	firedN    int
+	miss      int
+	missNoted bool
+	closed    bool
+}
+
+type desyncConn struct {
+	synSeq    uint32 // the ISN as the wire sees it (updated when a NAT rewrite is detected)
+	isnKnown  bool   // early mode: the ISN is known before any data fires
+	synAckSeq uint32 // seq of the server's SYN-ACK
+	synAckAck uint32 // ack field of the server's SYN-ACK (== ISN+1)
+	at        time.Time
+}
+
+// newDesyncTracker prepares the state machine for one peer IP.
+func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
+	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: FakeClientHello(cfg.SNI),
+		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}}
+}
+
+// announce registers a connection Wrap is waiting for and returns its channel. known says the ISN is exact
+// (from the socket probe); with known=false the tracker fires late, off the first data segment.
+func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ch := make(chan struct{})
+	if t.closed {
+		close(ch)
+		return ch
+	}
+	t.wait[k] = ch
+	t.conns[k] = &desyncConn{synSeq: isn, isnKnown: known, at: time.Now()}
+	return ch
+}
+
+// abandon drops a connection whose Wrap timed out (handshake never observed).
+func (t *desyncTracker) abandon(k desyncKey) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ch := t.wait[k]; ch != nil {
+		delete(t.wait, k)
+		close(ch)
+	}
+	delete(t.conns, k)
+}
+
+func (t *desyncTracker) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.closed {
+		t.closed = true
+		for k, ch := range t.wait {
+			close(ch)
+			delete(t.wait, k)
+		}
+		t.conns = map[desyncKey]*desyncConn{}
+	}
+}
+
+// fired reports how many fakes have been sent.
+func (t *desyncTracker) fired() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.firedN
+}
+
+// peerTTL reports the learned inbound TTL of the peer (0 = not seen yet).
+func (t *desyncTracker) peerTTL() uint8 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.peerTTLv
+}
+
+// handleIPv4 advances the state machine with one raw IPv4 packet (header included, no ethernet header).
+func (t *desyncTracker) handleIPv4(ip []byte) {
+	if len(ip) < 20 || ip[0]>>4 != 4 || ip[9] != 6 { // IPv4 TCP only, like the reference tool
+		return
+	}
+	ihl := int(ip[0]&0xf) * 4
+	if ihl < 20 || len(ip) < ihl+20 {
+		return
+	}
+	th := ip[ihl:]
+	if len(th) < 20 {
+		return
+	}
+	off := int(th[12]>>4) * 4
+	if off < 20 || len(th) < off {
+		return
+	}
+	var s, d [4]byte
+	copy(s[:], ip[12:16])
+	copy(d[:], ip[16:20])
+	sport, dport := binary.BigEndian.Uint16(th[0:]), binary.BigEndian.Uint16(th[2:])
+	out := desyncKey{s, d, sport, dport}
+	in := desyncKey{d, s, dport, sport}
+	seq, ackv := binary.BigEndian.Uint32(th[4:]), binary.BigEndian.Uint32(th[8:])
+	syn, ackf, rst := th[13]&0x02 != 0, th[13]&0x10 != 0, th[13]&0x04 != 0
+	payload := len(th) - off
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	now := time.Now()
+	// any SYN-ACK from the peer teaches the inbound TTL (ttl auto-calibration), tracked or not
+	if syn && ackf && payload == 0 && !rst && s == t.peerIP && t.peerTTLv == 0 {
+		t.peerTTLv = ip[8]
+	}
+	// our outgoing SYN on a tracked key: (re)learn the ISN from the wire
+	if c := t.conns[out]; c != nil && syn && !ackf && payload == 0 && !rst {
+		if !c.isnKnown || seq != c.synSeq {
+			c.synSeq, c.isnKnown, c.synAckSeq, c.synAckAck = seq, true, 0, 0
+		}
+		c.at = now
+		return
+	}
+	// inbound SYN-ACK for a tracked conn: remember its seq/ack, and follow a NAT that rewrote our ISN
+	if c := t.conns[in]; c != nil && syn && ackf && payload == 0 && !rst {
+		if c.isnKnown && ackv != c.synSeq+1 {
+			c.synSeq = ackv - 1 // uniform rewrite: the server's stream starts here now
+		}
+		c.synAckSeq, c.synAckAck, c.at = seq, ackv, now
+		return
+	}
+	if rst {
+		return
+	}
+	c := t.conns[out]
+	if c == nil || c.synAckAck == 0 && !c.isnKnown {
+		return // nothing to anchor the fake's ack to yet
+	}
+	switch {
+	case c.isnKnown:
+		// early: fire on the handshake's final ACK or the first data flight, whichever comes first
+		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 { // at or after the stream start
+			t.fireLocked(out, c, c.synSeq+1, ackv)
+		}
+	default:
+		// late: the first outbound data segment is the anchor (its seq IS the stream start)
+		if payload > 0 && ackf && !syn {
+			t.fireLocked(out, c, seq, ackv)
+		}
+	}
+}
+
+// fireLocked builds and sends the fake for one completed handshake (mu held).
+func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32) {
+	ttl := 64
+	if t.cfg.Mode == "ttl" {
+		ttl = t.cfg.TTL
+		if ttl <= 0 { // auto: one hop less than the distance the server's packets travel
+			if p := int(t.peerTTLv); p > 1 {
+				ttl = p - 1
+			} else {
+				t.miss++
+				if !t.missNoted {
+					t.missNoted = true
+					if t.logf != nil {
+						t.logf("wat: fake-sni ttl auto: the peer's TTL is not learned yet, handshake left unclassified (calibrates from the first SYN-ACK)")
+					}
+				}
+				return
+			}
+		}
+	}
+	// seq = base - len(fake): the fake lands exactly below the stream start. The server holds snd_una at the
+	// stream start, so this is an old duplicate; a DPI without window checks reassembles it as the first flight.
+	t.firedN++
+	delete(t.conns, k)
+	if ch := t.wait[k]; ch != nil {
+		delete(t.wait, k)
+		close(ch)
+	}
+	if t.send != nil {
+		t.send(fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello))
+	}
 }

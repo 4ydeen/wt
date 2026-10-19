@@ -10,6 +10,9 @@ import (
 // The raw-packet half of the fake-SNI desync needs an AF_PACKET sniffer; only the Linux client (the Iran side)
 // runs it, the same restriction as the ICMP carrier. Elsewhere NewDesync fails at startup, not silently.
 func NewDesync(cfg DesyncConfig, peer string) (*Desync, error) {
+	if err := validateDesync(cfg); err != nil { // same validation error messages everywhere
+		return nil, err
+	}
 	return nil, errors.New("wat: -fake-sni needs Linux with CAP_NET_RAW (the ICMP carrier's requirement)")
 }
 

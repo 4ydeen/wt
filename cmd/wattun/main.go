@@ -82,9 +82,9 @@ func main() {
 	echMode := flag.String("ech", "off", "client, tls|wss|h2|grpc carriers: Encrypted Client Hello: off|auto|<base64 ECHConfigList>; auto reads the HTTPS DNS record of the SNI/host name over DNS-over-HTTPS (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9 raced in parallel; the last good config is kept if they all fail) (client only, 2.2.0; server unchanged)")
 	echCache := flag.String("ech-cache", "", "client, with -ech auto: file keeping the last good ECH config across restarts, used at once on start while DoH refreshes in the background (2.2.3; empty = off)")
 	tlsFrag := flag.Int("tls-frag", 0, "client, tls|wss|h2|grpc carriers: split the TLS ClientHello into N-byte TCP segments, 0 = off (client only, 2.2.0; server unchanged)")
-	fakeSNI := flag.String("fake-sni", "", "client, tcp|tls carriers: after every connection's TCP handshake, inject a fake TLS ClientHello carrying this allowlisted SNI (raw socket, Linux, like the ICMP carrier), so the DPI classifies the flow as TLS to an allowed site; the server never sees the fake (client only, 2.6.0; server unchanged)")
-	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl)")
-	fakeTTL := flag.Int("fake-ttl", 0, "client, with -fake-sni -fake-mode ttl: hop count of the fake packet, 1 more than the distance to the censor's DPI box, 1 less than the distance to the server")
+	fakeSNI := flag.String("fake-sni", "", "client, tcp|tls|wss|h2|grpc carriers: track every outgoing TCP handshake on the wire and inject a fake TLS ClientHello carrying this allowlisted SNI right after it, so the DPI classifies the flow as TLS to an allowed site; the server never sees the fake (raw socket, Linux, like the ICMP carrier; client only, 2.6.0; server unchanged)")
+	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl N or 0 = calibrate it once with traceroute before the first fake)")
+	fakeTTL := flag.Int("fake-ttl", 0, "client, with -fake-sni -fake-mode ttl: hop count of the fake packet, 1 more than the distance to the censor's DPI box, 1 less than the distance to the server; 0 = calibrate once from the server's replies")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
 	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer; icmp carrier: the server sends the requests to -peer (the client's IP) and the client answers with replies (both ends need wattun >= 2.0.0 and -reverse)")
@@ -198,9 +198,9 @@ func main() {
 	if *tlsFrag < 0 || *tlsFrag > 1<<14 {
 		log.Fatalf("-tls-frag must be 0..16384, got %d", *tlsFrag)
 	}
-	// attachFakeSNI wires the -fake-sni desync layer into a pool client's dial path (tcp and tls carriers, client
-	// only). No-op without -fake-sni; a fatal error when the layer cannot start (no raw socket, bad mode). The
-	// sniffer lives for the process, like the ICMP carrier's raw socket.
+	// attachFakeSNI wires the -fake-sni desync layer into a pool client's dial path (tcp, tls and the TLS-based
+	// HTTP carriers, client only). No-op without -fake-sni; a fatal error when the layer cannot start (no raw
+	// socket, bad mode). The sniffer lives for the process, like the ICMP carrier's raw socket.
 	attachFakeSNI := func(pc *wat.TCPPoolClient, peer string) error {
 		if *fakeSNI == "" {
 			return nil
@@ -323,6 +323,9 @@ func main() {
 					pc, err = wat.NewGRPCPoolClient(peer, *conns, co)
 				default:
 					pc, err = wat.NewH2PoolClient(peer, *conns, co)
+				}
+				if err == nil {
+					err = attachFakeSNI(pc, peer)
 				}
 			}
 			if err != nil {

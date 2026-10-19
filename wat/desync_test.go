@@ -129,3 +129,370 @@ func TestTCPChecksum(t *testing.T) {
 		t.Fatalf("checksum verify failed: %04x", ^uint16(s))
 	}
 }
+
+// TestValidateDesync pins the config validation both OSes share.
+func TestValidateDesync(t *testing.T) {
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "seq"}); err != nil {
+		t.Fatalf("seq: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "ttl", TTL: 7}); err != nil {
+		t.Fatalf("ttl: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "ttl", TTL: 0}); err != nil {
+		t.Fatalf("ttl auto (TTL 0) is allowed: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "", Mode: "seq"}); err == nil {
+		t.Fatal("empty SNI must fail")
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "bogus"}); err == nil {
+		t.Fatal("bad mode must fail")
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "ttl", TTL: 300}); err == nil {
+		t.Fatal("TTL > 255 must fail")
+	}
+}
+
+// desyncTestPkt builds one raw IPv4 TCP packet (header included) the way the wire delivers it.
+func desyncTestPkt(src, dst [4]byte, sport, dport uint16, seq, ack uint32, flags byte, payload []byte, ttl int) []byte {
+	pkt := make([]byte, 20+20+len(payload))
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	pkt[8] = byte(ttl)
+	pkt[9] = 6
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	th := pkt[20:]
+	binary.BigEndian.PutUint16(th[0:], sport)
+	binary.BigEndian.PutUint16(th[2:], dport)
+	binary.BigEndian.PutUint32(th[4:], seq)
+	binary.BigEndian.PutUint32(th[8:], ack)
+	th[12] = 0x50
+	th[13] = flags
+	binary.BigEndian.PutUint16(th[14:], 0xffff)
+	copy(th[20:], payload)
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], src[:], dst[:]))
+	return pkt
+}
+
+const (
+	testFlagFIN = 0x01
+	testFlagRST = 0x04
+	testFlagPSH = 0x08
+	testFlagACK = 0x10
+	testFlagSYN = 0x02
+)
+
+// desyncTestTracker builds a tracker with a collected send path and a fixed client/peer pair.
+func desyncTestTracker(mode string, ttl int) (*desyncTracker, *[][]byte) {
+	var cfg DesyncConfig
+	switch mode {
+	case "seq":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "seq"}
+	case "ttl":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "ttl", TTL: ttl}
+	}
+	var p [4]byte
+	copy(p[:], net.ParseIP("10.8.0.1").To4())
+	tr := newDesyncTracker(cfg, p)
+	sent := &[][]byte{}
+	tr.send = func(pkt []byte) { *sent = append(*sent, pkt) }
+	return tr, sent
+}
+
+// testClientKey is one outgoing 4-tuple: 192.168.1.2:5000 -> 10.8.0.1:443.
+func testClientKey() desyncKey {
+	var s, d [4]byte
+	copy(s[:], net.ParseIP("192.168.1.2").To4())
+	copy(d[:], net.ParseIP("10.8.0.1").To4())
+	return desyncKey{s, d, 5000, 443}
+}
+
+// feedFullHandshake drives a normal SYN / SYN-ACK / final-ACK exchange into the tracker.
+func feedFullHandshake(tr *desyncTracker, k desyncKey, isn, srvSeq uint32) {
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+}
+
+// TestDesyncEarlyFiresBeforeData: the classic path — Wrap knows the ISN, the fake fires on the final ACK, one
+// packet, seq fully below the stream start, ack = the server's ISN.
+func TestDesyncEarlyFiresBeforeData(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	ch := tr.announce(k, isn+1, true) // probe reports SND.NXT = ISN+1 right after the handshake
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake never fired")
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("want 1 fake, got %d", len(*sent))
+	}
+	pkt := (*sent)[0]
+	if n := int(binary.BigEndian.Uint16(pkt[2:])); n != 20+20+len(tr.hello) {
+		t.Fatalf("fake length %d, want %d", n, 20+20+len(tr.hello))
+	}
+	if got := binary.BigEndian.Uint32(pkt[24:]); got != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("fake seq %d, want %d (below stream start)", got, isn+1-uint32(len(tr.hello)))
+	}
+	if got := binary.BigEndian.Uint32(pkt[28:]); got != srvSeq+1 {
+		t.Fatalf("fake ack %d, want %d (server's ISN+1)", got, srvSeq+1)
+	}
+	if pkt[8] != 64 {
+		t.Fatalf("fake ttl %d, want 64 (seq mode)", pkt[8])
+	}
+	if got := binary.BigEndian.Uint16(pkt[20:]); got != 5000 {
+		t.Fatalf("fake sport %d", got)
+	}
+	if got := binary.BigEndian.Uint16(pkt[22:]); got != 443 {
+		t.Fatalf("fake dport %d", got)
+	}
+	if tr.fired() != 1 {
+		t.Fatalf("fired counter %d", tr.fired())
+	}
+}
+
+// TestDesyncEarlyFiresOnFirstData: the real client's first flight went out before Wrap could register — the
+// fake still fires, anchored to the first outbound data segment (seq equal to that segment's stream start).
+func TestDesyncEarlyFiresOnFirstData(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(0xffff0000), uint32(17) // wrap-prone values
+	tr.announce(k, isn+1, true)
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	// the pool writes the session's first datagram BEFORE the final ACK would be seen on the wire
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 300), 64))
+	if tr.fired() != 1 {
+		t.Fatalf("fake did not fire on first data (fired %d)", tr.fired())
+	}
+	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	if seq != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
+	}
+}
+
+// TestDesyncLateFiresOnData: the ISN is unknown (probe unavailable) — the fake fires anchored to the first
+// outbound data segment, which is the only anchor available.
+func TestDesyncLateFiresOnData(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(42000), uint32(900)
+	ch := tr.announce(k, 0, false) // not known
+	// handshake seen only as SYN-ACK + first data (SYN lost to the sniffer, e.g. offload path)
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 100), 64))
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("late fake never fired")
+	}
+	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	if seq != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("late fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
+	}
+}
+
+// TestDesyncLateNeedsData: with no anchor (no data segment yet), the late path must NOT fire on bare ACKs.
+func TestDesyncLateNeedsData(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(42000), uint32(900)
+	tr.announce(k, 0, false)
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagACK, nil, 64))
+	if len(*sent) != 0 {
+		t.Fatalf("late path fired on bare ACKs (%d fakes)", len(*sent))
+	}
+}
+
+// TestDesyncNATRewrite: a NAT that shifts our sequence numbers between SYN and data (the documented seq-mode
+// killer) shifts the fake with it when the SYN-ACK still names the old ISN — the tracker follows the server's
+// view. The fake stays below the stream start as the SERVER sees it.
+func TestDesyncNATRewrite(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	tr.announce(k, isn+1, true)
+	// NAT rewrote our ISN from 1000 to 2000 before the server saw it
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	const natISN = isn + 1000
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, natISN+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, natISN+1, srvSeq+1, testFlagACK, nil, 64))
+	if tr.fired() != 1 {
+		t.Fatal("fake did not fire after NAT rewrite")
+	}
+	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	if seq != natISN+1-uint32(len(tr.hello)) {
+		t.Fatalf("fake seq %d, want %d (NAT-shifted)", seq, natISN+1-uint32(len(tr.hello)))
+	}
+}
+
+// TestDesyncTTLCalibration: -fake-ttl 0 learns the peer's inbound TTL from its SYN-ACK and sends the fake one
+// hop short of the server. Before the SYN-ACK is seen, nothing fires.
+func TestDesyncTTLCalibration(t *testing.T) {
+	tr, sent := desyncTestTracker("ttl", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // SYN-ACK arrives with TTL 52
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake never fired after calibration")
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("want 1 fake, got %d", len(*sent))
+	}
+	if got := (*sent)[0][8]; got != 51 {
+		t.Fatalf("calibrated ttl %d, want 51 (peer TTL 52 - 1)", got)
+	}
+}
+
+// TestDesyncTTLCalibratedBeforeHandshake: a previously learned TTL (from another connection) serves at once.
+func TestDesyncTTLCalibratedBeforeHandshake(t *testing.T) {
+	tr, sent := desyncTestTracker("ttl", 0)
+	defer tr.close()
+	k := testClientKey()
+	// a stray SYN-ACK from the peer (another connection's) teaches the TTL first
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, 9999, 77, 88, testFlagSYN|testFlagACK, nil, 60))
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	if tr.fired() != 1 {
+		t.Fatal("fake did not fire with pre-calibrated TTL")
+	}
+	if got := (*sent)[0][8]; got != 59 {
+		t.Fatalf("ttl %d, want 59", got)
+	}
+}
+
+// TestDesyncTTLCalibratedNotYet: before any SYN-ACK, an auto-TTL handshake stays unfired and the wait channel
+// is abandoned (Wrap times out; the tunnel works unclassified).
+func TestDesyncTTLCalibratedNotYet(t *testing.T) {
+	tr, sent := desyncTestTracker("ttl", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	ch := tr.announce(k, isn+1, true)
+	// handshake without a SYN-ACK on record (sniffer missed it): no TTL, no fake
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+	if tr.fired() != 0 || len(*sent) != 0 {
+		t.Fatal("auto-TTL fired without a learned TTL")
+	}
+	tr.abandon(k)
+	select {
+	case <-ch:
+	default:
+		t.Fatal("abandon must release the waiting Wrap")
+	}
+}
+
+// TestDesyncFixedTTL: -fake-ttl N is used as-is.
+func TestDesyncFixedTTL(t *testing.T) {
+	tr, sent := desyncTestTracker("ttl", 9)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	if tr.fired() != 1 {
+		t.Fatal("fake did not fire")
+	}
+	if got := (*sent)[0][8]; got != 9 {
+		t.Fatalf("ttl %d, want 9 (fixed)", got)
+	}
+}
+
+// TestDesyncOneFakePerConn: whatever arrives after the fake must not fire again.
+func TestDesyncOneFakePerConn(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 50), 64))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+60, srvSeq+1, testFlagACK, nil, 64))
+	if len(*sent) != 1 {
+		t.Fatalf("want exactly 1 fake, got %d", len(*sent))
+	}
+}
+
+// TestDesyncUnknownConnIgnored: traffic on connections the tracker never saw announced is passed over.
+func TestDesyncUnknownConnIgnored(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	feedFullHandshake(tr, k, 3000, 400) // never announced
+	if tr.fired() != 0 || len(*sent) != 0 {
+		t.Fatal("fired for an unannounced connection")
+	}
+}
+
+// TestDesyncFakePacketRoundTrip: the built fake parses back as IPv4/TCP with a valid checksum and carries the
+// SNI in its payload.
+func TestDesyncFakePacketRoundTrip(t *testing.T) {
+	k := testClientKey()
+	hello := FakeClientHello("mci.ir")
+	pkt := fakePacket(k, 799, 555, 63, hello)
+	if ip := parseEthIPv4(append([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00}, pkt...)); ip == nil {
+		t.Fatal("parseEthIPv4 rejected the fake")
+	} else {
+		if got := binary.BigEndian.Uint32(ip[16:20]); got != binary.BigEndian.Uint32(k.dstIP[:]) {
+			t.Fatalf("dst ip %x", got)
+		}
+		if ip[8] != 63 {
+			t.Fatalf("ttl %d", ip[8])
+		}
+	}
+	th := pkt[20:]
+	stored := binary.BigEndian.Uint16(pkt[20+16:])
+	binary.BigEndian.PutUint16(th[16:], 0)
+	if c := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); c != stored {
+		t.Fatalf("checksum mismatch: recomputed %04x, stored %04x", c, stored)
+	}
+	if !bytes.Equal(pkt[40:], hello) {
+		t.Fatal("payload is not the hello")
+	}
+}
+
+// TestDesyncAbandonAndClose: Wrap channels close cleanly, no fake fires after close.
+func TestDesyncAbandonAndClose(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	k := testClientKey()
+	ch1 := tr.announce(k, 123, true)
+	tr.abandon(k)
+	select {
+	case <-ch1:
+	default:
+		t.Fatal("abandon must close the wait channel")
+	}
+	tr.close()
+	tr.announce(k, 123, true) // after close: announced channels close at once, nothing fires
+	if tr.fired() != 0 || len(*sent) != 0 {
+		t.Fatal("fired after close")
+	}
+}
+
+// TestDesyncParseEthIPv4 rejects non-IPv4 frames.
+func TestDesyncParseEthIPv4(t *testing.T) {
+	arp := make([]byte, 60)
+	binary.BigEndian.PutUint16(arp[12:], 0x0806)
+	if parseEthIPv4(arp) != nil {
+		t.Fatal("ARP frame accepted")
+	}
+	if parseEthIPv4([]byte{1, 2, 3}) != nil {
+		t.Fatal("short frame accepted")
+	}
+}
