@@ -458,6 +458,58 @@ All carriers carry the same encrypted session. Pick one with `carrier:` (or `-ca
 Rules for every non-ICMP carrier: the client dials `peer` as `host:port`, and the server listens on `listen`
 (default `:4443`). `mtu` is 256 to 1400 for icmp and udp, and up to 16384 for the pool carriers.
 
+### Fake-SNI desync (`fake-sni`, 2.6.0)
+
+For routes where TCP passes but the censor classifies every flow by the TLS ClientHello SNI and kills
+non-allowlisted ones (the 2026 whitelisting). The client completes a normal TCP handshake, then injects one raw
+packet: a TLS ClientHello with an allowlisted SNI (`mci.ir` and similar) and a sequence number below the stream
+start. A DPI that reassembles flows without checking the TCP window reads that hello and marks the flow
+"TLS to an allowed site"; the server's kernel sees an old duplicate and answers with a plain duplicate ACK, so
+the relay then carries the session's own encrypted datagrams as if they were that connection's application
+data. `fake-mode: ttl` instead gives the fake a TTL that expires at the censor's hop (`fake-ttl`), so it never
+leaves Iran's network at all.
+
+Client-side only, Linux only, needs CAP_NET_RAW (the icmp carrier's requirement); the server needs no change
+and no new version. Two caveats from field reports of the same trick in other tools: it died where the ISP's
+NAT normalizes sequence numbers before the DPI (some ASNs, not all), and the allowlisted SNI itself must be
+reachable from your ISP. If connections stop passing data right after the handshake, your path is one of the
+normalizing ones — fall back to `tls` with `sni` set to an allowlisted name and `tls-frag`, or ECH.
+
+## Fake-SNI desync (whitelisting survival)
+
+For the SNI-checked whitelist regime (Iran 2026): the filter forwards TCP to an allowlisted IP only when the
+TLS ClientHello on that flow carries an allowlisted SNI, and it does not check TCP sequence numbers. Both facts
+together are the desync: the client opens its real pool connection, then injects ONE raw packet next to it that
+carries a fake ClientHello with an allowlisted SNI (`mci.ir` worked in the field) — crafted so the server never
+accepts it, while the DPI, reassembling without window checks, reads it as the flow's first flight. From then on
+the session's own encrypted datagrams ride the flow, classified as TLS application data to the allowed site.
+
+- `fake-sni: mci.ir` on the client, `carrier: tls` (or `tcp`). Linux + CAP_NET_RAW, like the icmp carrier.
+- `fake-mode: seq` (default): the fake's sequence number is `ISN+1-len(fake)`, below the stream start. The
+  server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI.
+- `fake-mode: ttl` + `fake-ttl: N`: the fake dies at the censor's hop and never reaches the server at all. N is
+  the hop count of the DPI box minus one: find it with `traceroute` to your server, then test downward. Some
+  ISPs normalize TTLs; there `seq` works better.
+- The server needs NO changes and no update: it never sees the fake packet. Only the client needs 2.6.0.
+- Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
+  REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
+  reassemble the first segment.
+
+What it does not survive: a NAT on the route that fully validates checksums and sequence numbers before the DPI
+(some ISPs moved to this after the first bypass wave — then no client-side trick helps, only ICMP/CDN routes),
+and allowlists enforced purely by destination IP, where no SNI is read at all.
+
+```yaml
+# /etc/wattun/iran.yml
+mode: client
+carrier: tls
+peer: kharej.example.com:443
+fake-sni: mci.ir
+sni: mci.ir
+fp: chrome
+key-file: /etc/wattun/key
+```
+
 ## Bonding
 
 `carrier: icmp+udp+tcp` joins several carriers into ONE session. The session keeps working when any one of them
@@ -752,6 +804,7 @@ Cloudflare: it speaks HTTP/1.1 to the origin except for gRPC. Avoid plain `ws` o
 | Symptom | Cause and fix |
 |---|---|
 | Connects, then stalls with no data | SNI black-holing. Set `ech: auto`, or try `fp: chrome` and `tls-frag`. Run `wattun cdn-tune NAME full`. |
+| Connects, then stalls on tcp/tls with `fake-sni` | Your ISP's NAT normalizes sequence numbers before the DPI, or the allowlisted SNI is not allowed on your ISP. Drop `fake-sni`, use `tls` with `sni` + `tls-frag`/ECH. |
 | All edges fail the scan | The domain is blocked even over ECH, or the zone has no ECH. Check `ech` and `tls_mode` in `/stats` and that the domain's HTTPS record exists. |
 | `ech: false` although `ech: auto` is set | The domain has no HTTPS DNS record (the zone is not on Cloudflare's ECH), or all four DoH servers are blocked and no earlier config was cached. The tunnel runs without ECH. |
 | `h2` never works through Cloudflare | Expected: Cloudflare speaks HTTP/1.1 to the origin except for gRPC. Use `wss` or `grpc`. |
@@ -760,6 +813,7 @@ Cloudflare: it speaks HTTP/1.1 to the origin except for gRPC. Avoid plain `ws` o
 | 403 from Cloudflare | A fronted SNI/Host mismatch. Keep `sni` and `host` the same domain. |
 | One entry in `edges` has `up: false` | That edge is dead. Auto-heal replaces it, or run `wattun cdn-tune NAME`. |
 | Works from some Iran servers or networks, fails on others | `peer` is the Kharej server's own IP, so the tunnel never goes through Cloudflare. It works only where that IP is reachable. Proxy a domain to Kharej (orange cloud), enter the domain as the Kharej address, or run `wattun cdn-tune NAME` to write Cloudflare edges into `peer`. Also check that `sni`/`host` is spelled exactly like the domain. |
+| `-fake-sni` connects but the filter still kills the flow | The ISP's NAT validates sequence numbers/checksums before the DPI (seq mode), or normalizes TTL (ttl mode). Try the other `fake-mode`, another allowlisted SNI, or fall back to ICMP / CDN routes. See [Fake-SNI desync](#fake-sni-desync-whitelisting-survival). |
 
 **Direct-IP warning (manager).** The `wss`, `grpc` and `h2` carriers dial `peer` and send `sni` as the TLS name, so
 with `peer` set to the origin's IP the connection goes straight to Kharej, not through Cloudflare, even when `sni`
@@ -860,6 +914,12 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. Since 2.2.0. |
 | `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
+| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp and tls carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, or a TTL that dies at the censor), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
+| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). Since 2.6.0. |
+| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Read it off a traceroute to the server. Since 2.6.0. |
+| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp and tls carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, or a TTL that dies at the censor), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
+| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). Since 2.6.0. |
+| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Set it to the traceroute hop count of the DPI minus one. Since 2.6.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
 
@@ -1614,6 +1674,18 @@ shipped.
 
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
+
+- **2.6.0: fake-SNI desync for whitelisting blackouts.** When a censor allowlists flows by their TLS ClientHello
+  name (the 2026 whitelisting, where only a handful of Iranian sites' HTTPS passes), the tcp and tls carriers can
+  now inject one raw fake ClientHello carrying an allowlisted SNI right after the TCP handshake of every pool
+  connection. The DPI classifies the flow as TLS to an allowed site; the server never receives the fake (it
+  carries a sequence number below the stream start, or a TTL that dies at the censor's hop), so the session flows
+  on as if it were that TLS connection. Only the Iran client needs the new version (client-side only, Linux, needs
+  CAP_NET_RAW like the icmp carrier); the Kharej server is unchanged and no wire format changed.
+  - New client keys: `fake-sni`, `fake-mode` (`seq`, default | `ttl`), `fake-ttl`.
+  - Works where the ISP's NAT does not normalize sequence numbers before the DPI (field reports of the same
+    method in other tools: it died on some ASNs after days; the allowlisted SNI itself must pass from your ISP).
+  - [Fake-SNI desync](#fake-sni-desync-fake-sni-260).
 
 - **2.5.1: faster download.** The receiving end kept re-growing and re-copying each stream's buffer. On a 2-core Iran
   server, that took about a quarter of the tunnel's CPU during a download. Received data now goes into reused 64 KB

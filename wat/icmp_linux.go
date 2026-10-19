@@ -131,19 +131,7 @@ func icmpFilter(want uint8, identBase uint16) []bpf.Instruction {
 	}
 }
 
-func csum(b []byte) uint16 {
-	var s uint32
-	for i := 0; i+1 < len(b); i += 2 {
-		s += uint32(b[i])<<8 | uint32(b[i+1])
-	}
-	if len(b)%2 == 1 {
-		s += uint32(b[len(b)-1]) << 8
-	}
-	for s>>16 != 0 {
-		s = s&0xffff + s>>16
-	}
-	return ^uint16(s)
-}
+// csum lives in desync.go (portable, shared with the fake-SNI injector).
 
 // Send is the client's path to its fixed peer.
 func (i *ICMPIO) Send(p []byte, lane int) error {

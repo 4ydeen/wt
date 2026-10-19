@@ -532,6 +532,7 @@ type PoolDialFunc func(ctx context.Context) (net.Conn, error)
 // TCPPoolClient is the client PacketIO over a pool of framed connections. The lane is ignored.
 type TCPPoolClient struct {
 	dial   func(ctx context.Context, slot int) (net.Conn, error)
+	hook   atomic.Pointer[func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)] // SetDialHook, wraps dial (fake-SNI)
 	tlsFn  func() (string, string, bool) // TLS fingerprint, mode and ECH state, nil for non-TLS carriers
 	ps     *peerSet
 	peer   poolAddr
@@ -552,6 +553,21 @@ type TCPPoolClient struct {
 	logMu      sync.Mutex
 	lastLog    time.Time // last failure line
 	failing    bool      // a failure was logged and no connection came up since
+}
+
+// SetDialHook wraps the pool's dial function (from the next redial on): the fake-SNI layer of the tcp and tls
+// carriers uses it to inject its packet into every connection the pool opens. Safe at any time.
+func (c *TCPPoolClient) SetDialHook(hook func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)) {
+	p := hook
+	c.hook.Store(&p)
+}
+
+// dialer returns the dial function the slots use: the hook, if set, wrapped around dial.
+func (c *TCPPoolClient) dialer() func(ctx context.Context, slot int) (net.Conn, error) {
+	if h := c.hook.Load(); h != nil {
+		return func(ctx context.Context, slot int) (net.Conn, error) { return (*h)(ctx, slot, c.dial) }
+	}
+	return c.dial
 }
 
 // NewTCPPoolClient dials conns (0 = DefaultPoolConns) TCP connections to host:port in the background; Send drops
@@ -758,7 +774,7 @@ func (c *TCPPoolClient) slotLoop(i int) {
 			return
 		default:
 		}
-		conn, err := c.dial(c.ctx, i)
+		conn, err := c.dialer()(c.ctx, i)
 		if err == nil {
 			conn.SetWriteDeadline(time.Now().Add(poolHelloWait))
 			_, err = conn.Write(c.id[:])
