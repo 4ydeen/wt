@@ -1,10 +1,18 @@
-# Agent handoff: what changed on branch `dev` (2.7.0)
+# Agent handoff: what changed on branch `dev` (2.7.0 + 2.7.1)
 
-Commit `d355a05` on branch `dev`, on top of `bf92665` (2.6.0) — 13 files, +1490/−209. Not merged to
-`main`, not tagged, no release cut. Companion docs committed in the same commit:
-`RESEARCH-2.md` (method research and ranking for the whitelisting and blackout scenarios) and
-`FAKE-SNI-DESIGN.md` (the 2.6.0 design; the packet layout and fake-hello mechanics are unchanged in
-2.7.0, only the *trigger* changed). This file describes every change of `d355a05` in full detail.
+Branch `dev` now carries TWO commits on top of `bf92665` (2.6.0):
+
+- `d355a05` — **2.7.0** "fake-sni desync hardened and fixed: the fake now actually fires" (13 files,
+  +1490/−209), with `RESEARCH-2.md` (method research for the whitelisting and blackout scenarios)
+  and `FAKE-SNI-DESIGN.md` (2.6.0 design; packet layout and fake-hello mechanics unchanged, only the
+  trigger changed) committed alongside.
+- `a03ba93` — the first full-detail handoff (this file, round 1).
+- `27ccdf3` — **2.7.1** "fake-mode sum, ISN probe fix, manager fake-sni support" (11 files,
+  +301/−30): the top-ranked next steps from the round-1 handoff, all done — see the 2.7.1 section
+  below for the full per-symbol map.
+
+Not merged to `main`, not tagged, no release cut. Everything below describes both commits in full
+detail; round-1 content (2.7.0) comes first, 2.7.1 after it.
 
 ## Why (the 2.6.0 bug this round fixes)
 
@@ -299,16 +307,152 @@ New (each pins one mechanic of the tracker):
 1. **Field-validate on an Iran path** (the queue, in order): does the early path fire on tcp and
    tls carriers (fake visible at the censor); does `fake-ttl: 0` calibrate; does the NAT-follow
    rescue an ISP where 2.6.0/seq died.
-2. If fake-SNI gets blocked while TCP still passes: implement RESEARCH-2 §1.2 — real-ClientHello
-   disorder (zapret multisplit/multidisorder). The tracker's `send` hook is the injection point;
-   a split-point resolver + segment builder slots next to `fakePacket`.
-3. Blackout scenario: write the domestic-relay chain recipe (RESEARCH-2 §2.2 — two wattun
-   instances, server role on a domestic box) into TECHNICAL.md after field-checking domestic VPS
-   availability. No code needed.
-4. Push `dev`, tag `v2.7.0` → release workflow; after it finishes
-   `gh release edit v2.7.0 --notes-file <file>`. Client-only update; server unchanged; no wire
+2. If fake-SNI gets blocked while TCP still passes: RESEARCH-2 §1.2 — real-ClientHello disorder.
+   **2.7.1 note: this is an NFQUEUE architecture change, not a function** (zapret's disorder needs
+   to hold the real segment back before the kernel sends it; our AF_PACKET observer cannot). Do not
+   bolt it on; decide deliberately.
+3. ~~Blackout scenario: write the domestic-relay chain recipe into TECHNICAL.md~~ — **done in
+   2.7.1** (see below).
+4. Push `dev`, tag `v2.7.0`/`v2.7.1` → release workflow; after it finishes
+   `gh release edit vX.Y.Z --notes-file <file>`. Client-only update; server unchanged; no wire
    change; mixed versions fine.
-5. Optional: teach `wattun-manager` the fake-sni flags (config keys already derive).
-6. Optional: `.gitignore` for `.gocache/.gomodcache/.gopath/.acl-recovery`.
+5. ~~Teach `wattun-manager` the fake-sni flags~~ — **done in 2.7.1** (see below).
+6. ~~`.gitignore` for build artifacts~~ — **done in 2.7.1**.
 7. Optional (flagged): IPv6 in the injector — still IPv4-only by design, same as the reference
    tool; add only if a real deployment needs it.
+
+---
+
+# 2.7.1 — what `27ccdf3` changed, in full detail
+
+Round-2 work: the round-1 handoff's queue, researched and implemented. Commit `27ccdf3`
+(JohnWatsoon only), 11 files +301/−30. Server unchanged, wire unchanged, ICMP path untouched.
+
+## Research that drove it (re-cloned sources still in %TEMP%\wt-research)
+
+- **GoodbyeDPI `--wrong-chksum`** (`src/fakepackets.c`, `send_fake_data`, lines ~145-215): the fake
+  is a copy of the triggering data packet with its payload replaced by the fake hello, checksums
+  recomputed via `WinDivertHelperCalcChecksums`, then **damaged**: `ppTcpHdr->Checksum =
+  htons(ntohs(ppTcpHdr->Checksum) - 1)`. The seq variant (`--wrong-seq`) moves AckNum by −66000 and
+  SeqNum by −10000 (comment: 66000 is the smallest drift Linux ≥ 2.6.18 still tolerates in
+  `nf_conntrack_proto_tcp.c` — window accounting). README line 100: wrong-seq + wrong-chksum make
+  TWO different fakes.
+- **zapret `--dpi-desync-fooling=badsum`** (`nfq/darkmagic.c:267`): `tcp->th_sum ^= 1 +
+  random()%0xFFFF` AFTER `tcp4_fix_checksum` — same idea, random damage instead of −1. Also
+  `FOOL_BADSEQ` (darkmagic.c:132): seq/ack shifted by configurable increments (defaults −10000 /
+  −66000, desync.c `badseq_increment`/`badseq_ack_increment`).
+- **zapret's fooling caveats** (`docs/readme.en.md:279-289`, authoritative field wisdom): badsum
+  "doesn't work if your device is behind a NAT which does not pass invalid packets" (Linux
+  `nf_conntrack_checksum=1` + INVALID-drop FORWARD rule kills it; openwrt sets it to 0; ISPs
+  usually pass badsum); **badseq** fakes are dropped by the server "but DPI also can ignore them" —
+  i.e. badseq is the weaker fooling. This directly ranked badsum above badseq for the new mode.
+- **Disorder verdict corrected** (§1.2 of RESEARCH-2.md updated): zapret's multisplit/multidisorder
+  run under NFQUEUE — the kernel hands nfqws the real packet, which holds/re-cuts/re-injects it.
+  Our AF_PACKET observer is read-only; it can never hold back the real ClientHello. Disorder would
+  need an NFQUEUE data path (iptables + root + per-packet verdicts) — an architecture change, so it
+  stays LATER with that reason now written down.
+
+## Fix: `Wrap` probe off-by-one (`wat/desync_linux.go`)
+
+`tcpStreamBase` returns SND.NXT — the next unsent sequence number, which is ISN+1 right after the
+handshake completes — but `Wrap` announced it as the ISN, so the tracker's `synSeq` was one too
+high: the early-path fake would have sat at ISN+2−len instead of ISN+1−len, i.e. **in-window**
+(one byte above the stream start) → the server would have accepted the fake's first bytes as real
+data and corrupted the stream. Worst-case failure, found only by auditing the kernel accounting.
+Fix in `Wrap` (desync_linux.go, Wrap body):
+
+```go
+isn, known := tcpStreamBase(tc)
+if known {
+    isn--
+}
+ch := d.inj.tr.announce(k, isn, known)
+```
+
+Pinned by `TestDesyncProbeIsnArithmetic` (below). Note the asymmetry with NAT-follow: the tracker's
+handleIPv4 learns the ISN from the SYN on the wire (correct as-is), and rebuilds it from a SYN-ACK
+ack as `ackv − 1` (also correct); only the probe path needed the −1.
+
+## New: `fake-mode sum` (`wat/desync.go`)
+
+The third fooling (GoodbyeDPI `--wrong-chksum` / zapret `badsum`), for censors that validate TCP
+sequence numbers — where `seq`'s below-window fake is read as junk and ignored. The fake mirrors
+the first outbound **data segment**: identical seq (in-window, so a strict censor reassembles it
+as the flow's first flight), identical ack, valid TTL — but a damaged TCP checksum, which every
+server kernel rejects at checksum validation, keeping the flow clean by construction.
+
+- `DesyncConfig.Mode` doc now lists `"seq" | "ttl" | "sum"`; `validateDesync` accepts `sum`.
+- `desyncTracker` gained `sumSeq uint32` — the seq of the data segment being mirrored, captured in
+  `handleIPv4` (both trigger paths set it: early waits for a segment with payload>0 — bare ACKs
+  have nothing to mirror — then `t.sumSeq = seq`; late is already data-anchored so it sets it too).
+- `fireLocked` in sum mode: `base = t.sumSeq` before the below-window arithmetic, then the packet
+  goes out with the **checksum damaged**: after `fakePacket` computes the correct checksum, the
+  field is rewritten `(s ^ 1) - 1` (GoodbyeDPI's −1, plus a bit-flip so no off-by-one coincidence
+  can repair it). TTL selection (64 / fixed / auto) unchanged — sum uses the same defaults as seq.
+- The firing rules per mode, final form (all in `handleIPv4`):
+  - early + seq/ttl: fires on the final ACK **or** first data, `base = synSeq + 1`.
+  - early + sum: waits for the first data segment, `base = synSeq + 1` but the fake's seq is
+    `sumSeq − len(hello)` (in-window mirror).
+  - late + any: first data segment, `base = seq`.
+
+## New tests (`wat/desync_test.go`, now 19)
+
+- `desyncTestTracker` gained the `"sum"` case.
+- `TestDesyncProbeIsnArithmetic` — pins the Wrap conversion: announce with `sndNxt − 1` (= ISN),
+  fire must land at `ISN+1−len(hello)` exactly as with a wire-learned ISN.
+- `TestDesyncSumModeFiresOnData` — sum mode: bare final ACK does NOT fire; first data segment
+  fires; pins fake seq = `ISN+1−len(hello)`, ack = server ISN+1, checksum INVALID (recomputed
+  good checksum ≠ stored), damage non-zero (`(good^1)−1` form).
+- `TestDesyncSumModeLate` — late path + sum mode: SYN-ACK + first data → fires with the mirrored
+  base; pins the seq.
+
+## `cmd/wattun/main.go` — flag help only
+
+`-fake-mode` help now lists `sum` with its one-line contract ("valid window, bad TCP checksum …
+fails behind NATs that validate checksums"); `-fake-ttl` help ends "unused by the seq and sum
+modes". No wiring changes (sum rides the same `attachFakeSNI` hooks).
+
+## `wattun-manager` — fake-sni support (was: "optional, not done")
+
+- Validators (near `v_fec`): `v_fake_mode` (seq|ttl|sum), `v_fake_ttl` (empty or 1-255),
+  `v_sni_name` (allowlist-style name).
+- `bin_ver_ok MIN` helper next to `ver_ge`: 1 when the installed wattun ≥ MIN (version gate for
+  the 2.7.0 features).
+- Iran wizard (`wizard_iran`): advanced block offers Fake SNI on pool carriers when not reverse and
+  running on Linux; asks name (empty = off), mode (default seq), ttl only for ttl mode (empty =
+  auto). Emits `fake-sni:` (+ `fake-mode:` when ≠ seq, + `fake-ttl:` for ttl mode) via
+  `write_client`; summary line "Fake SNI name (mode)". Guards: `bin_ver_ok 2.7.0`.
+- Advanced settings (`adv_menu`): new `k` entry for Iran + pool carrier + Linux — shows current
+  fake-sni, asks the same triple, `set_value`/`sed -i` writes the keys, empty name strips all three
+  (`sed -E '/^fake-(sni|mode|ttl):/d'`), auto-restart via the existing `changed` mechanism.
+- Unattended: `--fake-sni NAME --fake-mode seq|ttl|sum --fake-ttl 0-255` parsed into `NI_*` and
+  consumed by the wizard's asks; `usage()` documents them on the `iran` line. `MGR_VERSION`
+  unchanged (manager changes ship from `main` without a tag).
+
+## Docs + version (2.7.1)
+
+- `docs/TECHNICAL.md`: Fake-SNI chapter — new `fake-mode: sum` bullet (mechanism, when it wins,
+  NAT caveat, the `(checksum ^ 1) - 1` detail); flag table `fake-sni`/`fake-mode`/`fake-ttl` rows
+  updated; **new "Full blackout: the domestic relay chain (no new code)" subsection** (the §2.2
+  promise kept: two-hop chain of stock wattun instances — relay-out client → Kharej, relay-in
+  server → users, `WAT_PREFIX` sandbox note, relay-bandwidth caveat, fallback advice); new
+  **2.7.1 release-history entry** above 2.7.0's.
+- `README.md` / `README.fa.md`: badge → `release-v2.7.1`; intro extended with the checksum mode
+  (FA: «حالت «سامِ» با جمع‌آزمایی خراب», Persian digits ۲٫۷٫۱).
+- `RESEARCH-2.md`: title/status updated; §1.2 disorder entry gains the NFQUEUE-architecture note;
+  decision table gains row 1.1b (sum, BUILD 2.7.1); new §4b "What 2.7.1 changed, in one page";
+  §5 queue rewritten (field validation first, disorder decision, release).
+- `.gitignore`: added `AGENTS.md`, `.gocache/`, `.gomodcache/`, `.gopath/`, `.acl-recovery/`.
+- `wat/version.go`: `Version = "2.7.1"`.
+
+## Verification (2.7.1, this Windows box)
+
+- `go build ./...` ✅ · `go vet ./...` ✅ · `GOOS=linux go build ./...` ✅
+- `go test -count=1 ./cmd/...` 29 pass ✅
+- Desync suite 19/19 ✅ (`-run 'TestDesync|TestFake|TestValidateDesync|TestTCPChecksum'`)
+- `TestTwoClientsSameKey|TestFairQueueUngroupedIsPerStream` ✅ (the flaky pair, healthy)
+- `bash -n wattun-manager` ✅ (via Git-for-Windows bash; note the sandboxed shell cannot run bash
+  here — "couldn't create signal pipe, Win32 error 5" — use one approved unconfined run)
+- Full `wat/` suite still not run on this box (known load flakiness, unchanged caveat; nothing
+  2.7.1 touches session/cc/ICMP hot paths). Raw-socket half still needs a Linux + CAP_NET_RAW
+  (+ CAP_NET_ADMIN for the probe) box for field validation.
