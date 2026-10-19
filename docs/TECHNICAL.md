@@ -500,6 +500,14 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   the hop count of the DPI box minus one: find it with `traceroute` to your server, then test downward.
   `fake-ttl: 0` (2.7.0) auto-calibrates from the server's inbound TTL. Some ISPs normalize TTLs; there `seq`
   works better.
+- `fake-mode: sum` (2.7.1): the fake is an in-window duplicate of the first data segment — same sequence and
+  ack numbers, valid window — but with a deliberately damaged TCP checksum. The DPI's reassembler reads it
+  (it parses before checksumming); every server kernel drops it at checksum validation, so the flow stays
+  clean. This defeats censors that DO check TCP sequence numbers, where `seq` fails. Caveats: it needs a real
+  data segment to mirror (fires with the first outbound data, not the handshake's final ACK), and it dies
+  behind a NAT that validates checksums (Linux routers with `nf_conntrack_checksum=1` plus an INVALID-drop
+  rule; ISPs usually pass bad checksums). The damage is `(checksum ^ 1) - 1`, so no off-by-one coincidence
+  repairs it.
 - The server needs NO changes and no update: it never sees the fake packet. Only the client needs 2.6.0.
 - Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
   REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
@@ -519,6 +527,34 @@ sni: mci.ir
 fp: chrome
 key-file: /etc/wattun/key
 ```
+
+### Full blackout: the domestic relay chain (no new code)
+
+For the hard blackout scenario (foreign IPs unreachable from Iran, only domestic traffic passes) the recipe is a
+two-hop chain of two normal tunnels — no WatTunnel changes needed, both hops are stock wattun since 2.0:
+
+1. **Get a domestic relay**: any Iranian VPS / a friend's server / a cheap "Iran location" cloud instance whose
+   IP is reachable from your users' ISPs while foreign IPs are cut. It only needs to be able to reach the
+   Kharej server; everything on it is private.
+2. **Hop 1 — Kharej side (mode: server)**: run the normal Kharej setup on the REAL server (as always), but
+   instead of giving Iran the Kharej token, run a second wattun as a CLIENT on the domestic relay, pointed at
+   Kharej over a carrier that still passes from the relay (the relay sits inside Iran and dials out — whatever
+   passes from it: `tcp`, `tls`+`sni`, `wss`+CDN, or `icmp` when only ICMP passes).
+   `/etc/wattun/relay-out.yml`: `mode: client`, `carrier: tls`, `peer: KHAREJ_IP:443`, the same `key-file` as
+   Kharej's config, `ports:` mirroring the services (or `ports: [0]`-style full maps as usual).
+3. **Hop 2 — Iran side (mode: server→client flip)**: on the domestic relay also run a wattun SERVER that accepts
+   the users' connections, whose `ports:`/forwarding targets point at `127.0.0.1` of the relay's client from
+   hop 1. Iran connects to the relay's IP with any carrier that passes Iran→relay (domestic traffic is rarely
+   filtered).
+4. Iran users now reach Kharej through relay-in (server) → relay-out (client) → Kharej. The relay forwards
+   encrypted datagrams twice; it never sees plaintext (both hops are AEAD sessions under your key).
+
+Costs and caveats: the relay's bandwidth caps the chain (double-encryption costs ~nothing CPU-wise on modern
+VPSes, but the relay's uplink is the bottleneck); each hop adds its RTT (~relay↔Kharej latency dominates);
+and the relay is a single point of failure — keep the direct token as a fallback and re-run `auto-test` on
+Iran when the blackout lifts. wattun-manager does not automate this chain yet: set both relay configs up by
+hand (or run `wattun-manager` twice on the relay, with `WAT_PREFIX=relay1` / `WAT_PREFIX=relay2` sandboxes so
+the two installs do not collide).
 
 ## Bonding
 
@@ -924,9 +960,9 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. Since 2.2.0. |
 | `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
-| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp and tls carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, or a TTL that dies at the censor), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
-| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). Since 2.6.0. |
-| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the fake one hop short of the server. Since 2.6.0. |
+| `fake-sni` | empty (off) | client | Fake-SNI desync, tcp, tls, wss, h2 and grpc carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives the fake (wrong sequence number, a TTL that dies at the censor, or a bad checksum), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
+| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the fake carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the fake carries a small TTL and dies at the censor's hop (needs `fake-ttl`). `sum` (2.7.1): the fake mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it — the mode for censors that check sequence numbers. Since 2.6.0. |
+| `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the fake packet: one more than the distance to the censor's DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the fake one hop short of the server. Unused by `seq` and `sum`. Since 2.6.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
 
@@ -1681,6 +1717,16 @@ shipped.
 
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
+
+- **2.7.1: fake-SNI `sum` mode, probe fix, manager support.** Three client-side fake-SNI changes, server
+  unchanged, no wire format changed. (1) New `fake-mode: sum`: the fake mirrors the first data segment in-window
+  (same seq/ack) with a damaged TCP checksum — for censors that validate TCP sequence numbers, where `seq`
+  fails; server kernels drop the fake at checksum validation. Dies behind checksum-validating NATs. (2) Fixed a
+  probe off-by-one: the ISN probe (`TCP_REPAIR`) reports SND.NXT = ISN+1 right after the handshake, and `Wrap`
+  announced it as the ISN, putting the `seq`-mode fake one sequence number too high (the server would have seen
+  it as in-window). The tests pinned the wrong relation too; both are corrected. (3) `wattun-manager` now offers
+  fake-sni in the Iran wizard and Advanced settings (`--fake-sni/--fake-mode/--fake-ttl` unattended).
+  - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival).
 
 - **2.7.0: fake-SNI hardened, more carriers.** The fake-SNI desync (2.6.0) now anchors the fake to the first
   outbound packet it can observe (handshake final ACK or first data segment) instead of requiring the sniffer to

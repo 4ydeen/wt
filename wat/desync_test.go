@@ -190,6 +190,8 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *[][]byte) {
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "seq"}
 	case "ttl":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "ttl", TTL: ttl}
+	case "sum":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "sum"}
 	}
 	var p [4]byte
 	copy(p[:], net.ParseIP("10.8.0.1").To4())
@@ -494,5 +496,87 @@ func TestDesyncParseEthIPv4(t *testing.T) {
 	}
 	if parseEthIPv4([]byte{1, 2, 3}) != nil {
 		t.Fatal("short frame accepted")
+	}
+}
+
+// TestDesyncProbeIsnArithmetic pins the Wrap probe conversion: the TCP_REPAIR probe reports SND.NXT (the next
+// unsent byte, ISN+1 right after the handshake), the tracker's announce stores the ISN. desync_linux.go's Wrap
+// does `if known { isn-- }`; this pins the intended relation with the same numbers the Linux path sees.
+func TestDesyncProbeIsnArithmetic(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(30000), uint32(777)
+	const sndNxt = isn + 1 // what tcpStreamBase reports right after the handshake
+	ch := tr.announce(k, sndNxt-1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake never fired with probe-converted ISN")
+	}
+	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	if seq != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("fake seq %d, want %d (SND.NXT-1 based)", seq, isn+1-uint32(len(tr.hello)))
+	}
+}
+
+// TestDesyncSumModeFiresOnData: sum mode skips bare ACKs (nothing to mirror) and fires on the first data
+// segment with an IN-WINDOW seq (the segment's own seq, not below the stream) and a damaged checksum.
+func TestDesyncSumModeFiresOnData(t *testing.T) {
+	tr, sent := desyncTestTracker("sum", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(5000), uint32(800)
+	tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // final ACK: must NOT fire (bare ACK)
+	if tr.fired() != 0 {
+		t.Fatal("sum mode fired on a bare ACK")
+	}
+	const dataLen = 120
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, dataLen), 64))
+	if tr.fired() != 1 {
+		t.Fatal("sum mode did not fire on the data segment")
+	}
+	pkt := (*sent)[0]
+	seq := binary.BigEndian.Uint32(pkt[24:])
+	if seq != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("sum fake seq %d, want %d (mirrors the data segment's seq)", seq, isn+1-uint32(len(tr.hello)))
+	}
+	if ack := binary.BigEndian.Uint32(pkt[28:]); ack != srvSeq+1 {
+		t.Fatalf("sum fake ack %d, want %d", ack, srvSeq+1)
+	}
+	// the checksum must be INVALID: recompute the correct one and require a difference
+	stored := binary.BigEndian.Uint16(pkt[20+16:])
+	binary.BigEndian.PutUint16(pkt[20+16:], 0)
+	if good := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); good == stored {
+		t.Fatalf("sum fake carries a VALID checksum %04x (must be damaged)", good)
+	}
+	// and the damage is exactly (s^1)-1 of the correct value, not a zero field
+	if stored == 0 {
+		t.Fatal("sum fake checksum zeroed instead of damaged")
+	}
+	if tr.fired() != 1 {
+		t.Fatalf("fired counter %d", tr.fired())
+	}
+}
+
+// TestDesyncSumModeLate: the ISN is unknown; the late path mirrors the first data segment all the same.
+func TestDesyncSumModeLate(t *testing.T) {
+	tr, sent := desyncTestTracker("sum", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(61000), uint32(90)
+	ch := tr.announce(k, 0, false)
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 60), 64))
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("sum-mode late fake never fired")
+	}
+	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	if seq != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("sum late fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
 	}
 }

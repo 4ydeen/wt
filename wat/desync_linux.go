@@ -104,7 +104,13 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) {
 	copy(s[:], la.IP.To4())
 	copy(r[:], ra.IP.To4())
 	k := desyncKey{s, r, uint16(la.Port), uint16(ra.Port)}
+	// The probe reports SND.NXT = the next unsent sequence number. The tracker's announce stores the ISN (the
+	// stream start minus one): the early fire compares segment seq against synSeq+1, and the NAT follow rebuilds
+	// synSeq from a SYN-ACK's ack the same way. Handshake just finished => SND.NXT = ISN+1 => ISN = SND.NXT-1.
 	isn, known := tcpStreamBase(tc)
+	if known {
+		isn--
+	}
 	ch := d.inj.tr.announce(k, isn, known)
 	select {
 	case <-ch: // fake fired

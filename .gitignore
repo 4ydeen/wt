@@ -1,3 +1,8 @@
 dist/
 *.exe
 CLAUDE.md
+AGENTS.md
+.gocache/
+.gomodcache/
+.gopath/
+.acl-recovery/

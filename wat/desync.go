@@ -52,7 +52,7 @@ func tcpChecksum(th, src, dst []byte) uint16 {
 // DesyncConfig tunes the fake-SNI layer of the tcp, tls, wss, h2 and grpc carriers.
 type DesyncConfig struct {
 	SNI  string // allowlisted server name the fake ClientHello carries
-	Mode string // "seq" (wrong sequence number, default) or "ttl" (small TTL, packet dies at the DPI hop)
+	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL) or "sum" (valid window, bad checksum)
 	TTL  int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
 }
 
@@ -62,9 +62,9 @@ func validateDesync(cfg DesyncConfig) error {
 		return fmt.Errorf("wat: desync: empty SNI")
 	}
 	switch cfg.Mode {
-	case "", "seq", "ttl":
+	case "", "seq", "ttl", "sum":
 	default:
-		return fmt.Errorf("wat: -fake-mode must be seq or ttl, got %q", cfg.Mode)
+		return fmt.Errorf("wat: -fake-mode must be seq, ttl or sum, got %q", cfg.Mode)
 	}
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
@@ -254,6 +254,7 @@ type desyncTracker struct {
 	conns     map[desyncKey]*desyncConn
 	wait      map[desyncKey]chan struct{} // closed by fire, waited on by Wrap
 	peerTTLv  uint8
+	sumSeq    uint32 // sum mode: seq of the outbound data segment being mirrored (0 = none yet)
 	firedN    int
 	miss      int
 	missNoted bool
@@ -389,13 +390,24 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	}
 	switch {
 	case c.isnKnown:
-		// early: fire on the handshake's final ACK or the first data flight, whichever comes first
-		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 { // at or after the stream start
+		// early: fire on the handshake's final ACK or the first data flight, whichever comes first.
+		// sum mode stays for the first DATA segment: its fake is a valid-window duplicate of that segment, so it
+		// needs the segment's real seq/ack to be identical to the real flight (bare ACKs have nothing to mirror).
+		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 {
+			if t.cfg.Mode == "sum" {
+				if payload == 0 {
+					return // wait for the data segment to mirror
+				}
+				t.sumSeq = seq
+			}
 			t.fireLocked(out, c, c.synSeq+1, ackv)
 		}
 	default:
 		// late: the first outbound data segment is the anchor (its seq IS the stream start)
 		if payload > 0 && ackf && !syn {
+			if t.cfg.Mode == "sum" {
+				t.sumSeq = seq
+			}
 			t.fireLocked(out, c, seq, ackv)
 		}
 	}
@@ -421,6 +433,15 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			}
 		}
 	}
+	// sum mode mirrors the triggering data segment: identical seq (so the fake sits in the receiver window where
+	// the DPI's reassembler is already collecting), identical ack, but a deliberately damaged TCP checksum — the
+	// same fooling as GoodbyeDPI's --wrong-chksum and zapret's badsum. The server's kernel drops it at checksum
+	// validation; a DPI that parses before checksumming reads the SNI. NATs that validate checksums
+	// (nf_conntrack_checksum=1 + an INVALID-drop FORWARD rule) kill this mode; ISPs usually pass (zapret's
+	// documented field observation).
+	if t.cfg.Mode == "sum" {
+		base = t.sumSeq
+	}
 	// seq = base - len(fake): the fake lands exactly below the stream start. The server holds snd_una at the
 	// stream start, so this is an old duplicate; a DPI without window checks reassembles it as the first flight.
 	t.firedN++
@@ -430,6 +451,13 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		close(ch)
 	}
 	if t.send != nil {
-		t.send(fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello))
+		pkt := fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello)
+		if t.cfg.Mode == "sum" {
+			// the checksum was computed correctly by fakePacket; damage it in one reserved bit + flip, the
+			// GoodbyeDPI way (checksum - 1), so no off-by-one coincidence can repair it
+			s := binary.BigEndian.Uint16(pkt[20+16:])
+			binary.BigEndian.PutUint16(pkt[20+16:], (s^1)-1)
+		}
+		t.send(pkt)
 	}
 }

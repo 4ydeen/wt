@@ -1,10 +1,10 @@
-# RESEARCH-2: next methods for whitelisting and blackout scenarios (WatTunnel 2.7.0)
+# RESEARCH-2: next methods for whitelisting and blackout scenarios (WatTunnel 2.7.0/2.7.1)
 
 Status: research for branch `dev`, following 2.6.0's fake-SNI desync (see `FAKE-SNI-DESIGN.md`,
-`AGENT-HANDOFF-CHANGES.md`). Companion deliverable to the 2.7.0 implementation commit. Written for
-engineers (human or AI) continuing this work. The project's purpose is keeping internet access
-alive for its users during network restrictions; everything below is published, public
-transport-layer engineering, same family as the public projects it derives from.
+`AGENT-HANDOFF-CHANGES.md`). Companion deliverable to the 2.7.0 implementation commit, updated in
+2.7.1 (see §4b). Written for engineers (human or AI) continuing this work. The project's purpose
+is keeping internet access alive for its users during network restrictions; everything below is
+published, public transport-layer engineering, same family as the public projects it derives from.
 
 ## 0. Method and sources
 
@@ -87,7 +87,7 @@ Both-ends-or-client-only: **client only**, server unchanged, no wire change (unc
 Censor countermove: non-uniform sequence normalization or full TCP state validation at the NAT
 (ipid/seq sanity) — then no seq-mode fake passes; ttl mode remains if TTLs are not normalized.
 
-### 1.2 Real-ClientHello disordering (zapret multisplit/multidisorder family) — LATER
+### 1.2 Real-ClientHello disordering (zapret multisplit/multidisorder family) — LATER (2.7.1 note: deeper blockers found)
 
 Mechanism: instead of (or in addition to) a fake, split the *real* ClientHello into 2+ raw-crafted
 TCP segments sent out of order (multidisorder) or with seq-overlap junk on the first (multisplit
@@ -102,6 +102,16 @@ regimes where the censor *rejects* the fake but tolerates fragmented real hellos
 yet establishes that regime on the Iran path). The existing `-tls-frag` (in-order split) already
 covers DPIs that only parse the first segment; disorder adds the case of DPIs that reassemble
 until they see SNI. Add when field reports show fake-SNI blocked but TCP still passing.
+
+2.7.1 deeper analysis (why it stayed LATER even after a second look): zapret's implementation is
+**NFQUEUE-privileged** — the kernel has ALREADY queued the real ClientHello when nfqws decides how
+to cut it (desync.c works on the packet the kernel hands it, and `verdict` re-injects the pieces).
+Our architecture is AF_PACKET (observe-only) + IPPROTO_RAW (inject-only): the real bytes go out via
+the normal socket path, so the tracker can never hold the real segment back to re-segment it —
+disorder would require switching the carrier's data path to NFQUEUE (root, iptables rules, per-
+packet verdict latency on the pinned 30 MB/s ICMP path is irrelevant there but the complexity is
+real) or a TCP_REPAIR-based send-queue rewrite (fragile). This is an architecture change, not a
+function — hence LATER until field data demands it.
 
 ### 1.3 Domain fronting over real CDNs — NO (as a new feature; already available)
 
@@ -201,7 +211,8 @@ when the domestic box is one's own.
 | # | Method | Client-only? | New infra | Field-probability | Verdict |
 |---|---|---|---|---|---|
 | 1.1 | Fake-SNI hardened (early+late, NAT-follow, auto-TTL, 5 carriers) | yes | none | high where seq-mode worked before | **BUILD — shipped 2.7.0** |
-| 1.2 | Real-hello disorder (multisplit/multidisorder) | yes (raw) | none | plausible, unproven on path | LATER |
+| 1.1b | Fake-SNI sum mode (in-window bad-checksum fake, GoodbyeDPI `--wrong-chksum` / zapret `badsum`) | yes | none | for seq-checking censors (ISPs usually pass badsum — zapret docs) | **BUILD — shipped 2.7.1** |
+| 1.2 | Real-hello disorder (multisplit/multidisorder) | yes (raw) | none | plausible, unproven on path; needs NFQUEUE architecture | LATER |
 | 1.3 | Domain fronting (CDN + sni/host) | yes | none | proven (existing CDN numbers) | exists; docs only |
 | 1.4 | ECH | yes | none | proven (2.2.0) | exists; keep |
 | 1.5 | TLS-in-TLS padding | both ends | none | no whitelisting relevance | NO |
@@ -231,11 +242,35 @@ when the domestic box is one's own.
 - Docs/versions: TECHNICAL.md (carrier scope, auto-TTL, 2.7.0 history), READMEs (badge v2.7.0 +
   intro), `wat/version.go` → 2.7.0. Wire format unchanged; server unchanged; ICMP path untouched.
 
+## 4b. What 2.7.1 changed, in one page (this round, after the 2.7.0 research)
+
+1. **`fake-mode: sum` (method 1.1b, BUILD)** — the third fooling from GoodbyeDPI (`--wrong-chksum`,
+   fakepackets.c: `ppTcpHdr->Checksum = htons(ntohs(Checksum) - 1)` after recomputing) and zapret
+   (`FOOL_BADSUM`, darkmagic.c:267: `tcp->th_sum ^= 1+random()%0xFFFF`). Chosen over badseq:
+   zapret's own docs say badseq fakes are also ignored by some DPIs, while badsum fakes fail only
+   behind checksum-validating NATs and "ISPs usually pass badsum". Implementation: the fake
+   mirrors the first outbound data segment (in-window seq = the segment's own, correct ack), so a
+   window-checking censor reads it as the flow's real first flight; the checksum damage is
+   `(checksum ^ 1) - 1` so no off-by-one can repair it. Server-side: kernel drops at checksum
+   validation — no flow corruption by construction, unlike seq mode where correctness depends on
+   the below-window arithmetic surviving NAT rewrites.
+2. **Probe off-by-one fix** — `tcpStreamBase` returns SND.NXT (= ISN+1 after the handshake), but
+   `Wrap` announced it as the ISN; every early-path fake would have sat one sequence number too
+   high (in-window = corrupting, the worst failure). Fixed in `Wrap` (`isn--` when known); pinned
+   by `TestDesyncProbeIsnArithmetic`. Found while re-auditing with the kernel's own accounting
+   (`net/netfilter/nf_conntrack_proto_tcp.c` window rules via GoodbyeDPI's comment).
+3. **wattun-manager fake-sni support** — Iran wizard advanced block (name/mode/ttl asks, 2.7.0
+   version gate), Advanced-settings menu (`k` key) for existing tunnels, `--fake-sni/--fake-mode/
+   --fake-ttl` unattended flags, config keys emitted (`fake-sni`/`fake-mode`/`fake-ttl`).
+4. **Domestic-relay recipe** (§2.2's documentation promise) written into TECHNICAL.md under the
+   Fake-SNI chapter — two chained stock wattun instances, no new code, as researched.
+5. `.gitignore` for the session's build/repair artifacts.
+
 ## 5. Next agent's queue (recommended order)
 
-1. Field-validate 2.7.0's early/late triggers on a real Iran path (the raw-socket half still needs
-   a Linux + CAP_NET_RAW box; see handoff).
-2. If fake-SNI gets blocked but TCP passes: implement §1.2 disorder (portable split-point
-   resolver + segment builder fits the 2.7.0 tracker; the `send` hook already abstracts injection).
-3. If blackout returns: write the domestic-relay recipe (§2.2) into TECHNICAL.md after field
-   checking domestic VPS availability; no code needed.
+1. Field-validate 2.7.0/2.7.1 on a real Iran path (raw-socket half needs a Linux + CAP_NET_RAW
+   (+ CAP_NET_ADMIN for the probe) box; see handoff): does the early path fire; does sum mode
+   survive the ISP's NAT; does NAT-follow rescue a seq-killed ASN.
+2. If fake-SNI gets blocked but TCP passes: §1.2 disorder is an NFQUEUE architecture change —
+   decide deliberately, do not bolt onto AF_PACKET (see the 2.7.1 note).
+3. Push `dev`, tag `v2.7.1`, release notes (owner go-ahead; client-only update).

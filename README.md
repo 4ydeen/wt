@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.7.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.7.1-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -24,7 +24,8 @@ and forwards any TCP or UDP port between them. One static binary, no dependencie
 up from one pasted token. It rides whatever your route lets through: `icmp` (ping), `udp`, `tcp`, `tls`, `ws`,
 `wss`, `h2`, `h2c`, `grpc`, Cloudflare with ECH, reverse mode, several of them bonded into one tunnel, or
 fake-SNI desync (`fake-sni`) when the censor allowlists flows by their TLS name (2.6.0; since 2.7.0 on the wss,
-h2 and grpc carriers too, with automatic TTL calibration and NAT-sequence follow).
+h2 and grpc carriers too, with automatic TTL calibration and NAT-sequence follow, and since 2.7.1 a checksum
+mode for censors that validate sequence numbers).
 
 ## Speed
 

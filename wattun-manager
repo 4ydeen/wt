@@ -96,7 +96,7 @@ case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall)
 esac
 [ "$NONINTERACTIVE" = 1 ] || NONINTERACTIVE=0
 # Answers set by flags (see ni_parse); empty = the wizard's own default
-NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''
+NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''; NI_FAKESNI=''; NI_FAKEMODE=''; NI_FAKETTL=''
 NI_TOKEN=''; NI_MAP=''; NI_PICK=best; NI_SESSIONS=''; NI_YES=0; NI_POS=()
 ERRN=0
 
@@ -685,6 +685,9 @@ v_mbps_adv() { case "$1" in -|0|default) return 0 ;; esac; v_mbps "$1"; }
 v_mbps() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && return 0; err "Enter a number of MB/s (1-9999)."; return 1; }
 v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
 v_fec() { case "$1" in off|auto) return 0 ;; esac; err "Use off or auto."; return 1; }
+v_fake_mode() { case "$1" in seq|ttl|sum) return 0 ;; esac; err "Use seq, ttl or sum."; return 1; }
+v_fake_ttl() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -le 255 ] && return 0; err "Enter a hop count 1-255 (or leave empty for auto)."; return 1; }
+v_sni_name() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || { err "Enter a server name such as mci.ir."; return 1; }; return 0; }
 v_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]*$ ]] && return 0; err "The path must start with / (example: /wat)."; return 1; }
 v_token() {
   if read_token "$1"; then return 0; fi
@@ -1243,6 +1246,7 @@ ni_kharej_ports() { # --ports "18999,2000,53/udp" -> MAPS (Kharej side: the serv
 
 wizard_iran() {
   local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0 rport='' advdef=n linkok=1
+  local T_FAKESNI='' T_FAKEMODE='' T_FAKETTL=''
   page "New tunnel" "STEP 2 · Iran (inside server)"
   step_diagram 2
   echo
@@ -1345,6 +1349,26 @@ wizard_iran() {
     if [ "$T_CARRIER" = icmp ]; then ask_ok "ICMP type (must match Kharej)" "${T_ICMP:-echo}" v_icmp || return 1; T_ICMP=$REPLY_V; fi
     case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
     case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "${T_PATH:-/wat}" v_path || return 1; T_PATH=$REPLY_V ;; esac
+    # fake-SNI desync (2.6.0/2.7.0): client only, Linux, needs CAP_NET_RAW like the icmp carrier. Offered on the
+    # carriers the layer covers. Empty name = off (the default).
+    if [ "$T_REV" != 1 ] && is_pool "$T_CARRIER" && [ "$(uname -s)" = Linux ]; then
+      echo
+      hint "Under an SNI allowlist (only a few sites pass), fake-sni injects a fake ClientHello with an"
+      hint "allowlisted name (e.g. mci.ir) so the censor classifies the tunnel as TLS to that site. Needs"
+      hint "CAP_NET_RAW (the tunnel already runs with it for the icmp carrier). Leave empty to keep it off."
+      ask "Fake SNI (allowlisted name, empty = off)" "${NI_FAKESNI:-}"; T_FAKESNI=$REPLY_V
+      if [ -n "$T_FAKESNI" ]; then
+        v_sni_name "$T_FAKESNI" || return 1
+        [ "$(bin_ver_ok 2.7.0)" = 1 ] || err "fake-sni needs wattun 2.7.0 or newer on this server (run: $SELF update)."
+        case "${NI_FAKEMODE:-}" in seq|ttl|sum) T_FAKEMODE=$NI_FAKEMODE ;; *) T_FAKEMODE=seq ;; esac
+        ask_ok "Fake mode: seq (default), ttl or sum" "$T_FAKEMODE" v_fake_mode || return 1; T_FAKEMODE=$REPLY_V
+        T_FAKETTL=${NI_FAKETTL:-}
+        if [ "$T_FAKEMODE" = ttl ]; then
+          ask "Fake TTL (hop count, empty = auto-calibrate)" "$T_FAKETTL"; T_FAKETTL=$REPLY_V
+          v_fake_ttl "$T_FAKETTL" || return 1
+        else T_FAKETTL=''; fi
+      else T_FAKEMODE=''; T_FAKETTL=''; fi
+    fi
   fi
   valid_name "$name" || { err "The name '$name' is not available."; return 1; }
 
@@ -1355,6 +1379,11 @@ wizard_iran() {
   summary_line "Carrier" "$T_CARRIER${T_ICMP:+ ($T_ICMP)}"
   summary_line "Kharej" "$T_PEER"
   [ -n "$CT_DESC" ] && summary_line "CDN tuning" "$CT_DESC"
+  if [ -n "$T_FAKESNI" ]; then
+    local fsum="Fake SNI" fsv="$T_FAKESNI (${T_FAKEMODE:-seq} mode)"
+    [ "$T_FAKEMODE" = ttl ] && [ -n "$T_FAKETTL" ] && fsv="$fsv, ttl $T_FAKETTL"
+    summary_line "$fsum" "$fsv"
+  fi
   if [ "$T_REV" = 1 ]; then
     if [ -n "$rport" ]; then summary_line "Direction" "reverse (Kharej connects to this server on port $rport)"
     else summary_line "Direction" "reverse (Kharej sends the pings)"; fi
@@ -1393,6 +1422,7 @@ wizard_iran() {
       echo "peer: $T_PEER"
       [ -n "$T_PATH" ] && echo "path: $T_PATH"
       [ -n "$T_SNI" ] && { echo "sni: $T_SNI"; echo "host: $T_SNI"; }
+      [ -n "$T_FAKESNI" ] && { echo "fake-sni: $T_FAKESNI"; [ -n "$T_FAKEMODE" ] && [ "$T_FAKEMODE" != seq ] && echo "fake-mode: $T_FAKEMODE"; [ "$T_FAKEMODE" = ttl ] && [ -n "$T_FAKETTL" ] && echo "fake-ttl: $T_FAKETTL"; }
       [ -n "$T_ICMP" ] && [ "$T_ICMP" != echo ] && echo "icmp-type: $T_ICMP"
       [ "$T_REV" = 1 ] && echo "reverse: true"
       [ -n "$rport" ] && echo "listen: \":$rport\""
@@ -1481,6 +1511,10 @@ plan_port() { # list carrier -> port
   return 0
 }
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; } # $1 >= $2
+bin_ver_ok() { # min-version -> 1 when the installed wattun is new enough (empty output = not ok)
+  ver_ge "$(bin_ver || true)" "$1" 2>/dev/null && echo 1
+  return 0
+}
 is_auto_kharej() { # name : does NAME.token carry carrier "auto"?
   local raw
   [ -f "$CONF/$1.token" ] || return 1
@@ -3168,17 +3202,44 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
       if [ "$cr" = icmp ]; then summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej sends the pings)" || echo "normal (Iran sends the pings)")"
       else summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej connects to Iran)" || echo "normal (Iran connects to Kharej)")"; fi
     fi
+    if [ "$r" = Iran ] && is_pool "$cr" && [ "$(uname -s)" = Linux ]; then
+      local fks=$(cfg "$n" fake-sni) fkm=$(cfg "$n" fake-mode)
+      local fkl=${fks:-off}${fkm:+ ($fkm mode)}${fkm=ttl:+", ttl $(cfg "$n" fake-ttl || echo auto)"}
+      summary_line "fake-sni" "$fkl"
+    fi
     echo
     printf '  %s  speed ceiling   %s  FEC   ' "$(key_label m)" "$(key_label f)"
     [ "$r" = Iran ] && printf '%s  bind address   ' "$(key_label a)"
     [ "$cr" = icmp ] && printf "%s  ICMP type   " "$(key_label i)"
     rev_capable "$cr" && printf "%s  direction   " "$(key_label d)"
+    [ "$r" = Iran ] && is_pool "$cr" && [ "$(uname -s)" = Linux ] && printf '%s  fake-sni   ' "$(key_label k)"
     printf '%s  back\n' "$(key_label b)"
     key_read
     case "$KEY" in
       m) echo; ask_ok "Speed ceiling in MB/s (- or 0 or default = unset)" "$(cfg "$n" max-mbps)" v_mbps_adv || continue
          case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
          if [ -z "$REPLY_V" ]; then unset_value "$n" max-mbps; else set_value "$n" max-mbps "$REPLY_V"; fi; changed=1 ;;
+      k) [ "$r" = Iran ] && is_pool "$cr" || continue; echo
+         hint "Fake-SNI desync: injects a fake ClientHello with an allowlisted name after every outgoing TCP"
+         hint "handshake, so an SNI-allowlisting censor classifies the tunnel as TLS to that site. Client only,"
+         hint "needs CAP_NET_RAW. wattun 2.7.0+. Leave empty to switch it off."
+         ask "Fake SNI (allowlisted name, empty = off)" "$(cfg "$n" fake-sni)"; fs=$REPLY_V
+         [ -n "$fs" ] && { v_sni_name "$fs" || continue; }
+         if [ -z "$fs" ]; then
+           sed -i -E '/^fake-(sni|mode|ttl):/d' "$CONF/$n.yml"; changed=1; continue
+         fi
+         [ "$(bin_ver_ok 2.7.0)" = 1 ] || { err "fake-sni needs wattun 2.7.0 or newer (run: $SELF update)."; continue; }
+         local fm ft; fm=$(cfg "$n" fake-mode); [ -n "$fm" ] || fm=seq
+         ask_ok "Fake mode: seq, ttl or sum" "$fm" v_fake_mode || continue; fm=$REPLY_V
+         set_value "$n" fake-sni "$fs"; set_value "$n" fake-mode "$fm"
+         sed -i '/^fake-ttl:/d' "$CONF/$n.yml"
+         if [ "$fm" = ttl ]; then
+           ft=$(cfg "$n" fake-ttl)
+           ask "Fake TTL (hop count, empty = auto-calibrate)" "$ft"; ft=$REPLY_V
+           v_fake_ttl "$ft" || continue
+           [ -n "$ft" ] && set_value "$n" fake-ttl "$ft"
+         fi
+         changed=1 ;;
       f) echo; ask_ok "FEC: off or auto" "$(cfg "$n" fec | sed 's/^$/off/')" v_fec || continue
          if [ "$REPLY_V" = off ]; then unset_value "$n" fec; else set_value "$n" fec "$REPLY_V"; fi; changed=1 ;;
       a) [ "$r" = Iran ] || continue; echo; ask_ok "Bind address" "$(cfg "$n" bind | sed 's/^$/0.0.0.0/')" v_bind || continue
@@ -3525,6 +3586,9 @@ ni_parse() {
       --cdn-domain) v_domain_opt "$v" || return 1; NI_CDN=$v ;;
       --ports) [ -n "$v" ] || { err "--ports needs a list such as 18999,2000,53/udp"; return 1; }; NI_PORTS=$v ;;
       --max-mbps) v_mbps "$v" || return 1; NI_MBPS=$v ;;
+      --fake-sni) v_sni_name "$v" || return 1; NI_FAKESNI=$v ;;
+      --fake-mode) case "$v" in seq|ttl|sum) NI_FAKEMODE=$v ;; *) err "--fake-mode: use seq, ttl or sum (got '$v')"; return 1 ;; esac ;;
+      --fake-ttl) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -le 255 ] || { err "--fake-ttl: use a hop count 0-255 (0 = auto, got '$v')"; return 1; }; NI_FAKETTL=$v ;;
       --token) v_token "$v" || return 1; NI_TOKEN=$v ;;
       --map) [ -n "$v" ] || { err "--map needs a list such as 39901:18999,8443:443"; return 1; }; NI_MAP=$v ;;
       --pick) case "$v" in best|bond) NI_PICK=$v ;; *,*) [[ "$v" =~ ^[0-9]+(,[0-9]+)+$ ]] || { err "--pick: rows joined with commas, such as 1,3 (got '$v')"; return 1; }; NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond, a row number or rows such as 1,3 (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
@@ -3578,6 +3642,8 @@ or NONINTERACTIVE=1). Plain output, errors on stderr, exit code 0 = done, 1 = fa
          creates and starts the Iran tunnel. Auto token: runs the test, --pick chooses a row (default best, bond = all
          working direct carriers, 1,3 = join those rows). CDN token: automatic CDN tuning. Ends with LINK=up|down and TUNNEL=NAME; exit 1 if down.
          --sessions N writes "sessions: N" (only with wattun 2.3.0 or newer; otherwise it is ignored with a warning)
+         --fake-sni NAME [--fake-mode seq|ttl|sum] [--fake-ttl 0-255] enables the fake-SNI desync on a fixed-type
+         token (wattun 2.7.0 or newer; Linux only, needs CAP_NET_RAW; --fake-ttl only with --fake-mode ttl)
   cdn-tune NAME [full] --yes      apply the best CDN variant without asking
   auto-test NAME --yes            re-test an auto Iran tunnel, switch to --pick (default best) without asking
   delete NAME --yes               delete a tunnel without asking
