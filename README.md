@@ -2,9 +2,9 @@
 
 <img src="docs/img/banner.jpg" alt="WatTunnel: stay connected, even when only ping gets through" width="100%">
 
-# ðŸª WatTunnel
+# 🪁 WatTunnel
 
-**Encrypted Iran â†” Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
+**Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
 [![Release](https://img.shields.io/badge/release-v2.9.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -13,7 +13,7 @@
 [![Telegram Channel](https://img.shields.io/badge/Channel-@WatxDev-26A5E4?style=flat-square&logo=telegram)](https://t.me/WatxDev)
 [![Telegram](https://img.shields.io/badge/Contact-@watxox-26A5E4?style=flat-square&logo=telegram)](https://t.me/watxox)
 
-**English** Â· [ÙØ§Ø±Ø³ÛŒ](README.fa.md)
+**English** Â· [فارسی](README.fa.md)
 
 </div>
 
@@ -34,7 +34,7 @@ learns an ICMP path's volume ceiling from its reroute signature.
 
 ## Speed
 
-Measured on real Iran â‡„ Europe servers (2 vCPU each), October 2026. Ping is the round trip through the tunnel while
+Measured on real Iran ⇄ Europe servers (2 vCPU each), October 2026. Ping is the round trip through the tunnel while
 it is fully loaded; the route's own ping is about 40 ms.
 
 | Connection type | Download | Upload | Ping under load |
@@ -66,16 +66,16 @@ users.
 
 | | WatTunnel | GOST | pingtunnel | Hans | ptunnel-ng |
 |---|:-:|:-:|:-:|:-:|:-:|
-| ICMP carrier | âœ… | âœ… | âœ… | âœ… | âœ… |
-| UDP / TCP / TLS / WS / gRPC carriers | âœ… | âœ… | âŒ | âŒ | âŒ |
-| Cloudflare/CDN with ECH | âœ… | - | âŒ | âŒ | âŒ |
-| One token tests every connection type for you | âœ… | âŒ | âŒ | âŒ | âŒ |
-| Loss does not slow it down (delay-based pacing) | âœ… | âŒ | âŒ | âŒ | âŒ |
-| All ports in one process | âœ… | âœ… | âŒ | âœ… (tun) | âŒ |
-| Add or remove ports without a restart | âœ… | âŒ | âŒ | - | âŒ |
-| Reverse mode / reverse ICMP | âœ… / âœ… | âœ… / âŒ | âŒ | âŒ | âŒ |
-| Per-port traffic stats and quotas | âœ… | âŒ | âŒ | âŒ | âŒ |
-| Guided menu, auto-heal, update and rollback | âœ… | âŒ | âŒ | âŒ | âŒ |
+| ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Cloudflare/CDN with ECH | ✅ | - | ❌ | ❌ | ❌ |
+| One token tests every connection type for you | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Loss does not slow it down (delay-based pacing) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
+| Add or remove ports without a restart | ✅ | ❌ | ❌ | - | ❌ |
+| Reverse mode / reverse ICMP | ✅ / ✅ | ✅ / ❌ | ❌ | ❌ | ❌ |
+| Per-port traffic stats and quotas | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Guided menu, auto-heal, update and rollback | ✅ | ❌ | ❌ | ❌ | ❌ |
 
 On a clean, unfiltered link every tunnel reaches line rate and GOST uses a little less CPU; WatTunnel still halves
 small-request latency there (43 ms vs 83 ms) because interactive traffic goes first.
@@ -138,11 +138,11 @@ wat1:aWNtcHwyMDMuMC4xMTMuMTB8a1E3...
 `443, 8443:443, 53/udp` (`8443:443` means users connect to Iran port 8443 and reach Kharej port 443).
 
 ```
-  âœ” Writing key and config
-  âœ” Starting wattun@iran
-  âœ” CONNECTED (RTT 41.3 ms)
+  ✔ Writing key and config
+  ✔ Starting wattun@iran
+  ✔ CONNECTED (RTT 41.3 ms)
 
-  users â”€â”€â–º Iran :8443 â•â• tcp â•â•â–º Kharej â”€â”€â–º 127.0.0.1:443
+  users ──► Iran :8443 ══ tcp ══► Kharej ──► 127.0.0.1:443
 ```
 
 Done. Users connect to the Iran server's IP, and Kharej forwards only to its own `127.0.0.1`.
