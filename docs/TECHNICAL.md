@@ -517,6 +517,10 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   marker, checksum dropping alone does not stop the seq marker. Inherits sum's caveats (data segment needed,
   checksum-validating NATs) plus seq's (a uniform NAT rewrite is followed, a non-uniform one defeats marker 1).
 - The server needs NO changes and no update: it never sees the marker packet. Only the client needs 2.6.0.
+- The manager sets none of this up by default: the Iran wizard asks one explicit question (Enter =
+  skip), Advanced settings → resilience (`k`) on the tunnel page changes the values of an existing
+  tunnel, and `wattun-manager profile save NAME` keeps a working combination for the next install.
+  Auto mode never offers these keys, and its type switches keep or strip them per the chosen type.
 - Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
   REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
   reassemble the first segment.

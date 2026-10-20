@@ -36,7 +36,7 @@ else
   MGR=/usr/local/bin/wattun-manager
 fi
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
-MGR_VERSION=2026102001   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
+MGR_VERSION=2026102002   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
 HEAL_UNIT=$WAT_PREFIX-heal
 MCONF=$CONF/.manager.conf
 self_cmd() { # the command to type to start this manager (user-facing hints)
@@ -1247,7 +1247,7 @@ ni_kharej_ports() { # --ports "18999,2000,53/udp" -> MAPS (Kharej side: the serv
 }
 
 wizard_iran() {
-  local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0 rport='' advdef=n linkok=1
+  local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0 rport='' advdef=n linkok=1 askres
   local T_FAKESNI='' T_FAKEMODE='' T_FAKETTL='' T_POOLROT='' T_POOLBYTES=''
   page "New tunnel" "STEP 2 · Iran (inside server)"
   step_diagram 2
@@ -1351,14 +1351,25 @@ wizard_iran() {
     if [ "$T_CARRIER" = icmp ]; then ask_ok "ICMP type (must match Kharej)" "${T_ICMP:-echo}" v_icmp || return 1; T_ICMP=$REPLY_V; fi
     case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
     case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "${T_PATH:-/wat}" v_path || return 1; T_PATH=$REPLY_V ;; esac
-    # Resilience options (2.6.0-2.8.1), one block: fake-sni (name, mode, ttl) and pool-rotate churn.
-    # Client only, Linux, needs CAP_NET_RAW like the icmp carrier. Empty name = fake-SNI off (the default).
-    if [ "$T_REV" != 1 ] && is_pool "$T_CARRIER" && [ "$(uname -s)" = Linux ]; then
+  fi
+  # Resilience options (2.6.0-2.8.1): fake-sni (name, mode, ttl) and pool-rotate churn — the
+  # blackout/whitelisting survival kit (docs/TECHNICAL.md). Strictly for censored routes, so NOT part
+  # of the plain-tunnel flow: one explicit ask, then the same prompts as before. Unattended flags or a
+  # saved profile prefill it and skip the ask — a preset IS the ask.
+  # Client only, Linux, needs CAP_NET_RAW like the icmp carrier. Empty name = fake-SNI off (the default).
+  # Auto tokens (T_AUTO) never see the kit: choose a type first, add resilience later if needed.
+  if [ "$T_REV" != 1 ] && [ -z "$T_AUTO" ] && is_pool "$T_CARRIER" && [ "$(uname -s)" = Linux ]; then
+    prof_pick_defaults
+    askres=y
+    if [ -z "$NI_FAKESNI$NI_FAKEMODE$NI_FAKETTL$NI_POOLROT$NI_POOLBYTES$T_FAKESNI$T_FAKEMODE$T_FAKETTL$T_POOLROT$T_POOLBYTES" ]; then
+      confirm "Configure resilience options (fake-SNI, pool-rotate)? Only for censored routes; Enter = no" n || askres=n
+      [ "$askres" = n ] && hint "Fine for a normal route. If a censor starts blocking this tunnel: tunnel page -> o (advanced settings) -> resilience."
+    fi
+    if [ "$askres" = y ]; then
       echo
       hint "Under an SNI allowlist (only a few sites pass), fake-sni injects a fake ClientHello with an"
       hint "allowlisted name (e.g. mci.ir) so the censor classifies the tunnel as TLS to that site. Needs"
       hint "CAP_NET_RAW (the tunnel already runs with it for the icmp carrier). Leave empty to keep it off."
-      prof_pick_defaults
       ask "Fake SNI (allowlisted name, empty = off)" "${NI_FAKESNI:-${T_FAKESNI:-}}"; T_FAKESNI=$REPLY_V
       if [ -n "$T_FAKESNI" ]; then
         v_sni_name "$T_FAKESNI" || return 1
@@ -1488,6 +1499,9 @@ wizard_iran() {
   fi
   echo
   hint "Manage this tunnel any time: $SELF"
+  if [ "$linkok" = 1 ] && [ "$T_REV" != 1 ] && is_pool "$T_CARRIER" && [ "$(uname -s)" = Linux ] && [ -z "$T_FAKESNI$T_POOLROT$T_POOLBYTES" ]; then
+    hint "If a censor starts blocking this tunnel: tunnel page -> o (advanced settings) -> resilience (fake-SNI, pool-rotate)."
+  fi
   if [ "$NONINTERACTIVE" = 1 ]; then
     printf 'LINK=%s\nTUNNEL=%s\n' "$([ "$linkok" = 1 ] && echo up || echo down)" "$name"
     [ "$linkok" = 1 ] || return 1
@@ -2205,6 +2219,13 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
   [ "$oldrev" = 1 ] && is_pool "$(cfg "$n" carrier)" && oldpool=1
   sed -i -E '/^(carrier|peer|path|sni|host|reverse|listen|fp|ech|ech-cache|tls-frag|peer-[a-z0-9]+|listen-[a-z0-9]+):/d' "$f"
   set_value "$n" carrier "$T_CARRIER"
+  # a working fake-SNI/pool-rotate combination survives a type switch only when the new type can still
+  # carry it (single pool carrier, normal direction — the desync layer attaches nowhere else); strip it
+  # otherwise, so switching to icmp/udp/bond/reverse never leaves dead keys (or silently re-arms them
+  # when the type is switched back later)
+  local keepres=''
+  case "$T_CARRIER" in tcp|tls|ws|wss|h2|h2c|grpc) [ "$T_REV" != 1 ] && keepres=1 ;; esac
+  [ "$keepres" = 1 ] || sed -i -E '/^(fake-(sni|mode|ttl)|pool-rotate(-bytes)?):/d' "$f"
   set_value "$n" peer "$T_PEER"
   [ -n "$T_PATH" ] && set_value "$n" path "$T_PATH"
   if [ -n "$T_SNI" ]; then set_value "$n" sni "$T_SNI"; set_value "$n" host "$T_SNI"; fi
@@ -3354,6 +3375,7 @@ profile_cmd() { # profile save|list|show|del|apply NAME [tunnel]
       [ -n "$tun" ] || tun=$(prof_only_tunnel)
       [ -n "$tun" ] || { err "Name the tunnel explicitly (profile save $name TUNNEL)."; return 1; }
       [ -f "$CONF/$tun.yml" ] || { err "No tunnel named '$tun'."; return 1; }
+      [ "$(uname -s)" = Linux ] || { err "Resilience profiles are a Linux feature (fake-SNI needs CAP_NET_RAW, like the icmp carrier)."; return 1; }
       mkdir -p "$CONF/profiles"
       f=$(prof_path "$name"); tmp="$f.tmp.$$"
       if { echo "# WatTunnel resilience profile: $name"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # self-check for wattun-manager: resilience profiles (profile save/list/show/del/apply), the wizard's
-# profile defaults, the unattended flags (--fake-sni/--fake-mode/--fake-ttl/--pool-rotate/--pool-rotate-bytes)
-# and the value validators. No root, no systemd, no binary needed.
+# profile defaults, the unattended flags (--fake-sni/--fake-mode/--fake-ttl/--pool-rotate/--pool-rotate-bytes),
+# the value validators, and the flow gates (profiles are Linux-only; the resilience prompts are off
+# the plain wizard flow unless a flag or profile pre-fills them). No root, no systemd, no binary needed.
 cd "$(dirname "$0")" || exit 1
 export WAT_MANAGER_LIB=1 WAT_PREFIX=wattest
 export WAT_CONF="$PWD/.smoke/conf" WAT_BIN="$PWD/.smoke/wattun"
@@ -23,6 +24,7 @@ EOF
 . ./wattun-manager
 bin_ver_ok() { echo 1; }
 role() { echo Iran; }
+uname() { echo Linux; }
 systemctl() { return 0; }
 step() { shift; "$@"; }
 
@@ -54,6 +56,11 @@ expect_fail ni_parse --pool-rotate-bytes 20QQ
 expect_fail ni_parse --fake-ttl 999
 v_pool_rotate off && echo "ok   v_pool_rotate off" || { echo "FAIL v_pool_rotate off"; fail=1; }
 for v in 500MB 4G 300k 1.5gb 0b 0 off; do v_pool_bytes "$v" && echo "ok   v_pool_bytes $v" || { echo "FAIL v_pool_bytes $v"; fail=1; }; done
+
+uname() { echo Darwin; } # profiles are a CAP_NET_RAW feature: refuse to save off-Linux
+expect_fail profile_cmd save win t1
+chk "off-Linux save wrote nothing" "$([ -e "$WAT_CONF/profiles/win.env" ] && echo y || echo n)" "n"
+uname() { echo Linux; }
 
 [ "$fail" = 0 ] && echo "ALL OK" || echo "FAILURES: $fail"
 exit "$fail"

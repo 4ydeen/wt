@@ -1,6 +1,6 @@
 # Every change since 2.5.0, mapped out
 
-Scope: branch `dev`, `v2.5.0..HEAD` (2.5.1 → 2.8.1). For every release: what shipped, why it was
+Scope: branch `dev`, `v2.5.0..HEAD` (2.5.1 → 2.8.2). For every release: what shipped, why it was
 needed, how the decision was reached (including what was considered and rejected), what it costs,
 and how it was verified. Deep per-symbol detail lives in `AGENT-HANDOFF.md`; the method research
 behind the decisions lives in `RESEARCH.md`.
@@ -15,6 +15,7 @@ behind the decisions lives in `RESEARCH.md`.
 | 2.7.1 | 2026-10-19 | `fake-mode: sum`; ISN probe fix; manager support | unchanged | no |
 | 2.8.0 | 2026-10-20 | `pool-rotate` churn; `fake-mode: seqsum`; checksum-damage fix | unchanged | no |
 | 2.8.1 | 2026-10-20 | `pool-rotate-bytes`; fake-SNI on `tls/wss/h2`; `Clone` keeps the dial hook; manager resilience block + profiles; unattended-flag fix | unchanged | no |
+| 2.8.2 (manager) | 2026-10-20 | resilience kit off the default wizard flow; type switches keep/strip it; profiles refuse off-Linux | unchanged | no |
 
 Between the releases: a documentation restructure, a static release badge, the git-identity fix, a
 neutral-wording pass, and the consolidation of the work logs into the three files you are reading.
@@ -333,6 +334,46 @@ existing manager flows are unchanged.
 (60 iterations — the flake fix proven, not assumed). NOT hardware-tested: real marker transmission,
 real churn recycling, and the wizard's unattended path end to end (needs a live token).
 
+## 2.8.2 — manager only: the resilience kit off the default flow (this round)
+
+**What shipped.** The blackout/whitelisting survival kit (fake-SNI 2.6.0–2.8.0, pool-rotate
+2.8.0–2.8.1) had grown into the plain-tunnel flow: the Iran wizard always walked every resilience
+prompt, and Auto mode's type switches never cleaned the keys up. Manager-only fixes
+(`MGR_VERSION=2026102002`):
+
+- **Off the default flow**: the Iran wizard asks one explicit question ("Configure resilience
+  options (fake-SNI, pool-rotate)? Only for censored routes; Enter = no"). Enter skips, with a
+  pointer to tunnel page → o (advanced settings) → resilience for later; the success screen repeats
+  that pointer when a tunnel was created without the kit. Unattended flags (`--fake-sni`,
+  `--pool-rotate`, ...) and a saved profile still prefill the block and skip the ask — a preset IS
+  the ask. Auto-token creations never offer the kit at all; auto type switches keep or strip the
+  keys per the chosen variant.
+- **Type switches keep or strip the kit** (`auto_apply`, the auto-test / change-type path): a
+  working fake-SNI/pool-rotate combination survives switching to another single pool carrier in the
+  normal direction — the only shape the desync layer attaches to (verified against
+  `cmd/wattun/main.go:278/297/338`). Switching to `icmp`, `udp`, a bonded carrier or reverse deletes
+  the keys instead of leaving them dead in the config (or silently re-arming them on a switch back):
+  the Go config loader rejects those keys on carriers without the layer, so a stale `fake-sni:`
+  line would keep the switched tunnel from starting.
+- **Profiles are Linux-only**: `profile save` refuses off-Linux with the CAP_NET_RAW explanation
+  (fake-SNI needs it, like the icmp carrier; a saved profile is meaningless where it cannot start).
+- **Existing touchpoints unchanged**: the tunnel page's Advanced settings → resilience menu (and its
+  `is_pool` gate, which correctly excludes bonded carriers) is untouched; `profile
+  save|list|show|del|apply` and the unattended flags keep their 2.8.1 behavior. No Go change, no
+  config-format or wire change.
+
+**Why.** Owner direction: these transports exist strictly for blackout/whitelisting routes. A user
+on a normal route must not meet them in the default flow, and must find them in one obvious place
+when a censor escalates — one opt-in question plus a success-screen pointer is the smallest change
+that does both without hiding the feature behind jargon.
+
+**Cost / risk.** Manager-only. The wizard gains two branches; `test-manager.sh` stubs `uname` (its
+sandbox must look like Linux for the profile tests) and now also asserts the off-Linux save gate.
+
+**Verification (Windows box).** `bash -n wattun-manager`, `bash -n install.sh`, `bash -n
+test-manager.sh` → 0 (Git Bash; WSL is not installed on this box). `bash test-manager.sh` → ALL OK,
+exit 0, including the new off-Linux gate (rejected, nothing written). No Go changes this round.
+
 ## Docs and infra between the releases
 
 - `d64f4d5`/`ed2c2cf`/`34d461f` — 2.5.1 docs and speedtest cap raising (**why**: `/speedtest`'s flag
@@ -417,7 +458,8 @@ measurement record). `CLAUDE.md` and `AGENTS.md` were not touched.
 | `40318f6` | docs | next-agent brief (refine mission, manager UX redesign, queue, env notes) |
 | `cc8cc3c` | 2.8.1 | byte-axis churn budget, fake-SNI on tls/wss/h2, clone inherits dial hook |
 | `7378fde` | 2.8.1 | manager resilience block, profile save/apply, unattended fake/pool flags, docs sync |
-| this round | docs | consolidate the eight work logs into `RESEARCH.md`, `AGENT-HANDOFF.md`, this file |
+| `a591706` | 2.8.2 (mgr) | resilience kit off the default wizard flow; switches keep/strip it; profiles Linux-only |
+| `08f3641` | docs | consolidate the eight work logs into `RESEARCH.md`, `AGENT-HANDOFF.md`, this file |
 
 
 

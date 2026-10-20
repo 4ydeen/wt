@@ -1,4 +1,4 @@
-# AGENT-HANDOFF — what changed on branch `dev` (2.6.0 → 2.8.1)
+# AGENT-HANDOFF — what changed on branch `dev` (2.6.0 → 2.8.2)
 
 Consolidated handoff, replacing `AGENT-HANDOFF-CHANGES.md` (2.6.0),
 `AGENT-HANDOFF-CHANGES-2.md` (2.7.0 + 2.7.1), `AGENT-HANDOFF-CHANGES-3.md` (2.8.0),
@@ -822,6 +822,47 @@ finalizer closed it and the writer saw a dead connection under `-count>1`.
 5. Push `dev`, tag `v2.8.1`, release notes from the TECHNICAL 2.8.1 entry.
 
 ---
+
+# WatTunnel 2.8.2 — manager UX: resilience off the default flow (branch `dev`)
+
+Standing rule from the owner (2026-10-20): the three agent docs are updated with every commit. This
+part is that update for the round that moved the blackout/whitelisting kit (fake-SNI + pool-rotate)
+out of the plain-tunnel flow. Manager-only; `MGR_VERSION=2026102002`; commit `a591706` (also in the
+commit map at the end of `CHANGES-SINCE-2.5.0.md`).
+
+## Changes (all in `wattun-manager`)
+
+- `wizard_iran`: the resilience block moved out of the advanced-settings branch (it now runs at the
+  wizard's top level) and opens behind one explicit `confirm` (default n): "Configure resilience
+  options (fake-SNI, pool-rotate)? Only for censored routes; Enter = no". Declining prints the
+  pointer to tunnel page → o (advanced settings) → resilience. The ask is skipped when unattended
+  flags (`--fake-sni/--fake-mode/--fake-ttl/--pool-rotate/--pool-rotate-bytes`) or
+  `prof_pick_defaults` pre-filled any of the five values — a preset IS the ask. Auto-token
+  creations (`T_AUTO` set) skip the block entirely: choose a type first, add resilience later.
+  `prof_pick_defaults`
+  moved before the ask. New local `askres`; the success screen repeats the pointer when `linkok=1`
+  and the tunnel was created without the kit (wizard_iran tail, interactive only).
+- `auto_apply` (auto-test and the tunnel page's `m` type switch): after the carrier rewrite it
+  strips `fake-sni/fake-mode/fake-ttl/pool-rotate/pool-rotate-bytes` when the chosen variant cannot
+  carry them (`T_CARRIER` not a single pool carrier, or reverse); keeps them otherwise. Without
+  this, switching to icmp/udp/bond left keys the Go config loader rejects (the tunnel refuses to
+  start), and switching back would have silently re-armed them.
+- `profile_cmd save`: refuses off-Linux (`uname -s` != Linux) with the CAP_NET_RAW explanation.
+- No Go change: the desync layer attaches only in the single-pool-carrier client cases
+  (`cmd/wattun/main.go` tcp / tls / ws-wss-h2-h2c-grpc, via `attachFakeSNI`), so the Advanced
+  settings `is_pool` gate (bonds excluded) was already correct and stays.
+
+## Verification (Windows box)
+
+- `bash -n wattun-manager`, `bash -n install.sh`, `bash -n test-manager.sh` → 0 (Git Bash; WSL is
+  not installed on this box — plain `bash` resolves to the WSL stub).
+- `bash test-manager.sh` → ALL OK, exit 0; new checks: off-Linux `profile save` rejected and writes
+  nothing; the harness stubs `uname` (Linux) for the existing profile tests.
+- No Go changes this round: build, vet and tests unaffected.
+- Hardware verification of the kit itself: still outstanding (unchanged from 2.8.1).
+
+---
+
 
 # WatTunnel `dev` branch — next agent brief (2.8.0 → next)
 
