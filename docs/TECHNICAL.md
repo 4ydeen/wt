@@ -367,7 +367,7 @@ A tunnel's page has:
 - logs
 - the port-mapping editor
 - the token
-- advanced settings
+- advanced settings (speed ceiling, FEC, bind, ICMP type, direction, resilience)
 - change connection type (**m**)
 - restart and delete
 
@@ -383,6 +383,8 @@ wattun test NAME       # connection doctor + speed test
 wattun speedtest NAME  # speed test only (10 MB each way)
 wattun logs NAME       # follow the log
 wattun token NAME      # print the Kharej token
+wattun profile save NAME [tunnel]  # save a tunnel's fake-sni/pool-rotate combination under a name
+wattun profile apply NAME [tunnel] # put it back after a reinstall (also: list, show, del NAME)
 wattun auto-test NAME  # re-run the Auto mode test
 wattun cdn-tune NAME   # re-tune a Cloudflare tunnel
 wattun auto-ip NAME IP # tell an auto tunnel Iran's IP (on Kharej)
@@ -942,6 +944,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
 | `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
 | `pool-rotate` | 0 (off) | client (pool carriers: tcp, tls, ws, wss, h2, grpc) | Recycle each healthy pool connection after this long (`30m`, `4h`), so no single flow shows a months-stable lifetime; each connection's actual budget is jittered ±40 % and re-rolled on every recycle, so redials never line up into a detectable period. The session resends anything in flight, so the cost is one redial on one connection at a time. 0 = off. Since 2.8.0. |
+| `pool-rotate-bytes` | 0 (off) | client (pool carriers: tcp, tls, ws, wss, h2, grpc) | With or instead of `pool-rotate`: also recycle each healthy pool connection after this many bytes handed to its socket (`500MB`, `4G`, `300k`; decimal units, 1 MB = 10^6). Jittered +/-25 % like the time axis; whichever limit hits first recycles, so the byte axis does not betray the time axis's jitter. 0 = off. Since 2.8.1. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
 | `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp, tcp, tls, ws, wss, h2, h2c and grpc since 2.4.18 (200 from 2.3.0; before that 16 for every carrier; the server's value caps the download). See "ICMP path limits and pacing". |
 | `tcp-cc` | `bbr` | both | Since 2.4.18, Linux. TCP congestion control set on every pool socket (tcp, tls, ws, wss, h2, h2c, grpc). BBR does not back off on random loss; the kernel default (cubic) halves its window on every lost segment. `system` keeps the kernel default. Each end sets it for what it sends. `tcp_cc` in `/stats` shows what the kernel accepted (falls back to the default if the `tcp_bbr` module is missing). |
@@ -1725,6 +1728,18 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.8.1: byte-axis churn, fake-SNI on TLS carriers, manager resilience profiles.** Client-side only, server
+  unchanged, no wire format changed. (1) New `pool-rotate-bytes`: recycle each healthy pool connection after this
+  many bytes handed to its socket, alone or on top of `pool-rotate`; the byte budget is jittered like the time
+  budget and whichever limit hits first recycles. (2) `-fake-sni` now fires on the `tls`, `wss`, `h2` and `grpc`
+  carriers too: the desync layer unwraps the TLS/framing wrapper instead of requiring a bare `*net.TCPConn`.
+  (3) `Clone` carries the fake-SNI dial hook, so the second and later sessions keep it. (4) The sum-mode mirror
+  base is now per connection: two pool connections opening at once no longer cross-set each other's base.
+  (5) `wattun-manager` collapses fake-SNI and churn into one resilience block (Iran wizard and Advanced
+  settings), adds `profile save/list/show/del/apply` to re-apply a working combination after a reinstall, and
+  accepts `--fake-mode seqsum`, `--pool-rotate` and `--pool-rotate-bytes` unattended. The unattended
+  `--fake-sni`, `--fake-mode` and `--fake-ttl` flags were parsed as unknown options before and never worked.
+  - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival) · [the flags and config keys](#the-flags-and-config-keys).
 - **2.8.0: connection churn, dual-marker mode, checksum fix.** Client-side only, server unchanged, no wire
   format changed. (1) New `pool-rotate`: recycle each healthy pool connection after a jittered lifetime budget
   (±40 % per connection, re-rolled on every recycle), so no single flow shows a months-stable lifetime to a

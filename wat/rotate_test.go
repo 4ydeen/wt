@@ -82,9 +82,10 @@ func TestWriteLoopCountsBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+	srvC := make(chan net.Conn, 1)
 	go func() {
 		if c, err := ln.Accept(); err == nil {
-			_ = c // held open so the writer never sees a reset; the test process reaps it
+			srvC <- c // held (and referenced) so neither GC nor the peer closes it under the writer
 		}
 	}()
 	cl, err := net.Dial("tcp", ln.Addr().String())
@@ -95,7 +96,14 @@ func TestWriteLoopCountsBytes(t *testing.T) {
 	pc := newPoolConn(cl)
 	var wg sync.WaitGroup
 	go pc.serve(&wg, func([]byte) bool { return true })
-	defer func() { pc.fail(); wg.Wait() }() // LIFO: the conn closes before the wait
+	defer func() { // LIFO: the conns close before the wait
+		pc.fail(); wg.Wait()
+		select {
+		case c := <-srvC:
+			c.Close()
+		default:
+		}
+	}()
 	p := make([]byte, 100)
 	deadline := time.Now().Add(2 * time.Second)
 	for pc.txSize.Load() < uint64(2+len(p)) && time.Now().Before(deadline) {
