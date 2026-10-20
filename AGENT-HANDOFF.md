@@ -1,10 +1,140 @@
-﻿# Agent handoff: what changed on branch `dev` (2.7.0 + 2.7.1)
+# AGENT-HANDOFF — what changed on branch `dev` (2.6.0 → 2.8.1)
+
+Consolidated handoff, replacing `AGENT-HANDOFF-CHANGES.md` (2.6.0),
+`AGENT-HANDOFF-CHANGES-2.md` (2.7.0 + 2.7.1), `AGENT-HANDOFF-CHANGES-3.md` (2.8.0),
+`AGENT-HANDOFF-CHANGES-4.md` (2.8.1) and `NEXT-AGENT-PROMPT.md` (the next-agent brief). The five
+documents follow verbatim in that order — part 1 = 2.6.0, part 2 = 2.7.0 + 2.7.1, part 3 = 2.8.0,
+part 4 = 2.8.1, part 5 = the mission/queue/environment brief. References like "handoff 2" or
+"AGENT-HANDOFF-CHANGES-2.md" inside the text mean that part; "RESEARCH-2"/"RESEARCH-3" mean
+`RESEARCH.md` parts 2/3 (same § numbering).
+
+Branch state at the time of the merge: five feature commits on `dev` (`bf92665`, `d355a05`,
+`27ccdf3`, `1001f04`, `cc8cc3c` + `7378fde`), all committed, none merged to `main`, none tagged, no
+release cut. Server binary untouched since 2.5.0, no wire format change anywhere on the branch, ICMP
+path untouched. `wat/version.go` = 2.8.1, `MGR_VERSION=2026102001`.
+
+Companions: `CHANGES-SINCE-2.5.0.md` (every change since 2.5.0 with what/why/how-decided),
+`RESEARCH.md` (the design reference plus the method research and verdicts). Read `CLAUDE.md` and
+`AGENTS.md` first.
+
+Authorship: every commit, push, tag and release goes out under
+`JohnWatsoon <133103370+JohnWatsoon@users.noreply.github.com>`; never add an AI name, trailer or
+attribution line.
+
+---
+
+# Agent handoff: what changed on branch `dev` (2.6.0)
+
+Commit `bf92665` on branch `dev` â€” 11 files, +695/âˆ’20. Not merged to `main`, not tagged, no release
+cut. Everything below is committed; this file and `RESEARCH.md` are uncommitted by request.
+
+## Why
+
+The owner asked for availability-under-restriction capability: research tunnel projects that kept working through the
+Iran whitelisting regime and bring the proven methods into WatTunnel. Reference project studied:
+[patterniha/SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing) (wrong-seq extra ClientHello).
+Field context: net4people/bbs issue #626 (January 2026 whitelisting, ~4 days of the method working,
+defeated by ISP NAT sequence normalization in some networks).
+
+## Files changed (committed)
+
+### New â€” `wat/desync.go` (portable, builds everywhere)
+- `FakeClientHello(sni string) []byte` â€” builds a minimal, RFC-compliant TLS 1.2 ClientHello carrying an
+  arbitrary SNI. Record header `16 03 01`, handshake type 1, client version `03 03`, 32 random bytes
+  (`crypto/rand`, so no fixed fingerprint), empty session id, cipher suites `0xc02b, 0xc023`
+  (ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-ECDSA-AES128-SHA256), null compression, three extensions:
+  server_name (0000), supported_groups (000a: x25519, secp256r1), signature_algorithms (000d:
+  ecdsa_secp256r1_sha256). Returns `nil` for empty SNI.
+- `parseSNIOf(rec []byte) (string, error)` â€” test-only parser of our own hello; asserts round-trip.
+- `DesyncConfig{SNI, Mode, TTL}` â€” mode `seq` (default) or `ttl`.
+- `csum`, `tcpChecksum` â€” moved here from `icmp_linux.go` so tests compile on all OSes.
+  `icmp_linux.go` now has a one-line comment pointing here. `htons` also lives here.
+
+### New â€” `wat/desync_linux.go` (Linux only)
+- `Desync` type + `NewDesync(cfg, peer)` â€” validates config, resolves the peer to IPv4, opens one
+  AF_PACKET `SOCK_RAW|SOCK_NONBLOCK` sniffer on `ETH_P_ALL`, spawns `loop()`.
+- `Wrap(c net.Conn) (net.Conn, error)` â€” called by the pool after dial. Announces the connection's
+  outgoing 4-tuple to the sniffer, waits â‰¤ 2 s for the marker packet to be sent, returns the conn
+  unchanged. Non-IPv4-TCP conns pass straight through; a handshake the sniffer never sees (offload
+  paths) falls through after the timeout â€” tunnel still works, just unclassified.
+- `desyncInjector` state machine (`handle()`): outgoing SYN â†’ record ISN; inbound SYN-ACK â†’ record
+  `synAckSeq` and `synAckAck`; outgoing final ACK (ack field == `synAckSeq+1`) â†’ mark done, release
+  the waiting `Wrap`, spawn `fire()`. Keys are the outgoing 4-tuple; inbound frames match the
+  reversed key.
+- `fire()` â€” builds IPv4(20) + TCP(20) + hello packet: `seq = synSeq + 1 âˆ’ len(hello)` (fully below
+  the stream start), ack = `synAckAck`, flags PSH|ACK (0x18), window 0xffff, DF bit, TTL 64 (seq
+  mode) or `cfg.TTL` (ttl mode), valid TCP checksum. Sent through a throwaway IPPROTO_RAW socket
+  (IP_HDRINCL) via `Sendto`.
+
+### New â€” `wat/desync_other.go` (`!linux`)
+- `NewDesync` returns an error at startup ("needs Linux with CAP_NET_RAW"); no-op `Desync` so callers compile.
+
+### New â€” `wat/desync_test.go` (5 tests, all pass on Windows)
+- `TestFakeClientHelloRealParser` â€” feeds the hello to `crypto/tls.Server` (TLS 1.2 pinned, self-signed
+  cert). Acceptance: net.Error / AlertError / EOF / ErrClosedPipe, i.e. the record parsed and the
+  handshake advanced past parsing (the hello never completes key exchange). A parse-level rejection
+  fails the test.
+- `TestFakeClientHello` â€” SNI round-trip, record length consistency, randomness between builds, empty SNI â†’ nil.
+- `TestDesyncSeqBefore` â€” pins the seq arithmetic.
+- `TestDesyncPeerIP` â€” host:port and hostname; no assertion on unresolvable hosts (wildcard resolvers).
+- `TestTCPChecksum` â€” self-consistency (folded sum 0xffff with checksum in place).
+
+### Modified â€” `wat/carrier_tcp.go`
+- `TCPPoolClient` gained a dial hook:
+  ```go
+  SetDialHook(hook func(ctx, slot int, inner func(ctx, int) (net.Conn, error)) (net.Conn, error)) error-free
+  ```
+  stored in an `atomic.Pointer`; `dialer()` wraps `c.dial` when a hook is set; `slotLoop` now calls
+  `c.dialer()`. No behaviour change when no hook is set (default path byte-identical).
+
+### Modified â€” `cmd/wattun/main.go`
+- Three new client flags: `-fake-sni` (empty = off), `-fake-mode` (`seq`|`ttl`, default `seq`),
+  `-fake-ttl` (required > 0 for ttl mode).
+- `attachFakeSNI` closure inside `main()` (must stay inside: it reads the flag locals): builds one
+  `wat.Desync` per peer and installs it as the pool's dial hook so every connection passes through
+  `Wrap`. Wired into the `tcp` and `tls` client cases only.
+
+### Modified â€” `wat/icmp_linux.go`, `wat/version.go`
+- csum moved out (comment left behind); Version â†’ `2.6.0`.
+
+### Docs â€” `docs/TECHNICAL.md`, `README.md`, `README.fa.md`
+- TECHNICAL: three flag rows (Since 2.6.0), new "Fake-SNI desync" subsection under Carriers with the
+  NAT-normalization caveat, troubleshooting row "Connects, then stalls on tcp/tls with `fake-sni`",
+  2.6.0 release-history entry (client-only, server unchanged, no wire change).
+- Both READMEs: badge â†’ `release-v2.6.0`, intro sentence names fake-SNI desync. Farsi prose in
+  `<div dir="rtl">` with Persian digits (Û²Ù«Û¶Ù«Û°).
+
+## Verification status
+
+- `GOOS=linux go build ./...` âœ… Â· `go build ./...` âœ… Â· `go vet ./...` âœ…
+- `go test -count=1 ./cmd/...` â€” 29 pass âœ…
+- Desync tests: 5/5 on Windows âœ…
+- `bash -n install.sh wattun-manager` âœ…
+- Full `wat/` suite: times out at 280 s **on clean main too** (baseline hangs on
+  `TestTwoClientsSameKey`, my run on `TestFairQueueUngroupedIsPerStream`; both pass alone). Machine
+  load flakiness on this Windows box, not a regression. Re-run with `-timeout 600s` on a quiet machine
+  if you want belt and braces.
+- Linux raw-socket path (`desyncInjector`) not exercised by tests and cannot be tested on Windows â€”
+  needs a Linux box with CAP_NET_RAW. Untested code, flagged as such.
+
+## Not done / next steps for another agent
+
+- Push `dev`, tag `v2.6.0` â†’ release workflow. Tag push runs `go test ./...` + `build.sh`; after it
+  finishes, `gh release edit v2.6.0 --notes-file <file>` (client-only update, both ends SHOULD update
+  but the server binary is functionally unchanged; no wire change).
+- Optional: teach `wattun-manager` the new flags (config keys already work â€” they derive from flags).
+- Optional: IPv6 support in the injector (currently IPv4 only, by design â€” the tool it is modelled on is IPv4 too).
+- Commit these two handoff files if wanted.
+
+---
+
+# Agent handoff: what changed on branch `dev` (2.7.0 + 2.7.1)
 
 Branch `dev` now carries TWO commits on top of `bf92665` (2.6.0):
 
 - `d355a05` â€” **2.7.0** "fake-sni desync hardened and fixed: the marker now actually fires" (13 files,
-  +1490/âˆ’209), with `RESEARCH-2.md` (method research for the whitelisting and Restricted-routing scenarios)
-  and `FAKE-SNI-DESIGN.md` (2.6.0 design; packet layout and marker-hello mechanics unchanged, only the
+  +1490/âˆ’209), with `RESEARCH.md` (method research for the whitelisting and Restricted-routing scenarios)
+  and `RESEARCH.md` (2.6.0 design; packet layout and marker-hello mechanics unchanged, only the
   trigger changed) committed alongside.
 - `a03ba93` â€” the first full-detail handoff (this file, round 1).
 - `27ccdf3` â€” **2.7.1** "fake-mode sum, ISN probe fix, manager fake-sni support" (11 files,
@@ -321,13 +451,13 @@ New (each pins one mechanic of the tracker):
 7. Optional (flagged): IPv6 in the injector â€” still IPv4-only by design, same as the reference
    tool; add only if a real deployment needs it.
 8. **Refinement mission for the next agent (owner request):** read all the `.md` files on this
-   branch first — `FAKE-SNI-DESIGN.md`, `AGENT-HANDOFF-CHANGES.md`, `AGENT-HANDOFF-CHANGES-2.md`
-   (this file), `RESEARCH-2.md`, `RESEARCH-3.md`, plus `docs/TECHNICAL.md` — then fully refine
+   branch first — `RESEARCH.md`, `AGENT-HANDOFF.md`, `AGENT-HANDOFF.md`
+   (this file), `RESEARCH.md`, `RESEARCH.md`, plus `docs/TECHNICAL.md` — then fully refine
    EVERYTHING that was added in this branch (2.6.0 + 2.7.0 + 2.7.1: the fake-SNI feature end to
    end, its three modes, the probe, the tracker, the manager screens, the docs), and rethink how
    all of it is presented and managed in `wattun-manager` (one coherent UX for name/mode/ttl
    across the Iran wizard, the advanced menu, and the unattended flags). Only after that
-   re-think, consider the new items from `RESEARCH-3.md` section 2 (connection churn first, then
+   re-think, consider the new items from `RESEARCH.md` section 2 (connection churn first, then
    the optional marker IP-fragmentation knob; the larger Bale/WebRTC carrier only on field
    evidence that the current paths died). Keep every rule in CLAUDE.md: wire compatibility,
    client-only where stated, docs in sync, ICMP path untouched.
@@ -357,7 +487,7 @@ Round-2 work: the round-1 handoff's queue, researched and implemented. Commit `2
   `nf_conntrack_checksum=1` + INVALID-drop FORWARD rule kills it; openwrt sets it to 0; ISPs
   usually pass badsum); **badseq** markers are dropped by the server "but DPI also can ignore them" â€”
   i.e. badseq is the weaker variant. This directly ranked badsum above badseq for the new mode.
-- **Disorder verdict corrected** (Â§1.2 of RESEARCH-2.md updated): zapret's multisplit/multidisorder
+- **Disorder verdict corrected** (Â§1.2 of RESEARCH.md updated): zapret's multisplit/multidisorder
   run under NFQUEUE â€” the kernel hands nfqws the real packet, which holds/re-cuts/re-injects it.
   Our AF_PACKET observer is read-only; it can never hold back the real ClientHello. Disorder would
   need an NFQUEUE data path (iptables + root + per-packet verdicts) â€” an architecture change, so it
@@ -450,7 +580,7 @@ modes". No wiring changes (sum rides the same `attachFakeSNI` hooks).
   **2.7.1 release-history entry** above 2.7.0's.
 - `README.md` / `README.fa.md`: badge â†’ `release-v2.7.1`; intro extended with the checksum mode
   (FA: Â«Ø­Ø§Ù„Øª Â«Ø³Ø§Ù…ÙÂ» Ø¨Ø§ Ø¬Ù…Ø¹â€ŒØ¢Ø²Ù…Ø§ÛŒÛŒ Ø®Ø±Ø§Ø¨Â», Persian digits Û²Ù«Û·Ù«Û±).
-- `RESEARCH-2.md`: title/status updated; Â§1.2 disorder entry gains the NFQUEUE-architecture note;
+- `RESEARCH.md`: title/status updated; Â§1.2 disorder entry gains the NFQUEUE-architecture note;
   decision table gains row 1.1b (sum, BUILD 2.7.1); new Â§4b "What 2.7.1 changed, in one page";
   Â§5 queue rewritten (field validation first, disorder decision, release).
 - `.gitignore`: added `AGENTS.md`, `.gocache/`, `.gomodcache/`, `.gopath/`, `.acl-recovery/`.
@@ -467,3 +597,327 @@ modes". No wiring changes (sum rides the same `attachFakeSNI` hooks).
 - Full `wat/` suite still not run on this box (known load flakiness, unchanged caveat; nothing
   2.7.1 touches session/cc/ICMP hot paths). Raw-socket half still needs a Linux + CAP_NET_RAW
   (+ CAP_NET_ADMIN for the probe) box for field validation.
+
+---
+
+# Agent handoff: what changed on branch `dev` (2.8.0)
+
+Branch `dev` now carries 2.8.0 on top of 2.7.1 (`ce058b3` docs / `67b3842` research / `a9784c3`
+wording pass). **Commit pending at the time of writing — this file is committed together with the
+2.8.0 changes.** Server unchanged, wire unchanged, ICMP path untouched. Everything below is the
+full per-symbol map, continuing the format of AGENT-HANDOFF.md (rounds 1–2). The
+research that drove this round is RESEARCH.md; its §2 items 1 and 3 are now implemented.
+
+## Why (the owner request)
+
+The owner asked for the round-3 suggestions to be implemented. Two of the ranked ideas were
+client-only, wire-compatible and testable on the Windows box, so they shipped now:
+
+1. **Connection churn** (`pool-rotate`) — item 1 of RESEARCH-3 §2, the best speed-per-effort item:
+   no pool connection should present a months-stable lifetime × volume profile to a behavioral
+   classifier (#649: "a TLS flow held open for hours moving tens of GB is anomalous regardless of
+   a perfect handshake"; #628: throughput → probe → block domain+IP).
+2. **`fake-mode: seqsum`** — the double-marker experiment (§3): both the seq and the sum marker
+   per connection, so a filter must discard both correctly to miss the SNI.
+3. **A real bug found on the way (the headline): the 2.7.1 sum-mode checksum damage was an
+   identity for every even checksum.** `(s ^ 1) - 1` with s even = `(s+1) - 1 = s`. Half of the
+   sum-mode markers shipped with a fully VALID checksum; the server would have accepted the fake
+   hello's bytes as real stream data (flow corruption, the worst failure class). Found because the
+   sum-mode unit test flaked at ~50 % — the fake hello's crypto/rand bytes decide the checksum's
+   parity. Fixed in `damageChecksum`.
+
+## Files changed, in full detail
+
+### Modified — `wat/desync.go`
+
+- `DesyncConfig.Mode` doc: adds `"seqsum"`.
+- `validateDesync`: accepts `seqsum` (error text: `-fake-mode must be seq, ttl, sum or seqsum`).
+- `handleIPv4` trigger paths: both the early and the late branch now treat `"sum" || "seqsum"` as
+  the mirroring modes (wait for the first outbound DATA segment, capture `t.sumSeq = seq`; bare
+  ACKs do not fire). Unchanged for `seq`/`ttl`.
+- `fireLocked`:
+  - `sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"` picks `base = t.sumSeq`.
+  - New `seqsum` branch sends TWO packets: `fakePacket(k, base-len(hello), ack, ttl, hello)` (the
+    plain below-window seq marker, valid checksum) and then `fakePacket(k, base, ack, ttl, hello)`
+    with `damageChecksum` applied (the in-window mirror). Both leave before the server in the seq
+    sense (below-window / bad checksum); the ordering matters — the below-window one first, so a
+    window-checking reassembler sees junk first and a checksum-checking one drops the second.
+  - The old inline sum damage is replaced by `damageChecksum(pkt)`.
+- **New `damageChecksum(pkt []byte)`**: `d = s - 1`, and when that wraps to `0xffff` (the valid
+  fold of a correct packet is exactly `0xffff`, so `-1` from `0x0000` would be VALID) it writes
+  `s - 2` instead. Always invalid, for every input, no parity dependence. Doc comment carries the
+  full 2.7.1 post-mortem so nobody reintroduces the `(s^1)-1` shape.
+
+### Modified — `wat/carrier_tcp.go` (the churn engine)
+
+- `TCPPoolClient` struct: two new atomics, `rotate` (ns duration base, 0 = off) and `rotBytes`
+  (datagram-count base, 0 = off).
+- `poolConn` struct: new `rot atomic.Pointer[rotateBudget]` — nil on the server side (churn is a
+  client concept).
+- New `rotateBudget{at time.Time; bytes int64}` — one connection's jittered budget; a fresh one is
+  rolled for every (re)connection, so no two connections share a period.
+- New `rollRotate(base, baseBytes)`: time jitter ±40 % (`0.6 + 0.8*jitter01()`), count jitter ±25 %
+  (`0.75 + 0.5*jitter01()`); floors 10 s / 1 MB (a bad roll can never hot-loop the redialer).
+- New `jitter01()`: uniform [0,1) from crypto/rand (spread, not secrecy).
+- New `(pc *poolConn) rotateDue(now)`: true when either axis is hit (`now > at`, or `tx >= bytes`;
+  tx counts pool datagrams handed to the socket — near-uniform size, already lock-free).
+- New `SetRotate(d time.Duration, bytes int64)`: public knob; stores both bases. Client pools only.
+- `slotLoop` (client side): after `newPoolConn`, when either base is non-zero it stores
+  `rollRotate(...)` on the connection.
+- Health check (the `case now := <-t.C` branch): before the slow-connection judgement, when churn
+  is on, any slot whose `rotateDue` is true gets `poolRotates.Add(1)` + `pc.fail()` — the existing
+  death path (queue drained/dropped, session resends in flight, slot redials immediately). Runs
+  BEFORE the `keepSlow` continue, so churn works on direct paths too.
+- `Clone()` copies both rotate bases (sessions `-sessions > 1` keep the policy).
+- New counter `poolRotates` + accessor `PoolRotates() int64` (next to `PoolSlowKills()`), for
+  `/stats`-adjacent observation later.
+
+### New — `wat/rotate_test.go` (2 tests, pass, no flake)
+
+- `TestRollRotateJitterBounds` — 500 rolls of a 1 h base must land in 36..84 min; 4 MB base in
+  3..5 MB; floors hold (1 s → ≥10 s, 1 → ≥1 MB); zero base → zero budget.
+- `TestRotateDueSemantics` — no budget → never due; past `at` → due; inside `at` → not due;
+  `tx >= bytes` → due; below → not due.
+
+### Modified — `wat/desync_test.go` (21 tests now)
+
+- `desyncTestTracker` knows `"seqsum"`.
+- New `TestDesyncSeqSumSendsBoth` — early path: bare ACK does NOT fire; first data fires ONCE but
+  sends TWO markers; marker 1 = below-window seq + VALID checksum (recomputed == stored); marker 2
+  = in-window seq (`isn+1`) + INVALID checksum; both payloads equal `FakeClientHello("mci.ir")`.
+- New `TestDesyncSeqSumLateFiresBoth` — late path (unknown ISN): SYN-ACK + first data → two
+  markers, seqs `isn+1-len(hello)` and `isn+1`.
+
+### Modified — `cmd/wattun/main.go`
+
+- New client flag `-pool-rotate` (default `0`): Go duration (`30m`, `4h`, `90s`); parsed next to
+  the other validations, `0` = off; negative or unparsable → fatal with usage. Wired in `build()`:
+  `pc.SetRotate(rotateD, 0)` for every client pool (tcp/tls/ws/wss/h2/grpc — all flow through the
+  single `pc != nil` block), gated on `!server`.
+- `-fake-mode` help lists `seqsum`.
+- Config key `pool-rotate` derives from the flag automatically (project convention).
+
+### Modified — `wat/version.go`, `docs/TECHNICAL.md`, `README.md`, `README.fa.md`
+
+- Version → `2.8.0`; badges → `release-v2.8.0`; both README intros gained the churn clause
+  (Farsi written natively, Persian digits ۲٫۸٫۰).
+- TECHNICAL: the `fake-mode: sum` bullet now documents the 2.7.1 damage bug + the fix; new
+  `fake-mode: seqsum` bullet; new `pool-rotate` flag-table row; `fake-mode` row mentions seqsum;
+  new 2.8.0 release-history entry (with the explicit "if you run fake-mode: sum on 2.7.x, update
+  the client" callout).
+
+### Modified — `RESEARCH.md`
+
+- §2 item 1 marked **Implemented in 2.8.0** (time axis; byte axis reserved in the API).
+- §2 item 3 marked with the seqsum addition + the checksum-damage fix post-mortem.
+- §3 carries the correction: marker IP-fragmentation is NOT free under frag-dropping rules (#640)
+  — gate behind a path probe, default off (NOT implemented this round; see "Not done" below).
+
+## Verification (this Windows box)
+
+- `go build ./...` ✅ · `go vet ./...` ✅ · `GOOS=linux go build ./...` ✅
+- `go test -count=1 ./cmd/...` — 29 pass ✅
+- Target suite (`TestDesync|TestFake|TestValidateDesync|TestTCPChecksum|TestRollRotate|TestRotateDue`)
+  — **40 consecutive full iterations pass** ✅ (this is the run that caught the sum bug: before the
+  fix, `TestDesyncSumModeFiresOnData`/`TestDesyncSeqSumSendsBoth` failed ~50 % of runs)
+- Full `wat/` suite: not run to completion (same load-flakiness caveat as every round; nothing in
+  2.8.0 touches session/cc/ICMP hot paths — churn lives in the pool health check, and the only
+  desync change is the marker builder).
+- Raw-socket half (real marker transmission, real rotate recycling) still needs a Linux +
+  CAP_NET_RAW box — unchanged caveat, now with TWO features awaiting field validation.
+
+## Not done / next steps for another agent
+
+1. **Field-validate 2.8.0 on a real Iran path** (the standing queue item): `pool-rotate: 30m` on a
+   long session, `fake-mode: seqsum` vs `sum` vs `seq`, watch `PoolRotates()` and the fake counters.
+2. **Byte-axis churn**: `SetRotate`'s second argument and `rotBytes` are wired but the flag only
+   exposes time. Add `-pool-rotate-bytes` (or extend the duration syntax) when a user asks.
+3. **Filter telemetry + auto-mode** (RESEARCH-3 follow-up, specced in conversation): startup probe
+   (SYN with listed/unlisted SNI, one seq marker, one sum marker, one fragmented hello) →
+   `/stats` filter profile → auto-pick the fake mode. Supersedes manual mode selection.
+4. **Marker IP-fragmentation**: only behind the frag-drop probe of item 3 (RESEARCH-3 §3
+   correction) — never ship it as a free knob.
+5. **ICMP ceiling governor** (RESEARCH-3 follow-up): ramp the ICMP rate until the reroute
+   signature (RTT spike + loss, PathFeedback already sees both), binary-search down, cache per
+   path. Turns the hardcoded 16 MB/s default into a learned per-path ceiling.
+6. **ECH bootstrap ladder**: fetch the ECHConfigList THROUGH the icmp carrier when DoH is
+   DNS-hijacked (10.10.34.34), then promote to wss+ECH.
+7. **wattun-manager**: expose `pool-rotate` in the Iran wizard advanced block (one `read -e` ask +
+   a config-key emit next to fake-sni; `bin_ver_ok 2.8.0` guard) and in Advanced settings; the
+   refinement mission of AGENT-HANDOFF.md item 8 still stands on top of this.
+8. Push `dev`, tag `v2.8.0` → release workflow; notes-file from the TECHNICAL 2.8.0 entry.
+   Client-only update; server unchanged; no wire change; mixed versions fine.
+
+---
+
+# WatTunnel 2.8.1 - refinement round, step 1 + step 2 (branch `dev`)
+
+Handoff for the next agent. `AGENT-HANDOFF.md` is the mission; this file is what actually landed.
+
+## Step 1 - refinement of rounds 2.6.0-2.8.0 (commit `cc8cc3c`)
+
+- `rotateDue` compared the byte budget against the DATAGRAM COUNT (~256x off at the 4096-byte pool MTU):
+  now real bytes via `txSize`. New `rotatePick`: one recycle per tick, oldest-first, never drops the
+  last usable connection.
+- `Clone` dropped the dial hook (`carrier_tcp.go`): `n.hook.Store(c.hook.Load())` - every session
+  beyond the first dialed bare, so `-fake-sni` only fired on session 1.
+- Fake-SNI was dead on `tls`/`wss`/`h2`/`grpc`: `Wrap` unwraps the TLS/framing wrapper (`rawTCP`) instead
+  of asserting a bare `*net.TCPConn`.
+- `-pool-rotate-bytes` (`cmd/wattun/main.go`, `parseSize` suffixes, decimal units).
+- `sumSeq` mirror base is per connection (two pool connections opening at once cross-set each other's).
+- Tests in `wat/rotate_test.go`.
+
+## Step 2 - `wattun-manager` resilient-UX redesign (this round)
+
+One "resilience options" block instead of two scattered places, plus recallable profiles:
+
+- Wizard (Iran, pool carrier, Linux): fake-sni name / mode (`seq|ttl|sum|seqsum`) / ttl, then
+  `pool-rotate` and `pool-rotate-bytes`, all with `bin_ver_ok` guards. Profile pick happens first.
+- Advanced settings: key `k` renamed "resilience" - the same five values, plus summary lines
+  (`fake-sni`, `pool-rotate`, `pool-rotate-bytes`).
+- `profile save|list|show|del|apply [NAME] [TUNNEL]`: writes `$CONF/profiles/NAME.env`
+  (`FAKESNI/FAKEMODE/FAKETTL/POOLROT/POOLBYTES`, comments ignored on read, atomic `mv`), re-applies it
+  to a tunnel and restarts it. Reaches users as `wattun profile ...` too: any non-flag first argument
+  execs into the manager (`cmd/wattun/manager_unix.go`).
+- Unattended: `--fake-mode seqsum`, `--pool-rotate`, `--pool-rotate-bytes`. **Latent bug fixed**: the
+  `ni_parse` first case `--*)` swallowed `--fake-sni/--fake-mode/--fake-ttl`, so those flags always died
+  with "Unknown option"; the value list now routes them into the value branch.
+- Validators: `v_pool_rotate` (Go `time.ParseDuration` durations), `v_pool_bytes` (mirrors Go
+  `parseSize`: case-insensitive, optional `B`, decimals), `v_fake_mode` (+`seqsum`).
+- `MGR_VERSION=2026102001`.
+- `test-manager.sh`: one runnable check (assert-based, no root/systemd/binary) for profiles, apply/clear,
+  unattended flags and the validators. Run `bash test-manager.sh`.
+
+**Guard style is HARD on purpose.** The config loader rejects unknown keys (`config.go:164`), so a
+`pool-rotate:` line written for a 2.7.x binary makes the tunnel REFUSE TO START. Config keys are flag
+names (`flag.Lookup`), so `pool-rotate` / `pool-rotate-bytes` need no Go change.
+
+Also fixed a test-only flake: `TestWriteLoopCountsBytes` kept the accepted conn in `_`, so the GC
+finalizer closed it and the writer saw a dead connection under `-count>1`.
+
+## Docs synced
+
+- `wat/version.go` 2.8.1; release badges in both READMEs.
+- `docs/TECHNICAL.md`: `pool-rotate-bytes` row, 2.8.1 release-history entry, `wattun profile ...` in the
+  manager command block, advanced-settings bullet mentions resilience.
+- `README.md` / `README.fa.md`: fake-SNI line now names `seqsum` and the byte budget, native Farsi.
+
+## Verification (Windows box)
+
+- `bash -n wattun-manager`, `bash -n install.sh`, `bash test-manager.sh` -> ALL OK, exit 0.
+- `go build ./...`, `go vet ./...`, `GOOS=linux go vet ./wat/ ./cmd/wattun` -> clean.
+- `go test ./cmd/wattun/` -> ok. `go test ./wat/ -run 'Rotate|Clone|WriteLoopCounts|SumSeq' -count=60` -> ok.
+- NOT hardware-tested (needs Linux + CAP_NET_RAW/CAP_NET_ADMIN): real marker transmission, real churn
+  recycling, and the wizard's unattended path end to end (needs a real token).
+
+## Next (step 3, in priority order)
+
+1. **Filter telemetry + auto-mode** - probe FIRST (SYN with listed/unlisted SNI, one seq marker, one
+   sum marker) -> `/stats` filter profile -> auto-pick the fake mode. No marker IP-fragmentation before
+   that probe exists (RESEARCH-3 §3 correction).
+2. **ICMP ceiling governor** - ramp until the reroute signature (RTT spike + loss), binary-search down,
+   cache per path. Replaces the hardcoded 16 MB/s default.
+3. **ECH bootstrap ladder** - fetch the ECHConfigList through the icmp carrier when DoH is hijacked.
+4. Byte-axis churn: done in 2.8.1 (`pool-rotate-bytes`) - field-validate next.
+5. Push `dev`, tag `v2.8.1`, release notes from the TECHNICAL 2.8.1 entry.
+
+---
+
+# WatTunnel `dev` branch — next agent brief (2.8.0 → next)
+
+You are continuing work on WatTunnel (`github.com/JohnWatsoon/WatTunnel`, branch `dev`, Go 1.26,
+static linux/amd64+arm64). Read `CLAUDE.md` first, then `AGENTS.md`. One hard rule up front: every
+commit, push, tag and release goes out under the owner's identity only
+(`JohnWatsoon <133103370+JohnWatsoon@users.noreply.github.com>`); never add an AI name, trailer or
+attribution line anywhere.
+
+## Step 0 — read these files in order (they are the whole context)
+
+1. `CLAUDE.md`, `AGENTS.md` — project rules (wire compatibility, docs sync, ICMP performance pins).
+2. `CHANGES-SINCE-2.5.0.md` — every change since 2.5.0, why, and how it was decided (shortest, read first).
+3. `RESEARCH.md` part 1 — design of the flow-marker feature (2.6.0).
+4. `AGENT-HANDOFF.md` part 1 — 2.6.0 per-symbol map.
+5. `AGENT-HANDOFF.md` part 2 — 2.7.0 + 2.7.1 per-symbol map; its "Not done" item 8 is the
+   refinement mission, only partly closed by 2.8.1 step 1.
+6. `RESEARCH.md` part 2 — method research behind 2.7.0/2.7.1 (decision table, verdicts).
+7. `RESEARCH.md` part 3 — field status after the 2026 filter upgrades and what was implemented in
+   2.8.0.
+8. `AGENT-HANDOFF.md` parts 3-5 — 2.8.0 and 2.8.1 per-symbol maps, the "Not done" queue and the
+   environment notes.
+9. `docs/TECHNICAL.md` — every flag/config key/troubleshooting entry (the flag table and the
+   Fake-SNI chapter covers 2.6.0-2.8.1).
+
+## Step 1 — fully refine everything added on this branch (the standing mission)
+
+The branch carries four feature rounds on top of `main`'s `bf92665` baseline: 2.6.0 (flow marker),
+2.7.0 (trigger fix, NAT-follow, auto-TTL, more carriers), 2.7.1 (`sum` mode, probe off-by-one fix,
+manager support), 2.8.0 (`pool-rotate` churn, `seqsum` dual marker, checksum-damage fix). Go
+through ALL of it end to end with fresh eyes:
+
+- **Code**: `wat/desync.go`, `wat/desync_linux.go`, `wat/desync_other.go`, `wat/desync_test.go`,
+  `wat/rotate_test.go`, the churn engine in `wat/carrier_tcp.go` (rotate fields/budget/health-check
+  hook), and `cmd/wattun/main.go` (flag wiring). Look for anything the tests don't pin: wrap-around
+  arithmetic, the interaction of churn with the slow-connection check and with bonding, error
+  paths, the 2 s Wrap timeout story, counter overflow. The 2.8.0 checksum bug was found exactly
+  this way (a test flaking ~50 %) — assume there is at least one more latent defect and hunt it.
+- **Tests**: keep every pass at full determinism (2.8.0's target suite ran 40 consecutive
+  iterations clean; hold that bar). Add what's missing (e.g. churn × keepSlow interaction, clone
+  inheritance, `-pool-rotate` config parsing).
+- **Consistency**: naming, comments and error strings across the four rounds were written in
+  bursts — normalize them (the docs already use "flow marker"/"filter" wording; bring code comments
+  in line, keeping flag names and identifiers verbatim).
+
+## Step 2 — rethink how all of it is managed in `wattun-manager`
+
+`wattun-manager` (bash UI) grew its fake-sni support organically (Iran wizard advanced block,
+Advanced-settings `k` entry, `--fake-sni/--fake-mode/--fake-ttl` unattended flags; see the 2.7.1
+section of handoff 2). Now that `pool-rotate` exists too, redesign the UX so it is one coherent
+story instead of scattered asks:
+
+- One "resilience options" block (wizard + Advanced settings + unattended flags in agreement):
+  fake-sni name, mode (`seq|ttl|sum|seqsum`), ttl, and `pool-rotate`, with sensible grouped
+  defaults and one-line explanations read from `docs/TECHNICAL.md`.
+- Consider a named-profile idea: save/recall a working combination (`wattun-manager profile save
+  NAME` writes a snippet the wizard can apply), so a user who found a working combination can
+  re-apply it in seconds after a reinstall.
+- Respect the existing manager conventions (MGR_VERSION unchanged, atomic `mv` on update, `page`
+  for every screen, `/stats` as the only live state, `bin_ver_ok` guards for features newer than
+  the installed binary). `bash -n wattun-manager` must pass.
+- Keep 2.8.0's queue item in mind: expose `pool-rotate` with a `bin_ver_ok 2.8.0` guard.
+
+## Step 3 — only after 1 and 2: pick up new work from the queue
+
+In priority order (details and reasoning in `AGENT-HANDOFF.md` "Not done" and
+`RESEARCH.md` §2):
+
+1. Filter telemetry + auto-mode: a startup probe (SYN with listed/unlisted name, one seq marker,
+   one sum marker, one fragmented hello) reporting a per-path profile to `/stats`, from which the
+   client picks the marker mode itself. Do NOT implement marker IP-fragmentation unless this probe
+   exists first — RESEARCH-3 §3 explains why (a fragmented hello can tag the flow on paths that
+   drop fragments; default off, gated).
+2. ICMP ceiling governor: learn the per-path rate ceiling from congestion feedback instead of the
+   hardcoded default (ramp → signature → back off → cache with hysteresis). Must not touch the
+   session/cc hot paths' pinned sim-test behavior.
+3. ECH bootstrap ladder: fetch the ECH config through the icmp carrier when DNS-over-HTTPS is
+   unavailable, then promote to the fast CDN path.
+4. Byte-axis churn (`SetRotate`'s second argument is wired but unexposed) — small.
+
+Whatever you pick: keep every project rule (old/new peers must interoperate — server unchanged and
+no new frame types unless ignorable-by-old-peer; client-only where the docs say so; both READMEs in
+content sync with native Farsi; benchmark numbers only from real measurements), keep the wording of
+all docs and comments in the neutral engineering style already used on this branch, and finish with
+`go build ./... && go vet ./...`, the cmd tests, the target suite at 40 clean iterations, and
+`bash -n install.sh wattun-manager`. Commit under the owner identity only.
+
+## Environment notes (this Windows box)
+
+- Go needs workspace-local caches: set `GOCACHE=$PWD\.gocache`, `GOMODCACHE=$PWD\.gomodcache`,
+  `GOPATH=$PWD\.gopath` before any go command (the shell runs at Low integrity).
+- `git commit` from that shell fails on `.git/index.lock`; use one unconfined run for commits.
+- Web search/fetch are unavailable in this environment; GitHub API via git's bundled curl with
+  `--http1.1` works (`git -c http.sslBackend=openssl clone` also works).
+- The full `wat/` suite times out on this box even on clean main (machine-load flakiness); run the
+  targeted suites instead, and re-run the full suite on a quiet Linux box with `-timeout 600s`.
+- The raw-socket halves (marker injection, real churn recycling) can only be field-validated on a
+  Linux box with CAP_NET_RAW (+ CAP_NET_ADMIN for the ISN probe) — flag anything untested-on-
+  hardware as such, as every handoff before you did.

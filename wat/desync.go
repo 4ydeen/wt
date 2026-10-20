@@ -6,7 +6,7 @@ package wat
 // TLS to an allowlisted site; the real server drops the fake (out-of-window sequence number, or a TTL that dies at
 // the censor's hop), so the relay then carries the session's own encrypted datagrams, which the DPI passes as TLS
 // application data. Server-side changes: none. Reverse-engineered from patterniha/SNI-Spoofing (wrong-seq method,
-// January 2026 whitelisting; see FAKE-SNI-DESIGN.md) with the trigger handling generalised after zapret's
+// January 2026 whitelisting; see RESEARCH.md) with the trigger handling generalised after zapret's
 // zero-stage/second-stage split: the fake can also be sent alongside (not only before) the real first flight.
 //
 // This file holds the OS-independent parts so the state machine is testable everywhere: the handshake tracker, the

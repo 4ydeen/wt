@@ -873,7 +873,7 @@ type rotateBudget struct {
 	bytes int64
 }
 
-// rollRotate jitters the base budget: ±40 % on time, ±25 % on bytes (RESEARCH-3 §2: a fixed reconnect period
+// rollRotate jitters the base budget: ±40 % on time, ±25 % on bytes (RESEARCH.md part 3 §2: a fixed reconnect period
 // is itself a fingerprint). Floors: 10 s / 1 MB, so a bad roll cannot hot-loop the redialer.
 func rollRotate(base time.Duration, baseBytes int64) rotateBudget {
 	b := rotateBudget{}
@@ -947,8 +947,8 @@ func (c *TCPPoolClient) rotatePick(now time.Time) *poolConn {
 
 // SetRotate turns on connection churn (2.8.0): a healthy pool connection is recycled after d, or after bytes
 // handed to its socket (whichever comes first), so no long-lived flow presents a months-stable
-// lifetime x volume profile to a behavioral classifier (RESEARCH-3 #649: lifetime is the strongest real-world
-// tell). Each connection's budget is jittered ±40 % in time and ±25 % in count and re-rolled on every recycle,
+// lifetime x volume profile to a behavioral classifier (RESEARCH.md part 3, bbs #649: lifetime is the strongest
+// real-world tell). Each connection's budget is jittered ±40 % in time and ±25 % in count and re-rolled on every recycle,
 // so the redials do not line up into a synchronized, fingerprintable period. Recycling closes one connection at
 // a moment the pool picks itself: the session treats it like any connection death (in-flight datagrams are
 // resent), and the slot redials immediately. d <= 0 and bytes <= 0 disable their axis. Client side only.
