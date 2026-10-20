@@ -1,6 +1,10 @@
 package wat
 
 import (
+	"context"
+	"errors"
+	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -56,16 +60,77 @@ func TestRotateDueSemantics(t *testing.T) {
 	if pc.rotateDue(now) {
 		t.Fatal("inside the time budget: reported due")
 	}
-	// count axis: tx over the budget => due
+	// byte axis: txSize over the budget => due
 	b.at = now.Add(time.Hour)
 	b.bytes = 10
 	pc.rot.Store(&b)
-	pc.tx.Store(10)
+	pc.txSize.Store(10)
 	if !pc.rotateDue(now) {
-		t.Fatal("tx hit the count budget: not reported due")
+		t.Fatal("txSize hit the byte budget: not reported due")
 	}
-	pc.tx.Store(9)
+	pc.txSize.Store(9)
 	if pc.rotateDue(now) {
-		t.Fatal("tx under the count budget: reported due")
+		t.Fatal("txSize under the byte budget: reported due")
+	}
+}
+
+// TestWriteLoopCountsBytes: the churn byte axis counts the bytes handed to the socket, framing header included
+// (2.8.1: rotateDue compared the byte budget against the datagram count, ~256x off at the default 4096-byte MTU).
+func TestWriteLoopCountsBytes(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			_ = c // held open so the writer never sees a reset; the test process reaps it
+		}
+	}()
+	cl, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	pc := newPoolConn(cl)
+	var wg sync.WaitGroup
+	go pc.serve(&wg, func([]byte) bool { return true })
+	defer func() { pc.fail(); wg.Wait() }() // LIFO: the conn closes before the wait
+	p := make([]byte, 100)
+	deadline := time.Now().Add(2 * time.Second)
+	for pc.txSize.Load() < uint64(2+len(p)) && time.Now().Before(deadline) {
+		if !pc.enqueue(p) {
+			t.Fatal("enqueue failed: connection died")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := pc.txSize.Load(); got < uint64(2+len(p)) {
+		t.Fatalf("txSize %d after 2 s, want at least %d (2-byte header + payload)", got, 2+len(p))
+	}
+}
+
+// TestCloneCarriesDialHook: -sessions clones inherit the fake-SNI dial hook (2.8.1: they did not, so every
+// session beyond the first dialed bare and -fake-sni fired only on session 1's connections).
+func TestCloneCarriesDialHook(t *testing.T) {
+	c, err := newSlotPoolClient(func(ctx context.Context, slot int) (net.Conn, error) {
+		return nil, errors.New("no dial in this test")
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	called := false
+	c.SetDialHook(func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error) {
+		called = true
+		return nil, errors.New("hook ran")
+	})
+	n, err := c.Clone(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	_, _ = n.dialer()(t.Context(), 0)
+	if !called {
+		t.Fatal("the clone's dialer skipped the dial hook")
 	}
 }

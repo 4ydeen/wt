@@ -103,8 +103,9 @@ type poolConn struct {
 	once  sync.Once
 	wbusy atomic.Int64 // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
 	rx    atomic.Uint64 // datagrams received
-	tx    atomic.Uint64 // datagrams handed to the socket
-	born  time.Time
+	tx     atomic.Uint64  // datagrams handed to the socket
+	txSize atomic.Uint64  // bytes handed to the socket (churn byte axis)
+	born   time.Time
 
 	rxMark  uint64 // owned by the pool's health check (judgeSlow)
 	lowWins int
@@ -358,6 +359,7 @@ func (pc *poolConn) writeLoop() {
 				_, err := bw.Write(p)
 				putPkt(p) // bufio has copied it (or written it through)
 				pc.tx.Add(1)
+				pc.txSize.Add(uint64(len(p)))
 				if err != nil {
 					pc.fail()
 					return
@@ -678,12 +680,14 @@ func (c *TCPPoolClient) healthLoop() {
 		case <-c.done:
 			return
 		case now := <-t.C:
-			if rd := c.rotate.Load(); rd > 0 || c.rotBytes.Load() > 0 {
-				for i := range c.slots {
-					if pc := c.slots[i].Load(); pc != nil && pc.rotateDue(now) {
-						poolRotates.Add(1)
-						pc.fail() // the slot redials it; in-flight datagrams are resent like any death
-					}
+			// churn (2.8.0): recycle the connections that hit their budget. At most one per tick, oldest first,
+			// so a recycle never lands in the same tick as a slow-connection kill (two closures in one tick halve
+			// the judged traffic at once and read as one coordinated event) and the per-connection share the
+			// slow check judges against stays honest while a slot redials.
+			if rd := time.Duration(c.rotate.Load()); rd > 0 || c.rotBytes.Load() > 0 {
+				if pc := c.rotatePick(now); pc != nil {
+					poolRotates.Add(1)
+					pc.fail() // the slot redials it; in-flight datagrams are resent like any death
 				}
 			}
 			if c.keepSlow.Load() {
@@ -897,8 +901,9 @@ func jitter01() float64 {
 	return float64(binary.LittleEndian.Uint64(b[:])>>11) / (1 << 53)
 }
 
-// rotateDue reports whether the connection hit its churn budget (tx datagrams stand in for bytes: pool frames
-// are near-uniform in size, and tx is already lock-free).
+// rotateDue reports whether the connection hit its churn budget. bytes is a byte budget compared against the
+// bytes handed to the socket (2.8.1: it was datagram count, which at the default 4096-byte MTU ran the byte
+// axis ~256x late and under a larger -mtu far too early — the budget's unit is bytes and so is the counter's).
 func (pc *poolConn) rotateDue(now time.Time) bool {
 	b := pc.rot.Load()
 	if b == nil {
@@ -907,19 +912,46 @@ func (pc *poolConn) rotateDue(now time.Time) bool {
 	if !b.at.IsZero() && now.After(b.at) {
 		return true
 	}
-	return b.bytes > 0 && int64(pc.tx.Load()) >= b.bytes
+	return b.bytes > 0 && int64(pc.txSize.Load()) >= b.bytes
 }
 
 // SetKeepSlow turns off the slow-connection check for a direct path (see TCPPoolServer.SetKeepSlow).
 func (c *TCPPoolClient) SetKeepSlow(v bool) { c.keepSlow.Store(v) }
 
+// rotatePick returns the oldest live connection that is due for its churn recycle (nil when none is, or when the
+// recycle would strip the pool's last usable connection). At most one per health tick: a redial gap is invisible
+// to the session (it resends like any connection death) but two closures in one tick halve the pool at once, and
+// the slow check's per-connection share judgement reads better on a pool that loses one connection at a time.
+func (c *TCPPoolClient) rotatePick(now time.Time) *poolConn {
+	usable := 0
+	for i := range c.slots {
+		if pc := c.slots[i].Load(); pc != nil && len(pc.q) < poolBacklog && pc.stalledFor(now.UnixNano()) <= poolStall {
+			select {
+			case <-pc.done:
+			default:
+				usable++
+			}
+		}
+	}
+	if usable <= 1 {
+		return nil
+	}
+	var best *poolConn
+	for i := range c.slots {
+		if pc := c.slots[i].Load(); pc != nil && pc.rotateDue(now) && (best == nil || pc.born.Before(best.born)) {
+			best = pc
+		}
+	}
+	return best
+}
+
 // SetRotate turns on connection churn (2.8.0): a healthy pool connection is recycled after d, or after bytes
-// datagrams handed to its socket (whichever comes first), so no long-lived flow presents a months-stable
+// handed to its socket (whichever comes first), so no long-lived flow presents a months-stable
 // lifetime x volume profile to a behavioral classifier (RESEARCH-3 #649: lifetime is the strongest real-world
 // tell). Each connection's budget is jittered ±40 % in time and ±25 % in count and re-rolled on every recycle,
 // so the redials do not line up into a synchronized, fingerprintable period. Recycling closes one connection at
 // a moment the pool picks itself: the session treats it like any connection death (in-flight datagrams are
-// resent), and the slot redials immediately. d <= 0 disables. Client side only.
+// resent), and the slot redials immediately. d <= 0 and bytes <= 0 disable their axis. Client side only.
 func (c *TCPPoolClient) SetRotate(d time.Duration, bytes int64) {
 	c.rotate.Store(int64(d))
 	c.rotBytes.Store(bytes)
@@ -946,6 +978,7 @@ func (c *TCPPoolClient) Clone(slotOffset int) (*TCPPoolClient, error) {
 		return nil, err
 	}
 	n.ps, n.tlsFn = c.ps, c.tlsFn
+	n.hook.Store(c.hook.Load()) // the fake-SNI wrapper rides along, like every other dial-path setting
 	n.keepSlow.Store(c.keepSlow.Load())
 	n.maxBackoff.Store(c.maxBackoff.Load())
 	n.rotate.Store(c.rotate.Load())

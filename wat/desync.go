@@ -255,7 +255,6 @@ type desyncTracker struct {
 	conns     map[desyncKey]*desyncConn
 	wait      map[desyncKey]chan struct{} // closed by fire, waited on by Wrap
 	peerTTLv  uint8
-	sumSeq    uint32 // sum mode: seq of the outbound data segment being mirrored (0 = none yet)
 	firedN    int
 	miss      int
 	missNoted bool
@@ -267,6 +266,7 @@ type desyncConn struct {
 	isnKnown  bool   // early mode: the ISN is known before any data fires
 	synAckSeq uint32 // seq of the server's SYN-ACK
 	synAckAck uint32 // ack field of the server's SYN-ACK (== ISN+1)
+	sumSeq    uint32 // sum/seqsum: seq of the outbound data segment being mirrored (0 = none yet)
 	at        time.Time
 }
 
@@ -394,13 +394,14 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		// early: fire on the handshake's final ACK or the first data flight, whichever comes first.
 		// sum/seqsum modes stay for the first DATA segment: their fake is a valid-window duplicate of that
 		// segment, so it needs the segment's real seq/ack to be identical to the real flight (bare ACKs have
-		// nothing to mirror).
+		// nothing to mirror). The mirror base lives on the connection (2.8.1): it was tracker-global, so two
+		// pool connections opening at once cross-set it and the second fire mirrored the wrong segment.
 		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 {
 			if sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"; sumMode {
 				if payload == 0 {
 					return // wait for the data segment to mirror
 				}
-				t.sumSeq = seq
+				c.sumSeq = seq
 			}
 			t.fireLocked(out, c, c.synSeq+1, ackv)
 		}
@@ -408,7 +409,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		// late: the first outbound data segment is the anchor (its seq IS the stream start)
 		if payload > 0 && ackf && !syn {
 			if t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" {
-				t.sumSeq = seq
+				c.sumSeq = seq
 			}
 			t.fireLocked(out, c, seq, ackv)
 		}
@@ -443,7 +444,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 	// documented field observation).
 	sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"
 	if sumMode {
-		base = t.sumSeq
+		base = c.sumSeq
 	}
 	// seq = base - len(fake): the fake lands exactly below the stream start. The server holds snd_una at the
 	// stream start, so this is an old duplicate; a DPI without window checks reassembles it as the first flight.

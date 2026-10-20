@@ -91,8 +91,10 @@ func NewDesync(cfg DesyncConfig, peer string) (*Desync, error) {
 // A connection that is not a plain IPv4 TCP connection passes through unwrapped; a handshake the sniffer never
 // sees (offload paths) passes through after 2 s.
 func (d *Desync) Wrap(c net.Conn) (net.Conn, error) {
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
+	// the tls/wss/h2 carriers hand their hook an already-handshaked *tls.Conn (or a WS/HTTP framing wrapper);
+	// unwrap to the socket underneath, like newPoolConn does (rawTCP)
+	tc := rawTCP(c)
+	if tc == nil {
 		return c, nil
 	}
 	la, ok := tc.LocalAddr().(*net.TCPAddr)
