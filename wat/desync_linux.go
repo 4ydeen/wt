@@ -174,6 +174,11 @@ func (d *desyncInjector) loop() {
 // sendRaw writes one crafted IPv4 packet through a raw IP socket (IP_HDRINCL, the kernel fills the checksum).
 // One socket per fire: a fire happens once per pool connection, orders of magnitude too rare to matter.
 func (d *desyncInjector) sendRaw(pkt []byte) {
+	sendRawPacket(pkt)
+}
+
+// sendRawPacket is the raw injector every fire path shares (the tracker's send seam and the startup probe).
+func sendRawPacket(pkt []byte) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
 	if err != nil {
 		return

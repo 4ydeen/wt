@@ -16,6 +16,7 @@ behind the decisions lives in `RESEARCH.md`.
 | 2.8.0 | 2026-10-20 | `pool-rotate` churn; `fake-mode: seqsum`; checksum-damage fix | unchanged | no |
 | 2.8.1 | 2026-10-20 | `pool-rotate-bytes`; fake-SNI on `tls/wss/h2`; `Clone` keeps the dial hook; manager resilience block + profiles; unattended-flag fix | unchanged | no |
 | 2.8.2 (manager) | 2026-10-20 | resilience kit off the default wizard flow; type switches keep/strip it; profiles refuse off-Linux | unchanged | no |
+| 2.9.0 | 2026-10-20 | `fake-mode: auto` (startup filter probe), `-governor` (ICMP volume ceiling), `ech: ladder` (DoH through the tunnel's DNS relay); `wattun blackout` in the manager | unchanged | ladder relay wants 2.9.0 on Kharej (falls back cleanly on older) |
 
 Between the releases: a documentation restructure, a static release badge, the git-identity fix, a
 neutral-wording pass, and the consolidation of the work logs into the three files you are reading.
@@ -334,6 +335,55 @@ existing manager flows are unchanged.
 (60 iterations — the flake fix proven, not assumed). NOT hardware-tested: real marker transmission,
 real churn recycling, and the wizard's unattended path end to end (needs a live token).
 
+## 2.9.0 — filter probe + auto mode, ICMP governor, ECH ladder (`dev`/`blackout`, this round)
+
+**What shipped.** The three standing queue items from RESEARCH, in one round, plus the manager's `blackout`
+command:
+
+1. **`fake-mode: auto` (`wat/probe.go`)** — the user's biggest question was "which mode do I pick?". The client
+   answers it itself: before the first pool dial, one throwaway TCP connection to the peer carries a below-window
+   seq marker (through the normal sniffer/Wrap path) and then a bad-checksum in-window marker (crafted via
+   `fakePacket`+`damageChecksum` at the socket-probed SND.NXT). Verdict from which marker the flow survived:
+   survives both → `seq`; dies with the sum marker → `sum`; dies with the seq marker alone → `seqsum`; probe
+   socket dead at any step → `seq`. Costs ~3 s at startup, once; reported as `filter_profile` in `/stats`; any
+   failure degrades to `seq`. The RESEARCH gate is kept: marker IP-fragmentation stays out until this probe's
+   field data says the path drops fragments.
+2. **`-governor` (`wat/governor.go`, opt-in)** — learns an ICMP path's volume ceiling instead of the hardcoded
+   16 MB/s. Watches base RTT in 2 s windows; 3 stable windows arm it; a >25 % base-RTT jump (the field's 40→76 ms
+   reroute signature) sets a ceiling at 80 % of the highest rate of the 4 s before the jump, held 60 s; then
+   quiet windows creep it up 2 % each, released at 1.25× the trigger rate. Only ever caps the delay rule's
+   growth (one clamp in the non-reliable growth branch of `cc.tick`), never raises — the sim tests' pacer pins
+   hold untouched (target suite 40 clean iterations).
+3. **`ech: ladder` (`wat/ech.go` + `cmd/wattun/echladder.go`)** — when every direct DoH server fails, the ECH
+   config lookup goes through a second rung: a stream whose target header is 53 (the speed-test's reserved-port
+   pattern, never a local service) reaches a built-in server-side DNS relay — one raw DNS query in (≤512 B,
+   length-prefixed), one UDP exchange with a recursive resolver on the Kharej side, answer back, 6 s bounded.
+   Old server: port 53 is just a failed local dial → clean fallback to no ECH (pinned by a test). New server +
+   old client: unused. So a `wss`+ECH tunnel bootstraps on a DoH-hijacked route.
+4. **`wattun blackout NAME [SNI]`** (manager, this branch's namesake): one command turns the resilience kit on —
+   one ask (the allowlisted name), `fake-sni` + `fake-mode: seq` + auto-ttl written, restart, "watch `wattun test
+   NAME`". Diagnose points at it when a direct pool carrier's TCP port is reachable but the link is dead (the
+   SNI-allowlist tell), and `heal` logs the same hint after two failed restart cycles. `MGR_VERSION=2026102003`.
+
+**How the decisions were reached.** The probe reuses the existing sniffer + `Wrap` + `fakePacket` machinery — no
+new packet shapes. The governor reads only what `cc.sample` already sees (RTT samples + current rate), so the
+pacer's structure is untouched; it is opt-in like `-loss-ceiling` because a wrong ceiling is a throughput loss,
+not a correctness issue, and the field data is one path. The ECH relay is a reserved target port because that is
+the established in-band extension mechanism (target 0 = speedtest), needs no new frame type, and degrades to the
+old behaviour on old servers by construction.
+
+**Cost / risk.** No wire format change anywhere: the marker packets are the 2.6.0 shapes, the governor changes
+no peer-visible behaviour, and the DNS relay is a stream-to-port mapping that old peers never send. The relay
+adds one server-side code path (the only non-client-only change since 2.5.0) but does not require a server
+update — the ladder falls back cleanly. `filter_profile`'s verdict logic is unit-tested; the probe's live
+behaviour on a real filter is NOT (needs the Iran path — standing hardware caveat).
+
+**Verification (Windows box).** `go build ./...`, `GOOS=linux go build`, `go vet` clean. cmd suite 34/34 (was
+29; +5 relay/ladder). Target suite (governor/probe/ladder/desync/rotate) **40 consecutive iterations, 1400/1400
+pass**. One real bug found and fixed in the round: the relay guard test deadlocked (a Stream Read waits for the
+FIN, the truncated-query relay waited for the missing bytes — the test now closes its write side, as a real
+resetting client effectively does). Full `wat/` suite not run to completion on this box (standing load caveat).
+
 ## 2.8.2 — manager only: the resilience kit off the default flow (this round)
 
 **What shipped.** The blackout/whitelisting survival kit (fake-SNI 2.6.0–2.8.0, pool-rotate
@@ -361,6 +411,14 @@ prompt, and Auto mode's type switches never cleaned the keys up. Manager-only fi
   `is_pool` gate, which correctly excludes bonded carriers) is untouched; `profile
   save|list|show|del|apply` and the unattended flags keep their 2.8.1 behavior. No Go change, no
   config-format or wire change.
+- **`wattun blackout NAME [SNI]` (added this round, `MGR_VERSION=2026102003`)**: the blackout moment
+  is the wrong moment for five questions, so one command asks the only real decision — the
+  allowlisted name — and writes `fake-sni` + `fake-mode: seq` + auto ttl (pool-rotate stays off),
+  then restarts. Gates mirror the kit's own: Linux, direct Iran pool carrier, `bin_ver_ok 2.7.0`.
+  Diagnose points at it when a direct pool carrier's TCP port is reachable but the link stays dead
+  (the SNI-allowlist tell), and `heal` logs the same hint via `logger -t wattun-heal` after two
+  restart cycles fail on a plain non-reverse pool tunnel without fake-sni. Fine-tuning stays in
+  Advanced settings → resilience.
 
 **Why.** Owner direction: these transports exist strictly for blackout/whitelisting routes. A user
 on a normal route must not meet them in the default flow, and must find them in one obvious place

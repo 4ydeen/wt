@@ -6,6 +6,8 @@
 # Run it without arguments for the dashboard. Commands:
 #   wattun-manager [new [kharej|iran]|kharej|iran|status|list|monitor|ports NAME|test NAME|
 #                   speedtest NAME [MB]|logs NAME|token NAME|heal|update|rollback|help]
+#   Censor starts blocking the tunnel (whitelist regime): blackout NAME [SNI] turns the resilience kit
+#                   (fake-SNI desync + defaults) on with one command; profiles save/apply combinations.
 #   Auto carrier (one token, Iran tests every connection type): auto-test NAME | auto-ip NAME IP |
 #                   auto-watch NAME | auto-retest NAME   (the last two are run by systemd, not by hand)
 #   CDN carriers (ws, wss, h2, h2c, grpc via Cloudflare; wattun >= 2.2.0): cdn-tune NAME [full]
@@ -36,7 +38,7 @@ else
   MGR=/usr/local/bin/wattun-manager
 fi
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
-MGR_VERSION=2026102002   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
+MGR_VERSION=2026102003   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
 HEAL_UNIT=$WAT_PREFIX-heal
 MCONF=$CONF/.manager.conf
 self_cmd() { # the command to type to start this manager (user-facing hints)
@@ -2851,6 +2853,14 @@ test_tunnel() {
     if [ "$r" = Kharej ]; then err "No Iran server is connected yet"; else err "Tunnel link is DISCONNECTED"; fi
     say "  ${GRY}Common causes: different key on the two sides, different carrier/icmp-type, the other side not running,${RST}"
     say "  ${GRY}or the carrier is filtered on this route. Paste the Kharej token on Iran again to be sure.${RST}"
+    # the whitelist tell: TCP to the peer still connects but the tunnel stays dead — a filtering hop above
+    # TCP. Point at the one-command fix (no echo for reverse: Kharej dials in there, Iran can't fix it alone).
+    if [ "$r" = Iran ] && is_pool "$cr" && [ "$(is_reverse "$n")" != true ] && [ -n "$host" ] && [ -n "$port" ] \
+       && timeout 4 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+      echo
+      warn "The carrier's TCP port is reachable, but the tunnel still cannot connect: this looks like filtering ABOVE TCP (an SNI allowlist)."
+      hint "Turn on the resilience kit with one command:  $SELF blackout $n mci.ir   (replace mci.ir with an allowlisted name; fine-tuning: tunnel page -> o -> k)"
+    fi
   fi
   if [ "$r" = Iran ] && [ "$cr" = icmp ] && [ "$(jget "$s" alive)" != true ]; then
     if is_reverse "$n"; then
@@ -3366,6 +3376,32 @@ prof_only_tunnel() { # the single Iran pool tunnel, when there is exactly one
   return 0
 }
 
+blackout_cmd() { # name [sni] : one command to turn the resilience kit on when a censor starts blocking the tunnel.
+  # The blackout moment is the wrong moment for five questions: the only real decision is WHICH allowlisted
+  # name, so that is the one ask (or $2). Everything else gets known-safe defaults: fake-mode seq, fake-ttl
+  # auto (0, learned from the peer's SYN-ACKs), pool-rotate off. Fine-tuning stays in Advanced settings -> k.
+  local n=$1 sni=${2:-}
+  [ "$(uname -s)" = Linux ] || { err "The resilience kit is a Linux feature (fake-SNI needs CAP_NET_RAW, like the icmp carrier)."; return 1; }
+  [ "$(role "$n")" = Iran ] && is_pool "$(cfg "$n" carrier)" && [ "$(is_reverse "$n")" != true ] || {
+    err "'$n' is not a direct Iran tunnel on a pool carrier (tcp, tls, ws, wss, h2, h2c, grpc); the kit is client-only and only attaches there."; return 1; }
+  if [ -z "$sni" ] && [ "$NONINTERACTIVE" != 1 ]; then
+    echo
+    hint "Under an SNI allowlist (only a few sites pass), fake-SNI injects a fake ClientHello with an"
+    hint "allowlisted name (e.g. mci.ir) so the censor classifies the tunnel as TLS to that site."
+    ask "Fake SNI (allowlisted name)" ""; sni=$REPLY_V
+  fi
+  [ -n "$sni" ] || { err "An allowlisted name is required (blackout $n mci.ir)."; return 1; }
+  v_sni_name "$sni" || return 1
+  [ "$(bin_ver_ok 2.7.0)" = 1 ] || { err "fake-sni needs wattun 2.7.0 or newer on this server (run: $SELF update)."; return 1; }
+  set_value "$n" fake-sni "$sni"
+  set_value "$n" fake-mode seq
+  unset_value "$n" fake-ttl
+  ok "Resilience kit on: fake-sni $sni (seq mode, auto ttl). pool-rotate stays off; tune later: tunnel page -> o -> k."
+  if step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; then ok "Restart applied. Watch whether the link comes back: $SELF test $n"
+  else err "Restart failed: run  systemctl restart ${WAT_PREFIX}@$n"; return 1; fi
+  return 0
+}
+
 profile_cmd() { # profile save|list|show|del|apply NAME [tunnel]
   local sub name tun f names x tmp
   sub=${1:-}; name=${2:-}; tun=${3:-}
@@ -3565,6 +3601,11 @@ heal() { # restart Iran tunnels whose link is down 3 checks in a row
       logger -t wattun-heal "tunnel $n down for $cnt checks, restarting"
       systemctl restart "${WAT_PREFIX}@$n"; rm -f "$f"
       cyc=$(( $(cat "$RUN/$n.cycles" 2>/dev/null || echo 0) + 1 )); echo "$cyc" >"$RUN/$n.cycles"
+      # a direct Iran pool tunnel that restarts do not fix: tell the operator the kit exists (blackout Cmd)
+      if [ "$cyc" -ge 2 ] && [ "$(is_reverse "$n")" != true ] && is_pool "$(cfg "$n" carrier)" \
+         && [ "$(cfg "$n" fake-sni)" = '' ]; then
+        logger -t wattun-heal "tunnel $n: restarts do not fix it and its carrier port is plain TCP; if the route is being SNI-filtered, run: wattun blackout $n <allowlisted-name>"
+      fi
       # auto tunnel still down after two restart cycles (6 checks): test the other connection types in the background
       # (a plain CDN tunnel gets a fresh Cloudflare edge scan instead: dead edge IPs are replaced)
       if [ "$cyc" -ge 2 ] && { [ -f "$CONF/$n.auto" ] || { cdn_ok && cdn_tunnel_p "$n"; }; }; then heal_retest "$n"; fi
@@ -3824,6 +3865,9 @@ Usage: $SELF [command]
   token NAME            print the Kharej token again
   profile save|list|show|del|apply   resilience profiles: save one tunnel's fake-sni/pool-rotate combination
                         under a name and re-apply it later (profile save NAME [tunnel])
+  blackout NAME [SNI]   one command to turn the resilience kit on when a censor starts blocking the tunnel:
+                        asks for an allowlisted name (e.g. mci.ir), sets fake-sni + fake-mode seq + auto ttl,
+                        restarts. Fine-tuning (mode, ttl, pool-rotate): tunnel page -> o -> k. Linux only.
   auto-test NAME        test every connection type again for an auto Iran tunnel, offer to switch
   auto-ip NAME IP       auto Kharej tunnel: set Iran's IP by hand (creates NAME-r, the reverse side)
   cdn-tune NAME [full]  Iran CDN tunnel (ws/wss/h2/h2c/grpc): find the Cloudflare edges that serve the domain over ECH + TLS settings, apply (needs wattun 2.2.0)
@@ -3897,6 +3941,7 @@ main() {
     logs) need_tunnel "${2:?name}" && journalctl -u "${WAT_PREFIX}@$2" -f -o short-iso ;;
     token) need_tunnel "${2:?name}" && show_token "$2" ;;
     profile) shift; profile_cmd "$@" ;;
+    blackout) need_tunnel "${2:?name}" && ni_run blackout_cmd "$2" "${3:-}" ;;
     heal) heal ;;
     auto-test) need_tunnel "${NI_POS[0]:?name}" && ni_run auto_test_cmd "${NI_POS[0]}" ;;
     auto-ip) need_tunnel "${2:?name}" && auto_ip "$2" "${3:-}" ;;

@@ -59,6 +59,9 @@ type cc struct {
 	lossPct      float64 // last judged interval's loss, 0..1 (stats)
 	ceiling      float64 // bytes per second; 0 = none
 
+	// ICMP ceiling governor (2.9.0, -governor): learns the rate ceiling under the reroute signature
+	gov govState
+
 	// diagnostics (2.4.10, /stats "cc"): what held the sender back, per tick, and why the rate was cut
 	tokLim, cwndLim bool // set by build during the current tick
 	heldLim         bool // set by build: the carrier's send queues were full (Backlogger)
@@ -431,6 +434,7 @@ func (c *cc) sample(rtt time.Duration, now time.Time) {
 	if c.minRTT == 0 || rtt < c.minRTT || stale {
 		c.minRTT, c.minRTTAt = rtt, now
 	}
+	c.gov.govSample(rtt, c.rate, now) // the governor watches base-RTT jumps (2.9.0)
 	c.rttSum += rtt
 	if c.rttN == 0 || rtt < c.tickMin {
 		c.tickMin = rtt
@@ -504,6 +508,9 @@ func (c *cc) tick(now time.Time) {
 				c.rate *= 1.10
 				if c.ceiling > 0 && c.rate > c.ceiling {
 					c.rate = max(c.ceiling, c.rate/1.10) // never raise past the ceiling
+				}
+				if g := c.gov.ceiling; g > 0 && c.rate > g { // the reroute governor's learned ceiling (2.9.0)
+					c.rate = g
 				}
 				if c.rate > c.maxRate {
 					c.rate = c.maxRate

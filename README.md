@@ -6,7 +6,7 @@
 
 **Encrypted Iran â†” Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.8.1-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.9.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -27,6 +27,10 @@ fake-SNI desync (`fake-sni`) when the route permit-lists flows by their TLS name
 carriers too since 2.7.0, with automatic TTL calibration, NAT-sequence follow, a checksum mode for routes that
 validate sequence numbers (2.7.1), and both markers at once (`seqsum`, 2.8.0)), plus optional `pool-rotate` churn
 so no single connection shows a months-stable lifetime (2.8.0; optional byte budget `pool-rotate-bytes`, 2.8.1).
+The filter can be probed and the marker mode picked automatically (`fake-mode: auto`, 2.9.0); `wattun blackout
+NAME [SNI]` turns the kit on with one command when a censor starts blocking. `ech: ladder` (2.9.0) fetches the
+ECH config through the tunnel itself when every public DNS-over-HTTPS server is blocked, and `-governor` (2.9.0)
+learns an ICMP path's volume ceiling from its reroute signature.
 
 ## Speed
 

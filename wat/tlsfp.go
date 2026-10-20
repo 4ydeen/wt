@@ -158,6 +158,7 @@ func newTLSEngine(o TLSClientOptions, alpn string) (*tlsEngine, error) {
 	if e.ech, err = newECHState(o.ECH, o.ECHCache); err != nil {
 		return nil, err
 	}
+	e.ech.ladder = o.ECHLadder // -ech ladder's second rung (2.9.0); nil = behave as auto
 	return e, nil
 }
 

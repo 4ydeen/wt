@@ -371,7 +371,8 @@ A tunnel's page has:
 - change connection type (**m**)
 - restart and delete
 
-When a link is down, the doctor names the likely cause.
+When a link is down, the doctor names the likely cause — and when a direct pool carrier's TCP port is
+still reachable but the tunnel cannot connect (the SNI-allowlist tell), it points at `wattun blackout`.
 
 ```bash
 wattun                 # dashboard
@@ -385,6 +386,7 @@ wattun logs NAME       # follow the log
 wattun token NAME      # print the Kharej token
 wattun profile save NAME [tunnel]  # save a tunnel's fake-sni/pool-rotate combination under a name
 wattun profile apply NAME [tunnel] # put it back after a reinstall (also: list, show, del NAME)
+wattun blackout NAME [SNI]         # one command to turn the resilience kit on when a censor starts blocking
 wattun auto-test NAME  # re-run the Auto mode test
 wattun cdn-tune NAME   # re-tune a Cloudflare tunnel
 wattun auto-ip NAME IP # tell an auto tunnel Iran's IP (on Kharej)
@@ -494,6 +496,13 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
 
 - `fake-sni: mci.ir` on the client, `carrier: tls` (or `tcp`, `wss`, `h2`, `grpc` since 2.7.0). Linux +
   CAP_NET_RAW, like the icmp carrier.
+- `fake-mode: auto` (2.9.0): the client measures the filter once at startup and picks the mode itself. One
+  throwaway TCP connection to the peer carries two test markers — a below-window seq fake, then a bad-checksum
+  in-window fake — and the verdict comes from which marker the flow survived: flow survives both → `seq`;
+  dies with the sum marker in flight → `sum`; dies even with the seq marker alone → `seqsum`. The verdict is
+  logged once and reported as `filter_profile` in `/stats` (with `seq_ok`, `sum_ok`, `conn_alive`). Costs one
+  connection and ~3 s at startup, once; any failure degrades to `seq` without stopping the tunnel. Field
+  validation on a real filtering path is still outstanding — treat the verdict as a hint, check the log.
 - `fake-mode: seq` (default): the marker's sequence number is `ISN+1-len(marker)`, below the stream start. The
   server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI. A NAT
   that rewrites sequence numbers uniformly shifts the marker with it (2.7.0), so only non-uniform normalization
@@ -521,6 +530,11 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   skip), Advanced settings → resilience (`k`) on the tunnel page changes the values of an existing
   tunnel, and `wattun-manager profile save NAME` keeps a working combination for the next install.
   Auto mode never offers these keys, and its type switches keep or strip them per the chosen type.
+  When a censor starts blocking a working tunnel, `wattun blackout NAME [SNI]` turns the kit on with
+  one command: it asks for an allowlisted name (or takes it as the second argument), writes
+  `fake-sni` + `fake-mode: seq` + auto ttl, and restarts the tunnel — fine-tuning stays in Advanced
+  settings. Diagnose and the heal timer point at this command when a direct pool carrier's TCP port is
+  still reachable but the tunnel cannot connect (the SNI-allowlist tell).
 - Combine with the tls carrier's own camouflage: `sni` set to an allowlisted name and `fp: chrome` make the
   REAL ClientHello pass too, for filters that check both directions; `tls-frag` splits it past DPIs that only
   reassemble the first segment.
@@ -850,6 +864,22 @@ In Auto mode this is part of the CDN phase; the table labels look like `wss Â·
 happens before the dial. If DoH fails, the last good config is kept, and after a rejection the config is refreshed in
 the background.
 
+### ECH bootstrap ladder (2.9.0, `ech: ladder`)
+
+When EVERY direct DoH server is unreachable (a full DoH IP block, not just one), `ech: ladder` adds a second
+rung, modelled on the speed test's reserved target port: a stream whose 2-byte target header is 53 goes to the
+server's built-in DNS relay instead of a local service. The client writes one raw DNS query (length-prefixed),
+the relay forwards it as one UDP exchange to a recursive resolver on the Kharej side and writes the answer back.
+The ladder in full: direct DoH (the raced public servers) → the tunnel relay → no ECH, retry in 30 s. So a
+`wss`+ECH tunnel bootstraps on a route where only the tunnel itself passes and DNS is hijacked.
+
+- Both ends need 2.9.0. An old server treats target 53 as a local dial to `127.0.0.1:53`, which fails and
+  resets the stream; the ladder falls back to no ECH exactly as before — the tunnel still comes up.
+- The relay answers one query per stream, bounded at 512-byte queries and 6 s per exchange; a query is no more
+  sensitive than the tunnel's own handshake. Only the client's `ech: ladder` ever opens port 53; normal
+  forwarding is untouched.
+- `ech-cache` still applies: a config from before the DoH block is used at once while the ladder refreshes.
+
 **Field result (v2.2.0, real Iran server through Cloudflare).** Only ECH got through; every non-ECH variant failed.
 With ECH: `wss` 8.0 MB/s down and 7.5 MB/s up, `grpc` 6.7 MB/s down and 9.9 MB/s up.
 
@@ -971,7 +1001,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `plain` | false | both (dialer with `reverse`) | grpc without TLS. |
 | `header` | | client (server with `reverse`) | Extra request header `Name: value`. Repeatable. |
 | `fp` | `go` | client (server with `reverse`) | TLS ClientHello fingerprint (utls): `go`, `chrome`, `firefox`, `safari`, `edge` or `random`. Since 2.2.0. |
-| `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. Since 2.2.0. |
+| `ech` | `off` | client (server with `reverse`) | Encrypted Client Hello, hides the SNI: `off`, `auto`, `ladder` or a base64 ECHConfigList. `auto` fetches the domain's HTTPS DNS record over DoH, by IP (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9), and falls back to no ECH. `ladder` (2.9.0) adds the through-the-tunnel DNS relay as the second rung when every direct DoH server fails (both ends 2.9.0). Since 2.2.0. |
 | `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
 | `fake-sni` | empty (off) | client | Fake-SNI desync, tcp, tls, wss, h2 and grpc carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives it (wrong sequence number, a TTL that expires at the filtering hop, or a bad checksum), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
@@ -1103,6 +1133,7 @@ Every flag can also be a config key. Flags win over the file.
 | `-sessions N` | 1 | Client: N independent sessions, udp and the pool carriers only (2.3.0, server unchanged). |
 | `-icmp-type T` | `echo` | ICMP carrier: `echo`, `timestamp`, `info`, `mask` (both ends the same). |
 | `-loss-ceiling` | off | Pacer: also cut the rate when loss jumps far above its learned baseline (opt-in). |
+| `-governor` | off | Pacer, ICMP paths: learn the path's volume ceiling from the reroute signature (a sudden base-RTT jump after sustained bulk) and hold the rate under it (opt-in, 2.9.0; see ICMP path limits). |
 | `-slack-ms N` | 8 | Tolerated RTT growth. |
 | `-hedge` | off | Duplicate small young packets. |
 | `-fec auto` | off | Adaptive FEC, both ends (see FEC). |
@@ -1113,8 +1144,8 @@ Every flag can also be a config key. Flags win over the file.
 | `-sni`, `-tls-pin` | | Client: TLS name, certificate fingerprint. |
 | `-path`, `-host`, `-header`, `-plain` | `/wat` | HTTP carrier options. |
 | `-fp NAME` | `go` | Dialer: TLS fingerprint `go`, `chrome`, `firefox`, `safari`, `edge`, `random` (2.2.0). |
-| `-ech MODE` | `off` | Dialer: `off`, `auto` or a base64 ECHConfigList (2.2.0). |
-| `-ech-cache FILE` | empty | Dialer, with `-ech auto`: ECH config cache file (2.2.3). |
+| `-ech MODE` | `off` | Dialer: `off`, `auto`, `ladder` or a base64 ECHConfigList (2.2.0; `ladder` 2.9.0, see ECH bootstrap ladder). |
+| `-ech-cache FILE` | empty | Dialer, with `-ech auto`/`ladder`: ECH config cache file (2.2.3). |
 | `-tls-frag N` | 0 | Dialer: split the ClientHello into N-byte pieces (2.2.0). |
 | `-metrics ADDR` | off | Serve `/stats` and pprof. |
 | `-debug` | off | Log every stream. |
@@ -1638,6 +1669,14 @@ Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):
   it. Keep the total `max-mbps` of every ICMP tunnel on the path at about 30 or less, whatever the packet size.
 - `max-mbps` stays at 16 by default for `icmp` (and any bond that includes it). The ceiling that really binds is the path's packet rate, so values above
   roughly 30 only add queueing.
+- **Volume governor (2.9.0, opt-in `-governor`).** The hardcoded `max-mbps 16` above is the safe default for a
+  path that reroutes above ~30 MB/s total; the governor learns the real ceiling instead. It watches the base RTT
+  in 2 s windows (stable for 6 s = armed), and when the base jumps > 25 % (the field's 40 → 76 ms reroute
+  signature) it sets a ceiling at 80 % of the highest rate of the 4 s before the jump and holds it for 60 s. After
+  the hold, quiet windows creep the ceiling up 2 % each (released at 1.25× the rate that triggered it), so a path
+  that got faster is followed. It never raises the rate, only caps the delay rule's growth — the sim tests' pacer
+  pins are untouched. Watch `srtt_ms` and `min_rtt_ms` in `/stats`: a governor path shows the jump, then a rate
+  that stops climbing before the next jump.
 - **Loss-aware ceiling (1.8.0, opt-in).** Off by default: the pacer is delay-based and loss alone is not congestion.
   With `loss-ceiling: true` (`-loss-ceiling`) it also compares, every 50 ms, the interval's loss with a learned
   baseline (slow average of quiet intervals, at least 0.5 %). If loss is above `max(3 %, 4 x baseline)` the rate is
@@ -1732,6 +1771,34 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.9.0: filter probe + auto fake-mode, ICMP volume governor, ECH bootstrap ladder.** Client-side probe and
+  pacer logic, one small server-side addition (the DNS relay below). No wire format change: old peers interop
+  in both directions.
+  (1) **`fake-mode: auto`** — the client measures the filter once at startup with two throwaway markers on one
+  throwaway connection and picks `seq`/`sum`/`seqsum` from which marker the flow survived; verdict in the log
+  and as `filter_profile` in `/stats`. Failure degrades to `seq`. Not yet field-validated: treat the verdict
+  as a hint.
+  (2) **`-governor` (opt-in)** — learns an ICMP path's volume ceiling from the reroute signature (base-RTT jump
+  after sustained bulk, the field's 40 → 76 ms) instead of the hardcoded 16 MB/s default: ceiling = 80 % of the
+  pre-jump rate, 60 s hold, 2 % per quiet window creep, released at 1.25× the trigger. Never raises the rate;
+  the sim tests' pacer pins are untouched.
+  (3) **`ech: ladder`** — when every direct DoH server is unreachable, the ECH config lookup goes through a
+  built-in server-side DNS relay (stream target port 53, the speed-test pattern): raw DNS query in, one UDP
+  exchange with a recursive resolver on the Kharej side, answer back. Old server: port 53 is just a failed
+  local dial, the ladder falls back to no ECH. Both ends need 2.9.0 for the relay rung.
+  Also in 2.9.0 (manager, from `main` without a tag): the `wattun blackout NAME [SNI]` one-command enable and
+  the Diagnose/heal pointers to it (see the 2.8.2 entry).
+  - [fake-mode auto](#fake-sni-desync-whitelisting-survival) · [governor](#icmp-path-limits-and-pacing) ·
+    [ECH ladder](#ech-bootstrap-ladder-290-ech-ladder).
+- **2.8.2: manager — `wattun blackout`, kit stays off the default flow.** Manager only (`MGR_VERSION`
+  2026102002/2003), no client or wire change. (1) New command `wattun blackout NAME [SNI]`: the
+  blackout moment is the wrong moment for five questions, so it asks one thing — the allowlisted name
+  — and writes `fake-sni` + `fake-mode: seq` + auto ttl (pool-rotate stays off; tune later in Advanced
+  settings). (2) Diagnose points at it when a direct pool carrier's TCP port is reachable but the
+  tunnel cannot connect (the SNI-allowlist tell), and the heal timer logs the hint after restarts do
+  not fix the tunnel. (3) The resilience block stays off the plain wizard flow (one explicit question,
+  Enter = skip); unattended flags and profiles prefill it as before.
+  - [Fake-SNI desync](#fake-sni-desync-whitelisting-survival) · [manager commands](#managing-tunnels).
 - **2.8.1: byte-axis churn, fake-SNI on TLS carriers, manager resilience profiles.** Client-side only, server
   unchanged, no wire format changed. (1) New `pool-rotate-bytes`: recycle each healthy pool connection after this
   many bytes handed to its socket, alone or on top of `pool-rotate`; the byte budget is jittered like the time

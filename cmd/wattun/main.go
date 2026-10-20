@@ -66,6 +66,7 @@ func main() {
 	fecMode := flag.String("fec", "off", "off|auto: adaptive XOR parity after bursts of small packets (cuts tail latency on lossy links; both ends need 1.7.0 and -fec auto)")
 	hedge := flag.Bool("hedge", false, "send small young packets twice (extra packets, helps lossy tails)")
 	lossCeil := flag.Bool("loss-ceiling", false, "pacer: also cut the rate when loss jumps far above its learned baseline (opt-in; default: delay only)")
+	governor := flag.Bool("governor", false, "pacer, ICMP paths: learn the path's volume ceiling from the reroute signature (a sudden base-RTT jump after sustained bulk) and hold the rate under it (opt-in; replaces hand-tuned max-mbps on routes where ICMP above ~30 MB/s total triggers a reroute inside Iran; 2.9.0)")
 	icmpType := flag.String("icmp-type", "echo", "icmp carrier: echo|timestamp|info|mask - the ICMP request type the client sends (the server answers with the matching reply: 8/0, 13/14, 15/16, 17/18); both ends must use the same")
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
@@ -81,11 +82,11 @@ func main() {
 	mtu := flag.Int("mtu", 0, "datagram size cap incl. header/tag, 256-1400 (tcp|tls|ws|wss|h2|h2c|grpc: up to 16384) (0 = the carrier default: 640 icmp, 1400 udp, 4096 tcp-based)")
 	path := flag.String("path", "/wat", "client/server, ws|wss|h2|h2c|grpc carrier: URL path (grpc: service name, requests go to <path>/Tun)")
 	tlsFP := flag.String("fp", "go", "client (also a -reverse server), tls|wss|h2|grpc carriers: TLS ClientHello fingerprint go|chrome|firefox|safari|edge|random; go is the standard library's (client only, 2.2.0; server unchanged)")
-	echMode := flag.String("ech", "off", "client, tls|wss|h2|grpc carriers: Encrypted Client Hello: off|auto|<base64 ECHConfigList>; auto reads the HTTPS DNS record of the SNI/host name over DNS-over-HTTPS (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9 raced in parallel; the last good config is kept if they all fail) (client only, 2.2.0; server unchanged)")
+	echMode := flag.String("ech", "off", "client, tls|wss|h2|grpc carriers: Encrypted Client Hello: off|auto|ladder|<base64 ECHConfigList>; auto reads the HTTPS DNS record of the SNI/host name over DNS-over-HTTPS (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9 raced in parallel; the last good config is kept if they all fail); ladder = auto plus a second rung for hijacked networks (2.9.0): when every direct DoH server fails, the query goes through the tunnel's built-in DNS relay (server target port 53, the speed-test pattern), so a wss+ECH tunnel bootstraps on an ICMP-only route; both ends need 2.9.0 (old server: the relay port is just a failed local dial, the ladder falls back to no ECH)")
 	echCache := flag.String("ech-cache", "", "client, with -ech auto: file keeping the last good ECH config across restarts, used at once on start while DoH refreshes in the background (2.2.3; empty = off)")
 	tlsFrag := flag.Int("tls-frag", 0, "client, tls|wss|h2|grpc carriers: split the TLS ClientHello into N-byte TCP segments, 0 = off (client only, 2.2.0; server unchanged)")
 	fakeSNI := flag.String("fake-sni", "", "client, tcp|tls|wss|h2|grpc carriers: track every outgoing TCP handshake on the wire and inject a fake TLS ClientHello carrying this allowlisted SNI right after it, so the DPI classifies the flow as TLS to an allowed site; the server never sees the fake (raw socket, Linux, like the ICMP carrier; client only, 2.6.0; server unchanged)")
-	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl N or 0 = calibrate it from the server's replies); sum = valid window, bad TCP checksum, the server's kernel drops the fake (fails behind NATs that validate checksums); seqsum = both markers per connection, ~1 ms apart (experimental, 2.8.0)")
+	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl N or 0 = calibrate it from the server's replies); sum = valid window, bad TCP checksum, the server's kernel drops the fake (fails behind NATs that validate checksums); seqsum = both markers per connection, ~1 ms apart (experimental, 2.8.0); auto = run a one-time startup probe (2.9.0): two throwaway markers next to a throwaway connection tell which marker class the filter tolerates, and the mode is picked from that (logs the verdict; also in /stats as filter_profile)")
 	fakeTTL := flag.Int("fake-ttl", 0, "client, with -fake-sni -fake-mode ttl: hop count of the fake packet, 1 more than the distance to the censor's DPI box, 1 less than the distance to the server; 0 = calibrate from the server's replies (unused by the seq, sum and seqsum modes)")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
@@ -137,6 +138,7 @@ func main() {
 		wat.PoolTCPCC = ""
 	}
 	wat.SetLossCeiling(*lossCeil)
+	wat.SetGovernor(*governor)
 	if _, _, ok := wat.ICMPTypes(*icmpType); !ok {
 		log.Fatalf("-icmp-type must be echo, timestamp, info or mask, got %q", *icmpType)
 	}
@@ -191,6 +193,10 @@ func main() {
 			*maxMB = 16
 		}
 	}
+	// -ech ladder (2.9.0): the DoH-through-the-tunnel hook needs the sessions, which are built after the
+	// pools; the hook reads through a pointer that newTunnel sets (a nil/nil'd tunnel errors per query).
+	var tunRef *tunnel
+	ladderHook := func(query []byte) ([]byte, error) { return dialDNSRelay(tunRef, query) }
 	if _, err := wat.NormFingerprint(*tlsFP); err != nil {
 		log.Fatal(err)
 	}
@@ -215,7 +221,11 @@ func main() {
 		if *fakeSNI == "" {
 			return nil
 		}
-		d, err := wat.NewDesync(wat.DesyncConfig{SNI: *fakeSNI, Mode: *fakeMode, TTL: *fakeTTL}, peer)
+		mode := *fakeMode
+		if mode == "auto" { // 2.9.0: measure the filter once at startup, pick the mode from the verdict
+			mode = wat.ProbeFakeMode(wat.DesyncConfig{SNI: *fakeSNI, TTL: *fakeTTL}, peer, log.Printf)
+		}
+		d, err := wat.NewDesync(wat.DesyncConfig{SNI: *fakeSNI, Mode: mode, TTL: *fakeTTL}, peer)
 		if err != nil {
 			return err
 		}
@@ -292,7 +302,8 @@ func main() {
 					}
 				}
 				pc, err = wat.NewTLSPoolClient(peer, *conns, wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin,
-					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf})
+					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf,
+					ECHLadder: ladderHook})
 				if err == nil {
 					err = attachFakeSNI(pc, peer)
 				}
@@ -317,6 +328,7 @@ func main() {
 				co.TLS.ServerName = *sni
 				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				co.TLS.ECHCache = *echCache
+				co.TLS.ECHLadder = ladderHook
 				if *tlsPin != "" {
 					if co.TLS.PinSHA256, err = hex.DecodeString(strings.ReplaceAll(*tlsPin, ":", "")); err != nil || len(co.TLS.PinSHA256) != 32 {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
@@ -433,6 +445,7 @@ func main() {
 			list = append(list, s)
 		}
 		tun = newTunnel(list)
+		tunRef = tun // -ech ladder's DoH hook (2.9.0)
 	}
 	stats := func() wat.Stats {
 		if srv != nil {
@@ -521,6 +534,7 @@ func main() {
 					"dgram_sent": st.DgramSent, "dgram_recv": st.DgramRecv, "dgram_dropped_queue": st.DgramDropQueue,
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_fragmented": st.DgramFragmented, "dgram_reassembled": st.DgramReassembled, "dgram_flows": udpFlowsActive.Load(),
 					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(), "pool_conn_deaths": wat.PoolConnDeaths(), "pool_drops": wat.PoolDrops(), "tcp_cc": wat.PoolTCPCCInUse(), "pool_conns": wat.PoolConnStats(),
+					"filter_profile": wat.FilterProfileNow(), // fake-mode auto's startup verdict (2.9.0)
 				}
 				out["cc"] = map[string]any{ // pacer diagnostics (2.4.10): what held the sender back, and why it slowed
 					"ticks": st.CC.Ticks, "tok_limited": st.CC.TokLimited, "cwnd_limited": st.CC.CwndLimited,
@@ -863,6 +877,10 @@ func serve(sess *wat.Session, lo, hi int, al *allow) {
 			port := int(binary.BigEndian.Uint16(hdr[:]))
 			if port == speedTestPort { // built-in speed test, never a local service
 				serveSpeedTest(st)
+				return
+			}
+			if port == dnsRelayPort { // built-in DNS relay for -ech ladder (2.9.0), never a local service
+				serveDNSRelay(st)
 				return
 			}
 			if !al.ok(port, lo, hi) {

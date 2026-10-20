@@ -22,3 +22,7 @@ type Desync struct{}
 // Wrap exists so callers compile; NewDesync never returns a usable Desync off Linux.
 func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { return c, nil }
 func (d *Desync) Close() error                      { return nil }
+
+// Stubs for probe.go (never reached off Linux: ProbeFakeMode bails at NewDesync) so the package compiles.
+func sendRawPacket(pkt []byte)                     {}
+func tcpStreamBase(tc *net.TCPConn) (uint32, bool) { return 0, false }

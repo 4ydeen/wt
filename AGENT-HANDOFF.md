@@ -861,8 +861,52 @@ commit map at the end of `CHANGES-SINCE-2.5.0.md`).
 - No Go changes this round: build, vet and tests unaffected.
 - Hardware verification of the kit itself: still outstanding (unchanged from 2.8.1).
 
+## Addendum (same round, later): `wattun blackout NAME [SNI]`
+
+Owner asked for a one-command path for the blackout moment (five questions under pressure was the
+wrong UX). Manager-only, `MGR_VERSION=2026102003`:
+
+- `blackout_cmd` (before `profile_cmd`): gates — Linux, direct (non-reverse) Iran pool carrier,
+  `bin_ver_ok 2.7.0` — then asks the allowlisted name (or takes it as `$2`, which makes it
+  scriptable) and writes `fake-sni` + `fake-mode: seq` + no `fake-ttl` (auto), leaving
+  `pool-rotate` untouched. Restarts via the same `step`/`systemctl` pattern as `prof_apply`.
+  Wired as `main`'s `blackout` case with `need_tunnel`; works unattended because the SNI argument
+  replaces the ask.
+- Signal: `test_tunnel` (Diagnose) prints the whitelist tell — carrier TCP reachable but link dead,
+  Iran + pool + non-reverse only — pointing at `wattun blackout $n mci.ir`; `heal` logs the same
+  hint via `logger -t wattun-heal` at cycle ≥ 2 for plain non-reverse pool tunnels without fake-sni.
+- Docs: TECHNICAL.md manager block + resilience bullet + Managing-tunnels line + a 2.8.2 release
+  entry; `usage()` and the header comment. `test-manager.sh`: 3 new checks (writes seq default,
+  leaves fake-ttl unset, rejects a bad name) — 28 ok, exit 0.
+
 ---
 
+
+# WatTunnel 2.9.0 — probe, governor, ECH ladder (branch `dev`, to be renamed `blackout`)
+
+Round summary for the next agent; full detail in `CHANGES-SINCE-2.5.0.md` § 2.9.0.
+
+- **`fake-mode: auto`** (`wat/probe.go`, new; wiring in `cmd/wattun/main.go` `attachFakeSNI`): startup filter
+  probe on one throwaway connection — seq marker through the normal `Wrap` path, sum marker via `fakePacket` +
+  `damageChecksum` at `tcpStreamBase`'s SND.NXT — verdict `seq|sum|seqsum` from which marker the flow survived,
+  reported as `wat.FilterProfileNow()` → `/stats` `filter_profile`. Non-Linux degrades at `NewDesync` (stubs in
+  `desync_other.go`). Tests: `TestFilterProfileDefaults`, `TestProbeVerdictTable`.
+- **`-governor`** (`wat/governor.go`, new; hook in `cc.sample`/`cc.tick` growth branch): base-RTT-window
+  signature detection → ceiling 80 % of pre-jump max rate, 60 s hold, 2 %/quiet-window creep, release at 1.25×
+  trigger. Opt-in via `wat.SetGovernor`. Tests: `TestGovernorLearnsCeiling`, `TestGovernorOffByDefault`.
+- **`ech: ladder`** (`wat/ech.go` mode + `ECHLadder` hook on `TLSClientOptions`; `cmd/wattun/echladder.go`):
+  reserved server target port 53 = built-in DNS relay (≤512 B query, one UDP exchange, 6 s, no allowlist
+  check — built-in like target 0). `echState.ladderThrough` runs the second rung; old servers reset the stream
+  → clean no-ECH fallback. Both `serve()` sites unchanged except one new `port == dnsRelayPort` branch.
+  Tests: 4 in `wat/echladder_test.go`, 2 in `cmd/wattun/echladder_test.go`.
+- **`wattun blackout NAME [SNI]`** (manager, `blackout_cmd` before `profile_cmd`): see the 2.8.2 addendum.
+- `wat/version.go` 2.9.0; README badges + intros (both languages) synced; TECHNICAL.md flag rows, feature
+  sections (fake-mode auto, Volume governor, ECH bootstrap ladder) and the 2.9.0 release entry written.
+- Verified: builds (host+linux) + vet clean; cmd 34/34; target suite 40 iterations 1400/1400. NOT
+  hardware-validated: probe verdicts on a real filter, governor on the real reroute, ladder through a real
+  DoH block — all need the Iran path. Flagged in docs.
+
+---
 
 # WatTunnel `dev` branch — next agent brief (2.8.0 → next)
 

@@ -62,5 +62,16 @@ expect_fail profile_cmd save win t1
 chk "off-Linux save wrote nothing" "$([ -e "$WAT_CONF/profiles/win.env" ] && echo y || echo n)" "n"
 uname() { echo Linux; }
 
+# blackout_cmd: one command, defaults for everything but the name. Needs systemd restart + version
+# gates, so stub them; NONINTERACTIVE via NI_YES is not used here — pass the SNI as $2.
+printf 'mode: client\ncarrier: tcp\npeer: example.com:443\n' >"$WAT_CONF/t2.yml"
+bin_ver_ok() { [ "$1" = 2.7.0 ] || { echo "FAIL bin_ver_ok got '$1'"; fail=1; }; echo 1; }
+WAT_PREFIX=wattest blackout_cmd t2 mci.ir
+chk "blackout wrote fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t2.yml")" "fake-sni: mci.ir"
+chk "blackout default mode seq" "$(grep '^fake-mode:' "$WAT_CONF/t2.yml")" "fake-mode: seq"
+chk "blackout leaves fake-ttl unset" "$(grep -c '^fake-ttl:' "$WAT_CONF/t2.yml")" "0"
+expect_fail blackout_cmd t2 'bad name!'
+rm -f "$WAT_CONF/t2.yml"
+
 [ "$fail" = 0 ] && echo "ALL OK" || echo "FAILURES: $fail"
 exit "$fail"

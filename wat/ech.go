@@ -43,8 +43,12 @@ type echEntry struct {
 
 // echState caches the ECHConfigList per name.
 type echState struct {
-	mode   string // "off", "auto" or "static"
+	mode   string // "off", "auto", "ladder" or "static"
 	static []byte
+
+	// ladder (2.9.0): when the direct DoH servers all fail, the query goes through this hook instead
+	// (cmd/wattun wires it to the tunnel's built-in DNS relay, server target port 53). nil = behave as auto.
+	ladder func(query []byte) ([]byte, error)
 
 	mu       sync.Mutex
 	m        map[string]*echEntry
@@ -55,13 +59,15 @@ type echState struct {
 	cacheWarned bool
 }
 
-// ParseECHFlag validates a -ech value: off, auto or a base64 ECHConfigList.
+// ParseECHFlag validates a -ech value: off, auto, ladder or a base64 ECHConfigList.
 func ParseECHFlag(s string) (mode string, list []byte, err error) {
 	switch s = strings.TrimSpace(s); s {
 	case "", "off":
 		return "off", nil, nil
 	case "auto":
 		return "auto", nil, nil
+	case "ladder":
+		return "ladder", nil, nil
 	}
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
 		if b, e := enc.DecodeString(s); e == nil {
@@ -97,6 +103,8 @@ func (s *echState) get(ctx context.Context, name string, e *tlsEngine) []byte {
 			return en.list
 		}
 		return s.static
+	case "ladder":
+		return s.getLadder(ctx, name, e)
 	}
 	if name == "" {
 		e.note("ech-noname", "ech auto: needs a name to look up (set -sni or -host); connecting without ECH")
@@ -121,12 +129,45 @@ func (s *echState) get(ctx context.Context, name string, e *tlsEngine) []byte {
 	return s.m[name].list
 }
 
+// getLadder is auto plus the second rung: when the direct DoH lookup fails (all servers unreachable), the
+// query goes through the tunnel's DNS relay. A name with no ech parameter still ends the ladder (definitive).
+func (s *echState) getLadder(ctx context.Context, name string, e *tlsEngine) []byte {
+	if name == "" {
+		e.note("ech-noname", "ech ladder: needs a name to look up (set -sni or -host); connecting without ECH")
+		return nil
+	}
+	s.mu.Lock()
+	s.loadCacheLocked(e)
+	en := s.m[name]
+	if en != nil && time.Now().Before(en.next) {
+		defer s.mu.Unlock()
+		return en.list
+	}
+	if en != nil && en.list != nil {
+		list := en.list
+		s.mu.Unlock()
+		s.refreshAsync(name, e)
+		return list
+	}
+	defer s.mu.Unlock()
+	s.lookupLocked(name, e)
+	return s.m[name].list
+}
+
 // lookupLocked fetches name's config (s.mu held). The lookup does not use the dial's context, so a slow DoH cannot eat
 // the dial's budget. A failed lookup never drops a config we already have (stale-while-error).
 func (s *echState) lookupLocked(name string, e *tlsEngine) {
 	fctx, cancel := context.WithTimeout(context.Background(), dohTimeout+time.Second)
 	defer cancel()
 	list, err := FetchECHConfigList(fctx, name)
+	if err != nil && !errors.Is(err, errNoECH) && s.mode == "ladder" && s.ladder != nil {
+		if l2, err2 := s.ladderThrough(name); err2 == nil {
+			list, err = l2, nil
+			e.note("ech-ladder:"+name, "ech ladder: direct DoH failed (%v); fetched the config through the tunnel relay", err)
+		} else {
+			e.note("ech-ladder:"+name, "ech ladder: direct DoH failed and the relay could not answer (%v)", err2)
+		}
+	}
 	old := s.m[name]
 	switch {
 	case err == nil:
@@ -150,8 +191,21 @@ func (s *echState) lookupLocked(name string, e *tlsEngine) {
 	}
 }
 
-func (s *echState) refreshAsync(name string, e *tlsEngine) {
-	s.mu.Lock()
+// ladderThrough runs one DoH query through the fallback hook (2.9.0): build the HTTPS-record query, get the
+// answer from the hook, parse the ech SvcParam out of it.
+func (s *echState) ladderThrough(name string) ([]byte, error) {
+	q, err := buildDNSQuery(name, dnsTypeHTTPS)
+	if err != nil {
+		return nil, err
+	}
+	ans, err := s.ladder(q)
+	if err != nil {
+		return nil, err
+	}
+	return parseHTTPSECH(ans, q)
+}
+
+func (s *echState) refreshAsync(name string, e *tlsEngine) {	s.mu.Lock()
 	if s.inflight[name] {
 		s.mu.Unlock()
 		return
