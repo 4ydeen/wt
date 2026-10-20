@@ -26,11 +26,12 @@ import (
 
 // HTTPClientOptions configures the ws/h2/grpc client carriers.
 type HTTPClientOptions struct {
-	Path    string            // request path (grpc: the service name, the request goes to <Path>/Tun)
-	Host    string            // Host header / :authority (default: the peer address)
-	Headers map[string]string // extra request headers
-	Secure  bool              // TLS (wss, h2, grpc over TLS); false = ws, h2c
-	TLS     TLSClientOptions
+	Path     string                          // request path (grpc: the service name, the request goes to <Path>/Tun)
+	Host     string                          // Host header / :authority (default: the peer address)
+	Headers  map[string]string               // extra request headers
+	Secure   bool                            // TLS (wss, h2, grpc over TLS); false = ws, h2c
+	DialHook func(net.Conn) (net.Conn, error) // dial hook on raw TCP socket before TLS/framing (fake-SNI)
+	TLS      TLSClientOptions
 }
 
 // HTTPServerOptions configures the ws/h2/grpc server carriers.
@@ -61,6 +62,9 @@ func (o HTTPClientOptions) host(peer string) string {
 // engine is the TLS client for this carrier: SNI from -sni, else the Host name, ALPN fixed per carrier.
 func (o HTTPClientOptions) engine(alpn string) (*tlsEngine, error) {
 	t := o.TLS
+	if t.DialHook == nil && o.DialHook != nil {
+		t.DialHook = o.DialHook
+	}
 	if t.ServerName == "" && o.Host != "" {
 		t.ServerName, _, _ = strings.Cut(o.Host, ":")
 	}
@@ -93,6 +97,9 @@ func NewWSPoolClient(peer string, conns int, o HTTPClientOptions) (*TCPPoolClien
 			c, err = eng.dial(ctx, addr)
 		} else {
 			c, err = d.DialContext(ctx, "tcp", addr)
+			if err == nil && o.DialHook != nil {
+				c, err = o.DialHook(c)
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -348,8 +355,18 @@ func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPo
 			var protos http.Protocols
 			protos.SetHTTP2(o.Secure)
 			protos.SetUnencryptedHTTP2(!o.Secure)
+			dialer := &net.Dialer{Timeout: 5 * time.Second}
 			tr := &http.Transport{Protocols: &protos, DisableKeepAlives: true, ForceAttemptHTTP2: true,
-				DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
+				DialContext: func(ctx context.Context, netw, a string) (net.Conn, error) {
+					c, err := dialer.DialContext(ctx, netw, a)
+					if err != nil {
+						return nil, err
+					}
+					if o.DialHook != nil {
+						return o.DialHook(c)
+					}
+					return c, nil
+				}}
 			if eng != nil {
 				tr.DialTLSContext = func(ctx context.Context, _, a string) (net.Conn, error) { return eng.dial(ctx, a) }
 			}

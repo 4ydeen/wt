@@ -67,6 +67,7 @@ func main() {
 	hedge := flag.Bool("hedge", false, "send small young packets twice (extra packets, helps lossy tails)")
 	lossCeil := flag.Bool("loss-ceiling", false, "pacer: also cut the rate when loss jumps far above its learned baseline (opt-in; default: delay only)")
 	governor := flag.Bool("governor", false, "pacer, ICMP paths: learn the path's volume ceiling from the reroute signature (a sudden base-RTT jump after sustained bulk) and hold the rate under it (opt-in; replaces hand-tuned max-mbps on routes where ICMP above ~30 MB/s total triggers a reroute inside Iran; 2.9.0)")
+	dnsUpstream := flag.String("dns-relay-upstream", "8.8.8.8:53", "Kharej recursive resolver used by the internal DNS relay (port 53, -ech ladder); empty = 8.8.8.8:53")
 	icmpType := flag.String("icmp-type", "echo", "icmp carrier: echo|timestamp|info|mask - the ICMP request type the client sends (the server answers with the matching reply: 8/0, 13/14, 15/16, 17/18); both ends must use the same")
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
@@ -139,6 +140,13 @@ func main() {
 	}
 	wat.SetLossCeiling(*lossCeil)
 	wat.SetGovernor(*governor)
+	if *dnsUpstream != "" {
+		u := *dnsUpstream
+		if !strings.Contains(u, ":") {
+			u += ":53"
+		}
+		dnsRelayUpstream = u
+	}
 	if _, _, ok := wat.ICMPTypes(*icmpType); !ok {
 		log.Fatalf("-icmp-type must be echo, timestamp, info or mask, got %q", *icmpType)
 	}
@@ -195,8 +203,8 @@ func main() {
 	}
 	// -ech ladder (2.9.0): the DoH-through-the-tunnel hook needs the sessions, which are built after the
 	// pools; the hook reads through a pointer that newTunnel sets (a nil/nil'd tunnel errors per query).
-	var tunRef *tunnel
-	ladderHook := func(query []byte) ([]byte, error) { return dialDNSRelay(tunRef, query) }
+	var tunRef atomic.Pointer[tunnel]
+	ladderHook := func(query []byte) ([]byte, error) { return dialDNSRelay(tunRef.Load(), query) }
 	if _, err := wat.NormFingerprint(*tlsFP); err != nil {
 		log.Fatal(err)
 	}
@@ -214,12 +222,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("-pool-rotate-bytes must be a byte count (500MB, 4G) or 0, got %q", *poolRotateBytes)
 	}
-	// attachFakeSNI wires the -fake-sni desync layer into a pool client's dial path (tcp, tls and the TLS-based
-	// HTTP carriers, client only). No-op without -fake-sni; a fatal error when the layer cannot start (no raw
-	// socket, bad mode). The sniffer lives for the process, like the ICMP carrier's raw socket.
-	attachFakeSNI := func(pc *wat.TCPPoolClient, peer string) error {
+	// getDesync returns or lazily creates the fake-SNI layer for a peer.
+	var desyncMu sync.Mutex
+	desyncByPeer := map[string]*wat.Desync{}
+	getDesync := func(peer string) (*wat.Desync, error) {
 		if *fakeSNI == "" {
-			return nil
+			return nil, nil
+		}
+		desyncMu.Lock()
+		defer desyncMu.Unlock()
+		if d := desyncByPeer[peer]; d != nil {
+			return d, nil
 		}
 		mode := *fakeMode
 		if mode == "auto" { // 2.9.0: measure the filter once at startup, pick the mode from the verdict
@@ -227,6 +240,17 @@ func main() {
 		}
 		d, err := wat.NewDesync(wat.DesyncConfig{SNI: *fakeSNI, Mode: mode, TTL: *fakeTTL}, peer)
 		if err != nil {
+			return nil, err
+		}
+		desyncByPeer[peer] = d
+		return d, nil
+	}
+	// attachFakeSNI wires the -fake-sni desync layer into a pool client's dial path (tcp, tls and the TLS-based
+	// HTTP carriers, client only). No-op without -fake-sni; a fatal error when the layer cannot start (no raw
+	// socket, bad mode). The sniffer lives for the process, like the ICMP carrier's raw socket.
+	attachFakeSNI := func(pc *wat.TCPPoolClient, peer string) error {
+		d, err := getDesync(peer)
+		if err != nil || d == nil {
 			return err
 		}
 		pc.SetDialHook(func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error) {
@@ -301,11 +325,19 @@ func main() {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
 					}
 				}
-				pc, err = wat.NewTLSPoolClient(peer, *conns, wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin,
+				d, derr := getDesync(peer)
+				if derr != nil {
+					log.Fatalf("fake-sni: %v", derr)
+				}
+				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin,
 					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf,
-					ECHLadder: ladderHook})
-				if err == nil {
-					err = attachFakeSNI(pc, peer)
+					ECHLadder: ladderHook}
+				if d != nil {
+					tlsOpts.DialHook = d.Wrap
+				}
+				pc, err = wat.NewTLSPoolClient(peer, *conns, tlsOpts)
+				if err == nil && d != nil {
+					_ = attachFakeSNI(pc, peer)
 				}
 			}
 			if err != nil {
@@ -329,6 +361,14 @@ func main() {
 				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				co.TLS.ECHCache = *echCache
 				co.TLS.ECHLadder = ladderHook
+				d, derr := getDesync(peer)
+				if derr != nil {
+					log.Fatalf("fake-sni: %v", derr)
+				}
+				if d != nil {
+					co.DialHook = d.Wrap
+					co.TLS.DialHook = d.Wrap
+				}
 				if *tlsPin != "" {
 					if co.TLS.PinSHA256, err = hex.DecodeString(strings.ReplaceAll(*tlsPin, ":", "")); err != nil || len(co.TLS.PinSHA256) != 32 {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
@@ -346,8 +386,8 @@ func main() {
 				default:
 					pc, err = wat.NewH2PoolClient(peer, *conns, co)
 				}
-				if err == nil {
-					err = attachFakeSNI(pc, peer)
+				if err == nil && d != nil {
+					_ = attachFakeSNI(pc, peer)
 				}
 			}
 			if err != nil {
@@ -445,7 +485,7 @@ func main() {
 			list = append(list, s)
 		}
 		tun = newTunnel(list)
-		tunRef = tun // -ech ladder's DoH hook (2.9.0)
+		tunRef.Store(tun) // -ech ladder's DoH hook (2.9.0)
 	}
 	stats := func() wat.Stats {
 		if srv != nil {
@@ -879,7 +919,7 @@ func serve(sess *wat.Session, lo, hi int, al *allow) {
 				serveSpeedTest(st)
 				return
 			}
-			if port == dnsRelayPort { // built-in DNS relay for -ech ladder (2.9.0), never a local service
+			if port == dnsRelayPort && !al.ok(port, lo, hi) { // built-in DNS relay for -ech ladder (2.9.0), only if not forwarded
 				serveDNSRelay(st)
 				return
 			}

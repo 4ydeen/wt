@@ -194,6 +194,8 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *[][]byte) {
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "sum"}
 	case "seqsum":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "seqsum"}
+	case "rst":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "rst"}
 	}
 	var p [4]byte
 	copy(p[:], net.ParseIP("10.8.0.1").To4())
@@ -542,8 +544,8 @@ func TestDesyncSumModeFiresOnData(t *testing.T) {
 	}
 	pkt := (*sent)[0]
 	seq := binary.BigEndian.Uint32(pkt[24:])
-	if seq != isn+1-uint32(len(tr.hello)) {
-		t.Fatalf("sum fake seq %d, want %d (mirrors the data segment's seq)", seq, isn+1-uint32(len(tr.hello)))
+	if seq != isn+1 {
+		t.Fatalf("sum fake seq %d, want %d (mirrors the data segment's seq in-window)", seq, isn+1)
 	}
 	if ack := binary.BigEndian.Uint32(pkt[28:]); ack != srvSeq+1 {
 		t.Fatalf("sum fake ack %d, want %d", ack, srvSeq+1)
@@ -554,7 +556,7 @@ func TestDesyncSumModeFiresOnData(t *testing.T) {
 	if good := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); good == stored {
 		t.Fatalf("sum fake carries a VALID checksum %04x (must be damaged)", good)
 	}
-	// and the damage is exactly (s^1)-1 of the correct value, not a zero field
+	// and the damage is non-zero
 	if stored == 0 {
 		t.Fatal("sum fake checksum zeroed instead of damaged")
 	}
@@ -578,8 +580,74 @@ func TestDesyncSumModeLate(t *testing.T) {
 		t.Fatal("sum-mode late fake never fired")
 	}
 	seq := binary.BigEndian.Uint32((*sent)[0][24:])
-	if seq != isn+1-uint32(len(tr.hello)) {
-		t.Fatalf("sum late fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
+	if seq != isn+1 {
+		t.Fatalf("sum late fake seq %d, want %d (in-window)", seq, isn+1)
+	}
+}
+
+// TestDesyncRSTModeFiresOnData: rst mode fires an in-window RST|ACK with damaged checksum.
+// The packet has length 40 (IP+TCP, no payload), RST|ACK flags (0x14), in-window seq, and invalid checksum.
+func TestDesyncRSTModeFiresOnData(t *testing.T) {
+	tr, sent := desyncTestTracker("rst", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(5000), uint32(800)
+	tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // final ACK: must NOT fire
+	if tr.fired() != 0 {
+		t.Fatal("rst mode fired on a bare ACK")
+	}
+	const dataLen = 120
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, dataLen), 64))
+	if tr.fired() != 1 {
+		t.Fatalf("rst mode fired counter %d, want 1", tr.fired())
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent %d packets, want 1", len(*sent))
+	}
+	pkt := (*sent)[0]
+	if len(pkt) != 40 {
+		t.Fatalf("rst fake len %d, want 40 (pure RST|ACK header)", len(pkt))
+	}
+	flags := pkt[20+13]
+	if flags != 0x14 { // RST|ACK
+		t.Fatalf("rst fake flags 0x%02x, want 0x14 (RST|ACK)", flags)
+	}
+	seq := binary.BigEndian.Uint32(pkt[20+4:])
+	if seq != isn+1 {
+		t.Fatalf("rst fake seq %d, want %d (in-window)", seq, isn+1)
+	}
+	stored := binary.BigEndian.Uint16(pkt[20+16:])
+	binary.BigEndian.PutUint16(pkt[20+16:], 0)
+	if good := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); good == stored {
+		t.Fatalf("rst fake carries a VALID checksum %04x (must be damaged)", good)
+	}
+}
+
+// TestDesyncRSTModeLate: the ISN is unknown; the late path mirrors the first data segment with an in-window RST|ACK.
+func TestDesyncRSTModeLate(t *testing.T) {
+	tr, sent := desyncTestTracker("rst", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(61000), uint32(90)
+	ch := tr.announce(k, 0, false)
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 60), 64))
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("rst-mode late fake never fired")
+	}
+	pkt := (*sent)[0]
+	if len(pkt) != 40 {
+		t.Fatalf("rst late fake len %d, want 40", len(pkt))
+	}
+	if flags := pkt[20+13]; flags != 0x14 {
+		t.Fatalf("rst late fake flags 0x%02x, want 0x14", flags)
+	}
+	seq := binary.BigEndian.Uint32(pkt[20+4:])
+	if seq != isn+1 {
+		t.Fatalf("rst late fake seq %d, want %d (in-window)", seq, isn+1)
 	}
 }
 

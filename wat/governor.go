@@ -87,8 +87,8 @@ func (g *govState) govWindow(now time.Time) {
 		return
 	}
 	defer func() { g.winMin, g.winMaxRate = 0, 0 }()
+	defer func() { g.stableAt = now }()
 	if g.holdUntil.After(now) {
-		g.stableAt = now
 		return // holding below the ceiling; nothing to learn while the path reroutes back
 	}
 	if g.base > 0 && float64(closed) > govJump*float64(g.base) && g.armed {

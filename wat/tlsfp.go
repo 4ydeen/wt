@@ -226,6 +226,13 @@ func (e *tlsEngine) dial(ctx context.Context, addr string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
+		if e.o.DialHook != nil {
+			raw, err = e.o.DialHook(raw)
+			if err != nil {
+				raw.Close()
+				return nil, err
+			}
+		}
 		c, accepted, err := e.handshake(ctx, raw, sni, list)
 		if err == nil {
 			e.echOn.Store(accepted)

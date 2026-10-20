@@ -156,14 +156,28 @@ func (d *desyncInjector) close() {
 // loop reads ethernet frames and feeds them to the tracker.
 func (d *desyncInjector) loop() {
 	buf := make([]byte, 2048)
+	pfd := []unix.PollFd{{Fd: int32(d.fd), Events: unix.POLLIN}}
 	for {
+		// Poll with 200 ms timeout so the goroutine sleeps in the kernel when idle instead of spinning on EAGAIN.
+		nReady, err := unix.Poll(pfd, 200)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return
+		}
+		if nReady == 0 {
+			continue
+		}
+		if pfd[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return
+		}
 		n, err := unix.Read(d.fd, buf)
 		if err != nil {
 			if err == unix.EAGAIN || err == unix.EINTR {
 				continue
 			}
-			time.Sleep(10 * time.Millisecond) // closed or unexpected: back off, Wrap's timeout governs
-			continue
+			return
 		}
 		if ip := parseEthIPv4(buf[:n]); ip != nil {
 			d.tr.handleIPv4(ip)

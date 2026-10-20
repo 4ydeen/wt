@@ -30,7 +30,7 @@ func TestGovernorLearnsCeiling(t *testing.T) {
 	}
 	// the signature: base RTT jumps to 76 ms (the field's 40 -> 76)
 	g.govSample(76*time.Millisecond, rate, now)
-	now = now.Add(200 * time.Millisecond)
+	now = now.Add(govWindow)
 	g.govSample(76*time.Millisecond, rate, now) // close the window with the jump
 	if g.ceiling == 0 {
 		t.Fatalf("no ceiling learned from the base-RTT jump")
@@ -51,7 +51,7 @@ func TestGovernorLearnsCeiling(t *testing.T) {
 	now = g.holdUntil.Add(time.Second)
 	for w := 0; w < 40; w++ {
 		g.govSample(40*time.Millisecond, g.ceiling*0.5, now)
-		now = now.Add(200 * time.Millisecond)
+		now = now.Add(govWindow)
 	}
 	if g.ceiling != 0 {
 		t.Fatalf("ceiling never released after quiet recovery: %f", g.ceiling)

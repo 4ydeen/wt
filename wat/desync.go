@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,8 +53,8 @@ func tcpChecksum(th, src, dst []byte) uint16 {
 // DesyncConfig tunes the fake-SNI layer of the tcp, tls, wss, h2 and grpc carriers.
 type DesyncConfig struct {
 	SNI  string // allowlisted server name the fake ClientHello carries
-	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL), "sum" (valid window, bad checksum)
-	             // or "seqsum" (both markers per connection, ~1 ms apart; experimental, 2.8.0)
+	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL), "sum" (valid window, bad checksum),
+	             // "seqsum" (both markers per connection, ~1 ms apart; experimental, 2.8.0), or "rst" (bad-checksum RST)
 	TTL  int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
 }
 
@@ -63,9 +64,9 @@ func validateDesync(cfg DesyncConfig) error {
 		return fmt.Errorf("wat: desync: empty SNI")
 	}
 	switch cfg.Mode {
-	case "", "seq", "ttl", "sum", "seqsum":
+	case "", "seq", "ttl", "sum", "seqsum", "rst":
 	default:
-		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum or seqsum, got %q", cfg.Mode)
+		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum or rst, got %q", cfg.Mode)
 	}
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
@@ -164,6 +165,9 @@ func desyncPeerIP(peer string) string {
 
 // desyncPeerHostPort splits a host:port peer into its IPv4 address and port (best effort, like desyncPeerIP).
 func desyncPeerHostPort(peer string) (ip, port string) {
+	if i := strings.IndexByte(peer, ','); i >= 0 {
+		peer = strings.TrimSpace(peer[:i])
+	}
 	h, p, err := net.SplitHostPort(peer)
 	if err != nil {
 		h, p = peer, ""
@@ -210,6 +214,28 @@ func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
 	th[13] = 0x18 // PSH|ACK
 	binary.BigEndian.PutUint16(th[14:], 0xffff)
 	copy(th[20:], hello)
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
+	return pkt
+}
+
+// fakeRSTPacket builds an in-window TCP RST+ACK packet with no payload. Pure: the same inputs build the same packet.
+func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
+	pkt := make([]byte, 20+20)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	pkt[6] = 0x40 // Don't Fragment
+	pkt[8] = byte(ttl)
+	pkt[9] = 6 // TCP
+	copy(pkt[12:16], k.srcIP[:])
+	copy(pkt[16:20], k.dstIP[:])
+	th := pkt[20:]
+	binary.BigEndian.PutUint16(th[0:], k.srcPt)
+	binary.BigEndian.PutUint16(th[2:], k.dstPt)
+	binary.BigEndian.PutUint32(th[4:], seq)
+	binary.BigEndian.PutUint32(th[8:], ack)
+	th[12] = 0x50
+	th[13] = 0x14 // RST|ACK
+	binary.BigEndian.PutUint16(th[14:], 0)
 	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
 	return pkt
 }
@@ -397,7 +423,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		// nothing to mirror). The mirror base lives on the connection (2.8.1): it was tracker-global, so two
 		// pool connections opening at once cross-set it and the second fire mirrored the wrong segment.
 		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 {
-			if sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"; sumMode {
+			if sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst"; sumMode {
 				if payload == 0 {
 					return // wait for the data segment to mirror
 				}
@@ -408,7 +434,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	default:
 		// late: the first outbound data segment is the anchor (its seq IS the stream start)
 		if payload > 0 && ackf && !syn {
-			if t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" {
+			if t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst" {
 				c.sumSeq = seq
 			}
 			t.fireLocked(out, c, seq, ackv)
@@ -442,7 +468,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 	// validation; a DPI that parses before checksumming reads the SNI. NATs that validate checksums
 	// (nf_conntrack_checksum=1 + an INVALID-drop FORWARD rule) kill this mode; ISPs usually pass (zapret's
 	// documented field observation).
-	sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum"
+	sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst"
 	if sumMode {
 		base = c.sumSeq
 	}
@@ -455,6 +481,14 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		close(ch)
 	}
 	if t.send != nil {
+		if t.cfg.Mode == "rst" {
+			// rst mode sends an in-window RST|ACK with damaged checksum: middleboxes clear flow state,
+			// while the server kernel drops corrupted checksum packets before parsing flags.
+			pkt := fakeRSTPacket(k, base, ack, ttl)
+			damageChecksum(pkt)
+			t.send(pkt)
+			return
+		}
 		if t.cfg.Mode == "seqsum" {
 			// dual marker (2.8.0): the below-window seq fake first, then the in-window bad-checksum mirror
 			// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
@@ -466,12 +500,14 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			t.send(pkt)
 			return
 		}
-		pkt := fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello)
 		if t.cfg.Mode == "sum" {
-			// the checksum was computed correctly by fakePacket; damage it so no off-by-one coincidence
-			// can repair it (see damageChecksum)
+			// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
+			pkt := fakePacket(k, base, ack, ttl, t.hello)
 			damageChecksum(pkt)
+			t.send(pkt)
+			return
 		}
+		pkt := fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello)
 		t.send(pkt)
 	}
 }

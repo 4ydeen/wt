@@ -28,6 +28,7 @@ type TLSClientOptions struct {
 	ECH         string                // off (default), auto, ladder, or a base64 ECHConfigList
 	ECHCache    string                // ech auto: file keeping the last good ECHConfigList across restarts (2.2.3)
 	ECHLadder   func([]byte) ([]byte, error) // ech ladder (2.9.0): raw DNS query in, answer out, through the tunnel
+	DialHook    func(net.Conn) (net.Conn, error) // dial hook on the raw TCP socket before TLS handshake (fake-SNI)
 	Frag        int                   // split the ClientHello into this many bytes per TCP segment (0 = off)
 	Logf        func(string, ...any) // optional: one-time notes (ECH lookups, fallbacks)
 }

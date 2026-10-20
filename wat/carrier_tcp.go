@@ -933,7 +933,7 @@ func (c *TCPPoolClient) rotatePick(now time.Time) *poolConn {
 			}
 		}
 	}
-	if usable <= 1 {
+	if usable == 0 || (usable <= 1 && len(c.slots) > 1) {
 		return nil
 	}
 	var best *poolConn

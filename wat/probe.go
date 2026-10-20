@@ -118,10 +118,12 @@ func (p *filterProbe) run() string {
 	// step 3: is the flow still alive after both?
 	p.alive = p.connAlive(tc)
 	switch {
+	case !p.alive && !p.seqOK && p.sumOK:
+		return "sum" // died with seq marker in flight but sum survived: filter drops below-window junk -> use sum
 	case !p.alive && p.seqOK && !p.sumOK:
-		return "sum" // died with the sum marker in flight: the filter reads checksums -> sum is the fool
-	case !p.alive && !p.seqOK:
-		return "seqsum" // died even with a seq marker alone: throw both
+		return "seq" // died with sum marker in flight: filter drops bad checksums -> keep seq
+	case !p.alive && !p.seqOK && !p.sumOK:
+		return "seqsum" // died under both individual checks -> try seqsum
 	default:
 		return "seq"
 	}

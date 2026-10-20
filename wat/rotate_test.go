@@ -142,3 +142,30 @@ func TestCloneCarriesDialHook(t *testing.T) {
 		t.Fatal("the clone's dialer skipped the dial hook")
 	}
 }
+
+// TestRotatePickSingleConn: a pool with 1 connection recycles when due (len(c.slots)==1 allowed).
+func TestRotatePickSingleConn(t *testing.T) {
+	c, err := newSlotPoolClient(func(context.Context, int) (net.Conn, error) {
+		return nil, errors.New("no dial")
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	p1, p2 := net.Pipe()
+	defer p1.Close()
+	defer p2.Close()
+	pc := newPoolConn(p1)
+	c.slots[0].Store(pc)
+	now := time.Now()
+	// not due => nil
+	if c.rotatePick(now) != nil {
+		t.Fatal("rotatePick returned conn before due")
+	}
+	// due => returns pc even though len(c.slots) == 1
+	b := rotateBudget{at: now.Add(-time.Second)}
+	pc.rot.Store(&b)
+	if got := c.rotatePick(now); got != pc {
+		t.Fatalf("rotatePick single conn: got %v, want %v", got, pc)
+	}
+}
