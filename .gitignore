@@ -2,6 +2,9 @@ dist/
 *.exe
 CLAUDE.md
 AGENTS.md
+AGENT-HANDOFF.md
+CHANGES-SINCE-2.5.0.md
+RESEARCH.md
 .gocache/
 .gomodcache/
 .gopath/
