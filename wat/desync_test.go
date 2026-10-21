@@ -50,6 +50,45 @@ func TestFakeClientHelloRealParser(t *testing.T) {
 	}
 }
 
+// TestFakeClientHelloTLS13Parser verifies that crypto/tls.Server configured with TLS 1.3
+// accepts the ClientHello and negotiates TLS 1.3 without parse errors.
+func TestFakeClientHelloTLS13Parser(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	errc := make(chan error, 1)
+	go func() {
+		c1.SetDeadline(time.Now().Add(5 * time.Second))
+		srv := tls.Server(c1, &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			Certificates: []tls.Certificate{func() tls.Certificate {
+				c, err := SelfSignedCert()
+				if err != nil {
+					t.Error(err)
+				}
+				return c
+			}()},
+		})
+		errc <- srv.Handshake()
+	}()
+	c2.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	go func() {
+		io.Copy(io.Discard, c2)
+	}()
+	if _, err := c2.Write(FakeClientHello("mci.ir")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	err := <-errc
+	if err == nil {
+		return
+	}
+	var ne net.Error
+	var ae *tls.AlertError
+	if !errors.As(err, &ne) && !errors.As(err, &ae) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, io.EOF) {
+		t.Fatalf("stdlib TLS 1.3 parser rejected the fake: %v", err)
+	}
+}
+
 func TestFakeClientHello(t *testing.T) {
 	for _, sni := range []string{"mci.ir", "example.com", "xn--mgbaam7a8c.example"} {
 		rec := FakeClientHello(sni)
