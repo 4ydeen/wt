@@ -8,6 +8,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -391,5 +392,58 @@ func TestTCPPoolClientOptionsLocalAddr(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("dial timed out")
+	}
+}
+
+func TestJudgeSlowSkipsDeadConnections(t *testing.T) {
+	old := time.Now().Add(-time.Minute)
+	alive1 := &poolConn{born: old, done: make(chan struct{})}
+	alive2 := &poolConn{born: old, done: make(chan struct{})}
+	alive3 := &poolConn{born: old, done: make(chan struct{})}
+	dead := &poolConn{born: old, done: make(chan struct{})}
+	close(dead.done)
+
+	alive1.rx.Store(100)
+	alive2.rx.Store(100)
+	alive3.rx.Store(100)
+	dead.rx.Store(0)
+
+	now := time.Now()
+	conns := []*poolConn{alive1, alive2, alive3, dead}
+	// Run judgeSlow 3 times; dead connection must not be picked as slow
+	for i := 0; i < 4; i++ {
+		slow := judgeSlow(conns, now)
+		if slow == dead {
+			t.Fatal("dead connection was judged slow")
+		}
+	}
+}
+
+func TestRotatePickSkipsDeadConnections(t *testing.T) {
+	now := time.Now()
+	c := &TCPPoolClient{
+		slots: make([]atomic.Pointer[poolConn], 3),
+	}
+	old := now.Add(-time.Hour)
+	dead := &poolConn{born: old, done: make(chan struct{})}
+	close(dead.done)
+	dead.rot.Store(&rotateBudget{at: now.Add(-time.Minute)})
+
+	aliveDue := &poolConn{born: now.Add(-30 * time.Minute), done: make(chan struct{})}
+	aliveDue.rot.Store(&rotateBudget{at: now.Add(-time.Minute)})
+
+	aliveFresh := &poolConn{born: now.Add(-10 * time.Minute), done: make(chan struct{})}
+	aliveFresh.rot.Store(&rotateBudget{at: now.Add(time.Hour)})
+
+	c.slots[0].Store(dead)
+	c.slots[1].Store(aliveDue)
+	c.slots[2].Store(aliveFresh)
+
+	pick := c.rotatePick(now)
+	if pick == dead {
+		t.Fatal("rotatePick returned an already-dead connection")
+	}
+	if pick != aliveDue {
+		t.Fatalf("rotatePick returned %v, want aliveDue", pick)
 	}
 }

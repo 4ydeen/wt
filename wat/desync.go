@@ -312,20 +312,33 @@ func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struc
 		close(ch)
 		return ch
 	}
+	now := time.Now()
+	if len(t.conns) > 16 {
+		for ck, c := range t.conns {
+			if now.Sub(c.at) > 30*time.Second {
+				t.abandonLocked(ck)
+			}
+		}
+	}
 	t.wait[k] = ch
-	t.conns[k] = &desyncConn{synSeq: isn, isnKnown: known, at: time.Now()}
+	t.conns[k] = &desyncConn{synSeq: isn, isnKnown: known, at: now}
 	return ch
+}
+
+// abandonLocked drops a connection (caller holds t.mu).
+func (t *desyncTracker) abandonLocked(k desyncKey) {
+	if ch := t.wait[k]; ch != nil {
+		delete(t.wait, k)
+		close(ch)
+	}
+	delete(t.conns, k)
 }
 
 // abandon drops a connection whose Wrap timed out (handshake never observed).
 func (t *desyncTracker) abandon(k desyncKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if ch := t.wait[k]; ch != nil {
-		delete(t.wait, k)
-		close(ch)
-	}
-	delete(t.conns, k)
+	t.abandonLocked(k)
 }
 
 func (t *desyncTracker) close() {
@@ -409,6 +422,12 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		return
 	}
 	if rst {
+		if t.conns[out] != nil {
+			t.abandonLocked(out)
+		}
+		if t.conns[in] != nil {
+			t.abandonLocked(in)
+		}
 		return
 	}
 	c := t.conns[out]

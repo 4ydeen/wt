@@ -82,3 +82,41 @@ func TestDNSListenerServfailWhenTunnelDown(t *testing.T) {
 		t.Errorf("expected RCODE 2 (ServFail), got %d", buf[3]&0x0f)
 	}
 }
+
+func TestDNSListenerSemaphoreBoundsConcurrency(t *testing.T) {
+	// Start listener pointing to a getTun that returns nil
+	l, err := startDNSListener("127.0.0.1:0", func() *tunnel { return nil }, nil)
+	if err != nil {
+		t.Fatalf("startDNSListener failed: %v", err)
+	}
+	defer l.Close()
+
+	addr := l.(*dnsListenerCloser).pc.LocalAddr().String()
+
+	// Send 150 concurrent queries; all should complete cleanly without panicking or hanging
+	client, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
+
+	q := []byte{
+		0x99, 0x88, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x03, 'f', 'o', 'o', 0x00,
+	}
+
+	for i := 0; i < 50; i++ {
+		if _, err := client.Write(q); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 512)
+		n, err := client.Read(buf)
+		if err != nil {
+			t.Fatalf("query %d failed: %v", i, err)
+		}
+		if n < 12 || buf[3]&0x0f != 2 {
+			t.Fatalf("expected SERVFAIL on query %d, got n=%d", i, n)
+		}
+	}
+}

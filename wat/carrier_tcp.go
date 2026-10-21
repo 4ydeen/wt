@@ -219,6 +219,11 @@ func judgeSlow(conns []*poolConn, now time.Time) *poolConn {
 		if pc == nil {
 			continue
 		}
+		select {
+		case <-pc.done:
+			continue
+		default:
+		}
 		v := pc.rx.Load()
 		d := v - pc.rxMark
 		pc.rxMark = v
@@ -969,7 +974,16 @@ func (c *TCPPoolClient) rotatePick(now time.Time) *poolConn {
 	}
 	var best *poolConn
 	for i := range c.slots {
-		if pc := c.slots[i].Load(); pc != nil && pc.rotateDue(now) && (best == nil || pc.born.Before(best.born)) {
+		pc := c.slots[i].Load()
+		if pc == nil {
+			continue
+		}
+		select {
+		case <-pc.done:
+			continue
+		default:
+		}
+		if pc.rotateDue(now) && (best == nil || pc.born.Before(best.born)) {
 			best = pc
 		}
 	}

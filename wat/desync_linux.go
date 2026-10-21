@@ -195,6 +195,9 @@ func (d *desyncInjector) sendRaw(pkt []byte) {
 
 // sendRawPacket is the raw injector every fire path shares (the tracker's send seam and the startup probe).
 func sendRawPacket(pkt []byte) {
+	if len(pkt) < 24 {
+		return
+	}
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
 	if err != nil {
 		return

@@ -491,6 +491,68 @@ func TestDesyncAbandonAndClose(t *testing.T) {
 	}
 }
 
+// TestDesyncRSTCleansConnection: TCP RST packet cleans up tracked state and closes waiting channels.
+func TestDesyncRSTCleansConnection(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	ch := tr.announce(k, 500, true)
+	// Outbound RST packet
+	rstPkt := desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 501, 0, testFlagRST, nil, 64)
+	tr.handleIPv4(rstPkt)
+	select {
+	case <-ch: // channel closed on RST
+	case <-time.After(time.Second):
+		t.Fatal("channel not closed on RST")
+	}
+	tr.mu.Lock()
+	conn := tr.conns[k]
+	tr.mu.Unlock()
+	if conn != nil {
+		t.Fatal("connection state was not cleaned up on RST")
+	}
+	if tr.fired() != 0 || len(*sent) != 0 {
+		t.Fatal("fake fired on RST connection")
+	}
+}
+
+// TestDesyncStalePrune: stale uncompleted connection entries (>30s) are pruned on subsequent announces.
+func TestDesyncStalePrune(t *testing.T) {
+	tr, _ := desyncTestTracker("seq", 0)
+	defer tr.close()
+	// Announce 18 connections
+	for i := 0; i < 18; i++ {
+		k := testClientKey()
+		k.srcPt = uint16(10000 + i)
+		_ = tr.announce(k, uint32(1000+i), false)
+	}
+	tr.mu.Lock()
+	if len(tr.conns) != 18 {
+		tr.mu.Unlock()
+		t.Fatalf("expected 18 conns, got %d", len(tr.conns))
+	}
+	// Age them out
+	oldTime := time.Now().Add(-1 * time.Minute)
+	for _, c := range tr.conns {
+		c.at = oldTime
+	}
+	tr.mu.Unlock()
+
+	// 19th announce should trigger stale prune
+	kNew := testClientKey()
+	kNew.srcPt = 20000
+	tr.announce(kNew, 5000, true)
+
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if len(tr.conns) != 1 {
+		t.Fatalf("stale connections were not pruned: len=%d, want 1", len(tr.conns))
+	}
+	if tr.conns[kNew] == nil {
+		t.Fatal("new connection was pruned")
+	}
+}
+
 // TestDesyncParseEthIPv4 rejects non-IPv4 frames.
 func TestDesyncParseEthIPv4(t *testing.T) {
 	arp := make([]byte, 60)

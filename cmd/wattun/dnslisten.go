@@ -24,6 +24,9 @@ func dnsServfail(query []byte) []byte {
 	return resp
 }
 
+// maxInflightDNS bounds concurrent relayed queries to prevent goroutine storms under flood.
+const maxInflightDNS = 128
+
 // startDNSListener starts a local UDP DNS listener that forwards all queries through the tunnel's
 // internal DNS relay (server target port 53). This allows client operating systems and applications
 // to resolve external DNS records during severe censorship blackouts when domestic resolvers hijack UDP 53.
@@ -38,6 +41,7 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 
 	var wg sync.WaitGroup
 	done := make(chan struct{})
+	sem := make(chan struct{}, maxInflightDNS)
 
 	wg.Add(1)
 	go func() {
@@ -63,17 +67,26 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 			query := make([]byte, n)
 			copy(query, buf[:n])
 
-			go func(q []byte, from net.Addr) {
-				tun := getTun()
-				ans, err := dialDNSRelay(tun, q)
-				if err != nil || len(ans) < 12 {
-					if sf := dnsServfail(q); sf != nil {
-						_, _ = pc.WriteTo(sf, from)
+			select {
+			case sem <- struct{}{}:
+				go func(q []byte, from net.Addr) {
+					defer func() { <-sem }()
+					tun := getTun()
+					ans, err := dialDNSRelay(tun, q)
+					if err != nil || len(ans) < 12 {
+						if sf := dnsServfail(q); sf != nil {
+							_, _ = pc.WriteTo(sf, from)
+						}
+						return
 					}
-					return
+					_, _ = pc.WriteTo(ans, from)
+				}(query, src)
+			default:
+				// Congested / throttled: immediately return SERVFAIL so client doesn't stall
+				if sf := dnsServfail(query); sf != nil {
+					_, _ = pc.WriteTo(sf, src)
 				}
-				_, _ = pc.WriteTo(ans, from)
-			}(query, src)
+			}
 		}
 	}()
 
