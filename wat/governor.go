@@ -74,7 +74,9 @@ func (g *govState) govSample(rtt time.Duration, rate float64, now time.Time) {
 	if cut {
 		g.rateRing = g.rateRing[len(g.rateRing)-256:]
 	}
-	if g.stableAt.IsZero() || now.Sub(g.stableAt) >= govWindow {
+	if g.stableAt.IsZero() {
+		g.stableAt = now
+	} else if now.Sub(g.stableAt) >= govWindow {
 		g.govWindow(now)
 	}
 }
@@ -114,6 +116,11 @@ func (g *govState) govWindow(now time.Time) {
 		if g.arms >= govArmWindows {
 			g.armed = true
 		}
+	} else {
+		// Base RTT jumped while not yet armed: reset consecutive arm counter and converge base
+		// to the new baseline so governor doesn't lock out from arming.
+		g.arms = 0
+		g.base = closed
 	}
 	// quiet creep: no signature for a full window lifts the ceiling 2 %, released at 1.25x the rate that
 	// triggered it (the learned ceiling must not outlive its evidence by much)

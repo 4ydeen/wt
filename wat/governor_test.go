@@ -74,3 +74,54 @@ func TestGovernorOffByDefault(t *testing.T) {
 		t.Fatalf("governor learned while disabled (ceiling %f armed %v)", g.ceiling, g.armed)
 	}
 }
+
+// TestGovernorUnarmedJitterConvergence verifies that an RTT jump while unarmed does not lock the governor out,
+// but resets consecutive arming counters and converges to the new baseline.
+func TestGovernorUnarmedJitterConvergence(t *testing.T) {
+	old := governorOn.Load()
+	governorOn.Store(true)
+	defer governorOn.Store(old)
+	now := time.Now()
+	g := &govState{}
+	rate := 30e6
+
+	stepWindow := func(rtt time.Duration) {
+		for i := 0; i < 10; i++ {
+			g.govSample(rtt, rate, now)
+			now = now.Add(200 * time.Millisecond)
+		}
+	}
+
+	// 1. One window at 40 ms
+	stepWindow(40 * time.Millisecond)
+
+	// 2. Window at 80 ms while unarmed: closes window 1 (arms=1, base=40ms), then accumulates 80ms
+	stepWindow(80 * time.Millisecond)
+	if g.armed || g.arms != 1 || g.base != 40*time.Millisecond {
+		t.Fatalf("after window 1: armed=%v arms=%d base=%v", g.armed, g.arms, g.base)
+	}
+
+	// 3. Next window at 80 ms: closes the 80ms window.
+	// Since base was 40ms and closed is 80ms (>1.25*base) while !armed,
+	// it must reset arms to 0 and converge base to 80ms.
+	stepWindow(80 * time.Millisecond)
+	if g.armed || g.arms != 0 || g.base != 80*time.Millisecond {
+		t.Fatalf("after unarmed jump: armed=%v arms=%d base=%v", g.armed, g.arms, g.base)
+	}
+
+	// 4. Three consecutive stable windows at 80 ms: arms must count 1, 2, 3 and become armed.
+	for w := 0; w < 3; w++ {
+		stepWindow(80 * time.Millisecond)
+	}
+	if !g.armed {
+		t.Fatalf("governor failed to arm after convergence to new baseline: arms=%d base=%v", g.arms, g.base)
+	}
+
+	// 5. Now a censorship jump to 160 ms triggers the signature
+	g.govSample(160*time.Millisecond, rate, now)
+	now = now.Add(govWindow)
+	g.govSample(160*time.Millisecond, rate, now)
+	if g.ceiling == 0 {
+		t.Fatalf("governor failed to trigger signature after convergence")
+	}
+}
