@@ -92,9 +92,13 @@ func main() {
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
 	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer; icmp carrier: the server sends the requests to -peer (the client's IP) and the client answers with replies (both ends need wattun >= 2.0.0 and -reverse)")
-	peerBy, listenBy := map[string]*string{}, map[string]*string{}
+	srcIP := flag.String("src-ip", "", "client: outbound source IP address for carriers (or per-carrier -src-ip-NAME)")
+	dnsListen := flag.String("dns-listen", "", "client: local address to listen for DNS queries (e.g. 127.0.0.1:53 or 127.0.0.1:5353) and forward them via the tunnel's DNS relay (2.9.0)")
+	pathProbeMax := flag.Duration("path-probe-max", 0, "client, bonded carriers: maximum probe backoff for dead paths (default 30s; blackout mode: 6s)")
+	peerBy, listenBy, srcIPBy := map[string]*string{}, map[string]*string{}, map[string]*string{}
 	for _, c := range carrierNames {
 		peerBy[c] = flag.String("peer-"+c, "", "client, bonded carriers: server address of the "+c+" carrier (default: -peer)")
+		srcIPBy[c] = flag.String("src-ip-"+c, "", "client, bonded carriers: source IP address of the "+c+" carrier (default: -src-ip)")
 		if c != "icmp" {
 			listenBy[c] = flag.String("listen-"+c, "", "server (or -reverse client), bonded carriers: listen address of the "+c+" carrier (default: -listen)")
 		}
@@ -272,6 +276,14 @@ func main() {
 	// build opens one carrier; the single-carrier case is exactly the old code path.
 	build := func(carrier string) (pio wat.PacketIO, raw wat.RawIO) {
 		peer, listen := pick(peerBy, *peer, carrier), pick(listenBy, *udpListen, carrier)
+		src := pick(srcIPBy, *srcIP, carrier)
+		var srcNetIP net.IP
+		if src != "" {
+			srcNetIP = net.ParseIP(src)
+			if srcNetIP == nil {
+				log.Fatalf("%s carrier: invalid -src-ip %q", carrier, src)
+			}
+		}
 		if (carrier == "icmp" || carrier == "udp") && strings.Contains(peer, ",") {
 			log.Fatalf("%s carrier: -peer takes exactly one address, got %q (several comma separated addresses work with tcp|tls|ws|wss|h2|h2c|grpc)", carrier, peer)
 		}
@@ -282,7 +294,9 @@ func main() {
 		switch carrier {
 		case "icmp":
 			var ic *wat.ICMPIO
-			if !*reverse {
+			if srcNetIP != nil {
+				ic, err = wat.NewICMPIOSource(server, *reverse, peer, srcNetIP.String(), k, *icmpType)
+			} else if !*reverse {
 				ic, err = wat.NewICMPIOType(server, peer, k, *icmpType)
 			} else if ic, err = wat.NewICMPIOReverse(server, true, peer, k, *icmpType); err == nil && server {
 				if peer == "" {
@@ -297,6 +311,8 @@ func main() {
 		case "udp":
 			if server {
 				raw, err = wat.NewUDPServer(listen)
+			} else if srcNetIP != nil {
+				pio, err = wat.NewUDPClientAddr(peer, &net.UDPAddr{IP: srcNetIP})
 			} else {
 				pio, err = wat.NewUDPClient(peer)
 			}
@@ -307,7 +323,11 @@ func main() {
 			if lis {
 				ps, err = wat.NewTCPPoolServer(listen)
 			} else {
-				pc, err = wat.NewTCPPoolClient(peer, *conns)
+				var opt wat.TCPClientOptions
+				if srcNetIP != nil {
+					opt.LocalAddr = &net.TCPAddr{IP: srcNetIP}
+				}
+				pc, err = wat.NewTCPPoolClientOptions(peer, *conns, opt)
 				if err == nil {
 					err = attachFakeSNI(pc, peer)
 				}
@@ -321,7 +341,7 @@ func main() {
 			} else {
 				var pin []byte
 				if *tlsPin != "" {
-					if pin, err = hex.DecodeString(strings.ReplaceAll(*tlsPin, ":" , "")); err != nil || len(pin) != 32 {
+					if pin, err = hex.DecodeString(strings.ReplaceAll(*tlsPin, ":", "")); err != nil || len(pin) != 32 {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
 					}
 				}
@@ -332,6 +352,9 @@ func main() {
 				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin,
 					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf,
 					ECHLadder: ladderHook}
+				if srcNetIP != nil {
+					tlsOpts.LocalAddr = &net.TCPAddr{IP: srcNetIP}
+				}
 				if d != nil {
 					tlsOpts.DialHook = d.Wrap
 				}
@@ -358,6 +381,9 @@ func main() {
 				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				co.TLS.ECHCache = *echCache
 				co.TLS.ECHLadder = ladderHook
+				if srcNetIP != nil {
+					co.TLS.LocalAddr = &net.TCPAddr{IP: srcNetIP}
+				}
 				d, derr := getDesync(peer)
 				if derr != nil {
 					log.Fatalf("fake-sni: %v", derr)
@@ -433,9 +459,13 @@ func main() {
 			}
 		}
 		var err error
+		var tm wat.PathTimings
+		if *pathProbeMax > 0 {
+			tm.ProbeMax = *pathProbeMax
+		}
 		if server {
 			raw = wat.NewMultiRaw(names, raws)
-		} else if pio, err = wat.NewBondIO(kids, wat.BondOptions{Names: names, Lanes: lanesPer}); err != nil {
+		} else if pio, err = wat.NewBondIO(kids, wat.BondOptions{Names: names, Lanes: lanesPer, Timings: tm}); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -480,6 +510,13 @@ func main() {
 		}
 		tun = newTunnel(list)
 		tunRef.Store(tun) // -ech ladder's DoH hook (2.9.0)
+		if *dnsListen != "" {
+			dnsCloser, err := startDNSListener(*dnsListen, func() *tunnel { return tunRef.Load() }, log.Printf)
+			if err != nil {
+				log.Fatalf("dns-listen %s: %v", *dnsListen, err)
+			}
+			defer dnsCloser.Close()
+		}
 	}
 	stats := func() wat.Stats {
 		if srv != nil {

@@ -247,3 +247,41 @@ func waitOrFail(t *testing.T, wg *sync.WaitGroup, d time.Duration) {
 		t.Fatal("timeout")
 	}
 }
+
+func TestUDPClientAddrLocalAddr(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	done := make(chan net.Addr, 1)
+	go func() {
+		buf := make([]byte, 1024)
+		_, addr, err := pc.ReadFrom(buf)
+		if err == nil {
+			done <- addr
+		}
+	}()
+
+	laddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1")}
+	client, err := NewUDPClientAddr(pc.LocalAddr().String(), laddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Send([]byte("ping"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case addr := <-done:
+		uaddr, ok := addr.(*net.UDPAddr)
+		if !ok || !uaddr.IP.Equal(net.ParseIP("127.0.0.1")) {
+			t.Fatalf("expected 127.0.0.1 source, got %v", addr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive timed out")
+	}
+}

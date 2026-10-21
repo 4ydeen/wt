@@ -32,4 +32,8 @@ func NewICMPIOReverse(server, reverse bool, peerIP string, key []byte, kind stri
 	return nil, errors.New("the icmp carrier needs Linux")
 }
 
+func NewICMPIOSource(server, reverse bool, peerIP, srcIP string, key []byte, kind string) (*ICMPIO, error) {
+	return nil, errors.New("the icmp carrier needs Linux")
+}
+
 func (*ICMPIO) Knock(int, time.Duration) {}

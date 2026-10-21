@@ -357,3 +357,39 @@ func TestJudgeSlow(t *testing.T) {
 		}
 	}
 }
+
+func TestTCPPoolClientOptionsLocalAddr(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan net.Addr, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			done <- c.RemoteAddr()
+			c.Close()
+		}
+	}()
+
+	opt := TCPClientOptions{
+		LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1")},
+	}
+	client, err := NewTCPPoolClientOptions(ln.Addr().String(), 1, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	select {
+	case remote := <-done:
+		tcpAddr, ok := remote.(*net.TCPAddr)
+		if !ok || !tcpAddr.IP.Equal(net.ParseIP("127.0.0.1")) {
+			t.Fatalf("expected remote to see local 127.0.0.1, got %v", remote)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial timed out")
+	}
+}

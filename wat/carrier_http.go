@@ -81,7 +81,7 @@ func NewWSPoolClient(peer string, conns int, o HTTPClientOptions) (*TCPPoolClien
 		return nil, err
 	}
 	path := normPath(o.Path)
-	d := net.Dialer{Timeout: 5 * time.Second}
+	d := net.Dialer{Timeout: 5 * time.Second, LocalAddr: o.TLS.LocalAddr}
 	var eng *tlsEngine
 	if o.Secure {
 		if eng, err = o.engine("http/1.1"); err != nil {
@@ -355,7 +355,7 @@ func newH2Client(peer string, conns int, o HTTPClientOptions, grpc bool) (*TCPPo
 			var protos http.Protocols
 			protos.SetHTTP2(o.Secure)
 			protos.SetUnencryptedHTTP2(!o.Secure)
-			dialer := &net.Dialer{Timeout: 5 * time.Second}
+			dialer := &net.Dialer{Timeout: 5 * time.Second, LocalAddr: o.TLS.LocalAddr}
 			tr := &http.Transport{Protocols: &protos, DisableKeepAlives: true, ForceAttemptHTTP2: true,
 				DialContext: func(ctx context.Context, netw, a string) (net.Conn, error) {
 					c, err := dialer.DialContext(ctx, netw, a)

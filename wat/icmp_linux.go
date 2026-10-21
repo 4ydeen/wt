@@ -62,11 +62,22 @@ func NewICMPIOType(server bool, peerIP string, key []byte, kind string) (*ICMPIO
 // In reverse mode peerIP on the server is the client's IP, used only for Knock; the server still answers whatever
 // address a session authenticates from.
 func NewICMPIOReverse(server, reverse bool, peerIP string, key []byte, kind string) (*ICMPIO, error) {
+	return NewICMPIOSource(server, reverse, peerIP, "", key, kind)
+}
+
+// NewICMPIOSource is NewICMPIOReverse binding the raw ICMP socket to an optional local source IP address for multi-homing.
+func NewICMPIOSource(server, reverse bool, peerIP, srcIP string, key []byte, kind string) (*ICMPIO, error) {
 	req, rep, ok := ICMPTypes(kind)
 	if !ok {
 		return nil, errors.New("wat: -icmp-type must be echo, timestamp, info or mask")
 	}
-	c, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: net.IPv4zero})
+	bindIP := net.IPv4zero
+	if srcIP != "" {
+		if ip := net.ParseIP(srcIP); ip != nil {
+			bindIP = ip
+		}
+	}
+	c, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: bindIP})
 	if err != nil {
 		return nil, err
 	}

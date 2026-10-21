@@ -603,16 +603,26 @@ func (c *TCPPoolClient) dialer() func(ctx context.Context, slot int) (net.Conn, 
 	return c.dial
 }
 
+// TCPClientOptions configures client dial parameters (source IP binding, dial hook).
+type TCPClientOptions struct {
+	LocalAddr net.Addr
+}
+
 // NewTCPPoolClient dials conns (0 = DefaultPoolConns) TCP connections to host:port in the background; Send drops
 // until the first one is up, which the session treats as loss.
 //
 // peer may hold several comma-separated addresses: slot i dials address i%n (see peerSet).
 func NewTCPPoolClient(peer string, conns int) (*TCPPoolClient, error) {
+	return NewTCPPoolClientOptions(peer, conns, TCPClientOptions{})
+}
+
+// NewTCPPoolClientOptions is NewTCPPoolClient with custom TCPClientOptions (e.g. LocalAddr for multi-WAN bonding).
+func NewTCPPoolClientOptions(peer string, conns int, opt TCPClientOptions) (*TCPPoolClient, error) {
 	addrs, err := SplitPeers(peer)
 	if err != nil {
 		return nil, err
 	}
-	d := net.Dialer{Timeout: 5 * time.Second}
+	d := net.Dialer{Timeout: 5 * time.Second, LocalAddr: opt.LocalAddr}
 	return newSlotClient(addrs, conns, func(ctx context.Context, addr string) (net.Conn, error) {
 		return d.DialContext(ctx, "tcp", addr)
 	})

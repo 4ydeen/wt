@@ -22,11 +22,16 @@ type UDPClient struct {
 
 // NewUDPClient dials host:port. Dialing UDP sends nothing, so it succeeds before the server is reachable.
 func NewUDPClient(peer string) (*UDPClient, error) {
+	return NewUDPClientAddr(peer, nil)
+}
+
+// NewUDPClientAddr dials host:port binding to an optional local source UDP address.
+func NewUDPClientAddr(peer string, laddr *net.UDPAddr) (*UDPClient, error) {
 	ra, err := net.ResolveUDPAddr("udp", peer)
 	if err != nil {
 		return nil, err
 	}
-	c, err := net.DialUDP("udp", nil, ra)
+	c, err := net.DialUDP("udp", laddr, ra)
 	if err != nil {
 		return nil, err
 	}

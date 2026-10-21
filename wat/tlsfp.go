@@ -212,7 +212,7 @@ func (e *tlsEngine) sniFor(addr string) string {
 // dial opens a TCP connection to addr and runs the TLS handshake, retrying once with the server's ECH retry
 // configs when it rejected ours.
 func (e *tlsEngine) dial(ctx context.Context, addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second}
+	d := net.Dialer{Timeout: 5 * time.Second, LocalAddr: e.o.LocalAddr}
 	sni := e.sniFor(addr)
 	for attempt := 0; ; attempt++ {
 		list := e.ech.get(ctx, sni, e) // before the TCP dial: a slow lookup must not leave an idle connection waiting
