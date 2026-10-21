@@ -32,6 +32,9 @@ var dnsRelayTimeout = 6 * time.Second
 // dnsRelayUpstream is the recursive resolver the relay asks on the Kharej side (UDP, plain DNS).
 var dnsRelayUpstream = "8.8.8.8:53"
 
+// maxDNSMsgLen bounds DNS queries and answers to 4096 bytes (RFC 6891 EDNS0 maximum).
+const maxDNSMsgLen = 4096
+
 // serveDNSRelay runs on the server for a stream whose header asked for port 53. One query per stream, the
 // same one-shot shape as serveSpeedTest. No allowlist check: like target 0, it is built-in, never a local
 // service, and a DNS query carries no more information than the tunnel's own handshake already does.
@@ -42,7 +45,7 @@ func serveDNSRelay(st *wat.Stream) {
 		return
 	}
 	qlen := int(q[0])<<8 | int(q[1])
-	if qlen < 12 || qlen > 512 { // a DNS query is 12..512 bytes; bigger is abuse
+	if qlen < 12 || qlen > maxDNSMsgLen { // a DNS query is 12..4096 bytes (RFC 6891 EDNS0); bigger is abuse
 		return
 	}
 	query := make([]byte, qlen)

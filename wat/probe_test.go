@@ -43,3 +43,21 @@ func TestProbeVerdictTable(t *testing.T) {
 		}
 	}
 }
+
+// TestSumProbeMultiSNI verifies that a filterProbe configured with comma-separated SNIs
+// parses cleanly into individual valid hostnames and does not embed commas in the SNI.
+func TestSumProbeMultiSNI(t *testing.T) {
+	cfg := DesyncConfig{SNI: "mci.ir,divar.ir,digikala.com", Mode: "auto"}
+	snis := splitSNIs(cfg.SNI)
+	if len(snis) != 3 || snis[0] != "mci.ir" || snis[1] != "divar.ir" || snis[2] != "digikala.com" {
+		t.Fatalf("unexpected split SNIs: %+v", snis)
+	}
+	hello := FakeClientHello(snis[0])
+	gotSNI, err := parseSNIOf(hello)
+	if err != nil {
+		t.Fatalf("parseSNIOf error: %v", err)
+	}
+	if gotSNI != "mci.ir" {
+		t.Fatalf("got SNI %q, want mci.ir", gotSNI)
+	}
+}

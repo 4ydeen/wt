@@ -226,3 +226,65 @@ func TestDNSListenerTCP(t *testing.T) {
 		t.Errorf("expected RCODE 2 (ServFail) query2, got %d", buf2[3]&0x0f)
 	}
 }
+
+func TestDNSListenerLargeEDNS0Query(t *testing.T) {
+	l, err := startDNSListener("127.0.0.1:0", func() *tunnel { return nil }, nil)
+	if err != nil {
+		t.Fatalf("startDNSListener failed: %v", err)
+	}
+	defer l.Close()
+
+	closer := l.(*dnsListenerCloser)
+	addr := closer.ln.Addr().String()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial tcp %s failed: %v", addr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	// Construct a 1200-byte query (exceeds legacy 512-byte cap, simulating large EDNS0 options/cookies)
+	q := make([]byte, 1200)
+	q[0], q[1] = 0x55, 0x66 // ID
+	q[2], q[3] = 0x01, 0x00 // RD=1
+	q[4], q[5] = 0x00, 0x01 // QDCOUNT=1
+	copy(q[12:], []byte{0x04, 't', 'e', 's', 't', 0x00, 0x00, 0x01, 0x00, 0x01})
+
+	qlen := len(q)
+	qlenHdr := [2]byte{byte(qlen >> 8), byte(qlen)}
+	if _, err := conn.Write(qlenHdr[:]); err != nil {
+		t.Fatalf("write qlenHdr: %v", err)
+	}
+	if _, err := conn.Write(q); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+
+	var rlenHdr [2]byte
+	for r := 0; r < 2; {
+		n, err := conn.Read(rlenHdr[r:])
+		if err != nil {
+			t.Fatalf("read rlenHdr on large query (likely dropped due to size cap): %v", err)
+		}
+		r += n
+	}
+	rlen := int(rlenHdr[0])<<8 | int(rlenHdr[1])
+	if rlen != len(q) {
+		t.Fatalf("response length mismatch: got %d, want %d", rlen, len(q))
+	}
+
+	resp := make([]byte, rlen)
+	for r := 0; r < rlen; {
+		n, err := conn.Read(resp[r:])
+		if err != nil {
+			t.Fatalf("read response body on large query: %v", err)
+		}
+		r += n
+	}
+	if resp[0] != 0x55 || resp[1] != 0x66 {
+		t.Errorf("ID mismatch: got %02x%02x, want 5566", resp[0], resp[1])
+	}
+	if resp[3]&0x0f != 2 {
+		t.Errorf("expected RCODE 2 (ServFail), got %d", resp[3]&0x0f)
+	}
+}

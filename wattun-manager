@@ -38,7 +38,7 @@ else
   MGR=/usr/local/bin/wattun-manager
 fi
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
-MGR_VERSION=2026102104   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
+MGR_VERSION=2026102105   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
 HEAL_UNIT=$WAT_PREFIX-heal
 MCONF=$CONF/.manager.conf
 self_cmd() { # the command to type to start this manager (user-facing hints)
@@ -98,7 +98,7 @@ case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall)
 esac
 [ "$NONINTERACTIVE" = 1 ] || NONINTERACTIVE=0
 # Answers set by flags (see ni_parse); empty = the wizard's own default
-NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''; NI_FAKESNI=''; NI_FAKEMODE=''; NI_FAKETTL=''; NI_POOLROT=''; NI_POOLBYTES=''; NI_PRESET=''; NI_ECH=''; NI_GOVERNOR=''
+NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''; NI_FAKESNI=''; NI_FAKEMODE=''; NI_FAKETTL=''; NI_POOLROT=''; NI_POOLBYTES=''; NI_PRESET=''; NI_ECH=''; NI_GOVERNOR=''; NI_DNSLISTEN=''; NI_SRCIP=''
 NI_TOKEN=''; NI_MAP=''; NI_PICK=best; NI_SESSIONS=''; NI_YES=0; NI_POS=()
 ERRN=0
 
@@ -727,6 +727,27 @@ v_preset() {
   esac
   err "Unknown preset '$1'. Available: mci, irancell, blackout, conservative"
   return 1
+}
+v_dns_listen() {
+  local a=${1,,}
+  [ -z "$a" ] && return 0
+  case "$a" in 0|off) return 0 ;; esac
+  if [[ "$1" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})$ ]]; then
+    local ip="${BASH_REMATCH[1]}"
+    local port="${BASH_REMATCH[2]}"
+    ipv4_ok "$ip" || { err "DNS listen IP is invalid."; return 1; }
+    v_port "$port" || return 1
+    return 0
+  fi
+  err "--dns-listen: enter an address like 127.0.0.1:53 or 127.0.0.1:5353 (or off)."
+  return 1
+}
+v_src_ip() {
+  local ip=${1,,}
+  [ -z "$ip" ] && return 0
+  case "$ip" in 0|off) return 0 ;; esac
+  ipv4_ok "$1" || { err "--src-ip: enter a valid IPv4 address (or off)."; return 1; }
+  return 0
 }
 v_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]*$ ]] && return 0; err "The path must start with / (example: /wat)."; return 1; }
 v_token() {
@@ -1594,6 +1615,75 @@ pick_ech() { # [default] -> REPLY_V
   return 0
 }
 
+pick_dns_listen() { # [default] -> REPLY_V
+  local def=${1:-off}
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    REPLY_V=${NI_DNSLISTEN:-$def}
+    return 0
+  fi
+  say "  ${BOLD}Select DNS Forwarder Listener${RST} (in-band relay to bypass domestic DNS hijacking):"
+  say "    ${CYN}1${RST}  off            Disabled"
+  say "    ${CYN}2${RST}  127.0.0.1:53   Standard local DNS resolver"
+  say "    ${CYN}3${RST}  127.0.0.1:5353 Alternative unprivileged local port"
+  say "    ${CYN}4${RST}  0.0.0.0:53     LAN-wide DNS relay for home/office devices"
+  say "    ${CYN}c${RST}  Custom         Enter custom address:port"
+  echo
+  printf '  %s?%s Press a number %s[1 = off]%s ' "$CYN" "$RST" "$GRY" "$RST"
+  key_read
+  case "$KEY" in
+    1) REPLY_V="off" ;;
+    2) REPLY_V="127.0.0.1:53" ;;
+    3) REPLY_V="127.0.0.1:5353" ;;
+    4) REPLY_V="0.0.0.0:53" ;;
+    c|C) echo; ask_ok "Custom DNS listen address:port" "127.0.0.1:53" v_dns_listen || return 1 ;;
+    enter) REPLY_V="$def" ;;
+    esc|q) echo; return 1 ;;
+    *) REPLY_V="$def" ;;
+  esac
+  echo "$REPLY_V"
+  return 0
+}
+
+pick_src_ip() { # [default] -> REPLY_V
+  local def=${1:-off}
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    REPLY_V=${NI_SRCIP:-$def}
+    return 0
+  fi
+  say "  ${BOLD}Select Carrier Source IP Binding${RST} (for multi-WAN / cellular APN routing):"
+  say "    ${CYN}0${RST}  off  Default kernel routing (system routing table)"
+  local ips=() idx=1
+  if command -v ip >/dev/null 2>&1; then
+    while read -r _ _ _ ifa _ _ ifn _; do
+      local clean_ip="${ifa%%/*}"
+      [ "$clean_ip" = "127.0.0.1" ] && continue
+      ips+=("$clean_ip ($ifn)")
+      printf '    %s%d%s  %s\n' "$CYN" "$idx" "$RST" "$clean_ip ($ifn)"
+      idx=$((idx+1))
+    done < <(ip -4 -o addr show 2>/dev/null)
+  fi
+  printf '    %sc%s  Custom IPv4 address\n' "$CYN" "$RST"
+  echo
+  printf '  %s?%s Press a number %s[0 = off]%s ' "$CYN" "$RST" "$GRY" "$RST"
+  key_read
+  case "$KEY" in
+    0) REPLY_V="off" ;;
+    c|C) echo; ask_ok "Custom IPv4 address" "" v_src_ip || return 1 ;;
+    enter) REPLY_V="$def" ;;
+    esc|q) echo; return 1 ;;
+    *)
+      if [[ "$KEY" =~ ^[1-9]$ ]] && [ "$KEY" -le "${#ips[@]}" ]; then
+        local sel="${ips[$((KEY-1))]}"
+        REPLY_V="${sel%% *}"
+      else
+        REPLY_V="$def"
+      fi
+      ;;
+  esac
+  echo "$REPLY_V"
+  return 0
+}
+
 apply_preset() { # tunnel preset
   local tun=$1 raw_preset=$2 pr changed=0
   pr=$(preset_canonical "$raw_preset")
@@ -1663,7 +1753,7 @@ apply_preset() { # tunnel preset
 
 wizard_iran() {
   local name tok have manual=0 bind='' mbps='' fec='' itype='' sni='' path='' m i allow_note it new_pub=() t=0 rport='' advdef=n linkok=1 askres
-  local T_FAKESNI='' T_FAKEMODE='' T_FAKETTL='' T_POOLROT='' T_POOLBYTES='' T_ECH='' T_GOVERNOR=''
+  local T_FAKESNI='' T_FAKEMODE='' T_FAKETTL='' T_POOLROT='' T_POOLBYTES='' T_ECH='' T_GOVERNOR='' T_DNSLISTEN='' T_SRCIP=''
   page "New tunnel" "STEP 2 · Iran (inside server)"
   step_diagram 2
   echo
@@ -1785,9 +1875,11 @@ wizard_iran() {
     fi
     [ -n "$NI_ECH" ] && T_ECH=$NI_ECH
     [ -n "$NI_GOVERNOR" ] && T_GOVERNOR=$NI_GOVERNOR
+    [ -n "$NI_DNSLISTEN" ] && T_DNSLISTEN=$NI_DNSLISTEN
+    [ -n "$NI_SRCIP" ] && T_SRCIP=$NI_SRCIP
 
     askres=y
-    if [ -z "$NI_FAKESNI$NI_FAKEMODE$NI_FAKETTL$NI_POOLROT$NI_POOLBYTES$NI_PRESET$NI_ECH$NI_GOVERNOR$T_FAKESNI$T_FAKEMODE$T_FAKETTL$T_POOLROT$T_POOLBYTES$T_ECH$T_GOVERNOR" ]; then
+    if [ -z "$NI_FAKESNI$NI_FAKEMODE$NI_FAKETTL$NI_POOLROT$NI_POOLBYTES$NI_PRESET$NI_ECH$NI_GOVERNOR$NI_DNSLISTEN$NI_SRCIP$T_FAKESNI$T_FAKEMODE$T_FAKETTL$T_POOLROT$T_POOLBYTES$T_ECH$T_GOVERNOR$T_DNSLISTEN$T_SRCIP" ]; then
       confirm "Configure anti-censorship / blackout resilience? Only for censored routes; Enter = no" n || askres=n
       [ "$askres" = n ] && hint "Fine for a normal route. If a censor starts blocking this tunnel: tunnel page -> o -> k."
     fi
@@ -1920,6 +2012,8 @@ wizard_iran() {
       [ -n "$T_POOLBYTES" ] && [ "$T_POOLBYTES" != 0 ] && [ "$T_POOLBYTES" != off ] && echo "pool-rotate-bytes: $T_POOLBYTES"
       [ -n "$T_ECH" ] && [ "$T_ECH" != off ] && echo "ech: $T_ECH"
       [ "$T_GOVERNOR" = true ] && echo "governor: true"
+      [ -n "$T_DNSLISTEN" ] && [ "$T_DNSLISTEN" != off ] && echo "dns-listen: $T_DNSLISTEN"
+      [ -n "$T_SRCIP" ] && [ "$T_SRCIP" != off ] && echo "src-ip: $T_SRCIP"
       [ -n "$T_ICMP" ] && [ "$T_ICMP" != echo ] && echo "icmp-type: $T_ICMP"
       [ "$T_REV" = 1 ] && echo "reverse: true"
       [ -n "$rport" ] && echo "listen: \":$rport\""
@@ -3535,9 +3629,9 @@ tunnel_card() {
   [ -n "$sub" ] && box_row "${GRY}$sub${RST}"
   sub=$(cdn_summary "$n"); [ -n "$sub" ] && box_row "${GRY}CDN: $sub${RST}"
   if [ "$r" = Iran ] && [ "$(uname -s)" = Linux ]; then
-    local fks=$(cfg "$n" fake-sni) gov=$(cfg "$n" governor) rot=$(cfg "$n" pool-rotate)
-    if [ -n "$fks" ] || [ "$gov" = true ] || [ -n "$rot" ]; then
-      box_row "Anti-censor: $(detect_preset "$n")${fks:+ (fake-sni $fks)}"
+    local fks=$(cfg "$n" fake-sni) gov=$(cfg "$n" governor) rot=$(cfg "$n" pool-rotate) dl=$(cfg "$n" dns-listen)
+    if [ -n "$fks" ] || [ "$gov" = true ] || [ -n "$rot" ] || [ -n "$dl" ]; then
+      box_row "Anti-censor: $(detect_preset "$n")${fks:+ (fake-sni $fks)}${dl:+ (dns $dl)}"
     fi
   fi
   box_row "${GRY}service $(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "${WAT_PREFIX}@$n" 2>/dev/null | head -1)${RST}"
@@ -3797,6 +3891,7 @@ anticensor_test() {
   local fks=$(cfg "$n" fake-sni) fkm=$(cfg "$n" fake-mode) fkt=$(cfg "$n" fake-ttl)
   local rot=$(cfg "$n" pool-rotate) rbytes=$(cfg "$n" pool-rotate-bytes)
   local ech=$(cfg "$n" ech) gov=$(cfg "$n" governor)
+  local dl=$(cfg "$n" dns-listen) sip=$(cfg "$n" src-ip)
 
   if [ -n "$fks" ]; then
     printf '    • Fake-SNI:     %s (%s mode%s)\n' "$fks" "${fkm:-seq}" "${fkt:+, ttl $fkt}"
@@ -3806,6 +3901,8 @@ anticensor_test() {
   [ -n "$rot" ] && printf '    • Pool-Rotate:  %s%s\n' "$rot" "${rbytes:+ / $rbytes}"
   [ -n "$ech" ] && printf '    • ECH:          %s\n' "$ech"
   [ "$gov" = true ] && printf '    • Governor:     %s\n' "active"
+  [ -n "$dl" ] && printf '    • DNS Relay:    %s\n' "$dl"
+  [ -n "$sip" ] && printf '    • Source IP:    %s\n' "$sip"
   echo
 
   spin_start "Probing tunnel connection & DPI filter bypass"
@@ -3881,7 +3978,7 @@ anticensor_menu() {
   local changed=0
   while :; do
     page "Anti-Censorship & Resilience" "$n ($cr)"
-    local fs fm ft pr pb ech gov
+    local fs fm ft pr pb ech gov dl sip
     fs=$(cfg "$n" fake-sni)
     fm=$(cfg "$n" fake-mode); [ -n "$fm" ] || fm=seq
     ft=$(cfg "$n" fake-ttl)
@@ -3889,6 +3986,8 @@ anticensor_menu() {
     pb=$(cfg "$n" pool-rotate-bytes)
     ech=$(cfg "$n" ech)
     gov=$(cfg "$n" governor)
+    dl=$(cfg "$n" dns-listen)
+    sip=$(cfg "$n" src-ip)
 
     say "  ${BOLD}Anti-Censorship Configuration for '$n'${RST}"
     echo
@@ -3906,6 +4005,8 @@ anticensor_menu() {
       tls|wss|h2|grpc)
         printf '    %s7%s  ECH Mode               %s\n' "$CYN" "$RST" "${ech:-${GRY}off (disabled)${RST}}" ;;
     esac
+    printf '    %s8%s  DNS Forwarder          %s\n' "$CYN" "$RST" "${dl:-${GRY}off (disabled)${RST}}"
+    printf '    %s9%s  Carrier Source IP      %s\n' "$CYN" "$RST" "${sip:-${GRY}off (default route)${RST}}"
     echo
     printf '    %st%s  Test Filter Bypass & Link Status\n' "$CYN" "$RST"
     printf '    %sp%s  Save Current as Custom Profile\n' "$CYN" "$RST"
@@ -3998,16 +4099,26 @@ anticensor_menu() {
              fi
              sleep 1 ;;
          esac ;;
-      8) # Volume Governor toggle
-         if [ "$cr" = icmp ]; then
-           echo
-           if [ "$(cfg "$n" governor)" = true ]; then
-             unset_value "$n" governor; ok "Volume governor turned OFF."
+      8) # DNS Forwarder Listener
+         echo
+         if pick_dns_listen "${dl:-off}"; then
+           if [ "$REPLY_V" = off ] || [ "$REPLY_V" = 0 ]; then
+             unset_value "$n" dns-listen; ok "DNS forwarder listener turned OFF."; changed=1
            else
-             set_value "$n" governor true; ok "Volume governor turned ON."
+             set_value "$n" dns-listen "$REPLY_V"; ok "DNS forwarder listening on $REPLY_V."; changed=1
            fi
-           changed=1; sleep 1
-         fi ;;
+         fi
+         sleep 1 ;;
+      9) # Carrier Source IP Binding
+         echo
+         if pick_src_ip "${sip:-off}"; then
+           if [ "$REPLY_V" = off ] || [ "$REPLY_V" = 0 ]; then
+             unset_value "$n" src-ip; ok "Carrier source IP binding turned OFF."; changed=1
+           else
+             set_value "$n" src-ip "$REPLY_V"; ok "Carrier bound to source IP $REPLY_V."; changed=1
+           fi
+         fi
+         sleep 1 ;;
       t|T)
          anticensor_test "$n"
          pause ;;
@@ -4036,7 +4147,7 @@ prof_read() { # file -> the KEY=VALUE lines this manager wrote (comments and any
   local l
   [ -f "$1" ] || return 0
   while IFS= read -r l; do
-    case "$l" in FAKESNI=*|FAKEMODE=*|FAKETTL=*|POOLROT=*|POOLBYTES=*|ECH=*|GOVERNOR=*) echo "$l" ;; esac
+    case "$l" in FAKESNI=*|FAKEMODE=*|FAKETTL=*|POOLROT=*|POOLBYTES=*|ECH=*|GOVERNOR=*|DNSLISTEN=*|SRCIP=*) echo "$l" ;; esac
   done <"$1"
 }
 prof_pick_defaults() { # fill the wizard's resilience defaults from a saved profile (interactive only)
@@ -4054,6 +4165,7 @@ prof_pick_defaults() { # fill the wizard's resilience defaults from a saved prof
       FAKESNI) T_FAKESNI=$v ;; FAKEMODE) T_FAKEMODE=$v ;; FAKETTL) T_FAKETTL=$v ;;
       POOLROT) T_POOLROT=$v ;; POOLBYTES) T_POOLBYTES=$v ;;
       ECH) T_ECH=$v ;; GOVERNOR) T_GOVERNOR=$v ;;
+      DNSLISTEN) T_DNSLISTEN=$v ;; SRCIP) T_SRCIP=$v ;;
     esac
   done < <(prof_read "$(prof_path "$pick")")
   hint "Profile '$pick' loaded as the defaults below; press Enter to keep each."
@@ -4161,6 +4273,8 @@ profile_cmd() { # profile save|list|show|del|apply NAME [tunnel]
            echo "POOLBYTES=$(cfg "$tun" pool-rotate-bytes)"
            echo "ECH=$(cfg "$tun" ech)"
            echo "GOVERNOR=$(cfg "$tun" governor)"
+           echo "DNSLISTEN=$(cfg "$tun" dns-listen)"
+           echo "SRCIP=$(cfg "$tun" src-ip)"
          } >"$tmp"; then
         mv -f "$tmp" "$f"
         ok "Profile '$name' saved (from $tun). Re-apply later: $SELF profile apply $name TUNNEL."
@@ -4227,12 +4341,12 @@ profile_cmd() { # profile save|list|show|del|apply NAME [tunnel]
 
 prof_apply() { # profile tunnel : write the tunnel's resilience keys from a saved profile, then restart
   local name=$1 tun=$2 l k v changed=0
-  local fs='' fm='' ft='' pr='' pb='' ech='' gov=''
+  local fs='' fm='' ft='' pr='' pb='' ech='' gov='' dl='' sip=''
   while IFS= read -r l; do
     k=${l%%=*}; v=${l#*=}
     case "$k" in
       FAKESNI) fs=$v ;; FAKEMODE) fm=$v ;; FAKETTL) ft=$v ;; POOLROT) pr=$v ;; POOLBYTES) pb=$v ;;
-      ECH) ech=$v ;; GOVERNOR) gov=$v ;;
+      ECH) ech=$v ;; GOVERNOR) gov=$v ;; DNSLISTEN) dl=$v ;; SRCIP) sip=$v ;;
     esac
   done < <(prof_read "$(prof_path "$name")")
   if [ -n "$fs" ]; then
@@ -4269,6 +4383,14 @@ prof_apply() { # profile tunnel : write the tunnel's resilience keys from a save
     [ "$(bin_ver_ok 2.9.0)" = 1 ] || { err "governor needs wattun 2.9.0 or newer (run: $SELF update)."; return 1; }
     set_value "$tun" governor true; changed=1
   elif [ -n "$(cfg "$tun" governor)" ]; then unset_value "$tun" governor; changed=1
+  fi
+  if [ -n "$dl" ] && [ "$dl" != off ]; then
+    set_value "$tun" dns-listen "$dl"; changed=1
+  elif [ -n "$(cfg "$tun" dns-listen)" ]; then unset_value "$tun" dns-listen; changed=1
+  fi
+  if [ -n "$sip" ] && [ "$sip" != off ]; then
+    set_value "$tun" src-ip "$sip"; changed=1
+  elif [ -n "$(cfg "$tun" src-ip)" ]; then unset_value "$tun" src-ip; changed=1
   fi
   [ "$changed" = 1 ] || { hint "Nothing to change."; return 0; }
   ok "Profile '$name' applied to $tun."
@@ -4598,7 +4720,7 @@ ni_parse() {
         else
           NI_GOVERNOR=true
         fi; continue ;;
-      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--sessions|--fake-sni|--fake-mode|--fake-ttl|--pool-rotate|--pool-rotate-bytes|--preset|--ech)
+      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--sessions|--fake-sni|--fake-mode|--fake-ttl|--pool-rotate|--pool-rotate-bytes|--preset|--ech|--dns-listen|--src-ip)
         if [ "$hasv" = 0 ]; then
           [ $# -gt 0 ] || { err "$f needs a value"; return 1; }
           v=$1; shift
@@ -4632,6 +4754,8 @@ ni_parse() {
       --map) [ -n "$v" ] || { err "--map needs a list such as 39901:18999,8443:443"; return 1; }; NI_MAP=$v ;;
       --pick) case "$v" in best|bond) NI_PICK=$v ;; *,*) [[ "$v" =~ ^[0-9]+(,[0-9]+)+$ ]] || { err "--pick: rows joined with commas, such as 1,3 (got '$v')"; return 1; }; NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond, a row number or rows such as 1,3 (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
       --sessions) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$v))" -ge 1 ] || { err "--sessions: use a number of sessions, 1 or more (got '$v')"; return 1; }; NI_SESSIONS=$((10#$v)) ;;
+      --dns-listen) v_dns_listen "$v" || return 1; NI_DNSLISTEN=$v ;;
+      --src-ip) v_src_ip "$v" || return 1; NI_SRCIP=$v ;;
     esac
   done
   return 0

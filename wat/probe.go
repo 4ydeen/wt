@@ -164,7 +164,11 @@ func (p *filterProbe) sumProbe(c *net.TCPConn) bool {
 	if !ok1 || !ok2 || la.IP.To4() == nil || ra.IP.To4() == nil {
 		return true
 	}
-	hello := FakeClientHello(p.cfg.SNI)
+	snis := splitSNIs(p.cfg.SNI)
+	if len(snis) == 0 {
+		return true
+	}
+	hello := FakeClientHello(snis[0])
 	if hello == nil {
 		return true
 	}

@@ -519,6 +519,13 @@ func TestDesyncFakePacketRoundTrip(t *testing.T) {
 	if !bytes.Equal(pkt[40:], hello) {
 		t.Fatal("payload is not the hello")
 	}
+	if ipCsum := csum(pkt[:20]); ipCsum != 0 {
+		t.Fatalf("ipv4 header checksum mismatch: got %04x, want 0", ipCsum)
+	}
+	rstPkt := fakeRSTPacket(k, 800, 556, 64)
+	if ipCsum := csum(rstPkt[:20]); ipCsum != 0 {
+		t.Fatalf("rst ipv4 header checksum mismatch: got %04x, want 0", ipCsum)
+	}
 }
 
 // TestDesyncAbandonAndClose: Wrap channels close cleanly, no fake fires after close.

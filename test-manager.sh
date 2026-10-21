@@ -247,6 +247,35 @@ chk "pick_ech default" "$REPLY_V" "ladder"
 NI_ECH='auto' pick_ech
 chk "pick_ech explicit" "$REPLY_V" "auto"
 
+# Validators & pickers for dns-listen and src-ip
+v_dns_listen "127.0.0.1:53" || { echo "FAIL v_dns_listen 127.0.0.1:53"; fail=1; }
+v_dns_listen "0.0.0.0:5353" || { echo "FAIL v_dns_listen 0.0.0.0:5353"; fail=1; }
+v_dns_listen "off" || { echo "FAIL v_dns_listen off"; fail=1; }
+expect_fail v_dns_listen "invalid_addr"
+expect_fail v_dns_listen "127.0.0.1:99999"
+
+v_src_ip "192.168.1.50" || { echo "FAIL v_src_ip 192.168.1.50"; fail=1; }
+v_src_ip "10.0.0.2" || { echo "FAIL v_src_ip 10.0.0.2"; fail=1; }
+v_src_ip "off" || { echo "FAIL v_src_ip off"; fail=1; }
+expect_fail v_src_ip "999.999.999.999"
+expect_fail v_src_ip "bad_ip"
+
+NI_DNSLISTEN='' pick_dns_listen
+chk "pick_dns_listen default" "$REPLY_V" "off"
+NI_DNSLISTEN='127.0.0.1:53' pick_dns_listen
+chk "pick_dns_listen explicit" "$REPLY_V" "127.0.0.1:53"
+
+NI_SRCIP='' pick_src_ip
+chk "pick_src_ip default" "$REPLY_V" "off"
+NI_SRCIP='192.168.43.100' pick_src_ip
+chk "pick_src_ip explicit" "$REPLY_V" "192.168.43.100"
+
+# ni_parse handles --dns-listen and --src-ip
+NI_DNSLISTEN='' NI_SRCIP=''
+ni_parse --dns-listen 127.0.0.1:53 --src-ip 10.10.10.5
+chk "ni_parse dns-listen" "$NI_DNSLISTEN" "127.0.0.1:53"
+chk "ni_parse src-ip" "$NI_SRCIP" "10.10.10.5"
+
 # Automated link bypass verification (anticensor_test)
 cat >"$WAT_CONF/t_probe.yml" <<'EOF'
 mode: client

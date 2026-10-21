@@ -56,7 +56,7 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 2048)
+		buf := make([]byte, maxDNSMsgLen)
 		for {
 			n, src, err := pc.ReadFrom(buf)
 			if err != nil {
@@ -71,7 +71,7 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 					continue
 				}
 			}
-			if n < 12 || n > 512 {
+			if n < 12 || n > maxDNSMsgLen {
 				continue
 			}
 			query := make([]byte, n)
@@ -134,7 +134,7 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 							return
 						}
 						n := int(qlen[0])<<8 | int(qlen[1])
-						if n < 12 || n > 512 {
+						if n < 12 || n > maxDNSMsgLen {
 							return
 						}
 						query := make([]byte, n)

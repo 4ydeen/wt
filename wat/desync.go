@@ -253,6 +253,7 @@ func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
 	pkt[9] = 6 // TCP
 	copy(pkt[12:16], k.srcIP[:])
 	copy(pkt[16:20], k.dstIP[:])
+	binary.BigEndian.PutUint16(pkt[10:], csum(pkt[:20]))
 	th := pkt[20:]
 	binary.BigEndian.PutUint16(th[0:], k.srcPt)
 	binary.BigEndian.PutUint16(th[2:], k.dstPt)
@@ -276,6 +277,7 @@ func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
 	pkt[9] = 6 // TCP
 	copy(pkt[12:16], k.srcIP[:])
 	copy(pkt[16:20], k.dstIP[:])
+	binary.BigEndian.PutUint16(pkt[10:], csum(pkt[:20]))
 	th := pkt[20:]
 	binary.BigEndian.PutUint16(th[0:], k.srcPt)
 	binary.BigEndian.PutUint16(th[2:], k.dstPt)
