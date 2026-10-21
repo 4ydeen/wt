@@ -53,6 +53,13 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 	done := make(chan struct{})
 	sem := make(chan struct{}, maxInflightDNS)
 
+	closer := &dnsListenerCloser{
+		pc:   pc,
+		ln:   ln,
+		done: done,
+		wg:   &wg,
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -118,9 +125,11 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 						continue
 					}
 				}
+				closer.conns.Store(conn, struct{}{})
 				wg.Add(1)
 				go func(c net.Conn) {
 					defer wg.Done()
+					defer closer.conns.Delete(c)
 					defer c.Close()
 					writeResp := func(data []byte) {
 						hdr := [2]byte{byte(len(data) >> 8), byte(len(data))}
@@ -166,20 +175,16 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 		}()
 	}
 
-	return &dnsListenerCloser{
-		pc:   pc,
-		ln:   ln,
-		done: done,
-		wg:   &wg,
-	}, nil
+	return closer, nil
 }
 
 type dnsListenerCloser struct {
-	pc   net.PacketConn
-	ln   net.Listener
-	done chan struct{}
-	wg   *sync.WaitGroup
-	once sync.Once
+	pc    net.PacketConn
+	ln    net.Listener
+	done  chan struct{}
+	wg    *sync.WaitGroup
+	conns sync.Map
+	once  sync.Once
 }
 
 func (c *dnsListenerCloser) Close() error {
@@ -191,6 +196,12 @@ func (c *dnsListenerCloser) Close() error {
 		if c.ln != nil {
 			_ = c.ln.Close()
 		}
+		c.conns.Range(func(key, _ any) bool {
+			if conn, ok := key.(net.Conn); ok {
+				_ = conn.Close()
+			}
+			return true
+		})
 		c.wg.Wait()
 	})
 	return nil

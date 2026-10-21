@@ -203,6 +203,11 @@ func sendRawPacket(pkt []byte) {
 		return
 	}
 	defer unix.Close(fd)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1)
+	src := pkt[12:16]
+	if src[0] != 0 || src[1] != 0 || src[2] != 0 || src[3] != 0 {
+		_ = unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{src[0], src[1], src[2], src[3]}})
+	}
 	dst := pkt[16:20]
 	_ = unix.Sendto(fd, pkt, 0, &unix.SockaddrInet4{Port: int(binary.BigEndian.Uint16(pkt[22:])), Addr: [4]byte{dst[0], dst[1], dst[2], dst[3]}})
 }

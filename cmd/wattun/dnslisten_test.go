@@ -288,3 +288,38 @@ func TestDNSListenerLargeEDNS0Query(t *testing.T) {
 		t.Errorf("expected RCODE 2 (ServFail), got %d", resp[3]&0x0f)
 	}
 }
+
+func TestDNSListenerImmediateCloseWithActiveTCPConns(t *testing.T) {
+	l, err := startDNSListener("127.0.0.1:0", func() *tunnel { return nil }, nil)
+	if err != nil {
+		t.Fatalf("startDNSListener failed: %v", err)
+	}
+
+	closer := l.(*dnsListenerCloser)
+	addr := closer.ln.Addr().String()
+
+	// Connect 5 persistent TCP clients that remain idle
+	conns := make([]net.Conn, 5)
+	for i := range conns {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("client %d dial failed: %v", i, err)
+		}
+		defer c.Close()
+		conns[i] = c
+	}
+
+	// Small pause so Accept() finishes and registers conns in sync.Map
+	time.Sleep(20 * time.Millisecond)
+
+	start := time.Now()
+	if err := l.Close(); err != nil {
+		t.Fatalf("l.Close() failed: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Close must be prompt (<500ms) rather than hanging until dnsRelayTimeout (3s-6s)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("l.Close() took %v, want <500ms (idle client conns were not promptly closed)", elapsed)
+	}
+}
