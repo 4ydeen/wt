@@ -338,11 +338,20 @@ AT_SEL=("${AV_LABEL[*]}") # dummy to satisfy set -u shape; real selection below
 AT_SEL=(0)
 ac_matrix_apply t1
 chk "matrix apply: strips fake-sni on baseline" "$(grep -c '^fake-sni:' "$WAT_CONF/t1.yml" || true)" "0"
+chk "matrix apply: strips fake-ttl on baseline" "$(grep -c '^fake-ttl:' "$WAT_CONF/t1.yml" || true)" "0"
 AV_SEL=(); for ((i=0; i<${#AV_LABEL[@]}; i++)); do [ "${AV_FM[$i]}" = seqsum ] && AV_SEL+=("$i"); done
 AT_SEL=("${AV_SEL[0]}")
 ac_matrix_apply t1
 chk "matrix apply: writes fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t1.yml")" "fake-sni: mci.ir"
 chk "matrix apply: writes fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: seqsum"
+chk "matrix apply: resets fake-ttl" "$(grep -c '^fake-ttl:' "$WAT_CONF/t1.yml" || true)" "0"
+
+# matrix gate: a bond carrier is rejected with a pointer at auto-test
+echo "carrier: tcp+wss" >"$WAT_CONF/t_bond.yml"
+echo "mode: client" >>"$WAT_CONF/t_bond.yml"
+echo "peer: 198.51.100.1:443" >>"$WAT_CONF/t_bond.yml"
+NONINTERACTIVE=1 expect_fail ac_matrix_cmd t_bond
+rm -f "$WAT_CONF/t_bond.yml"
 
 [ "$fail" = 0 ] && echo "ALL OK" || echo "FAILURES: $fail"
 exit "$fail"

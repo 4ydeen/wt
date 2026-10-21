@@ -164,9 +164,13 @@ func (s *echState) fetchSync(name string, e *tlsEngine) []byte {
 // doLookup fetches name's config (no s.mu held). The lookup does not use the dial's context, so a slow DoH cannot eat
 // the dial's budget.
 func (s *echState) doLookup(name string, e *tlsEngine) ([]byte, error) {
+	// snapshot the server list: FetchECHConfigList races the servers in goroutines, and a lookup running in a
+	// background refresh (refreshAsync, rejected) must never read the package variable while a test (or a future
+	// config reload) swaps it (race found by -race on TestECHCacheFile, audit 2026-10-21 round 2).
+	servers := append([]string(nil), dohServers...)
 	fctx, cancel := context.WithTimeout(context.Background(), dohTimeout+time.Second)
 	defer cancel()
-	list, err := FetchECHConfigList(fctx, name)
+	list, err := fetchECHConfigListFrom(fctx, servers, name)
 	if err != nil && !errors.Is(err, errNoECH) && s.mode == "ladder" && s.ladder != nil {
 		if l2, err2 := s.ladderThrough(name); err2 == nil {
 			list, err = l2, nil
@@ -266,6 +270,11 @@ func (s *echState) rejected(name string, retry []byte, e *tlsEngine) bool {
 
 // FetchECHConfigList looks up the ECH SvcParam of name's HTTPS record through the DoH servers.
 func FetchECHConfigList(ctx context.Context, name string) ([]byte, error) {
+	return fetchECHConfigListFrom(ctx, dohServers, name)
+}
+
+// fetchECHConfigListFrom is FetchECHConfigList against an explicit server list (the caller owns the slice).
+func fetchECHConfigListFrom(ctx context.Context, servers []string, name string) ([]byte, error) {
 	q, err := buildDNSQuery(name, dnsTypeHTTPS)
 	if err != nil {
 		return nil, err
@@ -276,8 +285,8 @@ func FetchECHConfigList(ctx context.Context, name string) ([]byte, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ch := make(chan res, len(dohServers))
-	for _, srv := range dohServers {
+	ch := make(chan res, len(servers))
+	for _, srv := range servers {
 		go func() {
 			list, err := dohQuery(ctx, srv, q)
 			if err != nil && !errors.Is(err, errNoECH) {
@@ -289,7 +298,7 @@ func FetchECHConfigList(ctx context.Context, name string) ([]byte, error) {
 	var last error
 	noECH := false
 	var grace <-chan time.Time
-	for n := 0; n < len(dohServers); n++ {
+	for n := 0; n < len(servers); n++ {
 		select {
 		case r := <-ch:
 			switch {
@@ -306,7 +315,7 @@ func FetchECHConfigList(ctx context.Context, name string) ([]byte, error) {
 		case <-grace:
 			return nil, errNoECH
 		case <-ctx.Done():
-			n = len(dohServers)
+			n = len(servers)
 			if last == nil {
 				last = ctx.Err()
 			}
