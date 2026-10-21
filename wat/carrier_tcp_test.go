@@ -447,3 +447,23 @@ func TestRotatePickSkipsDeadConnections(t *testing.T) {
 		t.Fatalf("rotatePick returned %v, want aliveDue", pick)
 	}
 }
+
+func TestEnqueueDeadConnDrainsAndReturnsBuffer(t *testing.T) {
+	pc := &poolConn{
+		q:    make(chan []byte, 16),
+		done: make(chan struct{}),
+	}
+	close(pc.done)
+
+	// In a dead connection, enqueue must never leave stranded packets in pc.q
+	for i := 0; i < 50; i++ {
+		p := getPkt(256)
+		ok := pc.enqueue(p)
+		if ok {
+			t.Fatalf("enqueue returned true on closed connection (iter %d)", i)
+		}
+	}
+	if len(pc.q) != 0 {
+		t.Fatalf("pc.q contains %d stranded packets after enqueue on closed connection", len(pc.q))
+	}
+}

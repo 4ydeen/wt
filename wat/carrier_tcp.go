@@ -328,8 +328,23 @@ func (pc *poolConn) enqueue(p []byte) bool {
 	default:
 	}
 	select {
+	case <-pc.done:
+		putPkt(p)
+		return false
 	case pc.q <- p:
-		return true
+		select {
+		case <-pc.done:
+			for {
+				select {
+				case dropped := <-pc.q:
+					putPkt(dropped)
+				default:
+					return false
+				}
+			}
+		default:
+			return true
+		}
 	default:
 		poolDrops.Add(1)
 		putPkt(p)

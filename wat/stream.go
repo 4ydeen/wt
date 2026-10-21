@@ -636,7 +636,9 @@ func (q *rdQueue) read(b []byte) int {
 
 func (q *rdQueue) reset() {
 	for _, c := range q.ch {
-		rdPool.Put(c)
+		if c != nil {
+			rdPool.Put(c)
+		}
 	}
 	clear(q.ch)
 	*q = rdQueue{ch: q.ch[:0]}

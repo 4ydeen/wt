@@ -444,6 +444,10 @@ func main() {
 	}
 	var pio wat.PacketIO
 	var raw wat.RawIO
+	var tm wat.PathTimings
+	if *pathProbeMax > 0 {
+		tm.ProbeMax = *pathProbeMax
+	}
 	if len(names) == 1 {
 		pio, raw = build(names[0])
 	} else { // bonded: one session over all of them
@@ -459,10 +463,6 @@ func main() {
 			}
 		}
 		var err error
-		var tm wat.PathTimings
-		if *pathProbeMax > 0 {
-			tm.ProbeMax = *pathProbeMax
-		}
 		if server {
 			raw = wat.NewMultiRaw(names, raws)
 		} else if pio, err = wat.NewBondIO(kids, wat.BondOptions{Names: names, Lanes: lanesPer, Timings: tm}); err != nil {
@@ -471,7 +471,7 @@ func main() {
 	}
 	cfg := wat.Config{
 		Server: server, Key: k, Paths: *lanes, MaxBps: *maxMB * 1e6, Slack: time.Duration(*slackMs) * time.Millisecond,
-		Logf: log.Printf, Hedge: *hedge, FEC: *fecMode == "auto", MaxPayload: *mtu,
+		Logf: log.Printf, Hedge: *hedge, FEC: *fecMode == "auto", MaxPayload: *mtu, Bond: tm,
 		// no CDN can sit in a reverse pool (Kharej dials Iran's IP) or in front of raw tcp/tls: TCP paces (2.4.18)
 		Direct: len(names) == 1 && (*reverse && poolCarriers[names[0]] || names[0] == "tcp" || names[0] == "tls"),
 	}

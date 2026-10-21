@@ -66,6 +66,9 @@ func (t PathTimings) norm() PathTimings {
 	if t.ProbeMax <= 0 {
 		t.ProbeMax = 30 * time.Second
 	}
+	if t.ProbeFirst > t.ProbeMax {
+		t.ProbeFirst = t.ProbeMax
+	}
 	if t.Ramp <= 0 {
 		t.Ramp = 3 * time.Second
 	}
