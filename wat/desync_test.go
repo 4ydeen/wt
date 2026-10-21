@@ -18,7 +18,7 @@ func TestFakeClientHelloRealParser(t *testing.T) {
 	defer c2.Close()
 	errc := make(chan error, 1)
 	go func() {
-		c1.SetDeadline(time.Now().Add(5 * time.Second))
+		c1.SetDeadline(time.Now().Add(250 * time.Millisecond))
 		srv := tls.Server(c1, &tls.Config{MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12, Certificates: []tls.Certificate{func() tls.Certificate {
 			c, err := SelfSignedCert()
 			if err != nil {
@@ -28,14 +28,14 @@ func TestFakeClientHelloRealParser(t *testing.T) {
 		}()}})
 		errc <- srv.Handshake()
 	}()
-	c2.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	c2.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
 	go func() { // drain the server's flight so its write never blocks
 		io.Copy(io.Discard, c2)
 	}()
 	if _, err := c2.Write(FakeClientHello("mci.ir")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	c2.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 	err := <-errc
 	if err == nil {
 		return // parsed and got as far as completing: fine
@@ -57,7 +57,7 @@ func TestFakeClientHelloTLS13Parser(t *testing.T) {
 	defer c2.Close()
 	errc := make(chan error, 1)
 	go func() {
-		c1.SetDeadline(time.Now().Add(5 * time.Second))
+		c1.SetDeadline(time.Now().Add(250 * time.Millisecond))
 		srv := tls.Server(c1, &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			Certificates: []tls.Certificate{func() tls.Certificate {
@@ -70,14 +70,14 @@ func TestFakeClientHelloTLS13Parser(t *testing.T) {
 		})
 		errc <- srv.Handshake()
 	}()
-	c2.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	c2.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
 	go func() {
 		io.Copy(io.Discard, c2)
 	}()
 	if _, err := c2.Write(FakeClientHello("mci.ir")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	c2.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 	err := <-errc
 	if err == nil {
 		return
@@ -878,3 +878,199 @@ func TestDesyncMultiSNIRotation(t *testing.T) {
 		}
 	}
 }
+
+// TestFakeClientHelloECHGREASE verifies that FakeClientHello includes the RFC 9460 / RFC 8701
+// ECH GREASE extension (0xfe0d) with valid outer configuration.
+func TestFakeClientHelloECHGREASE(t *testing.T) {
+	rec := FakeClientHello("mci.ir")
+	if len(rec) < 5 || rec[0] != 0x16 {
+		t.Fatalf("bad TLS record header: %v", rec[:5])
+	}
+	hs := rec[5:]
+	if len(hs) < 4 || hs[0] != 1 {
+		t.Fatalf("bad handshake header: %v", hs[:4])
+	}
+	// Skip ClientHello fixed fields to find extensions:
+	// handshake header(4) + version(2) + random(32) + session_id(1+len) + cipher_suites(2+len) + compression(1+len)
+	off := 4 + 2 + 32
+	if off >= len(hs) {
+		t.Fatal("truncated hs at random")
+	}
+	sidLen := int(hs[off])
+	off += 1 + sidLen
+	if off+2 > len(hs) {
+		t.Fatal("truncated hs at session id")
+	}
+	csLen := int(binary.BigEndian.Uint16(hs[off : off+2]))
+	off += 2 + csLen
+	if off+1 > len(hs) {
+		t.Fatal("truncated hs at cipher suites")
+	}
+	compLen := int(hs[off])
+	off += 1 + compLen
+	if off+2 > len(hs) {
+		t.Fatal("truncated hs at compression")
+	}
+	extTotalLen := int(binary.BigEndian.Uint16(hs[off : off+2]))
+	off += 2
+	if off+extTotalLen > len(hs) {
+		t.Fatalf("truncated extensions: need %d have %d", extTotalLen, len(hs)-off)
+	}
+
+	foundECH := false
+	extEnd := off + extTotalLen
+	for off+4 <= extEnd {
+		extType := binary.BigEndian.Uint16(hs[off : off+2])
+		extLen := int(binary.BigEndian.Uint16(hs[off+2 : off+4]))
+		off += 4
+		if off+extLen > extEnd {
+			t.Fatalf("extension 0x%04x truncated", extType)
+		}
+		if extType == 0xfe0d {
+			foundECH = true
+			data := hs[off : off+extLen]
+			if len(data) != 138 {
+				t.Fatalf("ECH GREASE data len: got %d, want 138", len(data))
+			}
+			if data[0] != 0x00 { // outer ClientHello
+				t.Fatalf("ECH type: got %d, want 0 (outer)", data[0])
+			}
+			// HKDF-SHA256 (0x0001) + AES-128-GCM (0x0001)
+			if !bytes.Equal(data[1:5], []byte{0x00, 0x01, 0x00, 0x01}) {
+				t.Fatalf("ECH cipher suite mismatch: %x", data[1:5])
+			}
+			if data[5] != 0x00 { // config_id
+				t.Fatalf("ECH config_id: got %d, want 0", data[5])
+			}
+			encLen := binary.BigEndian.Uint16(data[6:8])
+			if encLen != 32 {
+				t.Fatalf("ECH encLen: got %d, want 32", encLen)
+			}
+			payloadLen := binary.BigEndian.Uint16(data[40:42])
+			if payloadLen != 96 {
+				t.Fatalf("ECH payloadLen: got %d, want 96", payloadLen)
+			}
+		}
+		off += extLen
+	}
+	if !foundECH {
+		t.Fatal("ECH GREASE extension (0xfe0d) not found in FakeClientHello")
+	}
+}
+
+// TestFakePacketWithOptions verifies IPv4/TCP header formatting, options placement,
+// and checksum calculation when TCP options are mirrored from the kernel.
+func TestFakePacketWithOptions(t *testing.T) {
+	k := desyncKey{
+		srcIP: [4]byte{192, 168, 1, 50},
+		dstIP: [4]byte{1, 2, 3, 4},
+		srcPt: 12345,
+		dstPt: 443,
+	}
+	// 12 bytes of TCP options: NOP, NOP, Timestamps (Kind=8, Len=10, TSval=0x11223344, TSecr=0x55667788)
+	opts := []byte{0x01, 0x01, 0x08, 0x0a, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	payload := []byte("TEST_PAYLOAD_BODY")
+
+	pkt := fakePacketWithOptions(k, 1000, 2000, 64, payload, opts)
+
+	// IPv4 header checks
+	if pkt[0] != 0x45 {
+		t.Fatalf("IP version/IHL: got 0x%02x, want 0x45", pkt[0])
+	}
+	totLen := binary.BigEndian.Uint16(pkt[2:4])
+	if int(totLen) != len(pkt) {
+		t.Fatalf("IP totLen: got %d, want %d", totLen, len(pkt))
+	}
+	if csum(pkt[:20]) != 0 {
+		t.Fatal("IPv4 header checksum invalid")
+	}
+
+	// TCP header checks: 20 bytes standard + 12 bytes options = 32 bytes (Data Offset = 8)
+	th := pkt[20:]
+	dataOffset := th[12] >> 4
+	if dataOffset != 8 {
+		t.Fatalf("TCP Data Offset: got %d, want 8", dataOffset)
+	}
+	if !bytes.Equal(th[20:32], opts) {
+		t.Fatalf("TCP options mismatch in header: got %x, want %x", th[20:32], opts)
+	}
+	if !bytes.Equal(pkt[20+32:], payload) {
+		t.Fatalf("Payload mismatch: got %q, want %q", pkt[20+32:], payload)
+	}
+
+	// TCP checksum verification
+	ph := make([]byte, 12)
+	copy(ph[0:4], k.srcIP[:])
+	copy(ph[4:8], k.dstIP[:])
+	ph[9] = 6
+	binary.BigEndian.PutUint16(ph[10:], uint16(len(th)))
+	if csum(append(ph, th...)) != 0 {
+		t.Fatal("TCP checksum invalid")
+	}
+}
+
+// TestDesyncOptsCapture verifies that outbound segments with TCP options (e.g. timestamps)
+// are recorded by the tracker and reflected in injected fake packets.
+func TestDesyncOptsCapture(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(2000), uint32(600000)
+	ch := tr.announce(k, isn+1, true)
+
+	// SYN (no options for simplicity)
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	// SYN-ACK from server
+	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+
+	// Final ACK with 12 bytes of TCP options (NOP, NOP, Timestamps)
+	opts := []byte{0x01, 0x01, 0x08, 0x0a, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22}
+	ackPkt := make([]byte, 20+32)
+	ackPkt[0] = 0x45
+	binary.BigEndian.PutUint16(ackPkt[2:], uint16(len(ackPkt)))
+	ackPkt[8] = 64
+	ackPkt[9] = 6
+	copy(ackPkt[12:16], k.srcIP[:])
+	copy(ackPkt[16:20], k.dstIP[:])
+	binary.BigEndian.PutUint16(ackPkt[10:], csum(ackPkt[:20]))
+	ath := ackPkt[20:]
+	binary.BigEndian.PutUint16(ath[0:], k.srcPt)
+	binary.BigEndian.PutUint16(ath[2:], k.dstPt)
+	binary.BigEndian.PutUint32(ath[4:], isn+1)
+	binary.BigEndian.PutUint32(ath[8:], srvSeq+1)
+	ath[12] = 0x80 // Data Offset = 8 (32 bytes)
+	ath[13] = testFlagACK
+	binary.BigEndian.PutUint16(ath[14:], 0xffff)
+	copy(ath[20:], opts)
+	binary.BigEndian.PutUint16(ath[16:], tcpChecksum(ath, k.srcIP[:], k.dstIP[:]))
+
+	tr.handleIPv4(ackPkt)
+
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake never fired")
+	}
+
+	if len(*sent) != 1 {
+		t.Fatalf("want 1 fake, got %d", len(*sent))
+	}
+	fake := (*sent)[0]
+	// TCP header must have Data Offset = 8
+	fth := fake[20:]
+	if fth[12]>>4 != 8 {
+		t.Fatalf("fake Data Offset: got %d, want 8", fth[12]>>4)
+	}
+	if !bytes.Equal(fth[20:32], opts) {
+		t.Fatalf("fake options mismatch: got %x, want %x", fth[20:32], opts)
+	}
+	// Fake payload starts at byte 52 (20 IP + 32 TCP)
+	gotSNI, err := parseSNIOf(fake[52:])
+	if err != nil {
+		t.Fatalf("parseSNIOf failed on fake: %v", err)
+	}
+	if gotSNI != "mci.ir" {
+		t.Fatalf("fake SNI: got %q, want mci.ir", gotSNI)
+	}
+}
+

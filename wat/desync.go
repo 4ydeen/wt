@@ -128,6 +128,26 @@ func FakeClientHello(sni string) []byte {
 	// 7. psk_key_exchange_modes: psk_dhe_ke (list len 1, ext len 2)
 	ext = append(ext, 0, 0x2d, 0, 2, 1, 1)
 
+	// 8. encrypted_client_hello (ECH GREASE, RFC 9460 §6.1 / RFC 8701 / draft-ietf-tls-esni-22):
+	// Modern browsers (Chrome 117+, Firefox 118+) attach an outer ECH GREASE extension by default.
+	// Middleboxes cannot decrypt inner ClientHellos, forcing allowlist classifiers to evaluate the
+	// outer server_name, while JA4 heuristic analyzers validate authentic browser extension composition.
+	echData := make([]byte, 0, 138)
+	echData = append(echData, 0x00)                     // outer
+	echData = append(echData, 0x00, 0x01, 0x00, 0x01) // HKDF-SHA256, AES-128-GCM
+	echData = append(echData, 0x00)                     // config_id
+	var echEnc [32]byte
+	_, _ = rand.Read(echEnc[:])
+	echData = append(echData, 0x00, 32)
+	echData = append(echData, echEnc[:]...)
+	var echPayload [96]byte
+	_, _ = rand.Read(echPayload[:])
+	echData = append(echData, 0x00, 96)
+	echData = append(echData, echPayload[:]...)
+
+	ext = append(ext, 0xfe, 0x0d, byte(len(echData)>>8), byte(len(echData)))
+	ext = append(ext, echData...)
+
 	body := make([]byte, 0, 128+len(ext))
 	body = append(body, 0x03, 0x03) // client version 1.2 in ClientHello body (RFC 8446)
 	var rnd [32]byte
@@ -242,10 +262,17 @@ type desyncKey struct {
 	dstPt uint16
 }
 
-// fakePacket builds the IPv4+TCP+payload packet of one fake ClientHello. Pure: the same inputs build the same
-// packet, so the tests pin it byte for byte (seq arithmetic, TTL, ack, checksum).
-func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
-	pkt := make([]byte, 20+20+len(hello))
+// fakePacketWithOptions builds the IPv4+TCP+options+payload packet of one fake ClientHello.
+// When opts is non-empty (e.g. Linux kernel TCP timestamps NOP, NOP, TSval, TSecr), the segment
+// mirrors standard kernel packet formatting (Data Offset > 5) so DPI appliances performing
+// TCP option consistency validation cannot distinguish the injected marker from normal traffic.
+func fakePacketWithOptions(k desyncKey, seq, ack uint32, ttl int, hello []byte, opts []byte) []byte {
+	tcpHdrLen := 20 + len(opts)
+	pad := (4 - (tcpHdrLen % 4)) % 4
+	tcpHdrLen += pad
+	dataOffset := byte(tcpHdrLen / 4)
+
+	pkt := make([]byte, 20+tcpHdrLen+len(hello))
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
 	pkt[6] = 0x40 // Don't Fragment
@@ -254,17 +281,30 @@ func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
 	copy(pkt[12:16], k.srcIP[:])
 	copy(pkt[16:20], k.dstIP[:])
 	binary.BigEndian.PutUint16(pkt[10:], csum(pkt[:20]))
-	th := pkt[20:]
+
+	th := pkt[20 : 20+tcpHdrLen]
 	binary.BigEndian.PutUint16(th[0:], k.srcPt)
 	binary.BigEndian.PutUint16(th[2:], k.dstPt)
 	binary.BigEndian.PutUint32(th[4:], seq)
 	binary.BigEndian.PutUint32(th[8:], ack)
-	th[12] = 0x50
+	th[12] = dataOffset << 4
 	th[13] = 0x18 // PSH|ACK
 	binary.BigEndian.PutUint16(th[14:], 0xffff)
-	copy(th[20:], hello)
+	if len(opts) > 0 {
+		copy(th[20:], opts)
+		for i := 20 + len(opts); i < tcpHdrLen; i++ {
+			th[i] = 0x01 // TCP NOP option
+		}
+	}
+	copy(pkt[20+tcpHdrLen:], hello)
 	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
 	return pkt
+}
+
+// fakePacket builds the IPv4+TCP+payload packet of one fake ClientHello without TCP options. Pure: the same inputs
+// build the same packet, so the tests pin it byte for byte (seq arithmetic, TTL, ack, checksum).
+func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
+	return fakePacketWithOptions(k, seq, ack, ttl, hello, nil)
 }
 
 // fakeRSTPacket builds an in-window TCP RST+ACK packet with no payload. Pure: the same inputs build the same packet.
@@ -345,6 +385,7 @@ type desyncConn struct {
 	synAckSeq uint32 // seq of the server's SYN-ACK
 	synAckAck uint32 // ack field of the server's SYN-ACK (== ISN+1)
 	sumSeq    uint32 // sum/seqsum: seq of the outbound data segment being mirrored (0 = none yet)
+	tcpOpts   []byte // kernel TCP options observed on outbound non-SYN segments (e.g. timestamps)
 	at        time.Time
 }
 
@@ -505,6 +546,10 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		}
 		return
 	}
+	// outbound non-SYN segment on a tracked connection: record kernel options (e.g. TCP timestamps)
+	if c := t.conns[out]; c != nil && !syn && off > 20 && len(c.tcpOpts) == 0 {
+		c.tcpOpts = append([]byte(nil), th[20:off]...)
+	}
 	c := t.conns[out]
 	if c == nil || c.synAckAck == 0 && !c.isnKnown {
 		return // nothing to anchor the fake's ack to yet
@@ -586,20 +631,21 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
 			// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
 			// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
-			t.send(fakePacket(k, base-uint32(len(hello)), ack, ttl, hello))
-			pkt := fakePacket(k, base, ack, ttl, hello)
+			t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+			time.Sleep(time.Millisecond)
+			pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 			damageChecksum(pkt)
 			t.send(pkt)
 			return
 		}
 		if t.cfg.Mode == "sum" {
 			// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
-			pkt := fakePacket(k, base, ack, ttl, hello)
+			pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 			damageChecksum(pkt)
 			t.send(pkt)
 			return
 		}
-		pkt := fakePacket(k, base-uint32(len(hello)), ack, ttl, hello)
+		pkt := fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts)
 		t.send(pkt)
 	}
 }
