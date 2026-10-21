@@ -400,6 +400,9 @@ func (ps *pathSet) stats() []CarrierStat {
 // mergeProfiles is the most conservative of the carriers: the smallest datagram, reliable only if all are, the
 // slowest start. The MTU must not change during a session, so it is fixed from the whole configured set.
 func mergeProfiles(ps []Profile) Profile {
+	if len(ps) == 0 {
+		return Profile{MTU: MaxPayload, MaxMTU: MaxPayloadHi, InitBps: 1.5e6}
+	}
 	out := Profile{Reliable: len(ps) > 0}
 	for i, p := range ps {
 		mtu := p.MTU
