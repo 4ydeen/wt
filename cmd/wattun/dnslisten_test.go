@@ -185,4 +185,44 @@ func TestDNSListenerTCP(t *testing.T) {
 	if buf[3]&0x0f != 2 {
 		t.Errorf("expected RCODE 2 (ServFail), got %d", buf[3]&0x0f)
 	}
+
+	// Send a second query on the same persistent TCP connection (RFC 7766 pipelining/reuse)
+	q2 := []byte{
+		0x11, 0x22, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x03, 'b', 'a', 'r', 0x00,
+	}
+	hdr2 := [2]byte{byte(len(q2) >> 8), byte(len(q2))}
+	if _, err := conn.Write(hdr2[:]); err != nil {
+		t.Fatalf("write tcp hdr2: %v", err)
+	}
+	if _, err := conn.Write(q2); err != nil {
+		t.Fatalf("write tcp query2: %v", err)
+	}
+
+	for r := 0; r < 2; {
+		n, err := conn.Read(rlenHdr[r:])
+		if err != nil {
+			t.Fatalf("read rlenHdr2 on persistent conn: %v", err)
+		}
+		r += n
+	}
+	rlen2 := int(rlenHdr[0])<<8 | int(rlenHdr[1])
+	if rlen2 != len(q2) {
+		t.Fatalf("response length mismatch: got %d, want %d", rlen2, len(q2))
+	}
+
+	buf2 := make([]byte, rlen2)
+	for r := 0; r < rlen2; {
+		n, err := conn.Read(buf2[r:])
+		if err != nil {
+			t.Fatalf("read response body2: %v", err)
+		}
+		r += n
+	}
+	if buf2[0] != 0x11 || buf2[1] != 0x22 {
+		t.Errorf("ID mismatch query2: got %02x%02x, want 1122", buf2[0], buf2[1])
+	}
+	if buf2[3]&0x0f != 2 {
+		t.Errorf("expected RCODE 2 (ServFail) query2, got %d", buf2[3]&0x0f)
+	}
 }

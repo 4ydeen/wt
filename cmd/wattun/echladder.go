@@ -66,6 +66,28 @@ func serveDNSRelay(st *wat.Stream) {
 	if err != nil || n == 0 {
 		return
 	}
+	if n >= 12 && buf[2]&0x02 != 0 {
+		// Upstream indicated truncation (TC=1): query upstream over TCP for the full untruncated answer
+		if tcpConn, err := d.DialContext(ctx, "tcp", dnsRelayUpstream); err == nil {
+			defer tcpConn.Close()
+			_ = tcpConn.SetDeadline(time.Now().Add(dnsRelayTimeout))
+			qlenHdr := [2]byte{byte(len(query) >> 8), byte(len(query))}
+			if _, err := tcpConn.Write(qlenHdr[:]); err == nil {
+				if _, err := tcpConn.Write(query); err == nil {
+					var rlenHdr [2]byte
+					if _, err := io.ReadFull(tcpConn, rlenHdr[:]); err == nil {
+						tn := int(rlenHdr[0])<<8 | int(rlenHdr[1])
+						if tn >= 12 && tn <= 4096 {
+							tbuf := make([]byte, tn)
+							if _, err := io.ReadFull(tcpConn, tbuf); err == nil {
+								buf, n = tbuf, tn
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	alen := [2]byte{byte(n >> 8), byte(n)}
 	if _, err := st.Write(alen[:]); err != nil {
 		return
