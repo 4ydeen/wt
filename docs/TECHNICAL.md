@@ -525,6 +525,14 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   fake). A filter must discard both correctly to miss the SNI: window-junk dropping alone does not stop the sum
   marker, checksum dropping alone does not stop the seq marker. Inherits sum's caveats (data segment needed,
   checksum-validating NATs) plus seq's (a uniform NAT rewrite is followed, a non-uniform one defeats marker 1).
+- `fake-mode: rst` (2.9.0): the marker is an in-window RST|ACK with a damaged TCP checksum, sent instead of a
+  ClientHello. A middlebox that tracks flow state clears the flow on the RST and stops inspecting it, while the
+  server's kernel drops the corrupted packet before it reads the flags, so the real connection is untouched.
+  The marker carries no ClientHello, so no SNI: it is for filters that keep per-flow state and stop
+  inspecting a flow once they have classified it. Same caveat as `sum` on checksum-validating
+  NATs, and the marker must stay in-window: a low-TTL RST can reach the server after a reroute shortens the path
+  and tear the real connection down, which is exactly what this mode exists to avoid.
+  `fake-mode: auto` never picks it.
 - The server needs NO changes and no update: it never sees the marker packet. Only the client needs 2.6.0.
 - The manager sets none of this up by default: the Iran wizard asks one explicit question (Enter =
   skip), Advanced settings → resilience (`k`) on the tunnel page changes the values of an existing
@@ -1005,7 +1013,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `ech-cache` | empty (off) | client, with `ech: auto` | File that keeps the last good ECHConfigList (`name base64` per line, written atomically, 0600). On start it is used at once while DoH refreshes in the background; cache errors are logged once and never stop the tunnel. Since 2.2.3. |
 | `tls-frag` | 0 | client (server with `reverse`) | Split the ClientHello into pieces of N bytes. 0 = off. Since 2.2.0. |
 | `fake-sni` | empty (off) | client | Fake-SNI desync, tcp, tls, wss, h2 and grpc carriers: after each connection's TCP handshake the client injects a raw TLS ClientHello carrying this allowlisted SNI. The DPI classifies the flow as TLS to the allowed site; the server never receives it (wrong sequence number, a TTL that expires at the filtering hop, or a bad checksum), so the session flows on as if it were that TLS connection. Needs Linux + CAP_NET_RAW on the client, like the icmp carrier. Server unchanged. Since 2.6.0. |
-| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the marker carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the marker carries a small TTL and expires at the filtering hop (needs `fake-ttl`). `sum` (2.7.1): the marker mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it — the mode for filters that check sequence numbers. `seqsum` (2.8.0, experimental): both the seq and the sum marker per connection, ~1 ms apart. Since 2.6.0. |
+| `fake-mode` | `seq` | client, with `fake-sni` | `seq`: the marker carries a sequence number below the stream start, the server drops it as an old duplicate. `ttl`: the marker carries a small TTL and expires at the filtering hop (needs `fake-ttl`). `sum` (2.7.1): the marker mirrors the first data segment in-window with a damaged TCP checksum; the server kernel drops it, DPIs that ignore checksums still read it — the mode for filters that check sequence numbers. `seqsum` (2.8.0, experimental): both the seq and the sum marker per connection, ~1 ms apart. `rst` (2.9.0): the marker is an in-window RST|ACK with a damaged TCP checksum — a stateful middlebox clears the flow, the server's kernel drops the packet before it reads the flags. Since 2.6.0. |
 | `fake-ttl` | 0 | client, `fake-mode: ttl` | Hop count of the marker packet: one more than the distance to the filtering DPI box, one less than the distance to the server. Read it off a traceroute to the server. 0 also means auto since 2.7.0: the client learns the peer's inbound TTL from its SYN-ACKs and sends the marker one hop short of the server. Unused by `seq` and `sum`. Since 2.6.0. |
 | `metrics` | off | both | Serve `/stats` and pprof on this address. Always loopback (see Metrics). |
 | `debug` | false | both | Log every stream open and close. |
@@ -1786,6 +1794,25 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.10.1: the audit round after 2.10.0.** Both ends benefit; no wire change, old and new peers interop either
+  way. A five-reviewer sweep of the tree (19 findings) plus the first `-race` run of the `wat/` suite.
+  (1) **Kharej restart recovery** (a 2.10.0 regression): a switched client that hears nothing authenticated for
+  4 s seals and accepts PSK-keyed packets for 10 s and keeps offering, so a restarted (PSK-only) server
+  re-authenticates the session, sends its boot frame and the exchange completes — streams recover in seconds
+  instead of hanging for good.
+  (2) **Key exchange**: the client re-arms with fresh keys after its 10 s give-up instead of staying PSK-only for
+  the session, and the server's fresh key expires when the offers stop (before: one failed AEAD open per packet
+  for the session's lifetime).
+  (3) **Fake-SNI and the probe**: `fake-mode: auto` can now pick `sum` (its verdict keyed on a recheck that made
+  the case unreachable); each fire synthesizes a fresh ClientHello instead of replaying one byte-identical copy
+  per peer, and the seqsum marker's 1 ms gap no longer sleeps under the sniffer's lock.
+  (4) **Pacer and governor**: the no-estimate ramp respects `-loss-ceiling` and the governor's ceiling, and the
+  governor's rate history is trimmed by age, so the reroute ceiling is learned on fast paths too.
+  (5) **`cmd/wattun` robustness**: `-map` targets are range-checked, a malformed FEC length varint can no longer
+  panic the process, the built-in DNS relay works under the default allowlist, per-port state files are written
+  by one goroutine at a time, the drain exit saves quota, and oversized DNS queries are dropped rather than
+  truncated.
+  - [Security model](#security-model).
 - **2.10.0: forward secrecy — X25519 key exchange on every session.** Both ends need it for the new protection;
   old and new peers interop either way. Inside the existing encryption the two ends run an ephemeral X25519
   exchange: about one RTT into a session both sides switch to a fresh session key derived from the PSK plus the
@@ -1815,6 +1842,8 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   built-in server-side DNS relay (stream target port 53, the speed-test pattern): raw DNS query in, one UDP
   exchange with a recursive resolver on the Kharej side, answer back. Old server: port 53 is just a failed
   local dial, the ladder falls back to no ECH. Both ends need 2.9.0 for the relay rung.
+  (4) **`fake-mode: rst`** — an in-window RST|ACK marker with a damaged checksum: a stateful middlebox
+  clears the flow, the server kernel drops it before reading the flags (see Fake-SNI desync).
   Also in 2.9.0 (manager, from `main` without a tag): the `wattun blackout NAME [SNI]` one-command enable and
   the Diagnose/heal pointers to it (see the 2.8.2 entry).
   - [fake-mode auto](#fake-sni-desync-whitelisting-survival) · [governor](#icmp-path-limits-and-pacing) ·
