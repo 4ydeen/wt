@@ -27,7 +27,7 @@ func dnsServfail(query []byte) []byte {
 // maxInflightDNS bounds concurrent relayed queries to prevent goroutine storms under flood.
 const maxInflightDNS = 128
 
-// startDNSListener starts a local UDP DNS listener that forwards all queries through the tunnel's
+// startDNSListener starts a local UDP and TCP DNS listener that forwards all queries through the tunnel's
 // internal DNS relay (server target port 53). This allows client operating systems and applications
 // to resolve external DNS records during severe censorship blackouts when domestic resolvers hijack UDP 53.
 func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string, ...any)) (io.Closer, error) {
@@ -35,8 +35,18 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 	if err != nil {
 		return nil, err
 	}
+	ln, err := net.Listen("tcp", pc.LocalAddr().String())
+	if err != nil {
+		if logf != nil {
+			logf("dns-listen: tcp listen on %s failed: %v (udp only)", pc.LocalAddr().String(), err)
+		}
+	}
 	if logf != nil {
-		logf("dns-listen: listening on %s (forwarding queries via tunnel DNS relay)", listenAddr)
+		if ln != nil {
+			logf("dns-listen: listening on %s (udp+tcp, forwarding queries via tunnel DNS relay)", pc.LocalAddr().String())
+		} else {
+			logf("dns-listen: listening on %s (udp, forwarding queries via tunnel DNS relay)", pc.LocalAddr().String())
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -90,8 +100,71 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 		}
 	}()
 
+	if ln != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					select {
+					case <-done:
+						return
+					default:
+						if errors.Is(err, net.ErrClosed) {
+							return
+						}
+						time.Sleep(10 * time.Millisecond)
+						continue
+					}
+				}
+				wg.Add(1)
+				go func(c net.Conn) {
+					defer wg.Done()
+					defer c.Close()
+					c.SetDeadline(time.Now().Add(dnsRelayTimeout))
+					var qlen [2]byte
+					if _, err := io.ReadFull(c, qlen[:]); err != nil {
+						return
+					}
+					n := int(qlen[0])<<8 | int(qlen[1])
+					if n < 12 || n > 512 {
+						return
+					}
+					query := make([]byte, n)
+					if _, err := io.ReadFull(c, query); err != nil {
+						return
+					}
+					writeResp := func(data []byte) {
+						hdr := [2]byte{byte(len(data) >> 8), byte(len(data))}
+						_, _ = c.Write(hdr[:])
+						_, _ = c.Write(data)
+					}
+					select {
+					case sem <- struct{}{}:
+						defer func() { <-sem }()
+						tun := getTun()
+						ans, err := dialDNSRelay(tun, query)
+						if err != nil || len(ans) < 12 {
+							if sf := dnsServfail(query); sf != nil {
+								writeResp(sf)
+							}
+							return
+						}
+						writeResp(ans)
+					default:
+						if sf := dnsServfail(query); sf != nil {
+							writeResp(sf)
+						}
+					}
+				}(conn)
+			}
+		}()
+	}
+
 	return &dnsListenerCloser{
 		pc:   pc,
+		ln:   ln,
 		done: done,
 		wg:   &wg,
 	}, nil
@@ -99,6 +172,7 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 
 type dnsListenerCloser struct {
 	pc   net.PacketConn
+	ln   net.Listener
 	done chan struct{}
 	wg   *sync.WaitGroup
 	once sync.Once
@@ -107,7 +181,12 @@ type dnsListenerCloser struct {
 func (c *dnsListenerCloser) Close() error {
 	c.once.Do(func() {
 		close(c.done)
-		_ = c.pc.Close()
+		if c.pc != nil {
+			_ = c.pc.Close()
+		}
+		if c.ln != nil {
+			_ = c.ln.Close()
+		}
 		c.wg.Wait()
 	})
 	return nil

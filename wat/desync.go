@@ -19,6 +19,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,10 +59,28 @@ type DesyncConfig struct {
 	TTL  int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
 }
 
+// splitSNIs splits a comma-separated list of SNIs into trimmed domain names.
+func splitSNIs(sni string) []string {
+	var out []string
+	for _, s := range strings.Split(sni, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // validateDesync checks a DesyncConfig the same way on every OS (NewDesync calls it before anything else).
 func validateDesync(cfg DesyncConfig) error {
-	if cfg.SNI == "" {
+	snis := splitSNIs(cfg.SNI)
+	if len(snis) == 0 {
 		return fmt.Errorf("wat: desync: empty SNI")
+	}
+	for _, s := range snis {
+		if strings.ContainsAny(s, " \t\r\n/") {
+			return fmt.Errorf("wat: desync: invalid SNI %q", s)
+		}
 	}
 	switch cfg.Mode {
 	case "", "seq", "ttl", "sum", "seqsum", "rst":
@@ -304,6 +323,8 @@ type desyncTracker struct {
 	cfg       DesyncConfig
 	peerIP    [4]byte
 	hello     []byte
+	hellos    [][]byte
+	helloIdx  atomic.Uint32
 	send      func(pkt []byte) // set by the injector (raw socket) or a test (collector); nil = drop
 	logf      func(string, ...any)
 	mu        sync.Mutex
@@ -327,8 +348,31 @@ type desyncConn struct {
 
 // newDesyncTracker prepares the state machine for one peer IP.
 func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
-	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: FakeClientHello(cfg.SNI),
+	snis := splitSNIs(cfg.SNI)
+	hellos := make([][]byte, 0, len(snis))
+	for _, s := range snis {
+		if h := FakeClientHello(s); len(h) > 0 {
+			hellos = append(hellos, h)
+		}
+	}
+	var hello []byte
+	if len(hellos) > 0 {
+		hello = hellos[0]
+	}
+	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: hello, hellos: hellos,
 		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}}
+}
+
+// pickHello selects an authentic FakeClientHello (round-robining if multiple SNIs are configured).
+func (t *desyncTracker) pickHello() []byte {
+	if len(t.hellos) == 0 {
+		return t.hello
+	}
+	if len(t.hellos) == 1 {
+		return t.hellos[0]
+	}
+	idx := t.helloIdx.Add(1) - 1
+	return t.hellos[int(idx)%len(t.hellos)]
 }
 
 // announce registers a connection Wrap is waiting for and returns its channel. known says the ISN is exact
@@ -534,25 +578,26 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			t.send(pkt)
 			return
 		}
+		hello := t.pickHello()
 		if t.cfg.Mode == "seqsum" {
 			// dual marker (2.8.0): the below-window seq fake first, then the in-window bad-checksum mirror
 			// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
 			// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
 			// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
-			t.send(fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello))
-			pkt := fakePacket(k, base, ack, ttl, t.hello)
+			t.send(fakePacket(k, base-uint32(len(hello)), ack, ttl, hello))
+			pkt := fakePacket(k, base, ack, ttl, hello)
 			damageChecksum(pkt)
 			t.send(pkt)
 			return
 		}
 		if t.cfg.Mode == "sum" {
 			// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
-			pkt := fakePacket(k, base, ack, ttl, t.hello)
+			pkt := fakePacket(k, base, ack, ttl, hello)
 			damageChecksum(pkt)
 			t.send(pkt)
 			return
 		}
-		pkt := fakePacket(k, base-uint32(len(t.hello)), ack, ttl, t.hello)
+		pkt := fakePacket(k, base-uint32(len(hello)), ack, ttl, hello)
 		t.send(pkt)
 	}
 }

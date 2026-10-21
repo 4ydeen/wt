@@ -189,6 +189,15 @@ func TestValidateDesync(t *testing.T) {
 	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "ttl", TTL: 300}); err == nil {
 		t.Fatal("TTL > 255 must fail")
 	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir,b.ir", Mode: "seq"}); err != nil {
+		t.Fatalf("comma-separated SNIs should pass: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "  a.ir  ,  b.ir  ", Mode: "seq"}); err != nil {
+		t.Fatalf("whitespace around comma-separated SNIs should pass: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir, bad name", Mode: "seq"}); err == nil {
+		t.Fatal("invalid characters in SNI list should fail")
+	}
 }
 
 // desyncTestPkt builds one raw IPv4 TCP packet (header included) the way the wire delivers it.
@@ -821,5 +830,44 @@ func TestDesyncSeqSumLateFiresBoth(t *testing.T) {
 	}
 	if got := binary.BigEndian.Uint32((*sent)[1][24:]); got != isn+1 {
 		t.Fatalf("seqsum late marker2 seq %d, want %d (in-window)", got, isn+1)
+	}
+}
+
+// TestDesyncMultiSNIRotation verifies that comma-separated SNIs rotate sequentially across connections.
+func TestDesyncMultiSNIRotation(t *testing.T) {
+	var p [4]byte
+	copy(p[:], net.ParseIP("10.8.0.1").To4())
+	cfg := DesyncConfig{
+		SNI:  "mci.ir,divar.ir,digikala.com",
+		Mode: "seq",
+	}
+	tr := newDesyncTracker(cfg, p)
+	defer tr.close()
+	sent := &[][]byte{}
+	tr.send = func(pkt []byte) { *sent = append(*sent, pkt) }
+
+	expectedSNIs := []string{"mci.ir", "divar.ir", "digikala.com", "mci.ir"}
+	for i, want := range expectedSNIs {
+		k := testClientKey()
+		k.srcPt = uint16(20000 + i)
+		ch := tr.announce(k, uint32(10000+i*100), true)
+		feedFullHandshake(tr, k, uint32(10000+i*100), uint32(50000+i*100))
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("conn %d never fired", i)
+		}
+		if len(*sent) != i+1 {
+			t.Fatalf("sent count mismatch at iter %d: got %d", i, len(*sent))
+		}
+		// Extract SNI from the sent packet (starts at byte 40 after 20-byte IP and 20-byte TCP header)
+		rec := (*sent)[i][40:]
+		got, err := parseSNIOf(rec)
+		if err != nil {
+			t.Fatalf("conn %d parseSNIOf: %v", i, err)
+		}
+		if got != want {
+			t.Fatalf("conn %d SNI: got %q, want %q", i, got, want)
+		}
 	}
 }

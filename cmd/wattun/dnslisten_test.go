@@ -120,3 +120,69 @@ func TestDNSListenerSemaphoreBoundsConcurrency(t *testing.T) {
 		}
 	}
 }
+
+func TestDNSListenerTCP(t *testing.T) {
+	l, err := startDNSListener("127.0.0.1:0", func() *tunnel { return nil }, nil)
+	if err != nil {
+		t.Fatalf("startDNSListener failed: %v", err)
+	}
+	defer l.Close()
+
+	closer := l.(*dnsListenerCloser)
+	if closer.ln == nil {
+		t.Fatal("expected TCP listener to be active")
+	}
+	addr := closer.ln.Addr().String()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial tcp %s failed: %v", addr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	q := []byte{
+		0xfe, 0xdc, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00,
+	}
+
+	// Write RFC 1035 TCP-framed DNS query: [2-byte length][query]
+	hdr := [2]byte{byte(len(q) >> 8), byte(len(q))}
+	if _, err := conn.Write(hdr[:]); err != nil {
+		t.Fatalf("write tcp hdr: %v", err)
+	}
+	if _, err := conn.Write(q); err != nil {
+		t.Fatalf("write tcp query: %v", err)
+	}
+
+	// Read 2-byte response length
+	var rlenHdr [2]byte
+	var rlen int
+	for r := 0; r < 2; {
+		n, err := conn.Read(rlenHdr[r:])
+		if err != nil {
+			t.Fatalf("read rlenHdr: %v", err)
+		}
+		r += n
+	}
+	rlen = int(rlenHdr[0])<<8 | int(rlenHdr[1])
+	if rlen != len(q) {
+		t.Fatalf("response length mismatch: got %d, want %d", rlen, len(q))
+	}
+
+	buf := make([]byte, rlen)
+	for r := 0; r < rlen; {
+		n, err := conn.Read(buf[r:])
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		r += n
+	}
+
+	if buf[0] != 0xfe || buf[1] != 0xdc {
+		t.Errorf("ID mismatch: got %02x%02x, want fedc", buf[0], buf[1])
+	}
+	if buf[3]&0x0f != 2 {
+		t.Errorf("expected RCODE 2 (ServFail), got %d", buf[3]&0x0f)
+	}
+}

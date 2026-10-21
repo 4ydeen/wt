@@ -38,7 +38,7 @@ else
   MGR=/usr/local/bin/wattun-manager
 fi
 REPO=${WAT_REPO:-JohnWatsoon/WatTunnel}
-MGR_VERSION=2026102103   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
+MGR_VERSION=2026102104   # YYYYMMDDNN; install.sh refuses to replace a newer manager with an older one
 HEAL_UNIT=$WAT_PREFIX-heal
 MCONF=$CONF/.manager.conf
 self_cmd() { # the command to type to start this manager (user-facing hints)
@@ -691,7 +691,18 @@ v_fake_mode() { case "$1" in seq|ttl|sum|seqsum|auto|rst) return 0 ;; esac; err 
 v_fake_ttl() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -le 255 ] && return 0; err "Enter a hop count 1-255 (or leave empty for auto)."; return 1; }
 v_pool_rotate() { [ -z "$1" ] && return 0; case "$1" in 0|off) return 0 ;; esac; [[ "$1" =~ ^[0-9]+(ms|s|m|h)$ ]] && return 0; err "Enter a lifetime such as 90s, 30m or 4h (or 0 to turn it off)."; return 1; }
 v_pool_bytes() { local s=${1,,}; [ -z "$s" ] && return 0; case "$s" in 0|0b|off) return 0 ;; esac; [[ "$s" =~ ^[0-9]+(\.[0-9]+)?(k|m|g|t)b?$ ]] && return 0; err "Enter a byte count such as 500MB, 4G or 300k (or 0 to turn it off)."; return 1; }
-v_sni_name() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || { err "Enter a server name such as mci.ir."; return 1; }; return 0; }
+v_sni_name() {
+  local part parts
+  local IFS=','
+  read -ra parts <<< "$1"
+  [ "${#parts[@]}" -gt 0 ] || { err "Enter a server name such as mci.ir."; return 1; }
+  for part in "${parts[@]}"; do
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [[ "$part" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || { err "Enter a server name such as mci.ir."; return 1; }
+  done
+  return 0
+}
 v_ech() {
   [ -z "$1" ] && return 0
   local v=${1,,}

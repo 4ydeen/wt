@@ -88,6 +88,12 @@ for m in seq ttl sum seqsum auto rst; do
 done
 expect_fail v_fake_mode "bad_mode"
 
+for s in mci.ir "mci.ir,divar.ir" "mci.ir, divar.ir, digikala.com"; do
+  v_sni_name "$s" && echo "ok   v_sni_name $s" || { echo "FAIL v_sni_name $s"; fail=1; }
+done
+expect_fail v_sni_name "bad name!"
+expect_fail v_sni_name "mci.ir, bad name"
+
 for g in on off true false 1 0; do
   v_governor "$g" && echo "ok   v_governor $g" || { echo "FAIL v_governor $g"; fail=1; }
 done
