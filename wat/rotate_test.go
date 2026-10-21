@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -127,9 +128,9 @@ func TestCloneCarriesDialHook(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	called := false
+	var called atomic.Bool // two dialers run the hook concurrently (slotLoop + the direct dial below)
 	c.SetDialHook(func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error) {
-		called = true
+		called.Store(true)
 		return nil, errors.New("hook ran")
 	})
 	n, err := c.Clone(1)
@@ -138,7 +139,7 @@ func TestCloneCarriesDialHook(t *testing.T) {
 	}
 	defer n.Close()
 	_, _ = n.dialer()(t.Context(), 0)
-	if !called {
+	if !called.Load() {
 		t.Fatal("the clone's dialer skipped the dial hook")
 	}
 }

@@ -365,7 +365,7 @@ type desyncTracker struct {
 	cfg       DesyncConfig
 	peerIP    [4]byte
 	hello     []byte
-	hellos    [][]byte
+	snis      []string // SNIs with a non-empty hello; pickHello rebuilds fresh bytes per fire
 	helloIdx  atomic.Uint32
 	send      func(pkt []byte) // set by the injector (raw socket) or a test (collector); nil = drop
 	logf      func(string, ...any)
@@ -389,33 +389,40 @@ type desyncConn struct {
 	at        time.Time
 }
 
-// newDesyncTracker prepares the state machine for one peer IP.
+// newDesyncTracker prepares the state machine for one peer IP. Only SNIs that produce a hello are
+// kept; pickHello rebuilds the hello per fire from these.
 func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
 	snis := splitSNIs(cfg.SNI)
-	hellos := make([][]byte, 0, len(snis))
+	good := make([]string, 0, len(snis))
+	var hello []byte
 	for _, s := range snis {
 		if h := FakeClientHello(s); len(h) > 0 {
-			hellos = append(hellos, h)
+			good = append(good, s)
+			if hello == nil {
+				hello = h
+			}
 		}
 	}
-	var hello []byte
-	if len(hellos) > 0 {
-		hello = hellos[0]
-	}
-	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: hello, hellos: hellos,
+	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: hello, snis: good,
 		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}}
 }
 
-// pickHello selects an authentic FakeClientHello (round-robining if multiple SNIs are configured).
+// pickHello builds a FRESH FakeClientHello per fire (round-robining the SNIs when several are
+// configured). A cached hello replays byte-identical randoms (client random, session id, key share,
+// ECH) on every connection from this process — two connections from one IP then carry matching
+// synthetic hellos, a one-glance censor signature (audit 2026-10-21). FakeClientHello is ~1 µs.
 func (t *desyncTracker) pickHello() []byte {
-	if len(t.hellos) == 0 {
+	if len(t.snis) == 0 {
 		return t.hello
 	}
-	if len(t.hellos) == 1 {
-		return t.hellos[0]
+	s := t.snis[0]
+	if len(t.snis) > 1 {
+		s = t.snis[int(t.helloIdx.Add(1)-1)%len(t.snis)]
 	}
-	idx := t.helloIdx.Add(1) - 1
-	return t.hellos[int(idx)%len(t.hellos)]
+	if h := FakeClientHello(s); len(h) > 0 {
+		return h
+	}
+	return t.hello
 }
 
 // announce registers a connection Wrap is waiting for and returns its channel. known says the ISN is exact
@@ -632,10 +639,12 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
 			// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
 			t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
-			time.Sleep(time.Millisecond)
 			pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 			damageChecksum(pkt)
-			t.send(pkt)
+			// the second marker goes out after the 1 ms gap WITHOUT sleeping under t.mu: fireLocked runs
+			// inside the sniffer's lock and a sleep here stalls every concurrent fire and Wrap announce
+			// (audit 2026-10-21). close() never nils t.send, so a fire racing shutdown is a dropped packet.
+			time.AfterFunc(time.Millisecond, func() { t.send(pkt) })
 			return
 		}
 		if t.cfg.Mode == "sum" {

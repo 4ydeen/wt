@@ -2,11 +2,14 @@ package wat
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"encoding/binary"
 	"io"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/curve25519"
 )
 
 // kexWait polls until fn turns true: the exchange runs on the pump timers, not synchronously with the writes.
@@ -74,10 +77,13 @@ func TestKexSwitch(t *testing.T) {
 
 // kexGrace after the switch the PSK key stops authenticating anything.
 func TestKexGraceDrop(t *testing.T) {
-	old := kexGrace
-	kexGrace = 30 * time.Millisecond
-	defer func() { kexGrace = old }()
 	cli, srv := memPair(t, Config{})
+	cli.mu.Lock()
+	cli.kexGrace = 30 * time.Millisecond // per-session field: shrinking a package global would race other pumps
+	cli.mu.Unlock()
+	srv.mu.Lock()
+	srv.kexGrace = 30 * time.Millisecond
+	srv.mu.Unlock()
 	go func() {
 		s, err := srv.Accept()
 		if err != nil {
@@ -104,13 +110,14 @@ func TestKexGraceDrop(t *testing.T) {
 	})
 }
 
-// A 2.9.x server has no ephemeral key: it ignores the frKex frame, the client gives up offering, and the session
-// stays on the PSK key exactly as before.
+// A 2.9.x server has no ephemeral key: it ignores the frKex frame, the client keeps offering (re-armed with
+// fresh keys once a round times out), and the session stays on the PSK key exactly as before.
 func TestKexOldPeer(t *testing.T) {
-	old := kexGiveUp
-	kexGiveUp = 50 * time.Millisecond
-	defer func() { kexGiveUp = old }()
 	cli, srv := memPair(t, Config{})
+	cli.mu.Lock()
+	cli.kexGiveUp = 50 * time.Millisecond // per-session field, not the package global (other pumps read it)
+	oldPub := append([]byte(nil), cli.kexPub...)
+	cli.mu.Unlock()
 	srv.mu.Lock()
 	srv.kexPriv, srv.kexPub = nil, nil
 	srv.mu.Unlock()
@@ -138,18 +145,36 @@ func TestKexOldPeer(t *testing.T) {
 	}
 	st.CloseWrite()
 	kexWait(t, "the data to arrive", func() bool { return atomic.LoadInt64(&total) == 1000 })
-	kexWait(t, "the client to give up offering", func() bool {
+	kexWait(t, "the client to re-arm with fresh keys", func() bool {
 		cli.mu.Lock(); defer cli.mu.Unlock()
-		return cli.kexPriv == nil && !cli.kexDone
+		return cli.kexPriv != nil && !cli.kexDone && !bytes.Equal(cli.kexPub, oldPub)
 	})
+	cli.mu.Lock()
+	defer cli.mu.Unlock()
+	if cli.oldAead != nil {
+		t.Fatal("client switched keys against an old peer")
+	}
 }
 
 // A 2.9.x client never offers: the server never replies and stays on the PSK key.
+// NoKex is set at NewSession — stripping kexPriv after the pair is up would race the client's
+// birth offer (kexPending emits one on the first packet), which under -race reached the server
+// and engaged it before the strip.
 func TestKexOldClient(t *testing.T) {
-	cli, srv := memPair(t, Config{})
-	cli.mu.Lock()
-	cli.kexPriv, cli.kexPub = nil, nil
-	cli.mu.Unlock()
+	a, b := newMemDir(), newMemDir()
+	cc := Config{Key: []byte("bench-key"), SID: 0x1234567, InitBps: 400e6, MaxBps: 400e6, NoKex: true}
+	sc := cc
+	sc.Server = true
+	sc.NoKex = false // the server stays kex-capable: it must not react even though it could
+	cli, err := NewSession(cc, &memIO{tx: a, rx: b, done: make(chan struct{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewSession(sc, &memIO{tx: b, rx: a, done: make(chan struct{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cli.Close(); srv.Close() })
 	var total int64
 	go func() {
 		s, err := srv.Accept()
@@ -189,5 +214,37 @@ func TestKexBadPeerKey(t *testing.T) {
 	srv.onKex(make([]byte, 32), time.Now())
 	if srv.kexPriv != nil || srv.kexAead != nil || srv.kexReplyPend {
 		t.Fatal("a low-order peer key must end the exchange without touching the session keys")
+	}
+}
+
+// A server whose client never switches stops paying one failed fresh-key open per packet: kexAead
+// expires kexGrace after the last offer, and the client's next offer (fresh keys, new pub) re-engages.
+func TestKexServerAeadExpiry(t *testing.T) {
+	cli, srv := memPair(t, Config{})
+	defer cli.Close()
+	defer srv.Close()
+	privB := make([]byte, 32)
+	if _, err := crand.Read(privB); err != nil {
+		t.Fatal(err)
+	}
+	pubB, err := curve25519.X25519(privB, curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.kexGrace = 30 * time.Millisecond // per-session field: a global would race the live pumps (seen under -race)
+	srv.onKex(cli.kexPub, now)           // first offer engages the fresh key; the reply never lands
+	if srv.kexAead == nil || srv.kexPeerPub == nil {
+		t.Fatal("offer did not engage the fresh key")
+	}
+	srv.timers(now.Add(2 * srv.kexGrace)) // no switch, no further offers: drop the stale exchange
+	if srv.kexAead != nil || srv.kexPeerPub != nil || srv.kexDone {
+		t.Fatal("stale kexAead did not expire")
+	}
+	srv.onKex(pubB, now.Add(3*srv.kexGrace)) // the re-armed client offers a new pub
+	if srv.kexAead == nil || !bytes.Equal(srv.kexPeerPub, pubB) || !srv.kexReplyPend {
+		t.Fatal("re-armed offer did not re-engage")
 	}
 }

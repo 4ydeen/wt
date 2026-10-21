@@ -63,7 +63,9 @@ func startDNSListener(listenAddr string, getTun func() *tunnel, logf func(string
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, maxDNSMsgLen)
+		// one byte over the cap: a datagram larger than 4096 is truncated to exactly 4096 by the kernel,
+		// and relaying a cut query corrupts it — the extra byte makes truncation observable (audit 2026-10-21)
+		buf := make([]byte, maxDNSMsgLen+1)
 		for {
 			n, src, err := pc.ReadFrom(buf)
 			if err != nil {

@@ -13,12 +13,14 @@ package wat
 //	   but ANY listening TCP service answers TCP at least with RST/ACK or data). If the connection still
 //	   carries data a moment later, the filter did not reset the flow for the marker.
 //
-// Verdict table (connAlive after the probes, and which marker correlated with a flow death):
+// Verdict table (which marker correlated with a flow death; the signal is the marker, not the final
+// connAlive, whose failure only mirrors the last probe that ran on that socket):
 //
-//	conn alive                                     -> filter does not act on the markers: seq (the default)
-//	conn died while a seq marker was in flight     -> filter drops below-window junk: sum
-//	conn died only with the sum marker in flight   -> filter validates window+checksum: seqsum
-//	probe socket never became writable             -> the path is fully blocked, no mode helps: seq anyway
+//	seq marker survived, sum marker survived  -> filter ignores both markers: seq (the default)
+//	seq marker killed its flow, sum survived  -> filter acts on below-window junk but ignores checksum junk: sum
+//	both single markers killed their flows    -> filter acts on both: seqsum (the dual marker, last resort)
+//	sum marker killed its flow, seq survived  -> filter acts on bad checksums but drops below-window junk: seq
+//	probe socket never became writable        -> the path is fully blocked, no mode helps: seq anyway
 //
 // The probe runs once per process, logs its verdict, and exposes it through /stats (FilterProfile()).
 // A failure anywhere degrades to seq (the 2.7.0 default) without stopping the tunnel.
@@ -126,17 +128,16 @@ func (p *filterProbe) run() string {
 
 	p.sumOK = p.sumProbe(targetConn)
 
-	// step 3: is the flow still alive after both?
+	// step 3: is the flow still alive after both? (kept for the log below; the verdict keys on which
+	// marker killed its flow, because sumOK already implies its socket was alive after the sum probe)
 	p.alive = p.connAlive(targetConn)
 	switch {
-	case !p.alive && !p.seqOK && p.sumOK:
-		return "sum" // died with seq marker in flight but sum survived: filter drops below-window junk -> use sum
-	case !p.alive && p.seqOK && !p.sumOK:
-		return "seq" // died with sum marker in flight: filter drops bad checksums -> keep seq
-	case !p.alive && !p.seqOK && !p.sumOK:
-		return "seqsum" // died under both individual checks -> try seqsum
+	case !p.seqOK && p.sumOK:
+		return "sum" // the seq marker killed its flow, the sum marker survived: the filter acts on below-window junk
+	case !p.seqOK && !p.sumOK:
+		return "seqsum" // both single markers correlate with a death: try the dual marker
 	default:
-		return "seq"
+		return "seq" // sum killed while seq survived (checksum validation), or nothing acted: keep seq
 	}
 }
 

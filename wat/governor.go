@@ -70,9 +70,17 @@ func (g *govState) govSample(rtt time.Duration, rate float64, now time.Time) {
 		g.winMaxRate = rate
 	}
 	g.rateRing = append(g.rateRing, govRate{now, rate})
-	cut := len(g.rateRing) > 256 // keep ~4 s of rate history, bounded
-	if cut {
-		g.rateRing = g.rateRing[len(g.rateRing)-256:]
+	// keep the full govPreWindow of history (the jump verdict reads back that far); a count-only cap
+	// covered well under 4 s on fast paths, where samples arrive once per RTT (audit 2026-10-21)
+	if cut := now.Add(-govPreWindow); len(g.rateRing) > 0 && g.rateRing[0].at.Before(cut) {
+		i := 0
+		for i < len(g.rateRing) && g.rateRing[i].at.Before(cut) {
+			i++
+		}
+		g.rateRing = append(g.rateRing[:0], g.rateRing[i:]...)
+	}
+	if len(g.rateRing) > 4096 { // count backstop for sub-millisecond RTTs
+		g.rateRing = g.rateRing[len(g.rateRing)-4096:]
 	}
 	if g.stableAt.IsZero() {
 		g.stableAt = now

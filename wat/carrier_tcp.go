@@ -739,6 +739,7 @@ func (c *TCPPoolClient) healthLoop() {
 				if pc := c.rotatePick(now); pc != nil {
 					poolRotates.Add(1)
 					pc.fail() // the slot redials it; in-flight datagrams are resent like any death
+					continue  // one closure per tick: the guarantee above covers the slow kill too
 				}
 			}
 			if c.keepSlow.Load() {

@@ -155,3 +155,26 @@ func readStreamFull(st *wat.Stream, b []byte) (int, error) {
 	}
 	return n, nil
 }
+
+// relayFor: the built-in relay owns target 53 by default and under an explicit list that omits 53; an
+// explicit list WITH 53 forwards it to the real local resolver instead. Before the 2026-10-21 audit fix
+// the default 1-65535 range hit the same forwarding path (ok(53) was true), so the ladder's relay rung
+// was dead on every default-config server.
+func TestRelayFor(t *testing.T) {
+	def := newAllow("", "")
+	if !def.relayFor(53, 1, 65535) {
+		t.Fatal("default range must leave the relay rung alive")
+	}
+	expl := newAllow("22,80,443", "")
+	if !expl.relayFor(53, 1, 65535) {
+		t.Fatal("explicit list without 53 must leave the relay alive")
+	}
+	fwd := newAllow("22,53,443", "")
+	if fwd.relayFor(53, 1, 65535) {
+		t.Fatal("explicit 53 forwards to the local resolver, not the relay")
+	}
+	fwd.setPorts([]int{53}) // cfg-authoritative list with 53
+	if fwd.relayFor(53, 1, 65535) {
+		t.Fatal("config list with 53 forwards to the local resolver")
+	}
+}

@@ -73,9 +73,11 @@ func NewICMPIOSource(server, reverse bool, peerIP, srcIP string, key []byte, kin
 	}
 	bindIP := net.IPv4zero
 	if srcIP != "" {
-		if ip := net.ParseIP(srcIP); ip != nil {
-			bindIP = ip
+		ip := net.ParseIP(srcIP)
+		if ip == nil {
+			return nil, errors.New("wat: bad source ip")
 		}
+		bindIP = ip
 	}
 	c, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: bindIP})
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -230,8 +231,23 @@ const (
 	testFlagSYN = 0x02
 )
 
+// sentLog collects the tracker's sends; the mutex covers the seqsum marker that
+// fires from a time.AfterFunc goroutine (the tracker's own send hook is sync for every other mode).
+type sentLog struct {
+	mu  sync.Mutex
+	pks [][]byte
+}
+
+func (s *sentLog) add(pkt []byte) { s.mu.Lock(); s.pks = append(s.pks, pkt); s.mu.Unlock() }
+func (s *sentLog) n() int         { s.mu.Lock(); defer s.mu.Unlock(); return len(s.pks) }
+func (s *sentLog) at(i int) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pks[i]
+}
+
 // desyncTestTracker builds a tracker with a collected send path and a fixed client/peer pair.
-func desyncTestTracker(mode string, ttl int) (*desyncTracker, *[][]byte) {
+func desyncTestTracker(mode string, ttl int) (*desyncTracker, *sentLog) {
 	var cfg DesyncConfig
 	switch mode {
 	case "seq":
@@ -248,8 +264,8 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *[][]byte) {
 	var p [4]byte
 	copy(p[:], net.ParseIP("10.8.0.1").To4())
 	tr := newDesyncTracker(cfg, p)
-	sent := &[][]byte{}
-	tr.send = func(pkt []byte) { *sent = append(*sent, pkt) }
+	sent := &sentLog{}
+	tr.send = sent.add
 	return tr, sent
 }
 
@@ -282,10 +298,10 @@ func TestDesyncEarlyFiresBeforeData(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fake never fired")
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("want 1 fake, got %d", len(*sent))
+	if sent.n() != 1 {
+		t.Fatalf("want 1 fake, got %d", sent.n())
 	}
-	pkt := (*sent)[0]
+	pkt := sent.at(0)
 	if n := int(binary.BigEndian.Uint16(pkt[2:])); n != 20+20+len(tr.hello) {
 		t.Fatalf("fake length %d, want %d", n, 20+20+len(tr.hello))
 	}
@@ -324,7 +340,7 @@ func TestDesyncEarlyFiresOnFirstData(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatalf("fake did not fire on first data (fired %d)", tr.fired())
 	}
-	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	seq := binary.BigEndian.Uint32(sent.at(0)[24:])
 	if seq != isn+1-uint32(len(tr.hello)) {
 		t.Fatalf("fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
 	}
@@ -346,7 +362,7 @@ func TestDesyncLateFiresOnData(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("late fake never fired")
 	}
-	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	seq := binary.BigEndian.Uint32(sent.at(0)[24:])
 	if seq != isn+1-uint32(len(tr.hello)) {
 		t.Fatalf("late fake seq %d, want %d", seq, isn+1-uint32(len(tr.hello)))
 	}
@@ -362,8 +378,8 @@ func TestDesyncLateNeedsData(t *testing.T) {
 	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
 	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
 	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagACK, nil, 64))
-	if len(*sent) != 0 {
-		t.Fatalf("late path fired on bare ACKs (%d fakes)", len(*sent))
+	if sent.n() != 0 {
+		t.Fatalf("late path fired on bare ACKs (%d fakes)", sent.n())
 	}
 }
 
@@ -384,7 +400,7 @@ func TestDesyncNATRewrite(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatal("fake did not fire after NAT rewrite")
 	}
-	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	seq := binary.BigEndian.Uint32(sent.at(0)[24:])
 	if seq != natISN+1-uint32(len(tr.hello)) {
 		t.Fatalf("fake seq %d, want %d (NAT-shifted)", seq, natISN+1-uint32(len(tr.hello)))
 	}
@@ -404,10 +420,10 @@ func TestDesyncTTLCalibration(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fake never fired after calibration")
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("want 1 fake, got %d", len(*sent))
+	if sent.n() != 1 {
+		t.Fatalf("want 1 fake, got %d", sent.n())
 	}
-	if got := (*sent)[0][8]; got != 51 {
+	if got := sent.at(0)[8]; got != 51 {
 		t.Fatalf("calibrated ttl %d, want 51 (peer TTL 52 - 1)", got)
 	}
 }
@@ -425,7 +441,7 @@ func TestDesyncTTLCalibratedBeforeHandshake(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatal("fake did not fire with pre-calibrated TTL")
 	}
-	if got := (*sent)[0][8]; got != 59 {
+	if got := sent.at(0)[8]; got != 59 {
 		t.Fatalf("ttl %d, want 59", got)
 	}
 }
@@ -441,7 +457,7 @@ func TestDesyncTTLCalibratedNotYet(t *testing.T) {
 	// handshake without a SYN-ACK on record (sniffer missed it): no TTL, no fake
 	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
 	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
-	if tr.fired() != 0 || len(*sent) != 0 {
+	if tr.fired() != 0 || sent.n() != 0 {
 		t.Fatal("auto-TTL fired without a learned TTL")
 	}
 	tr.abandon(k)
@@ -463,7 +479,7 @@ func TestDesyncFixedTTL(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatal("fake did not fire")
 	}
-	if got := (*sent)[0][8]; got != 9 {
+	if got := sent.at(0)[8]; got != 9 {
 		t.Fatalf("ttl %d, want 9 (fixed)", got)
 	}
 }
@@ -478,8 +494,8 @@ func TestDesyncOneFakePerConn(t *testing.T) {
 	feedFullHandshake(tr, k, isn, srvSeq)
 	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 50), 64))
 	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+60, srvSeq+1, testFlagACK, nil, 64))
-	if len(*sent) != 1 {
-		t.Fatalf("want exactly 1 fake, got %d", len(*sent))
+	if sent.n() != 1 {
+		t.Fatalf("want exactly 1 fake, got %d", sent.n())
 	}
 }
 
@@ -489,7 +505,7 @@ func TestDesyncUnknownConnIgnored(t *testing.T) {
 	defer tr.close()
 	k := testClientKey()
 	feedFullHandshake(tr, k, 3000, 400) // never announced
-	if tr.fired() != 0 || len(*sent) != 0 {
+	if tr.fired() != 0 || sent.n() != 0 {
 		t.Fatal("fired for an unannounced connection")
 	}
 }
@@ -541,7 +557,7 @@ func TestDesyncAbandonAndClose(t *testing.T) {
 	}
 	tr.close()
 	tr.announce(k, 123, true) // after close: announced channels close at once, nothing fires
-	if tr.fired() != 0 || len(*sent) != 0 {
+	if tr.fired() != 0 || sent.n() != 0 {
 		t.Fatal("fired after close")
 	}
 }
@@ -566,7 +582,7 @@ func TestDesyncRSTCleansConnection(t *testing.T) {
 	if conn != nil {
 		t.Fatal("connection state was not cleaned up on RST")
 	}
-	if tr.fired() != 0 || len(*sent) != 0 {
+	if tr.fired() != 0 || sent.n() != 0 {
 		t.Fatal("fake fired on RST connection")
 	}
 }
@@ -636,7 +652,7 @@ func TestDesyncProbeIsnArithmetic(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fake never fired with probe-converted ISN")
 	}
-	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	seq := binary.BigEndian.Uint32(sent.at(0)[24:])
 	if seq != isn+1-uint32(len(tr.hello)) {
 		t.Fatalf("fake seq %d, want %d (SND.NXT-1 based)", seq, isn+1-uint32(len(tr.hello)))
 	}
@@ -659,7 +675,7 @@ func TestDesyncSumModeFiresOnData(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatalf("sum mode fired %d, want 1", tr.fired())
 	}
-	pkt := (*sent)[0]
+	pkt := sent.at(0)
 	seq := binary.BigEndian.Uint32(pkt[24:])
 	if seq != isn+1 {
 		t.Fatalf("sum fake seq %d, want %d (mirrors the data segment's seq in-window)", seq, isn+1)
@@ -693,7 +709,7 @@ func TestDesyncSumModeLate(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("sum-mode late fake never fired")
 	}
-	seq := binary.BigEndian.Uint32((*sent)[0][24:])
+	seq := binary.BigEndian.Uint32(sent.at(0)[24:])
 	if seq != isn+1 {
 		t.Fatalf("sum late fake seq %d, want %d (in-window)", seq, isn+1)
 	}
@@ -716,10 +732,10 @@ func TestDesyncRSTModeFiresOnData(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatalf("rst mode fired counter %d, want 1", tr.fired())
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("sent %d packets, want 1", len(*sent))
+	if sent.n() != 1 {
+		t.Fatalf("sent %d packets, want 1", sent.n())
 	}
-	pkt := (*sent)[0]
+	pkt := sent.at(0)
 	if len(pkt) != 40 {
 		t.Fatalf("rst fake len %d, want 40 (pure RST|ACK header)", len(pkt))
 	}
@@ -752,7 +768,7 @@ func TestDesyncRSTModeLate(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("rst-mode late fake never fired")
 	}
-	pkt := (*sent)[0]
+	pkt := sent.at(0)
 	if len(pkt) != 40 {
 		t.Fatalf("rst late fake len %d, want 40", len(pkt))
 	}
@@ -783,12 +799,17 @@ func TestDesyncSeqSumSendsBoth(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatalf("seqsum fired %d, want 1", tr.fired())
 	}
-	if len(*sent) != 2 {
-		t.Fatalf("seqsum sent %d markers, want 2", len(*sent))
+	// marker 2 goes out ~1 ms later via time.AfterFunc (never under the tracker lock), so poll for it
+	deadline := time.Now().Add(time.Second)
+	for sent.n() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("seqsum sent %d markers, want 2 (marker 2 never arrived)", sent.n())
+		}
+		time.Sleep(time.Millisecond)
 	}
 	// marker 1: below-window seq, VALID checksum (plain seq fake). fakePacket built it correctly and seqsum
 	// sent it unmodified — recompute and require equality.
-	m1 := (*sent)[0]
+	m1 := sent.at(0)
 	if got := binary.BigEndian.Uint32(m1[24:]); got != isn+1-uint32(len(tr.hello)) {
 		t.Fatalf("seqsum marker1 seq %d, want %d (below stream start)", got, isn+1-uint32(len(tr.hello)))
 	}
@@ -798,7 +819,7 @@ func TestDesyncSeqSumSendsBoth(t *testing.T) {
 		t.Fatalf("seqsum marker1 checksum %04x, want the VALID value %04x", stored1, good)
 	}
 	// marker 2: in-window seq (the data segment's own), DAMAGED checksum
-	m2 := (*sent)[1]
+	m2 := sent.at(1)
 	if got := binary.BigEndian.Uint32(m2[24:]); got != isn+1 {
 		t.Fatalf("seqsum marker2 seq %d, want %d (in-window mirror)", got, isn+1)
 	}
@@ -807,10 +828,15 @@ func TestDesyncSeqSumSendsBoth(t *testing.T) {
 	if good := tcpChecksum(m2[20:], k.srcIP[:], k.dstIP[:]); good == stored2 {
 		t.Fatalf("seqsum marker2 carries a VALID checksum %04x (must be damaged)", good)
 	}
-	// both carry the same allowlisted SNI payload
+	// both carry the allowlisted SNI. pickHello rebuilds fresh randoms per fire, so compare the parsed
+	// SNI (and the per-SNI constant length), not the constructor's cached tr.hello bytes.
 	for i, m := range [][]byte{m1, m2} {
-		if string(m[40:]) != string(tr.hello) {
-			t.Fatalf("seqsum marker%d payload is not the fake hello", i+1)
+		if len(m[40:]) != len(tr.hello) {
+			t.Fatalf("seqsum marker%d payload len %d, want %d", i+1, len(m[40:]), len(tr.hello))
+		}
+		got, err := parseSNIOf(m[40:])
+		if err != nil || got != "mci.ir" {
+			t.Fatalf("seqsum marker%d SNI: got %q err %v, want mci.ir", i+1, got, err)
 		}
 	}
 }
@@ -829,14 +855,41 @@ func TestDesyncSeqSumLateFiresBoth(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("seqsum late fake never fired")
 	}
-	if len(*sent) != 2 {
-		t.Fatalf("seqsum late sent %d markers, want 2", len(*sent))
+	// marker 2 goes out ~1 ms later via time.AfterFunc (never under the tracker lock), so poll for it
+	deadline := time.Now().Add(time.Second)
+	for sent.n() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("seqsum late sent %d markers, want 2 (marker 2 never arrived)", sent.n())
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if got := binary.BigEndian.Uint32((*sent)[0][24:]); got != isn+1-uint32(len(tr.hello)) {
+	if got := binary.BigEndian.Uint32(sent.at(0)[24:]); got != isn+1-uint32(len(tr.hello)) {
 		t.Fatalf("seqsum late marker1 seq %d, want %d", got, isn+1-uint32(len(tr.hello)))
 	}
-	if got := binary.BigEndian.Uint32((*sent)[1][24:]); got != isn+1 {
+	if got := binary.BigEndian.Uint32(sent.at(1)[24:]); got != isn+1 {
 		t.Fatalf("seqsum late marker2 seq %d, want %d (in-window)", got, isn+1)
+	}
+}
+
+// TestDesyncPickHelloFreshRandoms: pickHello rebuilds the hello per fire, so two fires from one tracker
+// never replay byte-identical randoms (a censor correlating synthetic hellos across connections would
+// otherwise see the same client random / session id / key share). The per-SNI length stays constant.
+func TestDesyncPickHelloFreshRandoms(t *testing.T) {
+	var p [4]byte
+	copy(p[:], net.ParseIP("10.8.0.1").To4())
+	tr := newDesyncTracker(DesyncConfig{SNI: "mci.ir", Mode: "seq"}, p)
+	defer tr.close()
+	h1 := tr.pickHello()
+	h2 := tr.pickHello()
+	if len(h1) != len(tr.hello) || len(h2) != len(tr.hello) {
+		t.Fatalf("pickHello len drift: %d %d, want %d", len(h1), len(h2), len(tr.hello))
+	}
+	if string(h1) == string(h2) {
+		t.Fatal("two pickHello calls returned byte-identical hellos (replayed randoms)")
+	}
+	got, err := parseSNIOf(h2)
+	if err != nil || got != "mci.ir" {
+		t.Fatalf("pickHello SNI: got %q err %v, want mci.ir", got, err)
 	}
 }
 
@@ -850,8 +903,8 @@ func TestDesyncMultiSNIRotation(t *testing.T) {
 	}
 	tr := newDesyncTracker(cfg, p)
 	defer tr.close()
-	sent := &[][]byte{}
-	tr.send = func(pkt []byte) { *sent = append(*sent, pkt) }
+	sent := &sentLog{}
+	tr.send = sent.add
 
 	expectedSNIs := []string{"mci.ir", "divar.ir", "digikala.com", "mci.ir"}
 	for i, want := range expectedSNIs {
@@ -864,11 +917,11 @@ func TestDesyncMultiSNIRotation(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("conn %d never fired", i)
 		}
-		if len(*sent) != i+1 {
-			t.Fatalf("sent count mismatch at iter %d: got %d", i, len(*sent))
+		if sent.n() != i+1 {
+			t.Fatalf("sent count mismatch at iter %d: got %d", i, sent.n())
 		}
 		// Extract SNI from the sent packet (starts at byte 40 after 20-byte IP and 20-byte TCP header)
-		rec := (*sent)[i][40:]
+		rec := sent.at(i)[40:]
 		got, err := parseSNIOf(rec)
 		if err != nil {
 			t.Fatalf("conn %d parseSNIOf: %v", i, err)
@@ -1052,10 +1105,10 @@ func TestDesyncOptsCapture(t *testing.T) {
 		t.Fatal("fake never fired")
 	}
 
-	if len(*sent) != 1 {
-		t.Fatalf("want 1 fake, got %d", len(*sent))
+	if sent.n() != 1 {
+		t.Fatalf("want 1 fake, got %d", sent.n())
 	}
-	fake := (*sent)[0]
+	fake := sent.at(0)
 	// TCP header must have Data Offset = 8
 	fth := fake[20:]
 	if fth[12]>>4 != 8 {

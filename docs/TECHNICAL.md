@@ -1747,8 +1747,13 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
   switches to sending under the fresh key once the other side's packets authenticate with it; until then the old key
   still opens in-flight packets, for a 30 s grace, then it is dropped. After the switch, traffic recorded earlier
   cannot be decrypted even if the key file leaks later. The first RTT or so of a session is still PSK-only — that is
-  the window a passive recorder could use. An older peer that never answers gets offers for 10 s, then the client
-  gives up and the session stays PSK-only. `WAT_NO_KEX=1` turns the exchange off (A/B tests).
+  the window a passive recorder could use. An older peer that never answers gets offers forever, about one a second:
+  every 10 s the client re-arms with fresh keys, so an exchange whose replies were lost completes once the path
+  recovers. If a switched client hears nothing for 4 s while it keeps sending (the Kharej process
+  restarted: its new process cannot open the fresh key, so it could never authenticate the client),
+  it seals and accepts PSK-key packets for 10 s and keeps offering, so the restarted server
+  re-authenticates the session, sends its boot frame, and a full re-exchange completes — streams
+  recover in a few seconds instead of hanging. `WAT_NO_KEX=1` turns the exchange off (A/B tests).
 - **Authenticate first.** The server creates a session only if a packet authenticates. Garbage, scans and replays of
   another key are dropped without a response, and packet numbers are tracked, so a captured packet replayed later is
   dropped too.

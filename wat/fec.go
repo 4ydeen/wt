@@ -153,7 +153,9 @@ func (s *Session) onFec(r *reader, now time.Time) bool {
 	}
 	miss := -1
 	for i := 0; i < int(n); i++ {
-		if lens[i] > len(parity) {
+		if lens[i] < 0 || lens[i] > len(parity) {
+			// negative: a varint above 2^63 wrapped through int() — reject before rec[:lens[miss]] (audit 2026-10-21)
+			r.err = errBadFrame
 			return false
 		}
 		if s.rxAny && s.rxDup(pns[i]) {

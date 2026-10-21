@@ -534,6 +534,12 @@ func (c *cc) tickReliable(now time.Time, cut, busy bool) {
 	if c.maxBW <= 0 {
 		if c.limited && !cut { // no estimate yet: ramp like slow start
 			c.rate = min(c.rate*1.10, c.maxRate)
+			if c.ceiling > 0 && c.rate > c.ceiling { // the ramp honours the same ceilings as the probe above
+				c.rate = max(c.ceiling, c.rate/1.10)
+			}
+			if g := c.gov.ceiling; g > 0 && c.rate > g {
+				c.rate = g
+			}
 		}
 		return
 	}

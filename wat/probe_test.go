@@ -13,27 +13,28 @@ func TestFilterProfileDefaults(t *testing.T) {
 }
 
 // TestProbeVerdictTable pins the verdict mapping of filterProbe.run against synthetic observations
-// (the probe itself needs a real filter to be meaningful; the mapping is the testable part).
+// (the probe itself needs a real filter to be meaningful; the mapping is the testable part). The
+// verdict keys on which marker killed its flow, not on the final connAlive: sumOK already implies
+// the sum socket was alive after the probe, so gating on p.alive made "sum" unreachable.
 func TestProbeVerdictTable(t *testing.T) {
 	cases := []struct {
 		seqOK, sumOK, alive bool
 		want                string
 	}{
-		{true, true, true, "seq"},      // nothing kills the flow: default
-		{false, true, false, "sum"},    // died with seq marker in flight, sum survived: filter drops below-window junk -> use sum
-		{true, false, false, "seq"},    // died with sum marker in flight, seq survived: filter drops bad checksums -> keep seq
-		{false, false, false, "seqsum"}, // died under both -> try seqsum
-		{true, true, false, "seq"},     // died later without correlation: nothing proved, keep the default
+		{true, true, true, "seq"},    // nothing kills the flow: default
+		{false, true, true, "sum"},   // seq marker killed its flow, sum survived: filter acts on below-window junk
+		{true, false, false, "seq"},  // sum marker killed its flow, seq survived: filter acts on bad checksums
+		{false, false, false, "seqsum"}, // both single markers killed their flows: try the dual marker
+		{true, true, false, "seq"},   // final connAlive flaked without a marker correlation: keep the default
+		{false, true, false, "sum"},  // verdict keys on the marker, not a flaky final recheck
 	}
 	for _, c := range cases {
 		p := filterProbe{seqOK: c.seqOK, sumOK: c.sumOK, alive: c.alive}
 		var got string
 		switch {
-		case !p.alive && !p.seqOK && p.sumOK:
+		case !p.seqOK && p.sumOK:
 			got = "sum"
-		case !p.alive && p.seqOK && !p.sumOK:
-			got = "seq"
-		case !p.alive && !p.seqOK && !p.sumOK:
+		case !p.seqOK && !p.sumOK:
 			got = "seqsum"
 		default:
 			got = "seq"

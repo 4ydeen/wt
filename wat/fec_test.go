@@ -11,7 +11,10 @@ import (
 
 // Every possible single loss inside a random group is rebuilt byte-exactly and the data reaches the stream.
 func TestFecReconstruct(t *testing.T) {
-	snd, rcv, _, _ := newPair(t, 0, time.Millisecond, 10e6, Config{FEC: true})
+	// up is the server's receive direction: parity is injected through its channel so the session's
+	// own recvLoop handles it (a direct rcv.handle would race the recvLoop under -race; simDir.send
+	// would drop it — parity packets exceed the simulated 700 B link cap).
+	snd, rcv, up, _ := newPair(t, 0, time.Millisecond, 10e6, Config{FEC: true})
 	rnd := rand.New(rand.NewSource(5))
 	for trial := 0; trial < 60; trial++ {
 		n := 1 + rnd.Intn(fecMaxK)
@@ -56,7 +59,7 @@ func TestFecReconstruct(t *testing.T) {
 			rcv.parse(p, time.Now())
 		}
 		rcv.mu.Unlock()
-		rcv.handle(o.p, 0, nil)
+		up.out <- o.p
 		st, err := rcv.Accept()
 		if err != nil {
 			t.Fatal(err)
@@ -76,7 +79,7 @@ func TestFecReconstruct(t *testing.T) {
 
 // Two missing packets in one group cannot be rebuilt (and must not corrupt anything).
 func TestFecTwoMissing(t *testing.T) {
-	snd, rcv, _, _ := newPair(t, 0, time.Millisecond, 10e6, Config{FEC: true})
+	snd, rcv, up, _ := newPair(t, 0, time.Millisecond, 10e6, Config{FEC: true})
 	var plains [][]byte
 	snd.mu.Lock()
 	snd.cc.tokens = 1e9
@@ -96,7 +99,12 @@ func TestFecTwoMissing(t *testing.T) {
 		rcv.fecKeep(pn, plains[i])
 	}
 	rcv.mu.Unlock()
-	rcv.handle(o.p, 0, nil)
+	n0 := rcv.Stats().PktsIn
+	up.out <- o.p // same injection route as TestFecReconstruct
+	deadline := time.Now().Add(5 * time.Second)
+	for rcv.Stats().PktsIn <= n0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if r := rcv.Stats().FecRecovered; r != 0 {
 		t.Fatalf("recovered %d with two packets missing", r)
 	}
@@ -244,5 +252,25 @@ func TestFecBulkThroughput(t *testing.T) {
 	}
 	if float64(st.FecSent) > 0.05*float64(st.PktsOut) {
 		t.Fatalf("parity overhead %d of %d packets", st.FecSent, st.PktsOut)
+	}
+}
+
+// TestFecLenOverflow: a crafted parity frame with a length varint >= 2^63 wraps to a negative int;
+// before the audit fix the guard only rejected lens > len(parity), so rec[:lens[miss]] panicked on
+// the missing slot and one malformed frame killed the process.
+func TestFecLenOverflow(t *testing.T) {
+	snd, rcv, _, _ := newPair(t, 0, time.Millisecond, 10e6, Config{FEC: true})
+	defer snd.Close()
+	defer rcv.Close()
+	frame := appendUv(appendUv(appendUv(appendUv(nil, 1), 0), 0), 1<<63) // n=1 base=0 pn+0 len=2^63
+	frame = append(frame, 0xAA)                                         // 1 byte of parity
+	rcv.mu.Lock()
+	defer rcv.mu.Unlock()
+	r := &reader{b: frame}
+	if rcv.onFec(r, time.Now()) {
+		t.Fatal("overflow length must not repair anything")
+	}
+	if r.err == nil {
+		t.Fatal("overflow length must mark the reader bad")
 	}
 }

@@ -303,6 +303,8 @@ type registry struct {
 	tot      map[string][3]int64 // "c:20001" -> up, down, conns; "session" -> in, out, 0
 	sess     func() (in, out uint64)
 	sessBase [2]int64
+
+	saveMu sync.Mutex // one disk writer at a time: the .tmp + rename pair must not interleave between callers
 }
 
 var portReg = newRegistry()
@@ -391,7 +393,7 @@ func (r *registry) sessionTotals(in, out uint64) (int64, int64) {
 	return r.sessBase[0] + int64(in), r.sessBase[1] + int64(out)
 }
 
-// saveTotals writes the lifetime totals atomically (tmp file + rename).
+// saveTotals writes the lifetime totals atomically (tmp file + rename; saveMu held via save).
 func (r *registry) saveTotals() {
 	r.mu.Lock()
 	if r.totPath == "" {
@@ -420,8 +422,12 @@ func (r *registry) saveTotals() {
 	}
 }
 
-// save writes quota usage and the lifetime totals atomically (tmp file + rename).
+// save writes quota usage and the lifetime totals atomically (tmp file + rename). One writer at a time:
+// the 30 s ticker, the shutdown save and /quota/reset can overlap, and two writers on the same .tmp
+// file interleave and publish a corrupt state (audit 2026-10-21).
 func (r *registry) save() {
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
 	r.saveTotals()
 	if r.path == "" {
 		return

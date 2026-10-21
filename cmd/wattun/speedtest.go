@@ -105,14 +105,14 @@ type speedResult struct {
 
 // runSpeedTest moves size bytes in one direction through every live session of tun at once, streams streams on
 // each (size split between them all), and times the whole.
-func runSpeedTest(tun *tunnel, dir string, size uint64, streams int) speedResult {
+func runSpeedTest(tun *tunnel, dir string, size uint64, streams int, done <-chan struct{}) speedResult {
 	list := tun.live()
 	streams = max(streams, 1)
 	if len(list) == 0 {
 		return speedResult{Dir: dir, Bytes: size, Error: "tunnel is not connected", Sessions: len(tun.list), Streams: streams}
 	}
 	if len(list) == 1 && streams == 1 {
-		r := speedOne(list[0], dir, size)
+		r := speedOne(list[0], dir, size, done)
 		r.Sessions, r.Streams = 1, 1
 		return r
 	}
@@ -134,7 +134,7 @@ func runSpeedTest(tun *tunnel, dir string, size uint64, streams int) speedResult
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			parts[i] = speedOne(s, dir, n)
+			parts[i] = speedOne(s, dir, n, done)
 		}()
 	}
 	wg.Wait()
@@ -152,8 +152,10 @@ func runSpeedTest(tun *tunnel, dir string, size uint64, streams int) speedResult
 	return res
 }
 
-// speedOne moves size bytes in one direction through one stream of sess and times it.
-func speedOne(sess *wat.Session, dir string, size uint64) speedResult {
+// speedOne moves size bytes in one direction through one stream of sess and times it. done (the HTTP
+// request's context) aborts the transfer when the caller walks away — without it an abandoned /speedtest
+// kept up to sessions×32 streams running until the 3-minute cap (audit 2026-10-21).
+func speedOne(sess *wat.Session, dir string, size uint64, done <-chan struct{}) speedResult {
 	res := speedResult{Dir: dir, Bytes: size}
 	fail := func(err error) speedResult { res.Error = err.Error(); return res }
 	if !sess.Alive() {
@@ -165,6 +167,15 @@ func speedOne(sess *wat.Session, dir string, size uint64) speedResult {
 	}
 	timer := time.AfterFunc(speedTestLimit, st.Reset)
 	defer timer.Stop()
+	if done != nil {
+		go func() {
+			select {
+			case <-done:
+				st.Reset()
+			case <-time.After(speedTestLimit):
+			}
+		}()
+	}
 	var hdr [11]byte
 	binary.BigEndian.PutUint16(hdr[:2], speedTestPort)
 	hdr[2] = 'D'
@@ -222,6 +233,6 @@ func speedTestHandler(tun *tunnel) http.HandlerFunc {
 		}
 		mb = min(mb, speedTestMaxMB*streams) // the server's cap is per stream, and mb is split between the streams
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(runSpeedTest(tun, dir, uint64(mb)<<20, streams))
+		json.NewEncoder(w).Encode(runSpeedTest(tun, dir, uint64(mb)<<20, streams, r.Context().Done()))
 	}
 }

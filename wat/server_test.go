@@ -240,12 +240,18 @@ func TestDrain(t *testing.T) {
 }
 
 // The server process restarts (new boot id, no memory of any stream): the client must notice, drop its dead streams
-// and carry on with new ones. Before the boot frame existed the old connections just hung.
+// and carry on with new ones. Before the boot frame existed the old connections just hung; since 2.10.0 the kex
+// switch reintroduced the hang (a restarted server cannot open the switched client's fresh key) until the PSK
+// restart probe — the kexWait below pins that the switch has really happened before the restart.
 func TestServerRestart(t *testing.T) {
 	h, srv := newHub(t)
 	a, _ := NewSession(Config{Key: []byte("hub-key"), Paths: 4, Logf: t.Logf}, h.client("r1", 0.01, 15*time.Millisecond, 10e6, 70))
 	defer a.Close()
 	echoOnce(t, a, 100000, 1)
+	kexWait(t, "the client to switch keys before the restart", func() bool {
+		a.mu.Lock(); defer a.mu.Unlock()
+		return a.kexDone
+	})
 	// a stream that is open while the server dies
 	hang, _ := a.OpenStream()
 	hang.Write([]byte("hello"))

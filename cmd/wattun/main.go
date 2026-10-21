@@ -694,6 +694,7 @@ func main() {
 			for range time.Tick(2 * time.Second) {
 				if srv.Sessions() == 0 {
 					log.Printf("drained, exiting")
+					portReg.save() // the handover exit skips the signal path's save (audit 2026-10-21)
 					os.Exit(0)
 				}
 			}
@@ -713,7 +714,8 @@ func main() {
 				}
 				lp, e1 := strconv.Atoi(f[0])
 				sp, e2 := strconv.Atoi(f[1])
-				if e1 != nil || e2 != nil {
+				if e1 != nil || e2 != nil || lp < 1 || lp > 65535 || sp < 1 || sp > 65535 {
+					// range too: uint16(target) would silently wrap 70000->4464 and route 0 to the speed test
 					log.Fatalf("bad -map entry %q", m)
 				}
 				addr := net.JoinHostPort(bindAddr, strconv.Itoa(lp+*offset))
@@ -954,7 +956,7 @@ func serve(sess *wat.Session, lo, hi int, al *allow) {
 				st.Reset()
 				return
 			}
-			if port == dnsRelayPort && !al.ok(port, lo, hi) { // built-in DNS relay for -ech ladder (2.9.0), only if not forwarded
+			if port == dnsRelayPort && al.relayFor(port, lo, hi) { // built-in DNS relay for -ech ladder (2.9.0)
 				serveDNSRelay(st)
 				return
 			}
@@ -990,7 +992,8 @@ type allow struct {
 	udp   map[int]bool // udp target ports: `N/udp` entries in the config ports list, -allow-ports or -allow-file
 	file  string
 	mtime time.Time
-	cfg   bool // ports come from the config file: authoritative, even when empty
+	size  int64 // allow-file size, checked next to mtime (a same-granularity rewrite changes size)
+	cfg   bool  // ports come from the config file: authoritative, even when empty
 }
 
 func parsePorts(txt string) map[int]bool {
@@ -1035,7 +1038,8 @@ func newAllow(list, file string) *allow {
 
 func (a *allow) reload() {
 	st, err := os.Stat(a.file)
-	if err != nil || st.ModTime().Equal(a.mtime) {
+	// mtime alone misses a rewrite landing inside the filesystem's timestamp granularity; size catches it
+	if err != nil || (st.ModTime().Equal(a.mtime) && st.Size() == a.size) {
 		return
 	}
 	b, err := os.ReadFile(a.file)
@@ -1044,7 +1048,7 @@ func (a *allow) reload() {
 	}
 	m, um := parsePorts(string(b)), parseUDPPorts(string(b))
 	a.mu.Lock()
-	a.ports, a.udp, a.mtime = m, um, st.ModTime()
+	a.ports, a.udp, a.mtime, a.size = m, um, st.ModTime(), st.Size()
 	a.mu.Unlock()
 	log.Printf("allowed target ports: %d", len(m))
 }
@@ -1090,6 +1094,18 @@ func (a *allow) ok(port, lo, hi int) bool {
 		return a.ports[port]
 	}
 	return port >= lo && port <= hi
+}
+
+// relayFor: the built-in DNS relay owns target 53 unless an explicit allowlist forwards it to a real local
+// resolver. The default 1-65535 range does not count as explicit — otherwise the ladder's relay rung (2.9.0)
+// is dead on every default-config server, because 53 then dials a local resolver that is usually not there.
+func (a *allow) relayFor(port, lo, hi int) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.file != "" || a.cfg || len(a.ports) > 0 {
+		return !a.ports[port]
+	}
+	return true
 }
 
 var debugOn bool
