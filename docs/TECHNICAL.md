@@ -1794,6 +1794,21 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.10.2: anti-censor matrix tester, ECH lock contention fix, and transport resilience.** Client-side
+  reliability update, fully backward-compatible with 2.10.x servers.
+  (1) **Autonomous anti-censor matrix tester**: `wattun-manager matrix NAME` tests every resilience combination
+  (`base`, `seq`, `seqsum`, `sum`, `ttl`, `rst`, `auto-probe`, ECH ladder across allowlisted SNIs) entirely
+  from the Iran server using throw-away clients, ranking and applying the best working combination without
+  requiring SSH access to Kharej.
+  (2) **ECH ladder concurrency**: `echState` no longer holds `s.mu` across blocking network lookups (4 s DoH race +
+  6 s tunnel relay), eliminating pool dial stalls during cold boots or network blips.
+  (3) **HTTP carrier Host fallback**: When `-host` is omitted, `HTTPClientOptions.host()` now defaults to
+  `TLS.ServerName` instead of raw peer `IP:port`, preventing Cloudflare edge host rejections.
+  (4) **Desync link-layer support**: `parseEthIPv4` now decodes raw IPv4 (tun/wg), 802.1Q VLAN tags, and Linux SLL
+  cooked headers alongside standard Ethernet frames.
+  (5) **Capabilities and daemon stability**: `install.sh` systemd template retains `CAP_NET_BIND_SERVICE` and
+  `CAP_NET_ADMIN` alongside `CAP_NET_RAW` for port 53 and TCP sequence probes. Manager deduplicates `ech:` config
+  lines to prevent daemon boot crashes.
 - **2.10.1: the audit round after 2.10.0.** Both ends benefit; no wire change, old and new peers interop either
   way. A five-reviewer sweep of the tree (19 findings) plus the first `-race` run of the `wat/` suite.
   (1) **Kharej restart recovery** (a 2.10.0 regression): a switched client that hears nothing authenticated for

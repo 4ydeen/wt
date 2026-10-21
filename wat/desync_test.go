@@ -624,7 +624,7 @@ func TestDesyncStalePrune(t *testing.T) {
 	}
 }
 
-// TestDesyncParseEthIPv4 rejects non-IPv4 frames.
+// TestDesyncParseEthIPv4 validates ethernet, VLAN, SLL and raw frames, and rejects non-IPv4 frames.
 func TestDesyncParseEthIPv4(t *testing.T) {
 	arp := make([]byte, 60)
 	binary.BigEndian.PutUint16(arp[12:], 0x0806)
@@ -633,6 +633,30 @@ func TestDesyncParseEthIPv4(t *testing.T) {
 	}
 	if parseEthIPv4([]byte{1, 2, 3}) != nil {
 		t.Fatal("short frame accepted")
+	}
+
+	// Raw IPv4 packet (tun/wg)
+	rawIP := make([]byte, 40)
+	rawIP[0] = 0x45 // IPv4, 20-byte IHL
+	if got := parseEthIPv4(rawIP); got == nil || len(got) != 40 {
+		t.Fatal("raw IPv4 packet rejected")
+	}
+
+	// 802.1Q VLAN tagged frame (18-byte header)
+	vlan := make([]byte, 18+40)
+	binary.BigEndian.PutUint16(vlan[12:], 0x8100)
+	binary.BigEndian.PutUint16(vlan[16:], 0x0800)
+	vlan[18] = 0x45
+	if got := parseEthIPv4(vlan); got == nil || len(got) != 40 {
+		t.Fatal("VLAN-tagged IPv4 packet rejected")
+	}
+
+	// Linux cooked mode SLL (16-byte header)
+	sll := make([]byte, 16+40)
+	binary.BigEndian.PutUint16(sll[14:], 0x0800)
+	sll[16] = 0x45
+	if got := parseEthIPv4(sll); got == nil || len(got) != 40 {
+		t.Fatal("SLL IPv4 packet rejected")
 	}
 }
 

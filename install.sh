@@ -421,9 +421,9 @@ ExecStart=/usr/local/bin/wattun -config /etc/wattun/%i.yml
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-# only the ICMP carrier needs CAP_NET_RAW; nothing in the binary uses CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_RAW
+# CAP_NET_RAW for ICMP & raw packets; CAP_NET_ADMIN for TCP_REPAIR seq reading; CAP_NET_BIND_SERVICE for port 53 & web ports
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

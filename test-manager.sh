@@ -301,5 +301,48 @@ expect_fail env ANTICENSOR_TEST_WAIT=1 anticensor_test t_probe
 expect_fail anticensor_test non_existent_tunnel
 rm -f "$WAT_CONF/t_probe.yml"
 
+# Regression test for F9: AT_EXTRA deduplication with T_ECH
+t_extra=$(printf "fp: chrome\nech: auto\ntls-frag: 100")
+t_ech="ladder"
+if [ -n "$t_ech" ]; then
+  [ "$t_ech" != off ] && t_out="ech: $t_ech"
+  [ -n "$t_extra" ] && t_extra=$(printf '%s\n' "$t_extra" | grep -v '^ech:' || true)
+fi
+chk "F9 regression: t_extra stripped ech" "$(printf '%s\n' "$t_extra" | grep -c '^ech:' || true)" "0"
+chk "F9 regression: t_out preserved ladder" "$t_out" "ech: ladder"
+
+# Anti-censor matrix: av_add carries fake-sni/fake-mode; at_start passes them to the binary
+bin_ver_ok() { echo 1; }
+AV_LABEL=(); AV_CAR=(); AV_KIND=(); AV_PEER=(); AV_PORT=(); AV_SNI=(); AV_FP=(); AV_ECH=(); AV_FRAG=()
+AV_FS=(); AV_FM=()
+av_add "desync mci.ir · seqsum" tcp d "198.51.100.1:443" '' '' '' '' '' mci.ir seqsum
+av_add "base" tcp d "198.51.100.1:443" '' ''
+chk "matrix: AV_FS set" "${AV_FS[0]}" "mci.ir"
+chk "matrix: AV_FM set" "${AV_FM[0]}" "seqsum"
+chk "matrix: AV_FS empty for base" "${AV_FS[1]}" ""
+
+# ac_matrix builds the full variant list
+T_CARRIER=tcp; T_PEER=198.51.100.1:443; T_SNI=example.com; T_PATH=/wat; T_KEY=k; T_ICMP=''
+at_prep() { AT_DIR="$AUTO_RUN/t.$$"; mkdir -p "$AT_DIR"; printf 'k' >"$AT_DIR/key"; return 0; }
+at_probe() { AR_OK[$1]=1; AR_DOWN[$1]=5; AR_UP[$1]=5; AR_RTT[$1]=10; return 0; }
+ac_matrix t1
+chk "matrix: variant count" "${#AV_LABEL[@]}" "10" # 1 base + 5 modes + 3 SNIs + 1 auto-probe
+chk "matrix: baseline first" "${AV_LABEL[0]}" "base (no desync)"
+chk "matrix: seq present" "$(printf '%s\n' "${AV_FM[@]}" | grep -c '^seq$')" "1"
+chk "matrix: auto-probe present" "$(printf '%s\n' "${AV_FM[@]}" | grep -c '^auto$')" "1"
+chk "matrix: 9 desync rows carry fake-sni" "$(printf '%s\n' "${AV_FS[@]}" | grep -c .)" "9"
+chk "matrix: ranking fills" "${#AT_RANK[@]}" "10"
+
+# ac_matrix_apply writes the winner and strips desync keys for the baseline
+AT_SEL=("${AV_LABEL[*]}") # dummy to satisfy set -u shape; real selection below
+AT_SEL=(0)
+ac_matrix_apply t1
+chk "matrix apply: strips fake-sni on baseline" "$(grep -c '^fake-sni:' "$WAT_CONF/t1.yml" || true)" "0"
+AV_SEL=(); for ((i=0; i<${#AV_LABEL[@]}; i++)); do [ "${AV_FM[$i]}" = seqsum ] && AV_SEL+=("$i"); done
+AT_SEL=("${AV_SEL[0]}")
+ac_matrix_apply t1
+chk "matrix apply: writes fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t1.yml")" "fake-sni: mci.ir"
+chk "matrix apply: writes fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: seqsum"
+
 [ "$fail" = 0 ] && echo "ALL OK" || echo "FAILURES: $fail"
 exit "$fail"

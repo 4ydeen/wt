@@ -330,13 +330,26 @@ func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
 	return pkt
 }
 
-// parseEthIPv4 returns the IPv4 packet carried by an ethernet frame, or nil (not IPv4 / truncated).
+// parseEthIPv4 returns the IPv4 packet carried by an ethernet, SLL, or raw frame, or nil.
 func parseEthIPv4(frame []byte) []byte {
-	if len(frame) < 14+20 || binary.BigEndian.Uint16(frame[12:]) != 0x0800 {
-		return nil
+	// Standard Ethernet (14-byte header, EtherType 0x0800)
+	if len(frame) >= 34 && binary.BigEndian.Uint16(frame[12:]) == 0x0800 && frame[14]>>4 == 4 {
+		return frame[14:]
 	}
-	if ip := frame[14:]; ip[0]>>4 == 4 {
-		return ip
+	// Direct IPv4 (raw IP / tun / wg interfaces without L2 header)
+	if len(frame) >= 20 && frame[0]>>4 == 4 {
+		ihl := int(frame[0]&0x0f) * 4
+		if ihl >= 20 && len(frame) >= ihl {
+			return frame
+		}
+	}
+	// 802.1Q VLAN tagged Ethernet (18-byte header)
+	if len(frame) >= 38 && binary.BigEndian.Uint16(frame[12:]) == 0x8100 && binary.BigEndian.Uint16(frame[16:]) == 0x0800 && frame[18]>>4 == 4 {
+		return frame[18:]
+	}
+	// Linux cooked mode (SLL, 16-byte header)
+	if len(frame) >= 36 && binary.BigEndian.Uint16(frame[14:]) == 0x0800 && frame[16]>>4 == 4 {
+		return frame[16:]
 	}
 	return nil
 }

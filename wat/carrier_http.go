@@ -56,6 +56,9 @@ func (o HTTPClientOptions) host(peer string) string {
 	if o.Host != "" {
 		return o.Host
 	}
+	if o.TLS.ServerName != "" {
+		return o.TLS.ServerName
+	}
 	return peer
 }
 

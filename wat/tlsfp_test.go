@@ -699,7 +699,7 @@ func TestECHDoHRaceAndStale(t *testing.T) {
 		t.Fatalf("hanging servers delayed the answer by %v", d)
 	}
 
-	s := &echState{mode: "auto", m: map[string]*echEntry{}, inflight: map[string]bool{}}
+	s := &echState{mode: "auto", m: map[string]*echEntry{}, inflight: map[string]chan struct{}{}}
 	e := &tlsEngine{noted: map[string]bool{}}
 	if !bytes.Equal(s.get(context.Background(), "inner.example", e), list) {
 		t.Fatal("no config")
@@ -711,7 +711,7 @@ func TestECHDoHRaceAndStale(t *testing.T) {
 	}
 	for i := 0; i < 100; i++ { // the background refresh fails and must keep the config
 		s.mu.Lock()
-		busy := s.inflight["inner.example"]
+		busy := s.inflight["inner.example"] != nil
 		s.mu.Unlock()
 		if !busy {
 			break

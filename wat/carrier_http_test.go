@@ -216,3 +216,23 @@ func TestHTTPNoGoroutineLeak(t *testing.T) {
 	buf := make([]byte, 1<<16)
 	t.Fatalf("goroutines %d, baseline %d\n%s", n, base, buf[:runtime.Stack(buf, true)])
 }
+
+func TestHTTPClientHostFallback(t *testing.T) {
+	// Explicit Host takes priority
+	o1 := HTTPClientOptions{Host: "custom.host", TLS: TLSClientOptions{ServerName: "sni.host"}}
+	if got := o1.host("1.2.3.4:443"); got != "custom.host" {
+		t.Fatalf("want custom.host, got %s", got)
+	}
+
+	// ServerName used when Host empty (prevents leaking raw peer IP to CDNs)
+	o2 := HTTPClientOptions{TLS: TLSClientOptions{ServerName: "sni.host"}}
+	if got := o2.host("1.2.3.4:443"); got != "sni.host" {
+		t.Fatalf("want sni.host, got %s", got)
+	}
+
+	// Peer address used when both Host and ServerName empty
+	o3 := HTTPClientOptions{}
+	if got := o3.host("1.2.3.4:443"); got != "1.2.3.4:443" {
+		t.Fatalf("want 1.2.3.4:443, got %s", got)
+	}
+}

@@ -52,7 +52,7 @@ type echState struct {
 
 	mu       sync.Mutex
 	m        map[string]*echEntry
-	inflight map[string]bool // background refreshes running
+	inflight map[string]chan struct{} // in-flight lookups
 
 	cachePath   string // -ech-cache file ("" = off)
 	cacheLoaded bool
@@ -88,7 +88,7 @@ func newECHState(v, cachePath string) (*echState, error) {
 	if mode != "auto" && mode != "ladder" {
 		cachePath = ""
 	}
-	return &echState{mode: mode, static: list, m: map[string]*echEntry{}, inflight: map[string]bool{}, cachePath: cachePath}, nil
+	return &echState{mode: mode, static: list, m: map[string]*echEntry{}, inflight: map[string]chan struct{}{}, cachePath: cachePath}, nil
 }
 
 // get returns the ECHConfigList to offer for name, or nil to connect without ECH.
@@ -110,23 +110,7 @@ func (s *echState) get(ctx context.Context, name string, e *tlsEngine) []byte {
 		e.note("ech-noname", "ech auto: needs a name to look up (set -sni or -host); connecting without ECH")
 		return nil
 	}
-	s.mu.Lock()
-	s.loadCacheLocked(e)
-	en := s.m[name]
-	if en != nil && time.Now().Before(en.next) {
-		defer s.mu.Unlock()
-		return en.list
-	}
-	if en != nil && en.list != nil { // known config, due for a refresh: use it now, refresh behind the scenes
-		list := en.list
-		s.mu.Unlock()
-		s.refreshAsync(name, e)
-		return list
-	}
-	// held over the first fetch: concurrent slots wait for one lookup instead of making eight
-	defer s.mu.Unlock()
-	s.lookupLocked(name, e)
-	return s.m[name].list
+	return s.fetchSync(name, e)
 }
 
 // getLadder is auto plus the second rung: when the direct DoH lookup fails (all servers unreachable), the
@@ -136,27 +120,50 @@ func (s *echState) getLadder(ctx context.Context, name string, e *tlsEngine) []b
 		e.note("ech-noname", "ech ladder: needs a name to look up (set -sni or -host); connecting without ECH")
 		return nil
 	}
-	s.mu.Lock()
-	s.loadCacheLocked(e)
-	en := s.m[name]
-	if en != nil && time.Now().Before(en.next) {
-		defer s.mu.Unlock()
-		return en.list
-	}
-	if en != nil && en.list != nil {
-		list := en.list
-		s.mu.Unlock()
-		s.refreshAsync(name, e)
-		return list
-	}
-	defer s.mu.Unlock()
-	s.lookupLocked(name, e)
-	return s.m[name].list
+	return s.fetchSync(name, e)
 }
 
-// lookupLocked fetches name's config (s.mu held). The lookup does not use the dial's context, so a slow DoH cannot eat
-// the dial's budget. A failed lookup never drops a config we already have (stale-while-error).
-func (s *echState) lookupLocked(name string, e *tlsEngine) {
+// fetchSync gets or refreshes ECH config for name without holding s.mu across network lookups.
+func (s *echState) fetchSync(name string, e *tlsEngine) []byte {
+	s.mu.Lock()
+	s.loadCacheLocked(e)
+	for {
+		en := s.m[name]
+		if en != nil && time.Now().Before(en.next) {
+			s.mu.Unlock()
+			return en.list
+		}
+		if en != nil && en.list != nil { // known config, due for a refresh: use it now, refresh behind the scenes
+			list := en.list
+			s.mu.Unlock()
+			s.refreshAsync(name, e)
+			return list
+		}
+		if ch, ok := s.inflight[name]; ok {
+			s.mu.Unlock()
+			<-ch
+			s.mu.Lock()
+			continue
+		}
+		ch := make(chan struct{})
+		s.inflight[name] = ch
+		s.mu.Unlock()
+
+		list, err := s.doLookup(name, e)
+
+		s.mu.Lock()
+		s.applyLookupLocked(name, list, err, e)
+		delete(s.inflight, name)
+		close(ch)
+		res := s.m[name].list
+		s.mu.Unlock()
+		return res
+	}
+}
+
+// doLookup fetches name's config (no s.mu held). The lookup does not use the dial's context, so a slow DoH cannot eat
+// the dial's budget.
+func (s *echState) doLookup(name string, e *tlsEngine) ([]byte, error) {
 	fctx, cancel := context.WithTimeout(context.Background(), dohTimeout+time.Second)
 	defer cancel()
 	list, err := FetchECHConfigList(fctx, name)
@@ -168,6 +175,10 @@ func (s *echState) lookupLocked(name string, e *tlsEngine) {
 			e.note("ech-ladder:"+name, "ech ladder: direct DoH failed and the relay could not answer (%v)", err2)
 		}
 	}
+	return list, err
+}
+
+func (s *echState) applyLookupLocked(name string, list []byte, err error, e *tlsEngine) {
 	old := s.m[name]
 	switch {
 	case err == nil:
@@ -205,18 +216,22 @@ func (s *echState) ladderThrough(name string) ([]byte, error) {
 	return parseHTTPSECH(ans, q)
 }
 
-func (s *echState) refreshAsync(name string, e *tlsEngine) {	s.mu.Lock()
-	if s.inflight[name] {
+func (s *echState) refreshAsync(name string, e *tlsEngine) {
+	s.mu.Lock()
+	if _, ok := s.inflight[name]; ok {
 		s.mu.Unlock()
 		return
 	}
-	s.inflight[name] = true
+	ch := make(chan struct{})
+	s.inflight[name] = ch
 	s.mu.Unlock()
 	go func() {
+		list, err := s.doLookup(name, e)
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.lookupLocked(name, e)
+		s.applyLookupLocked(name, list, err, e)
 		delete(s.inflight, name)
+		close(ch)
+		s.mu.Unlock()
 	}()
 }
 
@@ -233,17 +248,10 @@ func (s *echState) rejected(name string, retry []byte, e *tlsEngine) bool {
 		s.m[key] = &echEntry{list: retry, next: time.Now().Add(echPosTTL)}
 		s.saveCacheLocked(e)
 		e.note("ech-retry", "ech: the server rejected our ECH config and sent a new one; retrying with it")
-		if s.mode == "auto" && name != "" { // also re-read DNS in the background (the keys rotated)
+		if (s.mode == "auto" || s.mode == "ladder") && name != "" { // also re-read DNS in the background (the keys rotated)
 			go func() {
 				time.Sleep(2 * time.Second) // let the retry connection win first; the refresh must not stall it
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				if s.inflight[name] {
-					return
-				}
-				s.inflight[name] = true
-				defer delete(s.inflight, name)
-				s.lookupLocked(name, e)
+				s.refreshAsync(name, e)
 			}()
 		}
 		return true
