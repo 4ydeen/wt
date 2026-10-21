@@ -17,6 +17,7 @@ const (
 	frDgram     = 0x08 // flow, port, len, data: an unreliable datagram (UDP forwarding); always the LAST frame of a packet
 	frFec       = 0x09 // XOR parity over the last few small data packets (fec.go); alone in its packet
 	frDgramFrag = 0x0a // flow, port, id, index, count, len, data: one piece of a datagram too big for one packet (2.5.0)
+	frKex       = 0x0b // 32-byte ephemeral X25519 public key: the forward-secrecy key exchange (2.10.0, both ends; see session.go onKex); always the LAST frame of a packet
 )
 
 var errBadFrame = errors.New("wat: malformed frame")

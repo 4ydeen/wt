@@ -950,6 +950,10 @@ func serve(sess *wat.Session, lo, hi int, al *allow) {
 				serveSpeedTest(st)
 				return
 			}
+			if isMetricsPort(port) { // the metrics server exposes stats, pprof and /quota/reset: never forward to it
+				st.Reset()
+				return
+			}
 			if port == dnsRelayPort && !al.ok(port, lo, hi) { // built-in DNS relay for -ech ladder (2.9.0), only if not forwarded
 				serveDNSRelay(st)
 				return

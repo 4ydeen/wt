@@ -6,8 +6,11 @@
 #   --force            reinstall even when the same version is installed
 #   --uninstall        stop every tunnel and remove WatTunnel (asks before deleting /etc/wattun)
 # Environment:
-#   WAT_PROXY=https://ghproxy.net/   prefix for every GitHub URL (when github.com is blocked)
+#   WAT_PROXY=https://ghproxy.net/   prefix for every GitHub URL (when github.com is blocked; untrusted: the
+#                                    release signature is then verified mandatorily)
 #   WAT_REPO=owner/name              fork to install from
+#   WAT_SIG_PUB=/path/to/pub.pem     another release-signing public key (forks)
+#   WAT_SKIP_CHECKSUM=1              install a local dist/ binary that has no .sha256 file
 #   WAT_NO_ANIM=1                    no animations (also automatic when output is not a terminal)
 #   NO_COLOR=1                       no colours
 # Installs: /usr/local/bin/wattun, /usr/local/bin/wattun-manager, /etc/systemd/system/wattun@.service, /etc/wattun/
@@ -185,7 +188,8 @@ WatTunnel installer
   --version vX.Y.Z   install that release instead of the latest
   --force            reinstall even when the same version is installed
   --uninstall        stop every tunnel and remove WatTunnel (asks before deleting /etc/wattun)
-Environment: WAT_PROXY=https://ghproxy.net/  WAT_REPO=owner/name  WAT_NO_ANIM=1  NO_COLOR=1
+Environment: WAT_PROXY=https://ghproxy.net/  WAT_REPO=owner/name  WAT_SIG_PUB=/path/to/pub.pem
+             WAT_SKIP_CHECKSUM=1  WAT_NO_ANIM=1  NO_COLOR=1
 EOF
 }
 
@@ -271,8 +275,27 @@ resolve_tag() {
   [[ "$u" =~ ^v[0-9]+\.[0-9]+ ]] || return 1
   TAG=$u
 }
-TAG=''; PREV_WARN=0; MGR_FALLBACK=0
+TAG=''; PREV_WARN=0; MGR_FALLBACK=0; FROM_DIST=0; DL_BASE=''
 human_size() { awk -v b="$1" 'BEGIN{printf "%.1f MB", b/1048576}'; }
+
+# The release signing key (the private half lives only in the release workflow's WAT_SIGN_KEY secret). The
+# installer checks an RSA signature over the release's SHA256SUMS, so a WAT_PROXY (or any tampered download) cannot
+# serve a matching binary and checksum pair. Forks: WAT_SIG_PUB=/path/to/pub.pem points at another key.
+SIG_PUB=$(cat <<'PEM'
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA0j+yK26CzKRD+am5rQZJ
+v8zChkZ5HuwQ4uBtj2mKfFRG8mrj7XN3iW60QEj7Le/fAYtk4hHvqsxb6Xhxw303
++rFCBxKr+mwc3GOB/zVh/fzNqN2pXzKCT+mSKiaDfwUmCizKFNUUCCnhNVpEx9hl
+A4B4n5iBgxW0G/ks4hOujx6teaKUN44+cZNgPshPSQ5KdiqQBi0rFCiSAKBCh1vL
+j07u5S/mvU8L8u9M6sUzST0mXcGw9WKQmAiIOCqAwLiyV1RtDodgaCIxLPJ93Qo/
+uK4DzYX3Ker8lW6MRKXgX3fAVXoyj/ZaE3oh1ZibVefAy6w7qB74JvQPv4nFvS/Y
+VJXpxiHiqE/YMdHbS9eCQnqjHVKmGWvBVPo/IlUiJFbl8nIEFZVij32Cp8A4awO2
+IORyD7iC8bA7AZHruzVfiUtrYA5XhBTRJplqws8kM0Ig4sLrws0HPOY4xOBRtSVh
+vgY6Qw/EWglth/K24PEC8AiuJYIRRkn/Kq+SBIRu8qVrAgMBAAE=
+-----END PUBLIC KEY-----
+PEM
+)
+[ -n "${WAT_SIG_PUB:-}" ] && SIG_PUB=$(cat "$WAT_SIG_PUB")
 
 step_check() {
   command -v curl >/dev/null || command -v wget >/dev/null || [ -f "$HERE/dist/$NAME" ] || { ERRMSG="curl or wget is required to download WatTunnel"; return 1; }
@@ -284,21 +307,45 @@ step_get() {
   if [ -f "$HERE/dist/$NAME" ]; then
     cp "$HERE/dist/$NAME" "$TMP/wattun" || { ERRMSG="cannot read $HERE/dist/$NAME"; return 1; }
     [ -f "$HERE/dist/$NAME.sha256" ] && cp "$HERE/dist/$NAME.sha256" "$TMP/sum"
+    FROM_DIST=1
     DETAIL="local build (dist/)"; return 0
   fi
   resolve_tag || TAG=''
   if [ -n "$TAG" ]; then base="https://github.com/$REPO/releases/download/$TAG"
   else base="https://github.com/$REPO/releases/latest/download"; fi
+  DL_BASE=$base
   if fetch "$base/$NAME" "$TMP/wattun"; then
     fetch "$base/$NAME.sha256" "$TMP/sum" || { ERRMSG="could not download the checksum file"; return 1; }
     DETAIL="release ${TAG:-latest}, $(human_size "$(stat -c %s "$TMP/wattun")")"
   elif [ -f "$HERE/go.mod" ] && command -v go >/dev/null; then
     (cd "$HERE" && timeout 900 sh build.sh "$ARCH") >"$TMP/build.log" 2>&1 || { ERRMSG="download failed and the source build failed too (see: sh build.sh)"; return 1; }
     cp "$HERE/dist/$NAME" "$TMP/wattun"; cp "$HERE/dist/$NAME.sha256" "$TMP/sum"
+    FROM_DIST=1
     DETAIL="built from source"
   else
     ERRMSG="download failed. If GitHub is blocked, try: WAT_PROXY=https://ghproxy.net/ bash install.sh"; return 1
   fi
+}
+# step_verify_sig checks the release's RSA signature over SHA256SUMS (see build.sh) against the key above. A local
+# dist/ copy skips it; anything downloaded must pass. Through WAT_PROXY (or any other prefix of untrusted origin)
+# the check is mandatory: fail closed when the signature cannot be fetched or openssl is missing.
+step_verify_sig() {
+  local got=$1 sums="$TMP/SHA256SUMS" sig="$TMP/SHA256SUMS.sig" pub="$TMP/sigpub.pem"
+  [ "$FROM_DIST" = 1 ] && { DETAIL="$DETAIL, no signature (local copy)"; return 0; }
+  if ! command -v openssl >/dev/null 2>&1; then
+    [ -n "$PROXY" ] && { ERRMSG="openssl is required to verify the release signature when WAT_PROXY is set"; return 1; }
+    DETAIL="$DETAIL, signature not checked (no openssl)"; return 0
+  fi
+  if ! fetch "$DL_BASE/SHA256SUMS" "$sums" || ! fetch "$DL_BASE/SHA256SUMS.sig" "$sig"; then
+    [ -n "$PROXY" ] && { ERRMSG="could not download SHA256SUMS(.sig): refusing to install through WAT_PROXY without a signature"; return 1; }
+    DETAIL="$DETAIL, signature not available"; return 0
+  fi
+  printf '%s\n' "$SIG_PUB" > "$pub"
+  if ! openssl dgst -sha256 -verify "$pub" -signature "$sig" "$sums" >/dev/null 2>&1; then
+    ERRMSG="the release signature does not verify (the download or SHA256SUMS was tampered with)"; return 1
+  fi
+  grep -qx -- "$got  $NAME" "$sums" || { ERRMSG="the binary's hash is not in the signed SHA256SUMS"; return 1; }
+  DETAIL="$DETAIL, signature ok"
 }
 step_verify() {
   local want got
@@ -306,7 +353,13 @@ step_verify() {
     want=$(awk '{print $1}' "$TMP/sum"); got=$(sha256sum "$TMP/wattun" | awk '{print $1}')
     [ "$want" = "$got" ] || { ERRMSG="checksum mismatch (want $want, got $got)"; return 1; }
     DETAIL="sha256 ${got:0:12}... ok"
-  else DETAIL="no checksum file, skipped"; fi
+  else
+    if [ "${WAT_SKIP_CHECKSUM:-0}" != 1 ]; then
+      ERRMSG="no checksum file (sh build.sh writes one; WAT_SKIP_CHECKSUM=1 installs an unchecked local binary anyway)"; return 1
+    fi
+    DETAIL="no checksum file, skipped (WAT_SKIP_CHECKSUM=1)"
+  fi
+  step_verify_sig "$got" || return 1
   chmod 755 "$TMP/wattun"
   NEW=$("$TMP/wattun" -version 2>&1 | awk '{print $2; exit}')
   [ -n "$NEW" ] || { ERRMSG="the downloaded binary does not run on this system"; return 1; }
@@ -368,7 +421,22 @@ ExecStart=/usr/local/bin/wattun -config /etc/wattun/%i.yml
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+# only the ICMP carrier needs CAP_NET_RAW; nothing in the binary uses CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_PACKET AF_NETLINK AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/etc/wattun
 
 [Install]
 WantedBy=multi-user.target

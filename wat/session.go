@@ -2,6 +2,7 @@
 package wat
 
 import (
+	"bytes"
 	"crypto/cipher"
 	crand "crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 )
 
 const (
@@ -119,8 +121,20 @@ type Session struct {
 	sid  uint64
 	io   PacketIO
 	aead cipher.AEAD
-	mu   sync.Mutex
-	now  time.Time
+	// forward-secrecy key exchange (2.10.0, both ends; see onKex): the client offers an ephemeral X25519 key until
+	// the server's reply switches it, the server answers offers until a packet sealed with the fresh key arrives.
+	oldAead      cipher.AEAD // the key before the switch: still opens in-flight packets for kexGrace, then dropped
+	kexPriv      []byte      // this side's ephemeral X25519 private key (nil: no exchange — WAT_NO_KEX, an old peer, or a bad peer key)
+	kexPub       []byte      // the matching public key, sent as the frKex frame
+	kexAead      cipher.AEAD // server: the fresh key, tried first on receive until the client proves it switched
+	kexPeerPub   []byte      // server: the client's ephemeral public key
+	kexReplyPend bool        // server: answer the offer with our own key in the next packet
+	kexSentAt    time.Time   // client: last offer sent (re-offered a second later if the reply is lost)
+	kexStart     time.Time   // client: when the offers began (an older peer gets 10 s, then no more offers)
+	kexAt        time.Time   // when the fresh key took over in both directions
+	kexDone      bool
+	mu           sync.Mutex
+	now          time.Time
 
 	closed   bool
 	stop     chan struct{}
@@ -335,6 +349,17 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 			s.lanes = append(s.lanes, i)
 		}
 	}
+	if !noKex { // both ends generate an ephemeral X25519 key; onKex turns the exchange into a key switch (2.10.0)
+		priv := make([]byte, 32)
+		if _, err := crand.Read(priv); err != nil {
+			return nil, err
+		}
+		pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+		if err != nil {
+			return nil, err
+		}
+		s.kexPriv, s.kexPub, s.kexStart = priv, pub, s.now
+	}
 	go s.recvLoop()
 	go s.pump()
 	return s, nil
@@ -349,6 +374,109 @@ func sessionAEAD(key []byte, sid uint64) (cipher.AEAD, error) {
 	binary.BigEndian.PutUint64(b[:], sid)
 	h.Write(b[:])
 	return chacha20poly1305.New(h.Sum(nil))
+}
+
+// sessionAEADEx derives the fresh key after the X25519 exchange (2.10.0, both ends): PSK, session id, both ephemeral
+// public keys (client's first) and the shared secret all go into the hash. Everything sealed after the switch stays
+// confidential even if the PSK leaks later (forward secrecy); the packets of the first RTT remain PSK-only.
+func sessionAEADEx(key []byte, sid uint64, shared, clientPub, serverPub []byte) (cipher.AEAD, error) {
+	h := sha256.New()
+	h.Write([]byte("github.com/JohnWatsoon/WatTunnel/v2:"))
+	h.Write(key)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], sid)
+	h.Write(b[:])
+	h.Write(clientPub)
+	h.Write(serverPub)
+	h.Write(shared)
+	return chacha20poly1305.New(h.Sum(nil))
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// kexGrace is how long the key before the switch still authenticates in-flight packets. It is a variable so tests
+// can shrink it. kexGiveUp is how long a client keeps offering before concluding that the peer ignores the frame.
+var kexGrace = 30 * time.Second
+
+var kexGiveUp = 10 * time.Second
+
+// onKex handles a peer frKex frame (s.mu held). The client offers on every packet (a second apart when the reply is
+// lost) until the reply switches its key; the server answers every offer until a packet only the fresh key opens
+// proves the client has switched. A peer key that yields the all-zero shared secret (a low-order point) ends the
+// exchange: the session stays on the PSK key, exactly like talking to an older peer.
+func (s *Session) onKex(pub []byte, now time.Time) {
+	if noKex || s.kexPriv == nil || s.kexDone || len(pub) != 32 {
+		return
+	}
+	if !s.cfg.Server {
+		if s.oldAead != nil {
+			return // an earlier reply already switched the key
+		}
+		shared, err := curve25519.X25519(s.kexPriv, pub)
+		if err != nil || allZero(shared) {
+			s.kexPriv = nil
+			return
+		}
+		fresh, err := sessionAEADEx(s.cfg.Key, s.sid, shared, s.kexPub, pub)
+		if err != nil {
+			s.kexPriv = nil
+			return
+		}
+		s.oldAead, s.aead, s.kexAt, s.kexDone = s.aead, fresh, now, true
+		return
+	}
+	if s.kexPeerPub != nil {
+		if s.kexAead != nil && bytes.Equal(s.kexPeerPub, pub) {
+			s.kexReplyPend = true // our reply was lost: the client is still offering
+		}
+		return
+	}
+	shared, err := curve25519.X25519(s.kexPriv, pub)
+	if err != nil || allZero(shared) {
+		s.kexPriv = nil
+		return
+	}
+	s.kexPeerPub = append([]byte(nil), pub...)
+	fresh, err := sessionAEADEx(s.cfg.Key, s.sid, shared, pub, s.kexPub) // the client's public key first, as on the client side
+	if err != nil {
+		s.kexPriv = nil
+		return
+	}
+	s.kexAead = fresh
+	s.kexReplyPend = true
+}
+
+// kexPending: this side has a frKex frame to send (the guards in build let such a packet out even when it is empty).
+func (s *Session) kexPending() bool {
+	if s.cfg.Server {
+		return s.kexReplyPend && s.kexAead != nil
+	}
+	return s.kexPriv != nil && !s.kexDone
+}
+
+// appendKex adds this side's frKex frame as the LAST frame of the packet (an older peer stops parsing there, which
+// is why nothing may follow it). The client offers when the first packet goes out and again a second later; the
+// server answers every offer it receives.
+func (s *Session) appendKex(p []byte, now time.Time) []byte {
+	if !s.kexPending() || len(p)+1+len(s.kexPub) > s.maxPlain {
+		return p
+	}
+	if !s.cfg.Server {
+		if !s.kexSentAt.IsZero() && now.Sub(s.kexSentAt) < time.Second {
+			return p
+		}
+		s.kexSentAt = now
+	} else {
+		s.kexReplyPend = false
+	}
+	return append(append(p, frKex), s.kexPub...)
 }
 
 func (s *Session) Close() {
@@ -639,6 +767,9 @@ const (
 
 var noLateAck = os.Getenv("WAT_NO_LATEACK") != ""
 
+// noKex (WAT_NO_KEX=1) turns the forward-secrecy key exchange off, for an A/B (2.10.0).
+var noKex = os.Getenv("WAT_NO_KEX") != ""
+
 // appendLateAck moves the packets received since the last ACK that the main frame will not cover into rxLate and
 // encodes the newest of them as a late-ACK frame; what does not fit goes out with the next ACK.
 func (s *Session) appendLateAck(p []byte, now time.Time) []byte {
@@ -673,7 +804,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	needAck := s.ackPend > 0 && (s.ackPend >= s.ackEvery || now.Sub(s.ackSince) >= 2*time.Millisecond)
 	canData := s.cc.tokens > 0 && s.inflight < s.cc.cwnd() && !s.held
 	needBoot := s.cfg.Server && s.cfg.Boot != 0 && now.Sub(s.bootAt) >= time.Second
-	if !canData && !needAck && !s.wantPing && len(s.ctrl) == 0 && !needBoot {
+	if !canData && !needAck && !s.wantPing && len(s.ctrl) == 0 && !needBoot && !s.kexPending() {
 		if s.hasWork() {
 			s.cc.limited = true
 			s.noteLimit()
@@ -757,7 +888,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 			p = append(p, dbuf...)
 			sp.dgram = true
 		}
-		if len(sp.frames) == 0 && len(p) == 0 {
+		if len(sp.frames) == 0 && len(p) == 0 && !s.kexPending() {
 			s.freeSent(sp)
 			return outPkt{}, false
 		}
@@ -768,7 +899,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 			}
 		}
 	}
-	if len(p) == 0 {
+	if len(p) == 0 && !s.kexPending() {
 		s.freeSent(sp)
 		return outPkt{}, false
 	}
@@ -787,6 +918,11 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	}
 	if s.pin && pinned && !sp.rtx && !prioSeen { // interactive data takes the least queued connection, not a bulk one's
 		lane = PinLaneBase + pinSlot
+	}
+	p = s.appendKex(p, now)
+	if len(p) == 0 {
+		s.freeSent(sp)
+		return outPkt{}, false
 	}
 	out, pn := s.seal(p)
 	size := len(out) + ipIcmpHdr
@@ -1045,6 +1181,12 @@ func (s *Session) timers(now time.Time) {
 			s.rebuildLanes()
 		}
 	}
+	if s.oldAead != nil && now.Sub(s.kexAt) > kexGrace {
+		s.oldAead = nil // long past the switch: in-flight old-key packets are gone, and the PSK must not authenticate anything again
+	}
+	if !s.cfg.Server && s.kexPriv != nil && !s.kexDone && now.Sub(s.kexStart) > kexGiveUp {
+		s.kexPriv = nil // no reply: an older peer ignores the frame, so stop adding the offer to every packet
+	}
 }
 
 func (s *Session) rebuildLanes() {
@@ -1159,12 +1301,22 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 			s.stats.RxDup++
 		}
 	}
+	// snapshot the keys: onKex and the switch below replace them under this same lock
+	first, fall := s.aead, s.oldAead
+	freshRx := s.kexAead // server between offer and switch: the client's fresh key opens first
+	if freshRx != nil {
+		first, fall = freshRx, s.aead
+	}
 	s.mu.Unlock()
 	if dup {
 		return
 	}
 	copy(s.rxNonce[4:], raw[8:16])
-	plain, err := s.aead.Open(s.openBuf[:0], s.rxNonce[:], raw[hdrLen:], raw[:8])
+	plain, err := first.Open(s.openBuf[:0], s.rxNonce[:], raw[hdrLen:], raw[:8])
+	if err != nil && fall != nil {
+		plain, err = fall.Open(s.openBuf[:0], s.rxNonce[:], raw[hdrLen:], raw[:8])
+		freshRx = nil
+	}
 	if err != nil {
 		return // not ours: stay silent
 	}
@@ -1173,6 +1325,9 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now = now
+	if freshRx != nil { // a packet only the fresh key opens: the peer has switched, so we seal our own packets with it too
+		s.oldAead, s.aead, s.kexAead, s.kexAt, s.kexDone = fall, first, nil, now, true
+	}
 	if s.rxDup(pn) { // re-check under the lock
 		return
 	}
@@ -1294,6 +1449,13 @@ func (s *Session) parse(b []byte, now time.Time) (eliciting bool) {
 			if s.onFec(r, now) {
 				eliciting = true
 			}
+		case frKex:
+			pub := r.take(32)
+			if r.err != nil {
+				return
+			}
+			eliciting = true
+			s.onKex(pub, now)
 		default:
 			return
 		}

@@ -407,8 +407,11 @@ ip_is_private() { # RFC1918, CGNAT 100.64/10, loopback, link-local
   [ "$a" = 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] && return 0
   return 1
 }
-public_ip() { # prints a valid IPv4 or nothing
+public_ip() { # prints a valid IPv4 or nothing. A public address on an interface comes first (no third-party
+  # lookup); NAT'd servers (the public IP is nowhere on the box) fall back to ipify/ifconfig.me, then to hostname -I
   local ip u
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\) .*/\1/p')
+  if ipv4_ok "$ip" && ! ip_is_private "$ip"; then echo "$ip"; return 0; fi
   for u in https://api.ipify.org https://ifconfig.me; do
     ip=$(curl -fs4 --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')
     ipv4_ok "$ip" && { echo "$ip"; return 0; }
@@ -1237,7 +1240,7 @@ wizard_kharej() {
     if [ "$cr" = icmp ]; then summary_line "Direction" "reverse: this server pings Iran at $iranip"
     else summary_line "Direction" "reverse: this server connects to Iran at $iranip:$listen"; fi
   fi
-  summary_line "Allowed ports" "${allow:-any}"
+  summary_line "Allowed ports" "${allow:-any (no allow list: everything on 127.0.0.1 of this server is reachable through the tunnel)}"
   [ -n "$mbps" ] && summary_line "Speed limit" "$mbps MB/s"
   [ "$fec" = auto ] && summary_line "FEC" auto
   echo
@@ -1279,6 +1282,7 @@ wizard_kharej() {
   if [ "$rev" = 1 ] && is_pool "$cr"; then hint "Reverse: Iran listens on port $listen (the Iran wizard opens it). Kharej must be allowed to connect out to $iranip:$listen."
   elif [ "$rev" = 1 ]; then hint "Reverse ICMP: Iran must answer ping from this server. Do not block ICMP in either cloud firewall."
   elif [ "$cr" = icmp ]; then hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."; fi
+  case "$cr" in tls|wss|grpc|h2) hint "TLS: the certificate is self-signed and unchecked by default. Pin it with tls-pin on the dialing side (docs/TECHNICAL.md, 'Certificates')." ;; esac
 
   echo
   celebrate "Kharej tunnel '$name' is ready"
@@ -1291,7 +1295,7 @@ wizard_kharej() {
   say "  ${BOLD}Now, STEP 2${RST}: on the ${BOLD}Iran${RST} server run ${CYN}${SELF}${RST}, press ${CYN}[n]${RST},"
   say "  choose Iran and paste the token."
   hint "Show it again any time: $SELF token $name"
-  warn "The token contains the key. Share it only over a private channel."
+  warn "The token contains the key — treat it like a password: anyone who sees it can use the tunnel. Share it only over a private channel."
   [ "$NONINTERACTIVE" = 1 ] && printf 'TUNNEL=%s\nTOKEN=%s\n' "$name" "$(cat "$CONF/$name.token")"
   return 0
 }
@@ -2228,7 +2232,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   [ -n "$AUTO_NOTE" ] && printf '%s' "$AUTO_NOTE" | sed "s/^/    $GRY/; s/\$/$RST/"
   summary_line "Address" "$AUTO_ADDR"
   summary_line "CDN domain" "${cdn:-none (CDN tests skipped)}"
-  summary_line "Allowed ports" "${allow:-any}"
+  summary_line "Allowed ports" "${allow:-any (no allow list: everything on 127.0.0.1 of this server is reachable through the tunnel)}"
   echo
   confirm "Create this tunnel?" y || { warn "Nothing was created."; return 1; }
   echo
@@ -2273,7 +2277,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   say "  ${BOLD}Now paste this token on Iran.${RST} It tests every connection type by itself (about 2-3 minutes)."
   hint "Show it again any time: $SELF token $name"
   hint "If the reverse tests fail because this server never learned Iran's IP: $SELF auto-ip $name IRAN_IP"
-  warn "The token contains the key. Share it only over a private channel."
+  warn "The token contains the key — treat it like a password: anyone who sees it can use the tunnel. Share it only over a private channel."
   [ "$NONINTERACTIVE" = 1 ] && printf 'TUNNEL=%s\nTOKEN=%s\n' "$name" "$(cat "$CONF/$name.token")"
   return 0
 }
@@ -3645,6 +3649,7 @@ tunnel_card() {
 show_token() {
   if [ -f "$CONF/$1.token" ]; then refresh_token "$1"; printf '%s%s%s\n' "$BOLD$YEL" "$(cat "$CONF/$1.token")" "$RST"
   else err "No token stored for '$1' (tokens exist only on Kharej tunnels)."; return 1; fi
+  warn "The token contains the key — treat it like a password: anyone who sees it can use the tunnel."
 }
 edit_ports() { # name
   local n=$1 r old=() it i pub=() before par

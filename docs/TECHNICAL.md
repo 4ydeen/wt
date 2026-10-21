@@ -1737,11 +1737,21 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 ## Security model
 
 - **Pre-shared key.** Both ends hold the same secret. It is never sent.
-- **Per session keys.** Each client session picks a random 8-byte id. The packet key is derived from the secret and
-  that id. Packet = `session id | packet number | ChaCha20-Poly1305(frames)`. The nonce is the packet number and is
-  never reused: server numbers start at a time-based value with a direction bit set.
+- **Per session keys.** Each client session picks a random 8-byte id. The packet key is SHA-256 over a fixed module
+  prefix, the secret and that id. Packet = `session id | packet number | ChaCha20-Poly1305(frames)`. The nonce is
+  the packet number and is never reused: server numbers start at a time-based value with a direction bit set.
+- **Forward secrecy (2.10.0, both ends).** The client offers an ephemeral X25519 key in its packets (re-offering
+  about once a second until the switch is done; the `frKex` frame is always the last frame of a packet: an older
+  peer stops parsing there and never sees it). The server answers with its own key and both derive a fresh session
+  key from the PSK plus the X25519 shared secret. Each side
+  switches to sending under the fresh key once the other side's packets authenticate with it; until then the old key
+  still opens in-flight packets, for a 30 s grace, then it is dropped. After the switch, traffic recorded earlier
+  cannot be decrypted even if the key file leaks later. The first RTT or so of a session is still PSK-only — that is
+  the window a passive recorder could use. An older peer that never answers gets offers for 10 s, then the client
+  gives up and the session stays PSK-only. `WAT_NO_KEX=1` turns the exchange off (A/B tests).
 - **Authenticate first.** The server creates a session only if a packet authenticates. Garbage, scans and replays of
-  another key are dropped without a response.
+  another key are dropped without a response, and packet numbers are tracked, so a captured packet replayed later is
+  dropped too.
 - **Server checks.** Clients can only reach the target ports on the server's allowlist, and only on `127.0.0.1`.
 - **What TLS, wss, h2 and grpc add.** They hide the traffic's shape from a middlebox: it looks like HTTPS, a
   WebSocket or gRPC. They do not add secrecy; the session is already encrypted. With the default self-signed
@@ -1771,6 +1781,20 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.10.0: forward secrecy — X25519 key exchange on every session.** Both ends need it for the new protection;
+  old and new peers interop either way. Inside the existing encryption the two ends run an ephemeral X25519
+  exchange: about one RTT into a session both sides switch to a fresh session key derived from the PSK plus the
+  X25519 shared secret, and from then on a later leak of the key file does not decrypt the traffic recorded before
+  the switch. Until the switch (and entirely with an older peer) the session is PSK-only, as before. No config
+  change; `WAT_NO_KEX=1` turns the exchange off for A/B tests. The offer frame (`frKex`) is ignorable by older
+  peers, so the wire stays compatible in both directions.
+  Scripts (served from `main`, no tag needed): `install.sh` now fails closed — a download with no checksum file,
+  or whose RSA-signed checksum list does not verify against the public key baked into the script, is refused
+  (proxy mirrors are untrusted); the shipped systemd unit drops to `CAP_NET_RAW` only and adds the usual
+  filesystem/namespace hardening. `wattun-manager` warns when a Kharej tunnel is created without a port allowlist,
+  points at `tls-pin` for the TLS-family carriers, and takes the public IP from the interface first (third-party
+  lookup only when the address is NAT'd).
+  - [Security model](#security-model).
 - **2.9.0: filter probe + auto fake-mode, ICMP volume governor, ECH bootstrap ladder.** Client-side probe and
   pacer logic, one small server-side addition (the DNS relay below). No wire format change: old peers interop
   in both directions.

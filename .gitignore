@@ -10,3 +10,5 @@ bugs.md
 .gomodcache/
 .gopath/
 .acl-recovery/
+wattun-release-signing.pem
+wattun-release-signing.pub.pem

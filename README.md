@@ -121,6 +121,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JohnWatsoon/WatTunnel/main/i
 WAT_PROXY=https://ghproxy.net/ bash <(curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/JohnWatsoon/WatTunnel/main/install.sh)
 ```
 
+The proxy is a third-party mirror: it sees and could alter the bytes. `install.sh` therefore checks every download
+against an RSA-signed checksum list, with the public key baked into the script, and refuses a mismatch (`openssl`
+must be installed; it is everywhere).
+
 Or download `wattun-linux-amd64`, `install.sh` and `wattun-manager` from the
 [releases](https://github.com/JohnWatsoon/WatTunnel/releases) page, put the binary in `dist/` next to `install.sh`,
 and run `bash install.sh`.
@@ -167,6 +171,20 @@ If you already know what your route allows, you can pick a type yourself in step
 | TCP passes | `tcp`, or `tls` to look like HTTPS |
 | Only a CDN gets out, or SNI is filtered | `wss` through Cloudflare ([CDN setup](docs/TECHNICAL.md#cdn-tuning)) |
 | Only Kharej can reach Iran | any of the above with [reverse mode](docs/TECHNICAL.md#reverse-mode) |
+
+## Security
+
+Traffic is encrypted with ChaCha20-Poly1305 under a key derived from the pre-shared key and a random per-session
+id; from 2.10.0 the two ends also run an ephemeral X25519 exchange on every session, so traffic recorded before a
+later key-file leak stays unreadable. That protects the **Iran ↔ Kharej leg only**: between your users and the Iran
+server the traffic is whatever the forwarded service itself provides, so run an end-to-end encrypted protocol
+(VLESS+Reality, TLS, WireGuard) inside the tunnel. Kharej dials only its own `127.0.0.1`, and only ports on the
+allowlist.
+The installer verifies the download's signature against a public key baked into it, so a `WAT_PROXY` mirror (or
+any tampered copy) cannot slip in a changed binary. The connection token contains the key: treat it like a
+password and share it only over a private channel. Keep `metrics` on `127.0.0.1`. What stays visible to the
+network: the server's address, and the volume and timing of packets. Details:
+[security model](docs/TECHNICAL.md#security-model).
 
 ## More
 

@@ -14,6 +14,11 @@ jobs:
           go-version: '1.26'
       - run: go test -count=1 ./...
       - run: sh build.sh
+        env:
+          WAT_SIGN_KEY: ${{ secrets.WAT_SIGN_KEY }}
+      # every release must carry a verifiable signature: the installer (and WAT_PROXY users especially) refuses
+      # a download whose SHA256SUMS it cannot check
+      - run: 'test -f dist/SHA256SUMS.sig || { echo "::error::dist/SHA256SUMS.sig missing — set the WAT_SIGN_KEY secret (RSA PEM)"; exit 1; }'
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

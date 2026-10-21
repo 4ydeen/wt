@@ -27,4 +27,16 @@ for a in $ARCHES; do
   printf '%s  %s\n' "$sum" "${out##*/}" > "$out.sha256"
   echo "wattun $VER $os/$arch $sum"
 done
+# The release's signed checksum list: install.sh verifies the RSA signature against the public key baked into it,
+# so a download that went through WAT_PROXY (or any tampered copy) cannot pair a swapped binary with its own
+# checksum. WAT_SIGN_KEY: path to the private PEM (the release workflow passes it from the WAT_SIGN_KEY secret).
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd dist && sha256sum wattun-* | grep -v '\.sha256$' > SHA256SUMS)
+elif command -v shasum >/dev/null 2>&1; then
+  (cd dist && shasum -a 256 wattun-* | grep -v '\.sha256$' > SHA256SUMS)
+fi
+if [ -f dist/SHA256SUMS ] && [ -n "${WAT_SIGN_KEY:-}" ]; then
+  openssl dgst -sha256 -sign "$WAT_SIGN_KEY" -out dist/SHA256SUMS.sig dist/SHA256SUMS || { echo "BUILD_FAIL sign"; exit 1; }
+  echo "SHA256SUMS signed"
+fi
 echo "BUILD_OK $VER"
