@@ -114,10 +114,12 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) {
 		isn--
 	}
 	ch := d.inj.tr.announce(k, isn, known)
-	select {
-	case <-ch: // fake fired
-	case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
-		d.inj.tr.abandon(k)
+	if known {
+		select {
+		case <-ch: // fake fired on final ACK
+		case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
+			d.inj.tr.abandon(k)
+		}
 	}
 	return c, nil
 }

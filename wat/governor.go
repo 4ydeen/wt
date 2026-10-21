@@ -105,8 +105,8 @@ func (g *govState) govWindow(now time.Time) {
 	}
 	// stability: a window whose base is within the jump threshold of the incumbent baseline is "stable".
 	if g.base == 0 || float64(closed) <= govJump*float64(g.base) {
-		if g.base == 0 {
-			g.base = closed
+		if g.base == 0 || closed < g.base {
+			g.base = closed // snap down immediately on lower physical RTT
 		} else {
 			g.base = time.Duration((7*int64(g.base) + int64(closed)) / 8) // slow follow within the band
 		}

@@ -147,8 +147,9 @@ type Session struct {
 	lastRecv  time.Time // cleared after 30 s of silence (the session then counts as dead)
 	lastAuth  time.Time // same, never cleared: what LastRecv reports
 
-	streams   map[uint64]*Stream
-	tomb      map[uint64]time.Time
+	streams       map[uint64]*Stream
+	tomb          map[uint64]time.Time
+	lastTombPrune time.Time
 	nextSID   uint64
 	acceptQ   []*Stream
 	acceptC   *sync.Cond
@@ -1030,7 +1031,8 @@ func (s *Session) timers(now time.Time) {
 		s.resetAll(ErrSessionDead)
 		s.lastRecv = time.Time{}
 	}
-	if len(s.tomb) > 0 && now.Second()%5 == 0 && now.Nanosecond() < 2e6 {
+	if len(s.tomb) > 0 && now.Sub(s.lastTombPrune) >= 5*time.Second {
+		s.lastTombPrune = now
 		for id, t := range s.tomb {
 			if now.Sub(t) > 2*time.Minute {
 				delete(s.tomb, id)

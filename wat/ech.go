@@ -85,7 +85,7 @@ func newECHState(v, cachePath string) (*echState, error) {
 	if err != nil {
 		return nil, err
 	}
-	if mode != "auto" {
+	if mode != "auto" && mode != "ladder" {
 		cachePath = ""
 	}
 	return &echState{mode: mode, static: list, m: map[string]*echEntry{}, inflight: map[string]bool{}, cachePath: cachePath}, nil

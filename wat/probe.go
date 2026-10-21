@@ -111,12 +111,23 @@ func (p *filterProbe) run() string {
 	}
 	p.seqOK = p.connAlive(tc)
 
-	// step 2: a sum-style marker next to the same flow. The tracker does not fire it for us (the probe's
-	// tracker is in seq mode), so craft it here: an in-window duplicate of a small real write.
-	p.sumOK = p.sumProbe(tc)
+	// step 2: if tc was killed by the seq marker, open a fresh connection to test sum independently!
+	targetConn := tc
+	if !p.seqOK {
+		_ = tc.Close()
+		nc2, err := net.DialTimeout("tcp4", p.peer, probeTimeout)
+		if err != nil {
+			return "seq"
+		}
+		defer nc2.Close()
+		targetConn = nc2.(*net.TCPConn)
+		_ = targetConn.SetDeadline(time.Now().Add(probeTimeout))
+	}
+
+	p.sumOK = p.sumProbe(targetConn)
 
 	// step 3: is the flow still alive after both?
-	p.alive = p.connAlive(tc)
+	p.alive = p.connAlive(targetConn)
 	switch {
 	case !p.alive && !p.seqOK && p.sumOK:
 		return "sum" // died with seq marker in flight but sum survived: filter drops below-window junk -> use sum

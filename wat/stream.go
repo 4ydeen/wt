@@ -293,13 +293,19 @@ func (s *Session) killStream(st *Stream, err error) {
 		return
 	}
 	st.dead = true
-	s.winExtra -= st.win - streamWindow
+	if extra := st.win - streamWindow; extra > 0 {
+		if s.winExtra >= extra {
+			s.winExtra -= extra
+		} else {
+			s.winExtra = 0
+		}
+	}
 	if st.err == nil {
 		st.err = err
 	}
 	delete(s.streams, st.id)
 	s.tomb[st.id] = s.now
-	s.winExtra -= st.win - streamWindow
+	st.ready.reset()
 	st.rc.Broadcast()
 	st.wc.Broadcast()
 }
@@ -339,7 +345,14 @@ func (st *Stream) maybeFinish() {
 	st.dead = true
 	delete(s.streams, st.id)
 	s.tomb[st.id] = s.now
-	s.winExtra -= st.win - streamWindow
+	if extra := st.win - streamWindow; extra > 0 {
+		if s.winExtra >= extra {
+			s.winExtra -= extra
+		} else {
+			s.winExtra = 0
+		}
+	}
+	st.ready.reset()
 	st.rc.Broadcast()
 	st.wc.Broadcast()
 }

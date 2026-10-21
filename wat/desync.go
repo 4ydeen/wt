@@ -424,10 +424,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		// pool connections opening at once cross-set it and the second fire mirrored the wrong segment.
 		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 {
 			if sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst"; sumMode {
-				if payload == 0 {
-					return // wait for the data segment to mirror
-				}
-				c.sumSeq = seq
+				c.sumSeq = c.synSeq + 1
 			}
 			t.fireLocked(out, c, c.synSeq+1, ackv)
 		}

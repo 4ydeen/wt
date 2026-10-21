@@ -336,9 +336,6 @@ func main() {
 					tlsOpts.DialHook = d.Wrap
 				}
 				pc, err = wat.NewTLSPoolClient(peer, *conns, tlsOpts)
-				if err == nil && d != nil {
-					_ = attachFakeSNI(pc, peer)
-				}
 			}
 			if err != nil {
 				log.Fatalf("tls carrier: %v", err)
@@ -385,9 +382,6 @@ func main() {
 					pc, err = wat.NewGRPCPoolClient(peer, *conns, co)
 				default:
 					pc, err = wat.NewH2PoolClient(peer, *conns, co)
-				}
-				if err == nil && d != nil {
-					_ = attachFakeSNI(pc, peer)
 				}
 			}
 			if err != nil {

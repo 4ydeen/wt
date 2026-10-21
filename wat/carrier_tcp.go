@@ -318,6 +318,7 @@ func (pc *poolConn) fail() {
 func (pc *poolConn) enqueue(p []byte) bool {
 	select {
 	case <-pc.done:
+		putPkt(p)
 		return false
 	default:
 	}
@@ -345,6 +346,16 @@ func (pc *poolConn) serve(wg *sync.WaitGroup, push func([]byte) bool) {
 func (pc *poolConn) writeLoop() {
 	bw := bufio.NewWriterSize(timedWriter{pc}, poolBufSize)
 	var hdr [2]byte
+	defer func() {
+		for {
+			select {
+			case p := <-pc.q:
+				putPkt(p)
+			default:
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case <-pc.done:
@@ -483,6 +494,11 @@ func backlogged(conns []*poolConn) bool {
 		if pc == nil {
 			continue
 		}
+		select {
+		case <-pc.done:
+			continue
+		default:
+		}
 		n++
 		l := len(pc.q)
 		anyQ = min(anyQ, l)
@@ -510,6 +526,11 @@ func leastQueued(conns []*poolConn, start int) *poolConn {
 		pc := conns[(start+i)%len(conns)]
 		if pc == nil {
 			continue
+		}
+		select {
+		case <-pc.done:
+			continue
+		default:
 		}
 		l := len(pc.q)
 		if l < al {

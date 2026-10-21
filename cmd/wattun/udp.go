@@ -347,6 +347,7 @@ func replyPump(sess *wat.Session, id uint64, f *sflow) {
 		if err != nil {
 			// a connected UDP socket reports an earlier ICMP port-unreachable as a read error: keep going
 			if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "forcibly closed") {
+				time.Sleep(20 * time.Millisecond)
 				continue
 			}
 			return

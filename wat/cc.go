@@ -550,6 +550,9 @@ func (c *cc) tickReliable(now time.Time, cut, busy bool) {
 	if c.ceiling > 0 && target > c.ceiling { // a recent real-loss cut caps the probe until the ceiling creeps back up
 		target = c.ceiling
 	}
+	if g := c.gov.ceiling; g > 0 && target > g { // learned governor ceiling on reliable carriers (2.9.0)
+		target = g
+	}
 	if target > c.maxRate {
 		target = c.maxRate
 	}

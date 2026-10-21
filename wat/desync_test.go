@@ -525,22 +525,22 @@ func TestDesyncProbeIsnArithmetic(t *testing.T) {
 	}
 }
 
-// TestDesyncSumModeFiresOnData: sum mode skips bare ACKs (nothing to mirror) and fires on the first data
-// segment with an IN-WINDOW seq (the segment's own seq, not below the stream) and a damaged checksum.
+// TestDesyncSumModeFiresEarly: when ISN is known (early path), sum mode fires immediately on the handshake's
+// final ACK with an in-window seq (isn+1), ack = srvSeq+1, and damaged checksum, allowing Wrap to unblock without delay.
 func TestDesyncSumModeFiresOnData(t *testing.T) {
 	tr, sent := desyncTestTracker("sum", 0)
 	defer tr.close()
 	k := testClientKey()
 	const isn, srvSeq = uint32(5000), uint32(800)
-	tr.announce(k, isn+1, true)
-	feedFullHandshake(tr, k, isn, srvSeq) // final ACK: must NOT fire (bare ACK)
-	if tr.fired() != 0 {
-		t.Fatal("sum mode fired on a bare ACK")
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // final ACK: fires early so Wrap unblocks
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("sum mode did not fire on final ACK")
 	}
-	const dataLen = 120
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, dataLen), 64))
 	if tr.fired() != 1 {
-		t.Fatal("sum mode did not fire on the data segment")
+		t.Fatalf("sum mode fired %d, want 1", tr.fired())
 	}
 	pkt := (*sent)[0]
 	seq := binary.BigEndian.Uint32(pkt[24:])
@@ -559,9 +559,6 @@ func TestDesyncSumModeFiresOnData(t *testing.T) {
 	// and the damage is non-zero
 	if stored == 0 {
 		t.Fatal("sum fake checksum zeroed instead of damaged")
-	}
-	if tr.fired() != 1 {
-		t.Fatalf("fired counter %d", tr.fired())
 	}
 }
 
@@ -585,20 +582,20 @@ func TestDesyncSumModeLate(t *testing.T) {
 	}
 }
 
-// TestDesyncRSTModeFiresOnData: rst mode fires an in-window RST|ACK with damaged checksum.
-// The packet has length 40 (IP+TCP, no payload), RST|ACK flags (0x14), in-window seq, and invalid checksum.
+// TestDesyncRSTModeFiresEarly: when ISN is known (early path), rst mode fires immediately on the handshake's
+// final ACK with an in-window RST|ACK and damaged checksum.
 func TestDesyncRSTModeFiresOnData(t *testing.T) {
 	tr, sent := desyncTestTracker("rst", 0)
 	defer tr.close()
 	k := testClientKey()
 	const isn, srvSeq = uint32(5000), uint32(800)
-	tr.announce(k, isn+1, true)
-	feedFullHandshake(tr, k, isn, srvSeq) // final ACK: must NOT fire
-	if tr.fired() != 0 {
-		t.Fatal("rst mode fired on a bare ACK")
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // final ACK
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("rst mode did not fire on final ACK")
 	}
-	const dataLen = 120
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, dataLen), 64))
 	if tr.fired() != 1 {
 		t.Fatalf("rst mode fired counter %d, want 1", tr.fired())
 	}
@@ -659,14 +656,15 @@ func TestDesyncSeqSumSendsBoth(t *testing.T) {
 	defer tr.close()
 	k := testClientKey()
 	const isn, srvSeq = uint32(7000), uint32(900)
-	tr.announce(k, isn+1, true)
-	feedFullHandshake(tr, k, isn, srvSeq) // bare ACK: no fire yet (needs the data segment to mirror)
-	if tr.fired() != 0 {
-		t.Fatal("seqsum fired on a bare ACK")
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq) // final ACK: fires both markers early
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("seqsum did not fire on final ACK")
 	}
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 80), 64))
 	if tr.fired() != 1 {
-		t.Fatal("seqsum did not fire on the data segment")
+		t.Fatalf("seqsum fired %d, want 1", tr.fired())
 	}
 	if len(*sent) != 2 {
 		t.Fatalf("seqsum sent %d markers, want 2", len(*sent))
