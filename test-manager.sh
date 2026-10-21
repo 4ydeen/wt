@@ -52,6 +52,8 @@ chk "unattended --fake-sni pair form" "$NI_FAKESNI" "mci.ir"
 chk "unattended --fake-mode seqsum" "$NI_FAKEMODE" "seqsum"
 ni_parse --fake-mode auto
 chk "unattended --fake-mode auto" "$NI_FAKEMODE" "auto"
+ni_parse --fake-mode rst
+chk "unattended --fake-mode rst" "$NI_FAKEMODE" "rst"
 ni_parse --preset mci --ech ladder --governor true
 chk "unattended --preset mci" "$NI_PRESET" "mci"
 chk "unattended --ech ladder" "$NI_ECH" "ladder"
@@ -60,6 +62,9 @@ ni_parse --preset "Iran Whitelist - Irancell/Mokhaberat" --ech auto --governor f
 chk "unattended --preset canonical irancell" "$NI_PRESET" "irancell"
 chk "unattended --ech auto" "$NI_ECH" "auto"
 chk "unattended --governor false" "$NI_GOVERNOR" "false"
+ECH_B64="VGhpcy1pcy11cmxzYWZlX2Jhc2U2NF9lY2g="
+ni_parse --ech "$ECH_B64"
+chk "unattended --ech preserves base64 case" "$NI_ECH" "$ECH_B64"
 
 expect_fail ni_parse --pool-rotate 30x
 expect_fail ni_parse --fake-mode gq
@@ -72,11 +77,16 @@ expect_fail ni_parse --governor bad_gov
 v_pool_rotate off && echo "ok   v_pool_rotate off" || { echo "FAIL v_pool_rotate off"; fail=1; }
 for v in 500MB 4G 300k 1.5gb 0b 0 off; do v_pool_bytes "$v" && echo "ok   v_pool_bytes $v" || { echo "FAIL v_pool_bytes $v"; fail=1; }; done
 
-for e in ladder auto off "VGhpcyBpcyBhIHZhbGlkIGJhc2U2NCBFQ0g="; do
+for e in ladder auto off "VGhpcyBpcyBhIHZhbGlkIGJhc2U2NCBFQ0g=" "VGhpcy1pcy11cmxzYWZlX2Jhc2U2NF9lY2g="; do
   v_ech "$e" && echo "ok   v_ech $e" || { echo "FAIL v_ech $e"; fail=1; }
 done
 expect_fail v_ech "invalid"
 expect_fail v_ech "short="
+
+for m in seq ttl sum seqsum auto rst; do
+  v_fake_mode "$m" && echo "ok   v_fake_mode $m" || { echo "FAIL v_fake_mode $m"; fail=1; }
+done
+expect_fail v_fake_mode "bad_mode"
 
 for g in on off true false 1 0; do
   v_governor "$g" && echo "ok   v_governor $g" || { echo "FAIL v_governor $g"; fail=1; }
@@ -96,8 +106,10 @@ chk "profile show blackout FAKEMODE" "$(profile_cmd show blackout | grep '^FAKEM
 chk "profile show blackout POOLROT" "$(profile_cmd show blackout | grep '^POOLROT=')" "POOLROT=90s"
 chk "profile show conservative POOLROT" "$(profile_cmd show conservative | grep '^POOLROT=')" "POOLROT=4h"
 chk "profile show conservative ECH" "$(profile_cmd show conservative | grep '^ECH=')" "ECH=auto"
+chk "profile show long name" "$(profile_cmd show 'iran whitelist - mci' | grep '^FAKESNI=')" "FAKESNI=mci.ir"
 expect_fail profile_cmd show nonexistent
 expect_fail profile_cmd del mci
+expect_fail profile_cmd save mci t1
 
 # Applying built-in presets to tunnels
 bin_ver_ok() { echo 1; }
@@ -133,7 +145,41 @@ apply_preset t_icmp mci
 chk "icmp preset sets governor" "$(grep '^governor:' "$WAT_CONF/t_icmp.yml")" "governor: true"
 apply_preset t_icmp off
 chk "icmp preset off clears governor" "$(grep -c '^governor:' "$WAT_CONF/t_icmp.yml")" "0"
-rm -f "$WAT_CONF/t_icmp.yml"
+# Reverse pool carrier & unsupported carrier rejection
+cat >"$WAT_CONF/t_rev.yml" <<'EOF'
+mode: client
+carrier: tcp
+listen: :443
+reverse: true
+EOF
+expect_fail apply_preset t_rev mci
+rm -f "$WAT_CONF/t_rev.yml"
+
+cat >"$WAT_CONF/t_udp.yml" <<'EOF'
+mode: client
+carrier: udp
+peer: 1.2.3.4:443
+EOF
+expect_fail apply_preset t_udp mci
+rm -f "$WAT_CONF/t_udp.yml"
+
+# Preset detection edge cases
+cat >"$WAT_CONF/t_det.yml" <<'EOF'
+mode: client
+carrier: tcp
+fake-sni: irancell.ir
+pool-rotate: 20m
+EOF
+chk "detect_preset defaults omitted fake-mode to seq" "$(detect_preset t_det)" "Iran Whitelist - Irancell/Mokhaberat"
+rm -f "$WAT_CONF/t_det.yml"
+
+cat >"$WAT_CONF/t_icmp_det.yml" <<'EOF'
+mode: client
+carrier: icmp
+governor: true
+EOF
+chk "detect_preset icmp governor" "$(detect_preset t_icmp_det)" "Governor Active (ICMP Pacer)"
+rm -f "$WAT_CONF/t_icmp_det.yml"
 
 uname() { echo Darwin; } # profiles are a CAP_NET_RAW feature: refuse to save off-Linux
 expect_fail profile_cmd save win t1
@@ -170,11 +216,15 @@ NI_FAKESNI='' pick_sni_preset
 chk "pick_sni_preset default" "$REPLY_V" "mci.ir"
 NI_FAKESNI='divar.ir' pick_sni_preset
 chk "pick_sni_preset explicit" "$REPLY_V" "divar.ir"
+NI_FAKESNI='off' pick_sni_preset
+chk "pick_sni_preset off" "$REPLY_V" "off"
 
 NI_FAKEMODE='' pick_fake_mode
 chk "pick_fake_mode default" "$REPLY_V" "seqsum"
 NI_FAKEMODE='auto' pick_fake_mode
 chk "pick_fake_mode explicit" "$REPLY_V" "auto"
+NI_FAKEMODE='rst' pick_fake_mode
+chk "pick_fake_mode rst" "$REPLY_V" "rst"
 
 NI_POOLROT='' pick_pool_rotate
 chk "pick_pool_rotate default" "$REPLY_V" "30m"
@@ -200,7 +250,10 @@ metrics: 127.0.0.1:54321
 fake-sni: mci.ir
 fake-mode: seqsum
 ech: ladder
+ports:
+  - 8443:443/tcp
 EOF
+port_busy() { return 0; }
 stats() {
   echo '{"alive": true, "srtt_ms": 22.4, "pkts_in": 120, "pkts_out": 135, "filter_profile": "desync-seqsum", "ech": "ladder"}'
 }
