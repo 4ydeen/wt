@@ -83,49 +83,59 @@ gfg() {
   local i=$(( $1 % 8 ))
   if [ "$NCOL" -ge 256 ]; then printf -v GFG '\e[1;38;5;%sm' "${GR_N[$i]}"; else printf -v GFG '\e[1;%sm' "${GR_F[$i]}"; fi
 }
-KITE=(
-  '       .'
-  '      /|\'
-  '     / | \'
-  '    <--+-->'
-  '     \ | /'
-  '      \|/'
-  '       `.'
-  '         `-.'
+WATTUN_BANNER=(
+  '   _       __      __  ______            '
+  '  | |     / /___ _/ /_/_  __/_  ______   '
+  '  | | /| / / __ `/ __/ / / / / / / __ \  '
+  '  | |/ |/ / /_/ / /_  / / / /_/ / / / /  '
+  '  |__/|__/\__,_/\__/ /_/  \__,_/_/ /_/   '
 )
-mapfile -t TXT <<'EOF'
-__        __    _  _____                       _
-\ \      / /_ _| ||_   _|   _ _ __  _ __   ___| |
- \ \ /\ / / _` | __|| || | | | '_ \| '_ \ / _ \ |
-  \ V  V / (_| | |_ | || |_| | | | | | | |  __/ |
-   \_/\_/ \__,_|\__||_| \__,_|_| |_|_| |_|\___|_|
-EOF
-TAGLINE='encrypted port forwarding, even when only ping works'
-B_K=(); B_T=()
-for i in 0 1 2 3 4 5 6 7; do
-  printf -v k '%-17s' "${KITE[$i]}"; B_K[i]=$k
-  if [ "$i" -ge 2 ] && [ "$i" -le 6 ]; then B_T[i]=${TXT[$((i-2))]}; elif [ "$i" -eq 7 ]; then B_T[i]=$TAGLINE; else B_T[i]=''; fi
-done
+META_GITHUB='https://github.com/JohnWatsoon'
+META_TELEGRAM='@Watdevs'
+
 banner() { # [1 = animated line-by-line reveal]
-  local i kc
-  for i in 0 1 2 3 4 5 6 7; do
-    kc=''
-    if [ "$USE_COLOR" = 1 ]; then
-      if [ "$NCOL" -ge 256 ]; then [ "$i" -le 5 ] && kc=$'\e[1;38;5;221m' || kc=$'\e[1;38;5;213m'
-      else [ "$i" -le 5 ] && kc=$'\e[1;33m' || kc=$'\e[1;35m'; fi
-    fi
-    gfg "$i"; [ "$i" -eq 7 ] && GFG=$GRY
-    printf '  %s%s%s%s%s%s\n' "$kc" "${B_K[$i]}" "$RST" "$GFG" "${B_T[$i]}" "$RST"
-    [ "${1:-0}" = 1 ] && sleep 0.035
-  done
+  local i cols GFG
+  cols=$(tput cols 2>/dev/null || echo 80)
+  if [ "$cols" -ge 80 ]; then
+    local side=(
+      "┌─ WatTun Community ────────────────┐"
+      "│ GitHub:   github.com/JohnWatsoon  │"
+      "│ Telegram: @Watdevs                │"
+      "│ Installer: v2.10.2 Production     │"
+      "└───────────────────────────────────┘"
+    )
+    for i in 0 1 2 3 4; do
+      gfg "$i"
+      local left="${WATTUN_BANNER[$i]}"
+      local right="${side[$i]}"
+      if [ "$USE_COLOR" = 1 ]; then
+        case "$i" in
+          0|4) right="${GRY}${side[$i]}${RST}" ;;
+          1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   github.com/JohnWatsoon  ${GRY}│${RST}" ;;
+          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}                ${GRY}│${RST}" ;;
+          3) right="${GRY}│${RST} ${GRY}Installer:${RST} v2.10.2 Production     ${GRY}│${RST}" ;;
+        esac
+      fi
+      printf '  %s%s%s %s\n' "$GFG" "$left" "$RST" "$right"
+      [ "${1:-0}" = 1 ] && sleep 0.03
+    done
+  else
+    for i in 0 1 2 3 4; do
+      gfg "$i"
+      printf '  %s%s%s\n' "$GFG" "${WATTUN_BANNER[$i]}" "$RST"
+      [ "${1:-0}" = 1 ] && sleep 0.03
+    done
+    printf '  %sGitHub:%s %s  •  %sTelegram:%s %s\n' "$CYN" "$RST" "$META_GITHUB" "$CYN" "$RST" "$META_TELEGRAM"
+  fi
   return 0
 }
 page() { # title [subtitle]
   [ "$IS_TTY" = 1 ] && printf '\e[H\e[2J\e[3J'
   echo
   if [ "$ANIM" = 1 ]; then banner 1; else banner 0; fi
-  hr
-  printf '  %s%s%s%s\n\n' "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
+  echo
+  printf '  %s◆%s %sWatTun%s %s›%s %s%s%s%s\n' "$CYN" "$RST" "$BOLD" "$RST" "$GRY" "$RST" "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
+  hr; echo
 }
 step_diagram() {
   local top; top=$(rep ─ 27)
@@ -135,7 +145,7 @@ step_diagram() {
   printf '  %s└%s┘%s          %s└%s┘%s\n' "$BOLD$CYN" "$top" "$RST" "$BOLD" "$top" "$RST"
 }
 
-# ---- step checklist: ◌ pending -> spinner -> ✔ done / ✘ failed (rows are rewritten in place) ----
+# ---- step checklist: high-contrast status badges and animated spinners ----
 SPIN_FR=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 CL_LABELS=(); CL_N=0; DETAIL=''; ERRMSG=''
 cl_row() { # idx text : rewrite checklist row idx in place
@@ -145,7 +155,7 @@ cl_row() { # idx text : rewrite checklist row idx in place
 cl_init() {
   local l; CL_LABELS=("$@"); CL_N=$#
   [ "$ANIM" = 1 ] || return 0
-  for l in "$@"; do printf '  %s◌ %s%s\n' "$GRY" "$l" "$RST"; done
+  for l in "$@"; do printf '  %s[◌ WAIT]%s %s\n' "$GRY" "$RST" "$l"; done
 }
 cl_start() { # idx
   [ "$ANIM" = 1 ] || return 0
@@ -154,7 +164,7 @@ cl_start() { # idx
   (
     local i=0 t0=$SECONDS up=$((CL_N - idx))
     while :; do
-      printf '\e[%dA\r\e[K  %s%s%s %s %s(%ds)%s\e[%dB\r' "$up" "$CYN" "${SPIN_FR[$i]}" "$RST" "$label" "$GRY" $((SECONDS-t0)) "$RST" "$up"
+      printf '\e[%dA\r\e[K  [%s%s%s RUN ] %s%s%s %s(%ds)%s\e[%dB\r' "$up" "$CYN" "${SPIN_FR[$i]}" "$RST" "$BOLD" "$label" "$RST" "$GRY" $((SECONDS-t0)) "$RST" "$up"
       i=$(( (i+1) % 10 )); sleep 0.1
     done
   ) &
@@ -163,9 +173,9 @@ cl_start() { # idx
 cl_end() { # idx rc
   local idx=$1 rc=$2 label=${CL_LABELS[$1]} line
   kill_spin
-  if [ "$rc" -eq 0 ]; then line=$(printf '  %s✔%s %s%s%s' "$GRN" "$RST" "$label" "${DETAIL:+   $GRY$DETAIL$RST}" "")
-  elif [ "$rc" -eq 2 ]; then line=$(printf '  %s–%s %s%s' "$GRY" "$RST" "$label" "${DETAIL:+   $GRY$DETAIL$RST}")
-  else line=$(printf '  %s✘%s %s' "$RED" "$RST" "$label"); fi
+  if [ "$rc" -eq 0 ]; then line=$(printf '  [%s✔ DONE%s] %s%s%s' "$GRN" "$RST" "$label" "${DETAIL:+   $GRY$DETAIL$RST}" "")
+  elif [ "$rc" -eq 2 ]; then line=$(printf '  [%s– SKIP%s] %s%s' "$GRY" "$RST" "$label" "${DETAIL:+   $GRY$DETAIL$RST}")
+  else line=$(printf '  [%s✘ FAIL%s] %s' "$RED" "$RST" "$label"); fi
   if [ "$ANIM" = 1 ]; then cl_row "$idx" "$line"; cur_show; else printf '%s\n' "$line"; fi
 }
 run_step() { # idx fn : rc 0 ok, 2 skipped (fn returns 2), else failure -> abort with ERRMSG
@@ -177,7 +187,7 @@ run_step() { # idx fn : rc 0 ok, 2 skipped (fn returns 2), else failure -> abort
   return 0
 }
 box() { # title lines... (plain or coloured)
-  local w=66 t=$1 l pad; shift
+  local w=70 t=$1 l pad; shift
   printf '  %s┌─ %s%s%s%s %s┐%s\n' "$GRY" "$RST" "$BOLD$t" "$RST" "$GRY" "$(rep ─ $((w-${#t}-3)))" "$RST"
   for l in "$@"; do vlen "$l"; pad=$((w-2-VLEN)); [ "$pad" -lt 0 ] && pad=0; printf '  %s│%s %s%*s %s│%s\n' "$GRY" "$RST" "$l" "$pad" '' "$GRY" "$RST"; done
   printf '  %s└%s┘%s\n' "$GRY" "$(rep ─ "$w")" "$RST"
@@ -451,7 +461,7 @@ EOF
 #  Main
 # ======================================================================================
 TMP=$(mktemp -d)
-page "Installer" "WatTunnel for linux/$ARCH"
+page "Installer" "WatTun for linux/$ARCH"
 cl_init "Check system" "Get wattun (${VERSION/latest/latest release})" "Verify checksum and binary" "Install wattun" "Install wattun-manager" "Set up systemd"
 run_step 0 step_check
 run_step 1 step_get
@@ -475,14 +485,16 @@ while IFS= read -r n; do
   if systemctl is-active -q "wattun@$n" 2>/dev/null; then running=$((running+1)); is_stale "$n" && stale_names="$stale_names $n"; fi
 done < <(tunnel_list)
 prev=''; [ -x "$BIN.prev" ] && prev=$("$BIN.prev" -version 2>/dev/null | awk '{print $2; exit}')
-if [ -n "$OLD" ] && [ "$OLD" = "$NEW" ] && [ "$FORCE" = 0 ]; then title="Already up to date: WatTunnel $NEW"
-elif [ -n "$OLD" ]; then title="Updated WatTunnel $OLD -> $NEW"
-else title="WatTunnel $NEW is installed"; fi
+if [ -n "$OLD" ] && [ "$OLD" = "$NEW" ] && [ "$FORCE" = 0 ]; then title="[✔ UP TO DATE] WatTun $NEW"
+elif [ -n "$OLD" ]; then title="[✔ UPDATED] WatTun $OLD -> $NEW"
+else title="[✔ INSTALLED] WatTun $NEW"; fi
 box "$title" \
-  "${BOLD}wattun${RST}          $BIN" \
-  "${BOLD}manager${RST}         $MGR" \
-  "${BOLD}tunnels${RST}         $total configured, $running running" \
-  "${BOLD}previous${RST}        ${prev:-none}${prev:+   (roll back from the manager)}"
+  "${CYN}Binary:${RST}          $BIN" \
+  "${CYN}Manager:${RST}         $MGR" \
+  "${CYN}Tunnels:${RST}         $total configured, $running running" \
+  "${CYN}Rollback:${RST}        ${prev:-none}${prev:+   (roll back from the manager)}" \
+  "${CYN}GitHub:${RST}          $META_GITHUB" \
+  "${CYN}Telegram:${RST}        $META_TELEGRAM"
 if [ -n "$stale_names" ]; then
   echo
   warn "These tunnels are still running the OLD binary:${stale_names}"

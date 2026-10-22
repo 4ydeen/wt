@@ -175,54 +175,57 @@ gfg() { # index -> GFG escape
   local i=$(( $1 % 8 ))
   if [ "$NCOL" -ge 256 ]; then printf -v GFG '\e[1;38;5;%sm' "${GR_N[$i]}"; else printf -v GFG '\e[1;%sm' "${GR_F[$i]}"; fi
 }
-KITE=(
-  '       .'
-  '      /|\'
-  '     / | \'
-  '    <--+-->'
-  '     \ | /'
-  '      \|/'
-  '       `.'
-  '         `-.'
+WATTUN_BANNER=(
+  '   _       __      __  ______            '
+  '  | |     / /___ _/ /_/_  __/_  ______   '
+  '  | | /| / / __ `/ __/ / / / / / / __ \  '
+  '  | |/ |/ / /_/ / /_  / / / /_/ / / / /  '
+  '  |__/|__/\__,_/\__/ /_/  \__,_/_/ /_/   '
 )
-mapfile -t TXT <<'EOF'
-__        __    _  _____                       _
-\ \      / /_ _| ||_   _|   _ _ __  _ __   ___| |
- \ \ /\ / / _` | __|| || | | | '_ \| '_ \ / _ \ |
-  \ V  V / (_| | |_ | || |_| | | | | | | |  __/ |
-   \_/\_/ \__,_|\__||_| \__,_|_| |_|_| |_|\___|_|
-EOF
-TAGLINE='encrypted port forwarding, even when only ping works'
-B_K=(); B_T=()
-banner_build() {
-  local i k
-  for i in 0 1 2 3 4 5 6 7; do
-    printf -v k '%-17s' "${KITE[$i]}"; B_K[i]=$k
-    if [ "$i" -ge 2 ] && [ "$i" -le 6 ]; then B_T[i]=${TXT[$((i-2))]}; elif [ "$i" -eq 7 ]; then B_T[i]=$TAGLINE; else B_T[i]=''; fi
-  done
-}
-banner_build
-banner_plain() { local i; for i in 0 1 2 3 4 5 6 7; do printf '  %s%s\n' "${B_K[$i]}" "${B_T[$i]}"; done; }
+META_GITHUB='https://github.com/JohnWatsoon'
+META_TELEGRAM='@Watdevs'
+
 banner() { # [1 = animated reveal]
-  local i kc
-  for i in 0 1 2 3 4 5 6 7; do
-    kc=''
-    if [ "$USE_COLOR" = 1 ]; then
-      if [ "$NCOL" -ge 256 ]; then [ "$i" -le 5 ] && kc=$'\e[1;38;5;221m' || kc=$'\e[1;38;5;213m'
-      else [ "$i" -le 5 ] && kc=$'\e[1;33m' || kc=$'\e[1;35m'; fi
-    fi
-    gfg "$i"
-    if [ "$i" -eq 7 ]; then GFG=$GRY; fi
-    printf '  %s%s%s%s%s%s\n' "$kc" "${B_K[$i]}" "$RST" "$GFG" "${B_T[$i]}" "$RST"
-    [ "${1:-0}" = 1 ] && sleep 0.035
-  done
+  local i cols kc GFG
+  cols=$(tput cols 2>/dev/null || echo 80)
+  if [ "$cols" -ge 80 ]; then
+    local side=(
+      "┌─ WatTun Community ────────────────┐"
+      "│ GitHub:   github.com/JohnWatsoon  │"
+      "│ Telegram: @Watdevs                │"
+      "│ Core:     Autonomous Failover     │"
+      "└───────────────────────────────────┘"
+    )
+    for i in 0 1 2 3 4; do
+      gfg "$i"
+      local left="${WATTUN_BANNER[$i]}"
+      local right="${side[$i]}"
+      if [ "$USE_COLOR" = 1 ]; then
+        case "$i" in
+          0|4) right="${GRY}${side[$i]}${RST}" ;;
+          1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   github.com/JohnWatsoon  ${GRY}│${RST}" ;;
+          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}                ${GRY}│${RST}" ;;
+          3) right="${GRY}│${RST} ${GRY}Core:${RST}     Autonomous Failover     ${GRY}│${RST}" ;;
+        esac
+      fi
+      printf '  %s%s%s %s\n' "$GFG" "$left" "$RST" "$right"
+      [ "${1:-0}" = 1 ] && sleep 0.03
+    done
+  else
+    for i in 0 1 2 3 4; do
+      gfg "$i"
+      printf '  %s%s%s\n' "$GFG" "${WATTUN_BANNER[$i]}" "$RST"
+      [ "${1:-0}" = 1 ] && sleep 0.03
+    done
+    printf '  %sGitHub:%s %s  •  %sTelegram:%s %s\n' "$CYN" "$RST" "$META_GITHUB" "$CYN" "$RST" "$META_TELEGRAM"
+  fi
   return 0
 }
 
 VER=''
 LOGO=''
 make_logo() {
-  local w=WatTunnel i
+  local w=WatTun i
   LOGO=''
   for ((i=0; i<${#w}; i++)); do gfg $((i*8/${#w})); LOGO+="$GFG${w:i:1}"; done
   LOGO+=$RST
@@ -231,23 +234,29 @@ make_logo
 
 EL=''; [ "$IS_TTY" = 1 ] && EL=$'\e[K'
 clear_screen() { [ "$IS_TTY" = 1 ] && printf '\e[H\e[2J'; return 0; }
-page_full() { # title [subtitle] : big banner (dashboard, first screens)
+
+render_header() { # title [subtitle] [animated=0]
   if [ "$NONINTERACTIVE" = 1 ]; then printf '== %s%s ==\n' "$1" "${2:+ ($2)}"; return 0; fi
   clear_screen; echo
-  if [ "$ANIM" = 1 ] && [ "$INTRO_DONE" = 0 ]; then banner 1; else banner 0; fi
-  INTRO_DONE=1
-  hr
-  printf '  %s%s%s%s\n\n' "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
-}
-page() { # title [subtitle] : compact header with breadcrumb
-  if [ "$NONINTERACTIVE" = 1 ]; then printf '== %s%s ==\n' "$1" "${2:+ ($2)}"; return 0; fi
-  clear_screen
-  printf '\n  %s◆%s %s%s%s %s›%s %s%s%s%s\n' "$CYN" "$RST" "$LOGO" "${VER:+ $GRY$VER$RST}" "" "$GRY" "$RST" "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
+  banner "${3:-0}"
+  echo
+  printf '  %s◆%s %s%s%s %s›%s %s%s%s%s\n' "$CYN" "$RST" "$LOGO" "${VER:+ $GRY$VER$RST}" "" "$GRY" "$RST" "$BOLD" "$1" "$RST" "${2:+   ${GRY}$2${RST}}"
   hr; echo
 }
 
+page_full() { # title [subtitle]
+  local anim=0
+  if [ "$ANIM" = 1 ] && [ "$INTRO_DONE" = 0 ]; then anim=1; fi
+  INTRO_DONE=1
+  render_header "$1" "${2:-}" "$anim"
+}
+
+page() { # title [subtitle]
+  render_header "$1" "${2:-}" 0
+}
+
 # ---- boxes ----
-BOXW=72
+BOXW=74
 box_top() { printf '  %s┌─ %s%s%s%s %s┐%s\n' "$GRY" "$RST" "$BOLD$1" "$RST" "$GRY" "$(rep ─ $((BOXW-${#1}-3)))" "$RST"; }
 box_row() { vlen "$1"; local pad=$((BOXW-2-VLEN)); [ "$pad" -lt 0 ] && pad=0; printf '  %s│%s %s%*s %s│%s\n' "$GRY" "$RST" "$1" "$pad" '' "$GRY" "$RST"; }
 box_bot() { printf '  %s└%s┘%s\n' "$GRY" "$(rep ─ "$BOXW")" "$RST"; }
@@ -455,8 +464,16 @@ port_busy() { # port [tcp|udp|any] : is something listening on it on this server
   done
   return 1
 }
-port_user() { # port proto -> process name or empty
+port_user() { # port proto -> process name and PID or empty
   local f=-Hltnp; [ "${2:-tcp}" = udp ] && f=-Hlunp
+  local line u pid
+  line=$(ss "$f" "( sport = :$1 )" 2>/dev/null | grep -o 'users:(("[^"]*",pid=[0-9]*' | head -1)
+  if [ -n "$line" ]; then
+    u=$(echo "$line" | cut -d'"' -f2)
+    pid=$(echo "$line" | grep -o 'pid=[0-9]*' | cut -d= -f2)
+    if [ -n "$pid" ] && [ -n "$u" ]; then echo "$u (PID $pid)"; return; fi
+    [ -n "$u" ] && { echo "$u"; return; }
+  fi
   ss "$f" "( sport = :$1 )" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -1 | cut -d'"' -f2
 }
 
@@ -568,6 +585,48 @@ unset_value() { # same tmp+mv pattern as set_value: the 3 s hot-reloader must ne
   grep -v "^$2:" "$f" >"$tmp"
   chmod 600 "$tmp"; mv -f "$tmp" "$f"
 }
+set_port_limit() { # name port rate quota
+  local f="$CONF/$1.yml" lp=$2 lr=$3 lq=$4 tmp
+  [ -f "$f" ] || return 1
+  tmp=$(mktemp "$CONF/.tmp.XXXXXX") || return 1
+  awk -v lp="$lp" -v lr="$lr" -v lq="$lq" '
+    BEGIN { in_lim=0; wrote=0 }
+    /^limits:/ { in_lim=1; print; next }
+    in_lim && /^[a-zA-Z0-9_-]+:/ {
+      if (!wrote && ((lr != "" && lr != "0") || (lq != "" && lq != "0"))) {
+        s = "  - " lp
+        if (lr != "" && lr != "0") s = s " rate=" lr
+        if (lq != "" && lq != "0") s = s " quota=" lq
+        print s
+        wrote = 1
+      }
+      in_lim = 0
+      print
+      next
+    }
+    in_lim && $1 == "-" && $2 ~ ("^" lp "([[:space:]]|$)") {
+      if (!wrote && ((lr != "" && lr != "0") || (lq != "" && lq != "0"))) {
+        s = "  - " lp
+        if (lr != "" && lr != "0") s = s " rate=" lr
+        if (lq != "" && lq != "0") s = s " quota=" lq
+        print s
+        wrote = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!wrote && ((lr != "" && lr != "0") || (lq != "" && lq != "0"))) {
+        if (!in_lim) print "limits:"
+        s = "  - " lp
+        if (lr != "" && lr != "0") s = s " rate=" lr
+        if (lq != "" && lq != "0") s = s " quota=" lq
+        print s
+      }
+    }
+  ' "$f" >"$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+}
 
 # Connection token: wat1:BASE64("carrier|peer|key|path|sni|icmp-type|allowed-ports[|reverse]")
 # Field 7 (allowed ports on Kharej, comma list, empty = any) was added in 1.9.0; 6-field tokens still parse.
@@ -662,6 +721,15 @@ tunnel_using_listen() { # port [exclude] -> name of a tunnel (Kharej, or Iran in
 listen_blocked() { # proto port
   port_busy "$2" "$1" || tunnel_using_listen "$2" >/dev/null
 }
+listen_conflict_desc() { # proto port -> explanation string
+  local proto=${1:-tcp} port=$2
+  local tun u
+  tun=$(tunnel_using_listen "$port")
+  if [ -n "$tun" ]; then echo "tunnel '$tun'"; return; fi
+  u=$(port_user "$port" "$proto")
+  if [ -n "$u" ]; then echo "$u"; return; fi
+  echo "another process or tunnel"
+}
 default_listen() { # carrier -> a free listen port
   local base proto=tcp c
   case "$1" in ws|h2c) base=8080 ;; wss|tls|grpc|h2) base=443 ;; *) base=4443 ;; esac
@@ -694,6 +762,10 @@ reverse_hint() { # [carrier]
 v_icmp() { case "$1" in echo|timestamp|info|mask) return 0 ;; esac; err "Use echo, timestamp, info or mask."; return 1; }
 v_mbps_adv() { case "$1" in -|0|default) return 0 ;; esac; v_mbps "$1"; }
 v_mbps() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && return 0; err "Enter a number of MB/s (1-9999)."; return 1; }
+v_sessions() { [ -z "$1" ] && return 0; case "$1" in -|0|default) return 0 ;; esac; [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 64 ] && return 0; err "Enter sessions count 1-64 (or 0/default to unset)."; return 1; }
+v_conns() { [ -z "$1" ] && return 0; case "$1" in -|0|default) return 0 ;; esac; [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 128 ] && return 0; err "Enter conns count 1-128 (or 0/default to unset)."; return 1; }
+v_mtu() { [ -z "$1" ] && return 0; case "$1" in -|0|default) return 0 ;; esac; [[ "$1" =~ ^[0-9]{3,5}$ ]] && [ "$1" -ge 576 ] && [ "$1" -le 65535 ] && return 0; err "Enter MTU 576-65535 (or 0/default to unset)."; return 1; }
+v_num() { [[ "$1" =~ ^[0-9]+$ ]] && return 0; err "Enter a valid positive number."; return 1; }
 v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
 v_fec() { case "$1" in off|auto) return 0 ;; esac; err "Use off or auto."; return 1; }
 v_fake_mode() { case "$1" in seq|ttl|sum|seqsum|auto|rst) return 0 ;; esac; err "Use seq, ttl, sum, seqsum, auto or rst."; return 1; }
@@ -796,11 +868,37 @@ conn_diagram() { # carrier canonical... : users ──► Iran :8443 ══ icmp
 }
 
 # ======================================================================================
-#  Tunnel info
+#  Tunnel info & telemetry
 # ======================================================================================
 TI_STATE=stopped; TI_RTT=0; TI_STREAMS=0; TI_SESS=0; TI_IN=0; TI_OUT=0; TI_RATE=0; TI_RAW=''
-tinfo() { # name -> TI_*  (state: up | down | stopped)
+TI_CAR_COUNT=0; TI_CAR_ALIVE=0; TI_CAR_MUTED=0
+CAR_COUNT=0; CAR_NAME=(); CAR_ALIVE=(); CAR_RTT=(); CAR_LOSS=(); CAR_SHARE=(); CAR_MUTED=()
+parse_carriers() { # json
+  local json=$1 carr_block item
+  CAR_COUNT=0; CAR_NAME=(); CAR_ALIVE=(); CAR_RTT=(); CAR_LOSS=(); CAR_SHARE=(); CAR_MUTED=()
+  carr_block=$(grep -o '"carriers": *\[[^]]*\]' <<<"$json" | head -1)
+  [ -n "$carr_block" ] || return 0
+  while read -r item; do
+    [ -n "$item" ] || continue
+    local nm al rtt ls sh mu
+    nm=$(grep -o '"name": *"[^"]*"' <<<"$item" | head -1 | cut -d'"' -f4)
+    al=$(grep -o '"alive": *[^,}]*' <<<"$item" | head -1 | sed 's/.*: *//; s/"//g')
+    rtt=$(grep -o '"srtt_ms": *[^,}]*' <<<"$item" | head -1 | sed 's/.*: *//; s/"//g')
+    ls=$(grep -o '"loss": *[^,}]*' <<<"$item" | head -1 | sed 's/.*: *//; s/"//g')
+    sh=$(grep -o '"share": *[^,}]*' <<<"$item" | head -1 | sed 's/.*: *//; s/"//g')
+    mu=$(grep -o '"muted": *[^,}]*' <<<"$item" | head -1 | sed 's/.*: *//; s/"//g')
+    CAR_NAME+=("${nm:-unknown}")
+    CAR_ALIVE+=("${al:-false}")
+    CAR_RTT+=("${rtt:-0}")
+    CAR_LOSS+=("${ls:-0}")
+    CAR_SHARE+=("${sh:-0}")
+    CAR_MUTED+=("${mu:-false}")
+    CAR_COUNT=$((CAR_COUNT+1))
+  done < <(grep -o '{[^{}]*}' <<<"$carr_block")
+}
+tinfo() { # name -> TI_*  (state: up | degraded | down | stopped)
   TI_STATE=stopped; TI_RTT=0; TI_STREAMS=0; TI_SESS=0; TI_IN=0; TI_OUT=0; TI_RATE=0; TI_RAW=''
+  TI_CAR_COUNT=0; TI_CAR_ALIVE=0; TI_CAR_MUTED=0
   systemctl is-active -q "${WAT_PREFIX}@$1" 2>/dev/null || return 0
   TI_RAW=$(stats "$1")
   if [ "$(jget "$TI_RAW" alive)" = true ]; then TI_STATE=up; else TI_STATE=down; fi
@@ -808,14 +906,38 @@ tinfo() { # name -> TI_*  (state: up | down | stopped)
   TI_IN=$(jget "$TI_RAW" bytes_in_total); TI_OUT=$(jget "$TI_RAW" bytes_out_total); TI_RATE=$(jget "$TI_RAW" rate_bps)
   [ -n "$TI_IN" ] || { TI_IN=$(jget "$TI_RAW" bytes_in); TI_OUT=$(jget "$TI_RAW" bytes_out); } # before 2.4.19: since the last restart
   : "${TI_RTT:=0}" "${TI_STREAMS:=0}" "${TI_SESS:=0}" "${TI_IN:=0}" "${TI_OUT:=0}" "${TI_RATE:=0}"
+  parse_carriers "$TI_RAW"
+  TI_CAR_COUNT=$CAR_COUNT
+  if [ "$TI_STATE" = up ] && [ "$CAR_COUNT" -gt 0 ]; then
+    local i unmuted_live=0 unmuted_total=0
+    for ((i=0; i<CAR_COUNT; i++)); do
+      if [ "${CAR_MUTED[$i]}" = true ]; then
+        TI_CAR_MUTED=$((TI_CAR_MUTED+1))
+      else
+        unmuted_total=$((unmuted_total+1))
+        [ "${CAR_ALIVE[$i]}" = true ] && unmuted_live=$((unmuted_live+1))
+      fi
+    done
+    TI_CAR_ALIVE=$unmuted_live
+    if [ "$unmuted_total" -gt 1 ] && [ "$unmuted_live" -lt "$unmuted_total" ]; then
+      TI_STATE=degraded
+    fi
+  fi
+  if [ "$TI_STATE" = up ]; then
+    local loss
+    loss=$(jget "$TI_RAW" loss_pct)
+    if [ -n "$loss" ] && [ "${loss%.*}" -ge 5 ] 2>/dev/null; then
+      TI_STATE=degraded
+    fi
+  fi
 }
 SC_COL=''; SC_TXT=''; SC_DOT='●'
 state_cell() { # role state
-  SC_DOT='●'
   case "$2" in
-    up) SC_COL=$GRN; SC_TXT=CONNECTED ;;
-    down) if [ "$1" = Kharej ]; then SC_COL=$YEL; SC_TXT='WAITING'; else SC_COL=$RED; SC_TXT=DISCONNECTED; fi ;;
-    *) SC_COL=$GRY; SC_TXT=STOPPED; SC_DOT='○' ;;
+    up) SC_COL=$GRN; SC_DOT='●'; SC_TXT=UP ;;
+    degraded) SC_COL=$YEL; SC_DOT='◐'; SC_TXT=DEGRADED ;;
+    down) SC_COL=$RED; SC_DOT='○'; if [ "$1" = Kharej ]; then SC_TXT=WAITING; else SC_TXT=DOWN; fi ;;
+    *) SC_COL=$GRY; SC_DOT='◌'; SC_TXT=STOPPED ;;
   esac
 }
 ports_summary() { # name [maxlen] -> "443 · 8443→443 · 53/udp"
@@ -836,19 +958,35 @@ ports_summary() { # name [maxlen] -> "443 · 8443→443 · 53/udp"
 # ---- dashboard ----
 DASH_N=()
 dash_row() { # idx name
-  local i=$1 n=$2 r cr load rtt tr pl par
+  local i=$1 n=$2 r cr load rtt tr pl par cols car_display
+  cols=$(tput cols 2>/dev/null || echo 80)
   r=$(role "$n"); cr=$(carrier_label "$n"); par=$(companion_of "$n")
   tinfo "$n"; state_cell "$r" "$TI_STATE"
   load=''; rtt=''
   if [ "$TI_STATE" != stopped ]; then
     if [ "$r" = Kharej ]; then load="$TI_SESS clients"; else load="$TI_STREAMS streams"; fi
-    [ "$TI_STATE" = up ] && rtt="$(printf '%.0f' "$TI_RTT") ms"
+    { [ "$TI_STATE" = up ] || [ "$TI_STATE" = degraded ]; } && rtt="$(printf '%.0f' "$TI_RTT") ms"
   fi
   tr='-'; [ "$TI_STATE" != stopped ] && tr="↓$(human "$TI_IN") ↑$(human "$TI_OUT")"
   [ "$r" = Kharej ] && pl="allows $(ports_summary "$n" 40)" || pl="ports $(ports_summary "$n" 42)"
   [ -n "$par" ] && pl="auto: reverse side of $par"
   pl="$pl$(cs=$(cdn_summary "$n" short); [ -n "$cs" ] && printf '  %s[%s]' "$CYN" "$cs$RST")"
-  printf ' %s%2s%s  %-13s %-6s %-6s %s%s%s %s%-12s%s %6s  %s\n' "$BOLD$CYN" "$i" "$RST" "${n:0:13}" "$r" "${cr:0:6}" \
+
+  if [ "$cols" -ge 100 ]; then
+    car_display="${cr:0:16}"
+  elif [ "$cols" -lt 70 ]; then
+    if [[ "$cr" == *"+"* ]]; then
+      local -a bcnt; IFS='+' read -ra bcnt <<<"$cr"; car_display="bond[${#bcnt[@]}]"
+    elif is_auto_kharej "$n" || [ -f "$CONF/$n.auto" ]; then
+      car_display="[AUTO]"
+    else
+      car_display="${cr:0:6}"
+    fi
+  else
+    car_display="${cr:0:8}"
+  fi
+
+  printf ' %s%2s%s  %-13s %-6s %-10s %s%s%s %s%-9s%s %6s  %s\n' "$BOLD$CYN" "$i" "$RST" "${n:0:13}" "$r" "$car_display" \
     "$SC_COL" "$SC_DOT" "$RST" "$SC_COL" "$SC_TXT" "$RST" "$rtt" "$load"
   printf '     %s%s   %s%s\n' "$GRY" "$tr" "$pl" "$RST"
 }
@@ -863,7 +1001,8 @@ dash_table() {
     printf '  Press %s[n]%s to create your first tunnel.\n' "$CYN$BOLD" "$RST"
     return 0
   fi
-  printf ' %s%2s  %-13s %-6s %-6s   %-12s %6s  %s%s\n' "$GRY" '#' NAME ROLE CARRIER STATE RTT LOAD "$RST"
+  printf ' %s%2s  %-13s %-6s %-10s   %-9s %6s  %s%s\n' "$GRY" '#' NAME ROLE CARRIER STATE RTT LOAD "$RST"
+  printf ' %s%s%s\n' "$GRY" "$(rep ─ 74)" "$RST"
   for n in "${DASH_N[@]}"; do i=$((i+1)); dash_row "$i" "$n"; done
 }
 dash_actions() {
@@ -874,7 +1013,8 @@ dash_actions() {
     printf '  %s▸ Press %s%s%s%s to manage a tunnel%s %s(status, ports, token, logs, restart)%s\n' "$BOLD" "$CYN" "$range" "$RST" "$BOLD" "$RST" "$GRY" "$RST"
   fi
   hr
-  printf '  %s new tunnel   %s live monitor   %s update   %s settings   %s quit\n' "$(key_label n)" "$(key_label m)" "$(key_label u)" "$(key_label s)" "$(key_label q)"
+  printf '  %s new tunnel   %s batch actions   %s live monitor   %s update   %s settings   %s quit\n' \
+    "$(key_label n)" "$(key_label a)" "$(key_label m)" "$(key_label u)" "$(key_label s)" "$(key_label q)"
 }
 
 # ======================================================================================
@@ -986,8 +1126,10 @@ pe_draw() {
   page "Port mappings" "${PE_TUNNEL:-new tunnel} · $PE_ROLE"
   if [ "$PE_ROLE" = Iran ]; then
     printf '  %s%3s  %-19s      %-23s %s%s\n' "$GRY" '#' 'Iran port (users)' 'Kharej port (service)' proto "$RST"
+    printf '  %s%s%s\n' "$GRY" "$(rep ─ 70)" "$RST"
   else
     printf '  %s%3s  %-31s %s%s\n' "$GRY" '#' 'Port on this server (service)' proto "$RST"
+    printf '  %s%s%s\n' "$GRY" "$(rep ─ 70)" "$RST"
   fi
   if [ "${#MAPS[@]}" -eq 0 ]; then
     printf '  %s  (empty)%s\n' "$GRY" "$RST"
@@ -1218,7 +1360,7 @@ wizard_kharej() {
     else
       while :; do
         ask_ok "Listen port" "$listen" v_port || return 1
-        if listen_blocked "$([ "$cr" = udp ] && echo udp || echo tcp)" "$REPLY_V"; then err "Port $REPLY_V is already used (by this server or another tunnel)."; else listen=$((10#$REPLY_V)); break; fi
+        if listen_blocked "$([ "$cr" = udp ] && echo udp || echo tcp)" "$REPLY_V"; then err "Port $REPLY_V is already used by $(listen_conflict_desc "$([ "$cr" = udp ] && echo udp || echo tcp)" "$REPLY_V")."; else listen=$((10#$REPLY_V)); break; fi
         t=$((${t:-0}+1)); [ "$t" -ge 3 ] && { err "Too many tries, going back."; return 1; }
       done
       if is_pool "$cr"; then
@@ -1844,7 +1986,7 @@ wizard_iran() {
   port_editor || { warn "Cancelled."; return 1; }
   if [ -n "$rport" ]; then
     if listen_blocked tcp "$rport"; then
-      err "Port $rport/tcp is already in use here (another program or tunnel). Reverse needs it free: pick another carrier port on Kharej and make a new token."
+      err "Port $rport/tcp is already in use here by $(listen_conflict_desc tcp "$rport"). Reverse needs it free: pick another carrier port on Kharej and make a new token."
       return 1
     fi
     for ((i=0; i<${#MAPS[@]}; i++)); do
@@ -2036,6 +2178,8 @@ wizard_iran() {
       [ -n "$mbps" ] && echo "max-mbps: $mbps"
       [ "$fec" = auto ] && echo "fec: auto"
       sessions_line
+      conns_line
+      mtu_line
       echo "metrics: 127.0.0.1:$m"
       maps_yaml_block
     } >"$CONF/$name.yml"
@@ -2096,6 +2240,14 @@ sessions_line() { # the engine refuses sessions with icmp, bonded carriers, reve
   case "$T_CARRIER" in icmp|*,*) warn "--sessions ignored: not supported with carrier '$T_CARRIER'" >&2; return 0 ;; esac
   [ "$T_REV" = 1 ] && { warn "--sessions ignored: not supported in reverse mode" >&2; return 0; }
   echo "sessions: $(( SESS_USE > 16 ? 16 : SESS_USE ))"; return 0
+}
+conns_line() {
+  [ -n "${NI_CONNS:-}" ] && echo "conns: $NI_CONNS"
+  return 0
+}
+mtu_line() {
+  [ -n "${NI_MTU:-}" ] && echo "mtu: $NI_MTU"
+  return 0
 }
 
 # ======================================================================================
@@ -2622,12 +2774,35 @@ auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKI
   AT_SECS=$((SECONDS-t0))
   return 0
 }
-at_rank() { # -> AT_RANK (working variants, best first: down+up, then lower rtt)
-  local i; AT_RANK=()
-  while read -r _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
-    for ((i=0; i<${#AV_LABEL[@]}; i++)); do
-      [ "${AR_OK[$i]}" = 1 ] && awk -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%.6f %.3f %d\n", d+u, r, i}'
-    done | sort -k1,1gr -k2,2g)
+at_rank() { # [policy] -> AT_RANK (working variants, best first: policy driven)
+  local pol=${1:-${NI_POLICY:-}} i
+  if [ -z "$pol" ] && [ -n "${AT_TUNNEL:-}" ] && [ -f "$CONF/$AT_TUNNEL.policy" ]; then
+    pol=$(cat "$CONF/$AT_TUNNEL.policy" 2>/dev/null || echo speed)
+  fi
+  : "${pol:=speed}"
+  AT_RANK=()
+  case "$pol" in
+    latency)
+      while read -r _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
+        for ((i=0; i<${#AV_LABEL[@]}; i++)); do
+          [ "${AR_OK[$i]}" = 1 ] && awk -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%.3f %.6f %d\n", r, d+u, i}'
+        done | sort -k1,1g -k2,2gr)
+      ;;
+    direct)
+      while read -r _ _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
+        for ((i=0; i<${#AV_LABEL[@]}; i++)); do
+          local dir_p=0
+          case "${AV_CAR[$i]}" in tcp|tls|udp|icmp) [ "${AV_KIND[$i]}" = d ] && dir_p=1 ;; esac
+          [ "${AR_OK[$i]}" = 1 ] && awk -v dp="$dir_p" -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%d %.6f %.3f %d\n", dp, d+u, r, i}'
+        done | sort -k1,1nr -k2,2gr -k3,3g)
+      ;;
+    bond|speed|*)
+      while read -r _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
+        for ((i=0; i<${#AV_LABEL[@]}; i++)); do
+          [ "${AR_OK[$i]}" = 1 ] && awk -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%.6f %.3f %d\n", d+u, r, i}'
+        done | sort -k1,1gr -k2,2g)
+      ;;
+  esac
 }
 at_table() {
   local i k=0
@@ -2668,10 +2843,13 @@ at_choose() { # rc 0 = chosen (T_* ready), 1 = cancelled
   local n=${#AT_RANK[@]} best=${AT_RANK[0]} bond=() i t num rest bd bu
   for i in "${AT_RANK[@]}"; do [ "${AV_KIND[$i]}" = d ] && bond+=("$i"); done
   if [ "$NONINTERACTIVE" = 1 ]; then # --pick best (default) | bond | N (row number of the table)
-    case "${NI_PICK:-best}" in
+    local def_pick="best"
+    local cur_pol=${NI_POLICY:-}
+    [ -z "$cur_pol" ] && [ -n "${AT_TUNNEL:-}" ] && cur_pol=$(cat "$CONF/$AT_TUNNEL.policy" 2>/dev/null || echo speed)
+    [ "$cur_pol" = bond ] && def_pick="bond"
+    case "${NI_PICK:-$def_pick}" in
       best) AT_SEL=("$best") ;;
-      bond) [ "${#bond[@]}" -ge 2 ] || { err "--pick bond needs two or more working direct carriers (only ${#bond[@]} work)"; return 1; }
-            AT_SEL=("${bond[@]}") ;;
+      bond) if [ "${#bond[@]}" -ge 2 ]; then AT_SEL=("${bond[@]}"); else AT_SEL=("$best"); fi ;;
       *,*) at_rows "$NI_PICK" || return 1 ;;
       ''|*[!0-9]*) err "--pick must be best, bond, a row number of the table, or several joined with commas (1,3)"; return 1 ;;
       *) if [ "$NI_PICK" -ge 1 ] && [ "$NI_PICK" -le "$n" ]; then AT_SEL=("${AT_RANK[$((NI_PICK-1))]}")
@@ -2829,6 +3007,7 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
     err "'$n' is not an auto Iran tunnel (it has no $n.auto). Create it with the token from an auto Kharej tunnel."; return 1
   fi
   if ! { read_token "$(cat "$CONF/$n.auto")" && [ -n "$T_AUTO" ]; }; then err "$CONF/$n.auto is not a valid auto token."; return 1; fi
+  AT_TUNNEL=$n
   cur=$(auto_current_key "$n")
   AT_QUIET=0; AT_MB=8; AT_NOTE=""; AT_SKIP=''; AT_AGAIN="$SELF auto-test $n"
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac # its own port / ICMP are in use by the running tunnel
@@ -2849,29 +3028,54 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   confirm "Switch '$n' to $AT_SEL_LABEL? (open connections drop)" y || { warn "No change."; return 0; }
   auto_apply "$n"
 }
-auto_retest() { # name : unattended (auto-heal): 1 MB tests, switch only if the current variant fails and another works
-  local n=$1 cur best
+auto_retest() { # name : unattended (auto-heal or auto-optimize): 1 MB tests
+  local n=$1 cur best winner winner_key pol
   if ! { [ -f "$CONF/$n.auto" ] && read_token "$(cat "$CONF/$n.auto")" && [ -n "$T_AUTO" ]; }; then
     # not an auto tunnel: a plain CDN tunnel only gets a fresh edge scan (dead edge IPs replaced)
     cdn_tunnel_p "$n" && { cdn_refresh_edges "$n"; return 0; }
     return 1
   fi
+  AT_TUNNEL=$n
   AT_QUIET=1; AT_MB=1; AT_NOTE=''; AT_SKIP=''; AT_AGAIN=''
   cur=$(auto_current_key "$n")
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac
   auto_test || return 1
   at_rank
   if [ "${#AT_RANK[@]}" -eq 0 ]; then logger -t wattun-heal "retest of $n: no connection type works right now"; return 0; fi
-  for best in "${AT_RANK[@]}"; do
-    if [ "$(av_key "$best")" = "$cur" ]; then
-      logger -t wattun-heal "retest of $n: current variant $cur still works, no switch"
-      [ "$cur" = "$(cfg "$n" carrier)/c" ] && cdn_refresh_edges "$n" # same carrier through the CDN: replace dead edge IPs
-      return 0
+  winner=${AT_RANK[0]}
+  winner_key=$(av_key "$winner")
+  if [ "$winner_key" = "$cur" ]; then
+    logger -t wattun-heal "retest of $n: current variant $cur is already the top-ranked carrier, no switch"
+    [ "$cur" = "$(cfg "$n" carrier)/c" ] && cdn_refresh_edges "$n" # same carrier through the CDN: replace dead edge IPs
+    return 0
+  fi
+  # If off-peak optimization or SLA breach triggered this, always upgrade to the winner!
+  # Otherwise (connection recovery), if current variant is still working, avoid flapping.
+  if [ "${AUTO_OPTIMIZE:-0}" != 1 ] && [ ! -f "$RUN/$n.sla_triggered" ]; then
+    for best in "${AT_RANK[@]}"; do
+      if [ "$(av_key "$best")" = "$cur" ]; then
+        logger -t wattun-heal "retest of $n: current variant $cur still works, no switch"
+        [ "$cur" = "$(cfg "$n" carrier)/c" ] && cdn_refresh_edges "$n"
+        return 0
+      fi
+    done
+  fi
+  pol=$(cat "$CONF/$n.policy" 2>/dev/null || echo speed)
+  if [ "$pol" = bond ]; then
+    local -a bond_cars=()
+    for i in "${AT_RANK[@]}"; do [ "${AV_KIND[$i]}" = d ] && bond_cars+=("$i"); done
+    if [ "${#bond_cars[@]}" -ge 2 ]; then
+      AT_SEL=("${bond_cars[@]}")
+    else
+      AT_SEL=("$winner")
     fi
-  done
-  AT_SEL=("${AT_RANK[0]}"); at_to_t
+  else
+    AT_SEL=("$winner")
+  fi
+  at_to_t
   auto_apply "$n" >/dev/null 2>&1
   logger -t wattun-heal "switched $n from $cur to $AT_SEL_KEY"
+  rm -f "$RUN/$n.sla_triggered"
   return 0
 }
 heal_matrix() { # name : unattended matrix, apply the best only when the current config has no working link (called by heal)
@@ -2883,7 +3087,7 @@ heal_matrix() { # name : unattended matrix, apply the best only when the current
   mapfile -t renv < <(run_env_args)
   [ -x "$m" ] || m=$(readlink -f "$0")
   systemd-run --quiet --collect --unit "${WAT_PREFIX}-matrix-$n" "${renv[@]}" \
-    "$m" matrix "$n" --yes >/dev/null 2>&1
+    --setenv=AC_FALLBACK=1 "$m" matrix "$n" --yes >/dev/null 2>&1
   return 0
 }
 heal_retest() { # name : at most once per 30 min, in a transient unit so it outlives the heal run
@@ -2935,6 +3139,11 @@ ac_matrix() { # name : needs T_* loaded from the tunnel (ac_load); fills AV_*, A
   # 4. auto mode: the binary's own startup probe picks seq/sum/seqsum/rst by itself
   if [ "$(bin_ver_ok 2.9.0)" = 1 ]; then
     av_add "desync auto-probe" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "${AC_SNIS%%,*}" auto
+  fi
+  # 5. Native ICMP echo fallback (activated when emergency ladder AC_FALLBACK=1 is set)
+  if [ "${AC_FALLBACK:-0}" = 1 ] && [ "$car" != icmp ] && [ -n "$T_PEER" ]; then
+    local icmp_peer="${T_PEER%:*}"
+    av_add "fallback ICMP echo" icmp d "$icmp_peer" '' '' '' '' '' '' ''
   fi
   AT_SKIP=''; AT_NOTE=''
   for ((i=0; i<${#AV_LABEL[@]}; i++)); do
@@ -3563,8 +3772,55 @@ test_tunnel() {
       else err "Cannot open TCP $host:$port: port closed, firewall, or this carrier is filtered. Try another carrier."; fi
     fi
   fi
+  if [[ "$cr" == *"+"* ]]; then
+    local -a car_list
+    IFS='+' read -ra car_list <<<"$cr"
+    say "  ${BOLD}Multi-Carrier Bond Diagnostics (${#car_list[@]} paths):${RST}"
+    local c_idx=0 cp cpeer chost cport
+    for cp in "${car_list[@]}"; do
+      c_idx=$((c_idx+1))
+      cpeer=$(cfg "$n" "peer-$cp")
+      [ -z "$cpeer" ] && cpeer=$peer
+      chost=${cpeer%:*}; cport=${cpeer##*:}
+      printf '    • Path #%d [%s]: ' "$c_idx" "$cp"
+      if [ "$r" = Iran ]; then
+        if [ "$cp" = icmp ]; then
+          if ping -c 1 -W 2 -q "$chost" >/dev/null 2>&1; then
+            printf '%sICMP ping OK%s\n' "$GRN" "$RST"
+          else
+            printf '%sICMP ping failed%s\n' "$RED" "$RST"
+          fi
+        elif [ "$cp" != udp ] && [ -n "$cport" ]; then
+          if timeout 3 bash -c "</dev/tcp/$chost/$cport" 2>/dev/null; then
+            printf '%sTCP %s:%s reachable%s\n' "$GRN" "$chost" "$cport" "$RST"
+          else
+            printf '%sTCP %s:%s blocked / unreachable%s\n' "$RED" "$chost" "$cport" "$RST"
+          fi
+        else
+          printf '%sconfigured%s\n' "$CYN" "$RST"
+        fi
+      else
+        printf '%sactive on server%s\n' "$CYN" "$RST"
+      fi
+    done
+    echo
+  fi
   s=$(stats "$n")
-  if [ "$(jget "$s" alive)" = true ]; then ok "Tunnel link is CONNECTED (RTT $(ms "$(jget "$s" srtt_ms)") ms)"
+  if [ "$(jget "$s" alive)" = true ]; then
+    ok "Tunnel link is CONNECTED (RTT $(ms "$(jget "$s" srtt_ms)") ms)"
+    parse_carriers "$s"
+    if [ "$CAR_COUNT" -gt 0 ]; then
+      say "  ${BOLD}Live Path Telemetry:${RST}"
+      local ci ccol cdot ctxt c_pct
+      for ((ci=0; ci<CAR_COUNT; ci++)); do
+        [ "${CAR_ALIVE[$ci]}" = true ] && { ccol=$GRN; cdot='●'; ctxt="UP"; } || { ccol=$RED; cdot='○'; ctxt="DOWN"; }
+        [ "${CAR_MUTED[$ci]}" = true ] && { ccol=$GRY; cdot='○'; ctxt="MUTED"; }
+        c_pct=$(awk -v sh="${CAR_SHARE[$ci]:-0}" 'BEGIN{printf "%.0f", sh*100}')
+        printf '    %s%s %-6s%s %-10s  rtt: %4.0f ms  loss: %4.1f%%  share: %3s%%\n' \
+          "$ccol" "$cdot" "$ctxt" "$RST" "${CAR_NAME[$ci]}" "${CAR_RTT[$ci]}" "$(awk -v l="${CAR_LOSS[$ci]:-0}" 'BEGIN{printf "%.1f", l*100}')" "$c_pct"
+      done
+      echo
+    fi
   else
     if [ "$r" = Kharej ]; then err "No Iran server is connected yet"; else err "Tunnel link is DISCONNECTED"; fi
     say "  ${GRY}Common causes: different key on the two sides, different carrier/icmp-type, the other side not running,${RST}"
@@ -3797,7 +4053,29 @@ tunnel_card() {
   fi
   box_row "${GRY}service $(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "${WAT_PREFIX}@$n" 2>/dev/null | head -1)${RST}"
   if [ "$TI_STATE" != stopped ]; then
+    local bmode=$(cfg "$n" bond-mode)
+    [ -n "$bmode" ] && box_row "Bond Mode: ${BOLD}$bmode${RST}"
+    if [ -f "$CONF/$n.sla" ]; then
+      local min_r=$(grep '^sla_min_rate_kbps=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
+      local max_rtt=$(grep '^sla_max_rtt_ms=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
+      local max_l=$(grep '^sla_max_loss_pct=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
+      box_row "SLA Target: min ${min_r:-0}kbps · max ${max_rtt:-0}ms · max ${max_l:-0}% loss"
+    fi
     box_row "rtt $(ms "$TI_RTT") ms (min $(ms "$(jget "$TI_RAW" min_rtt_ms)"))   rate $(human "$TI_RATE")/s   loss $(jget "$TI_RAW" loss_pct)%   retrans $(jget "$TI_RAW" retrans)"
+    if [ "$TI_CAR_COUNT" -gt 0 ]; then
+      local ci ccol cdot ctxt c_pct
+      for ((ci=0; ci<TI_CAR_COUNT; ci++)); do
+        if [ "${CAR_MUTED[$ci]}" = true ]; then
+          ccol=$GRY; cdot='○'; ctxt="MUTED"
+        elif [ "${CAR_ALIVE[$ci]}" = true ]; then
+          ccol=$GRN; cdot='●'; ctxt="UP"
+        else
+          ccol=$RED; cdot='○'; ctxt="DOWN"
+        fi
+        c_pct=$(awk -v sh="${CAR_SHARE[$ci]:-0}" 'BEGIN{printf "%.0f", sh*100}')
+        box_row "  ${ccol}${cdot} ${ctxt}${RST} [path $ci] ${CAR_NAME[$ci]} · rtt $(ms "${CAR_RTT[$ci]}") ms · loss $(awk -v l="${CAR_LOSS[$ci]:-0}" 'BEGIN{printf "%.1f", l*100}')% · traffic share ${c_pct}%"
+      done
+    fi
     box_row "streams $TI_STREAMS   clients $TI_SESS   udp flows $(jget "$TI_RAW" dgram_flows)   ↓$(human "$TI_IN") ↑$(human "$TI_OUT")"
   fi
   if [ "$r" = Kharej ]; then box_row "Iran may reach: $(ports_summary "$n" 48)"; else box_row "Publishes: $(ports_summary "$n" 56)"; fi
@@ -3849,7 +4127,7 @@ change_peer() {
     np=$((10#${v##*:}))
     if is_pool "$cr" && is_reverse "$n" && [ "$np" != "$op" ]; then
       # reverse: Iran listens on the carrier port, so it follows the peer port
-      if listen_blocked tcp "$np"; then err "Port $np/tcp is already in use here (another program or tunnel)."; return 1; fi
+      if listen_blocked tcp "$np"; then err "Port $np/tcp is already in use here by $(listen_conflict_desc tcp "$np")."; return 1; fi
       set_value "$n" listen "\":$np\""
       fw_open "$np/tcp"
     fi
@@ -3938,7 +4216,7 @@ set_direction() { # name
         pp=$(cfg "$n" peer); pp=${pp##*:}
         v_port "$pp" >/dev/null 2>&1 && [ "$pp" != "$(cfg "$n" peer)" ] || { err "The peer has no carrier port, so reverse cannot be set up."; return 1; }
         pp=$((10#$pp))
-        if listen_blocked tcp "$pp"; then err "Port $pp/tcp is already in use here (another program or tunnel)."; return 1; fi
+        if listen_blocked tcp "$pp"; then err "Port $pp/tcp is already in use here by $(listen_conflict_desc tcp "$pp")."; return 1; fi
         set_value "$n" listen "\":$pp\""
         fw_open "$pp/tcp"
       fi
@@ -3972,6 +4250,9 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
   while :; do
     page "Advanced settings" "$n"
     summary_line "max-mbps" "$(cfg "$n" max-mbps | sed 's/^$/16 (default)/')"
+    summary_line "sessions" "$(cfg "$n" sessions | sed 's/^$/1 (default)/')"
+    summary_line "conns" "$(cfg "$n" conns | sed 's/^$/8 (default)/')"
+    summary_line "mtu" "$(cfg "$n" mtu | sed 's/^$/auto (default)/')"
     summary_line "fec" "$(cfg "$n" fec | sed 's/^$/off (default)/')"
     [ "$r" = Iran ] && summary_line "bind" "$(cfg "$n" bind | sed 's/^$/0.0.0.0 (default)/')"
     [ "$cr" = icmp ] && summary_line "icmp-type" "$(cfg "$n" icmp-type | sed 's/^$/echo (default)/')"
@@ -3996,17 +4277,26 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
       fi
     fi
     echo
-    printf '  %s  speed ceiling   %s  FEC   ' "$(key_label m)" "$(key_label f)"
-    [ "$r" = Iran ] && printf '%s  bind address   ' "$(key_label a)"
+    printf '  %s  speed   %s  sessions   %s  conns   %s  MTU   %s  FEC   ' "$(key_label m)" "$(key_label s)" "$(key_label c)" "$(key_label u)" "$(key_label f)"
+    [ "$r" = Iran ] && printf '%s  bind   ' "$(key_label a)"
     [ "$cr" = icmp ] && printf "%s  ICMP type   " "$(key_label i)"
     rev_capable "$cr" && printf "%s  direction   " "$(key_label d)"
-    [ "$r" = Iran ] && [ "$(uname -s)" = Linux ] && printf '%s  resilience & anti-censorship   ' "$(key_label k)"
+    [ "$r" = Iran ] && [ "$(uname -s)" = Linux ] && printf '%s  resilience   ' "$(key_label k)"
     printf '%s  back\n' "$(key_label b)"
     key_read
     case "$KEY" in
       m) echo; ask_ok "Speed ceiling in MB/s (- or 0 or default = unset)" "$(cfg "$n" max-mbps)" v_mbps_adv || continue
          case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
          if [ -z "$REPLY_V" ]; then unset_value "$n" max-mbps; else set_value "$n" max-mbps "$REPLY_V"; fi; changed=1 ;;
+      s) echo; ask_ok "Sessions count 1-64 (- or 0 or default = unset)" "$(cfg "$n" sessions)" v_sessions || continue
+         case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
+         if [ -z "$REPLY_V" ]; then unset_value "$n" sessions; else set_value "$n" sessions "$REPLY_V"; fi; changed=1 ;;
+      c) echo; ask_ok "Conns count 1-128 (- or 0 or default = unset)" "$(cfg "$n" conns)" v_conns || continue
+         case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
+         if [ -z "$REPLY_V" ]; then unset_value "$n" conns; else set_value "$n" conns "$REPLY_V"; fi; changed=1 ;;
+      u) echo; ask_ok "MTU 576-65535 (- or 0 or default = unset)" "$(cfg "$n" mtu)" v_mtu || continue
+         case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
+         if [ -z "$REPLY_V" ]; then unset_value "$n" mtu; else set_value "$n" mtu "$REPLY_V"; fi; changed=1 ;;
       k) [ "$r" = Iran ] || continue; anticensor_menu "$n" ;;
       f) echo; ask_ok "FEC: off or auto" "$(cfg "$n" fec | sed 's/^$/off/')" v_fec || continue
          if [ "$REPLY_V" = off ]; then unset_value "$n" fec; else set_value "$n" fec "$REPLY_V"; fi; changed=1 ;;
@@ -4390,6 +4680,120 @@ blackout_cmd() { # name [sni_or_preset] : turn the resilience kit on when a cens
   return 0
 }
 
+arm_blackout_cmd() { # name
+  local n=$1 r
+  [ -f "$CONF/$n.yml" ] || { err "No tunnel named '$n'."; return 1; }
+  r=$(role "$n")
+  if [ "$r" = Kharej ]; then
+    say "  ${BOLD}Arming Kharej '$n' in Fortress Mode for Blackout Resilience${RST}"
+    if [ "$(uname -s)" = Linux ]; then
+      sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
+      sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+      sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+      sysctl -w net.core.rmem_max=67108864 >/dev/null 2>&1 || true
+      sysctl -w net.core.wmem_max=67108864 >/dev/null 2>&1 || true
+    fi
+    fw_open 80/tcp >/dev/null 2>&1 || true
+    fw_open 443/tcp >/dev/null 2>&1 || true
+    fw_open 4443/tcp >/dev/null 2>&1 || true
+    fw_open 8443/tcp >/dev/null 2>&1 || true
+    fw_open 53/udp >/dev/null 2>&1 || true
+    fw_open 4443/udp >/dev/null 2>&1 || true
+    set_value "$n" carrier fortress
+    [ -n "$(cfg "$n" dns-relay-upstream)" ] || set_value "$n" dns-relay-upstream "1.1.1.1:53"
+    systemctl restart "${WAT_PREFIX}@$n" >/dev/null 2>&1 || true
+    ok "Kharej '$n' armed in Fortress Mode (ICMP, TCP:80, TLS:443, WSS:8443, UDP:53)."
+    say "  Emergency blackout token for Iran distribution:"
+    show_token "$n"
+  else
+    say "  ${BOLD}Arming Iran '$n' for Autonomous Blackout Failover${RST}"
+    set_value "$n" path-probe-max "6s"
+    set_value "$n" governor true
+    heal_enable >/dev/null 2>&1 || true
+    systemctl restart "${WAT_PREFIX}@$n" >/dev/null 2>&1 || true
+    ok "Iran '$n' armed for Autonomous Failover (fast silence detection, auto-heal timer active)."
+  fi
+  return 0
+}
+
+audit_blackout_cmd() { # name
+  local n=$1 r pid pass_cnt=0 fail_cnt=0
+  [ -f "$CONF/$n.yml" ] || { err "No tunnel named '$n'."; return 1; }
+  r=$(role "$n")
+  echo
+  say "  ${BOLD}Blackout Preparedness Audit for '$n' ($r)${RST}"
+  echo
+  pid=$(systemctl show -p MainPID --value "${WAT_PREFIX}@$n" 2>/dev/null || echo 0)
+  if [ -n "$pid" ] && [ "$pid" -gt 0 ] && [ -r "/proc/$pid/status" ]; then
+    local cap_eff; cap_eff=$(grep -i CapEff "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
+    if [ -n "$cap_eff" ]; then
+      ok "Process capabilities active (PID $pid, CapEff $cap_eff)"
+      pass_cnt=$((pass_cnt+1))
+    else
+      warn "Unable to read process capabilities"
+      fail_cnt=$((fail_cnt+1))
+    fi
+  else
+    warn "Tunnel process is not currently running"
+    fail_cnt=$((fail_cnt+1))
+  fi
+
+  if [ "$(uname -s)" = Linux ]; then
+    local icmp_ign; icmp_ign=$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 1)
+    if [ "$icmp_ign" = 0 ]; then
+      ok "Sysctl: net.ipv4.icmp_echo_ignore_all == 0 (ICMP replies enabled)"
+      pass_cnt=$((pass_cnt+1))
+    else
+      warn "Sysctl: net.ipv4.icmp_echo_ignore_all != 0 (ICMP carrier will fail)"
+      fail_cnt=$((fail_cnt+1))
+    fi
+    local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)
+    if [ "$cc" = bbr ]; then
+      ok "Sysctl: congestion control is BBR"
+      pass_cnt=$((pass_cnt+1))
+    else
+      hint "Sysctl: congestion control is $cc (BBR recommended for anti-policing)"
+    fi
+  fi
+
+  if [ "$r" = Kharej ]; then
+    local p53; p53=$(ss -ulnp 2>/dev/null | grep -E ':53\s' || true)
+    if [ -n "$p53" ] && [[ "$p53" != *"wattun"* ]]; then
+      warn "Port 53/udp bound by another process: $p53"
+      fail_cnt=$((fail_cnt+1))
+    else
+      ok "Port 53/udp available or bound by wattun"
+      pass_cnt=$((pass_cnt+1))
+    fi
+  fi
+
+  local dns_up; dns_up=$(cfg "$n" dns-relay-upstream)
+  if [ -n "$dns_up" ]; then
+    ok "DNS in-band relay configured ($dns_up)"
+    pass_cnt=$((pass_cnt+1))
+  else
+    hint "DNS in-band relay not configured (default upstreams active)"
+  fi
+
+  local st; st=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null || echo inactive)
+  if [ "$st" = active ]; then
+    ok "Service ${WAT_PREFIX}@$n is active"
+    pass_cnt=$((pass_cnt+1))
+  else
+    warn "Service ${WAT_PREFIX}@$n is $st"
+    fail_cnt=$((fail_cnt+1))
+  fi
+
+  echo
+  if [ "$fail_cnt" -eq 0 ]; then
+    say "  ${GRN}${BOLD}OVERALL STATUS: ARMED & READY FOR BLACKOUT${RST} (${pass_cnt} checks passed)"
+  else
+    say "  ${YEL}${BOLD}OVERALL STATUS: PARTIALLY ARMED${RST} (${pass_cnt} passed, ${fail_cnt} warnings)"
+  fi
+  echo
+  return 0
+}
+
 preset_cmd() { # name [preset]
   local n=$1 p=${2:-}
   [ "$(uname -s)" = Linux ] || { err "Anti-censorship presets are a Linux feature."; return 1; }
@@ -4587,6 +4991,477 @@ change_type() { # name : one place to change how the two servers connect, whatev
   hint "To switch freely: make a new tunnel here with Auto ($SELF, n, Kharej, 1), paste its token on the Iran server,"
   hint "then delete this one. After that the type is chosen and changed on the Iran side (tunnel page, m)."
 }
+# ======================================================================================
+#  Kernel Speed Boost (/boost)
+# ======================================================================================
+BOOST_SYSCTL=/etc/sysctl.d/99-$WAT_PREFIX-boost.conf
+is_container() {
+  if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then return 0; fi
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container -q 2>/dev/null; then return 0; fi
+  if [ -f /proc/user_beancounters ]; then return 0; fi
+  if [ ! -w /proc/sys/net/ipv4/tcp_congestion_control ]; then return 0; fi
+  return 1
+}
+boost_status() {
+  local cc qdisc rmax wmax
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo unknown)
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo unknown)
+  rmax=$(sysctl -n net.core.rmem_max 2>/dev/null || cat /proc/sys/net/core/rmem_max 2>/dev/null || echo 0)
+  wmax=$(sysctl -n net.core.wmem_max 2>/dev/null || cat /proc/sys/net/core/wmem_max 2>/dev/null || echo 0)
+  say "  Kernel Speed Boost Status:"
+  if [ -f "$BOOST_SYSCTL" ]; then
+    say "    • Configuration File: ${GRN}$BOOST_SYSCTL active${RST}"
+  else
+    say "    • Configuration File: ${GRY}none ($BOOST_SYSCTL not present)${RST}"
+  fi
+  say "    • Congestion Control: ${BOLD}$cc${RST} $([ "$cc" = bbr ] && printf '%s(optimal)%s' "$GRN" "$RST")"
+  say "    • Queue Discipline:   ${BOLD}$qdisc${RST} $([ "$qdisc" = fq ] && printf '%s(optimal)%s' "$GRN" "$RST")"
+  say "    • Max Read Buffer:    ${BOLD}$(human "$rmax")${RST} ($rmax B)"
+  say "    • Max Write Buffer:   ${BOLD}$(human "$wmax")${RST} ($wmax B)"
+  if is_container; then
+    warn "Running inside a container/namespace with restricted sysctl permissions."
+  fi
+}
+boost_apply() {
+  if is_container; then
+    warn "Container environment detected. Sysctl writes may be restricted by the host."
+  fi
+  mkdir -p "${BOOST_SYSCTL%/*}"
+  cat >"$BOOST_SYSCTL" <<EOF
+# WatTunnel High-Speed Transport Engine Tunables (/boost)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 33554432
+net.core.wmem_default = 33554432
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.core.netdev_max_backlog = 100000
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+EOF
+  chmod 644 "$BOOST_SYSCTL"
+  modprobe tcp_bbr 2>/dev/null || true
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl -p "$BOOST_SYSCTL" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+  fi
+  ok "Boost parameters written to $BOOST_SYSCTL and applied."
+  boost_status
+}
+boost_undo() {
+  rm -f "$BOOST_SYSCTL"
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+  ok "Removed $BOOST_SYSCTL and reloaded system defaults."
+  boost_status
+}
+boost_cmd() {
+  case "${1:-}" in
+    --status|-s|status) boost_status ;;
+    --undo|-u|undo) boost_undo ;;
+    --yes|-y|apply|"") boost_apply ;;
+    *) err "Usage: $SELF boost [--status|--undo|--yes]"; return 1 ;;
+  esac
+}
+boost_menu() {
+  while :; do
+    page "Kernel Speed Boost (/boost)"
+    boost_status
+    echo
+    printf '  %s apply boost tunables   %s undo / restore defaults   %s back\n' \
+      "$(key_label a)" "$(key_label u)" "$(key_label b)"
+    key_read
+    case "$KEY" in
+      a) boost_apply; pause ;;
+      u) confirm "Rollback boost tunables?" y && boost_undo; pause ;;
+      b|0|q|enter|esc) return 0 ;;
+    esac
+  done
+}
+
+# ======================================================================================
+#  Off-Peak Auto-Optimize (Timer)
+# ======================================================================================
+OPTIMIZE_UNIT=$WAT_PREFIX-auto-optimize
+optimize_enable() {
+  local mgr=/usr/local/bin/wattun-manager
+  [ "$SANDBOX" = 1 ] && mgr=$MGR
+  {
+    printf '[Unit]\nDescription=WatTunnel off-peak auto-optimize%s\n[Service]\nType=oneshot\n' "$([ "$SANDBOX" = 1 ] && echo " (sandbox $WAT_PREFIX)")"
+    unit_env_lines
+    printf 'ExecStart=%s auto-optimize\n' "$mgr"
+  } >"/etc/systemd/system/$OPTIMIZE_UNIT.service"
+  cat >"/etc/systemd/system/$OPTIMIZE_UNIT.timer" <<EOF
+[Unit]
+Description=WatTunnel off-peak auto-optimize daily at 04:30
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "/etc/systemd/system/$OPTIMIZE_UNIT.service" "/etc/systemd/system/$OPTIMIZE_UNIT.timer"
+  systemctl daemon-reload && systemctl enable --now "$OPTIMIZE_UNIT.timer" >/dev/null 2>&1 && ok "Auto-optimize timer enabled (daily at 04:30)."
+}
+optimize_disable() {
+  systemctl disable --now "$OPTIMIZE_UNIT.timer" >/dev/null 2>&1; ok "Auto-optimize timer disabled."
+}
+auto_optimize_all() {
+  local n
+  for n in $(tunnels); do
+    if [ "$(role "$n")" = Iran ] && [ -f "$CONF/$n.auto" ]; then
+      logger -t wattun-auto-optimize "running scheduled off-peak optimization for $n"
+      AUTO_OPTIMIZE=1 auto_retest "$n"
+    fi
+  done
+}
+
+# ======================================================================================
+#  Backup & Restore, Bulk Operations
+# ======================================================================================
+backup_cmd() { # [dest.tar.gz]
+  local dest=${1:-wattun-backup-$(date +%Y%m%d%H%M%S).tar.gz}
+  dest=$(readlink -f "$dest" 2>/dev/null || echo "$dest")
+  say "  Backing up $CONF to $dest..."
+  tar -czf "$dest" -C "${CONF%/*}" "${CONF##*/}" || { err "Backup failed"; return 1; }
+  chmod 600 "$dest"
+  ok "Backup saved: $dest ($(du -h "$dest" | cut -f1))"
+}
+restore_cmd() { # <archive.tar.gz>
+  local src=${1:-}
+  [ -f "$src" ] || { err "Backup archive '$src' not found."; return 1; }
+  say "  Restoring $CONF from $src..."
+  mkdir -p "$CONF"
+  tar -xzf "$src" -C "${CONF%/*}" || { err "Restore extraction failed"; return 1; }
+  chmod 700 "$CONF"
+  chmod 600 "$CONF"/*.key 2>/dev/null || true
+  chmod 600 "$CONF"/*.yml 2>/dev/null || true
+  ok "Restored configuration to $CONF."
+  systemctl daemon-reload 2>/dev/null || true
+  ok "Ready. You can start or restart your tunnels now."
+}
+start_all() {
+  local n c=0
+  for n in $(tunnels); do
+    if ! systemctl is-active -q "${WAT_PREFIX}@$n" 2>/dev/null; then
+      step "Starting ${WAT_PREFIX}@$n" systemctl start "${WAT_PREFIX}@$n"; c=$((c+1))
+    fi
+  done
+  [ "$c" -gt 0 ] && ok "Started $c tunnel(s)." || warn "All tunnels are already active."
+}
+stop_all() {
+  local n c=0
+  for n in $(tunnels); do
+    if systemctl is-active -q "${WAT_PREFIX}@$n" 2>/dev/null; then
+      step "Stopping ${WAT_PREFIX}@$n" systemctl stop "${WAT_PREFIX}@$n"; c=$((c+1))
+    fi
+  done
+  [ "$c" -gt 0 ] && ok "Stopped $c tunnel(s)." || warn "All tunnels are already stopped."
+}
+batch_actions_menu() {
+  while :; do
+    page "Batch Tunnel Actions"
+    say "  ${BOLD}Select a bulk operation:${RST}"
+    echo
+    printf '  %s start all tunnels      %s stop all tunnels       %s restart all tunnels\n' "$(key_label 1)" "$(key_label 2)" "$(key_label 3)"
+    printf '  %s status of all tunnels  %s backup all configs     %s restore configs\n' "$(key_label 4)" "$(key_label 5)" "$(key_label 6)"
+    printf '  %s back\n' "$(key_label b)"
+    key_read
+    case "$KEY" in
+      1) start_all; pause ;;
+      2) confirm "Stop all active tunnels?" n && stop_all; pause ;;
+      3) confirm "Restart all tunnels? Open connections drop." n && restart_all; pause ;;
+      4) status_all; pause ;;
+      5) echo; ask "Backup destination file" "wattun-backup-$(date +%Y%m%d).tar.gz"; backup_cmd "$REPLY_V"; pause ;;
+      6) echo; ask "Path to backup .tar.gz" ""; restore_cmd "$REPLY_V"; pause ;;
+      b|0|q|enter|esc) return 0 ;;
+    esac
+  done
+}
+
+# ======================================================================================
+#  Bonding Manager Submenu
+# ======================================================================================
+bonding_menu() { # name
+  local n=$1 r cr
+  r=$(role "$n"); cr=$(cfg "$n" carrier)
+  while :; do
+    page "Bonding Manager" "$n"
+    tinfo "$n"
+    local bmode=$(cfg "$n" bond-mode)
+    say "  Bond Carrier:  ${BOLD}$cr${RST}"
+    say "  Bond Mode:     ${BOLD}${bmode:-balanced}${RST} ${GRY}(balanced | active-backup | replicate)${RST}"
+    echo
+    if [ "$TI_CAR_COUNT" -gt 0 ]; then
+      printf '  %s%4s  %-10s %-8s %8s %8s %12s%s\n' "$GRY" '#' PATH STATE RTT LOSS SHARE "$RST"
+      local ci ccol cdot ctxt c_pct
+      for ((ci=0; ci<TI_CAR_COUNT; ci++)); do
+        if [ "${CAR_MUTED[$ci]}" = true ]; then
+          ccol=$GRY; cdot='○'; ctxt="MUTED"
+        elif [ "${CAR_ALIVE[$ci]}" = true ]; then
+          ccol=$GRN; cdot='●'; ctxt="UP"
+        else
+          ccol=$RED; cdot='○'; ctxt="DOWN"
+        fi
+        c_pct=$(awk -v s="${CAR_SHARE[$ci]:-0}" 'BEGIN{printf "%.0f", s*100}')
+        printf '  %s%4s%s  %-10s %s%s %-6s%s %6.0f ms %7.1f%% %11s%%\n' "$CYN" "$ci" "$RST" \
+          "${CAR_NAME[$ci]}" "$ccol" "$cdot" "$ctxt" "$RST" "${CAR_RTT[$ci]}" "$(awk -v l="${CAR_LOSS[$ci]:-0}" 'BEGIN{printf "%.1f", l*100}')" "$c_pct"
+      done
+    else
+      say "  ${GRY}No multi-carrier telemetry active yet (tunnel stopped or single carrier).${RST}"
+    fi
+    echo
+    printf '  %s toggle/mute path   %s change bond mode   %s add carrier   %s remove carrier   %s back\n' \
+      "$(key_label t)" "$(key_label m)" "$(key_label a)" "$(key_label d)" "$(key_label b)"
+    key_read
+    case "$KEY" in
+      t)
+        echo
+        ask_ok "Path index to toggle mute" "0" v_num || continue
+        local pidx=$REPLY_V m=$(cfg "$n" metrics)
+        if [ -n "$m" ]; then
+          local res
+          res=$(curl -fs --noproxy '*' --max-time 3 "http://$m/carrier/toggle?path=$pidx" 2>/dev/null)
+          if [ -n "$res" ]; then
+            ok "Toggled mute on path $pidx (muted: $(jget "$res" muted))."
+          else
+            err "Failed to toggle path $pidx on metrics server http://$m."
+          fi
+        else
+          warn "Tunnel '$n' has no metrics endpoint configured."
+        fi
+        pause ;;
+      m)
+        echo
+        say "  Choose bond mode:"
+        say "    ${CYN}1${RST} balanced       (smooth weighted round-robin based on path capacities)"
+        say "    ${CYN}2${RST} active-backup  (100% on primary path, 50ms keepalives on secondary, fast cutover)"
+        say "    ${CYN}3${RST} replicate      (replicate datagrams across all paths for zero loss)"
+        ask_ok "Choice" "1" v_nonempty || continue
+        case "$REPLY_V" in
+          1|balanced) set_value "$n" bond-mode balanced ;;
+          2|active-backup) set_value "$n" bond-mode active-backup ;;
+          3|replicate) set_value "$n" bond-mode replicate ;;
+          *) warn "Unknown bond mode '$REPLY_V'."; continue ;;
+        esac
+        ok "Set bond-mode: $(cfg "$n" bond-mode)"
+        confirm "Restart '$n' to apply mode change?" y && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
+        pause ;;
+      a)
+        echo
+        ask_ok "Carrier name to add (tcp, tls, ws, wss, udp, icmp...)" "tls" v_nonempty || continue
+        local ncar=$REPLY_V cur_car=$(cfg "$n" carrier)
+        if [[ "$cur_car" == *"$ncar"* ]]; then
+          warn "Carrier '$ncar' is already in carrier list '$cur_car'."
+        else
+          set_value "$n" carrier "$cur_car+$ncar"
+          ok "Updated carrier: $(cfg "$n" carrier)"
+          confirm "Restart '$n' to apply new carrier bond?" y && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
+        fi
+        pause ;;
+      d)
+        echo
+        ask_ok "Carrier name to remove" "" v_nonempty || continue
+        local rcar=$REPLY_V cur_car=$(cfg "$n" carrier)
+        if [[ "$cur_car" != *"$rcar"* ]]; then
+          warn "Carrier '$rcar' not found in '$cur_car'."
+        else
+          local new_car
+          new_car=$(echo "$cur_car" | sed -E "s/(^|\+)$rcar(\+|$)/\1/g; s/^\+//; s/\+$//")
+          if [ -z "$new_car" ]; then
+            err "Cannot remove the only carrier."
+          else
+            set_value "$n" carrier "$new_car"
+            ok "Updated carrier: $(cfg "$n" carrier)"
+            confirm "Restart '$n' to apply?" y && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
+          fi
+        fi
+        pause ;;
+      b|0|q|enter|esc) break ;;
+    esac
+  done
+}
+
+# ======================================================================================
+#  Auto Mode Settings Submenu
+# ======================================================================================
+auto_menu() { # name
+  local n=$1 cur pol sla_f
+  sla_f="$CONF/$n.sla"
+  while :; do
+    page "Auto Mode Settings & SLA" "$n"
+    cur=$(auto_current_key "$n" 2>/dev/null || cfg "$n" carrier)
+    pol=$(cat "$CONF/$n.policy" 2>/dev/null || echo speed)
+    say "  Current Variant:  ${BOLD}${cur:--}${RST}"
+    say "  Selection Policy: ${BOLD}$pol${RST} ${GRY}(speed | latency | direct | bond)${RST}"
+    echo
+    say "  ${BOLD}Service Level Agreement (SLA) Thresholds:${RST}"
+    if [ -f "$sla_f" ]; then
+      local min_r=$(grep '^sla_min_rate_kbps=' "$sla_f" 2>/dev/null | cut -d= -f2)
+      local max_rtt=$(grep '^sla_max_rtt_ms=' "$sla_f" 2>/dev/null | cut -d= -f2)
+      local max_l=$(grep '^sla_max_loss_pct=' "$sla_f" 2>/dev/null | cut -d= -f2)
+      say "    • Min Throughput: ${min_r:-0} kbps"
+      say "    • Max Latency:    ${max_rtt:-0} ms"
+      say "    • Max Loss:       ${max_l:-0} %"
+    else
+      say "    ${GRY}No SLA configured (heal only triggers on complete link disconnect).${RST}"
+    fi
+    echo
+    local opt_timer_st="off"
+    systemctl is-active -q "$WAT_PREFIX-auto-optimize.timer" 2>/dev/null && opt_timer_st="${GRN}active${RST}"
+    say "  Off-Peak Auto-Optimize Timer: $opt_timer_st ${GRY}(daily scheduled re-evaluations)${RST}"
+    echo
+    printf '  %s change policy   %s configure SLA   %s retest & re-rank now   %s toggle timer   %s back\n' \
+      "$(key_label p)" "$(key_label s)" "$(key_label r)" "$(key_label o)" "$(key_label b)"
+    key_read
+    case "$KEY" in
+      p)
+        echo
+        say "  Choose carrier selection policy:"
+        say "    ${CYN}1${RST} speed    (rank by Down+Up throughput, lowest RTT tiebreak)"
+        say "    ${CYN}2${RST} latency  (rank by lowest round-trip latency)"
+        say "    ${CYN}3${RST} direct   (prioritize direct unproxied paths over CDN)"
+        say "    ${CYN}4${RST} bond     (automatically bond top direct performers)"
+        ask_ok "Choice" "1" v_nonempty || continue
+        case "$REPLY_V" in
+          1|speed) echo speed >"$CONF/$n.policy" ;;
+          2|latency) echo latency >"$CONF/$n.policy" ;;
+          3|direct) echo direct >"$CONF/$n.policy" ;;
+          4|bond) echo bond >"$CONF/$n.policy" ;;
+          *) warn "Unknown policy '$REPLY_V'."; continue ;;
+        esac
+        ok "Policy saved: $(cat "$CONF/$n.policy")"
+        pause ;;
+      s)
+        echo
+        local cur_min=0 cur_rtt=0 cur_loss=0
+        if [ -f "$sla_f" ]; then
+          cur_min=$(grep '^sla_min_rate_kbps=' "$sla_f" | cut -d= -f2)
+          cur_rtt=$(grep '^sla_max_rtt_ms=' "$sla_f" | cut -d= -f2)
+          cur_loss=$(grep '^sla_max_loss_pct=' "$sla_f" | cut -d= -f2)
+        fi
+        ask_ok "Minimum required throughput in kbps (0 = none)" "${cur_min:-0}" v_num || continue
+        cur_min=$REPLY_V
+        ask_ok "Maximum tolerable RTT in ms (0 = none, e.g. 300)" "${cur_rtt:-0}" v_num || continue
+        cur_rtt=$REPLY_V
+        ask_ok "Maximum tolerable packet loss % (0 = none, e.g. 10)" "${cur_loss:-0}" v_num || continue
+        cur_loss=$REPLY_V
+        {
+          echo "sla_min_rate_kbps=$cur_min"
+          echo "sla_max_rtt_ms=$cur_rtt"
+          echo "sla_max_loss_pct=$cur_loss"
+        } >"$sla_f"
+        chmod 600 "$sla_f"
+        ok "SLA configured."
+        pause ;;
+      r)
+        echo
+        say "  Running auto-test & policy re-evaluation..."
+        AUTO_OPTIMIZE=1 auto_retest "$n"
+        pause ;;
+      o)
+        echo
+        if systemctl is-active -q "$WAT_PREFIX-auto-optimize.timer" 2>/dev/null; then
+          optimize_disable
+        else
+          optimize_enable
+        fi
+        sleep 1 ;;
+      b|0|q|enter|esc) break ;;
+    esac
+  done
+}
+
+# ======================================================================================
+#  Bandwidth Quotas & Limits Submenu
+# ======================================================================================
+limits_menu() { # name
+  local n=$1 r cr
+  r=$(role "$n"); cr=$(cfg "$n" carrier)
+  while :; do
+    page "Bandwidth Quotas & Rate Limits" "$n"
+    say "  Global Speed Ceiling (max-mbps): $(cfg "$n" max-mbps | sed 's/^$/16 (default)/') MB/s"
+    echo
+    say "  ${BOLD}Configured Per-Port Limits & Quotas:${RST}"
+    local -a p_limits=()
+    mapfile -t p_limits < <(grep -E '^[[:space:]]*-[[:space:]]+[0-9]+' "$CONF/$n.yml" | grep -E 'rate=|quota=' || true)
+    if [ "${#p_limits[@]}" -gt 0 ]; then
+      local it
+      for it in "${p_limits[@]}"; do
+        say "    $it"
+      done
+    else
+      say "    ${GRY}No per-port rate limits or quotas active.${RST}"
+    fi
+    echo
+    local m=$(cfg "$n" metrics)
+    if [ -n "$m" ]; then
+      local prt_json
+      prt_json=$(curl -fs --noproxy '*' --max-time 2 "http://$m/ports" 2>/dev/null)
+      if [ -n "$prt_json" ]; then
+        say "  ${BOLD}Live Port Quota Usage:${RST}"
+        local pobj
+        while read -r pobj; do
+          [ -n "$pobj" ] || continue
+          local lp qu ql qe
+          lp=$(jget "$pobj" port)
+          qu=$(jget "$pobj" quota_used)
+          ql=$(jget "$pobj" quota_limit)
+          qe=$(jget "$pobj" quota_exceeded)
+          if [ "${ql:-0}" -gt 0 ]; then
+            say "    Port $lp: used $(human "$qu") / $(human "$ql") $([ "$qe" = true ] && printf '%s[EXCEEDED]%s' "$RED$BOLD" "$RST")"
+          fi
+        done < <(grep -o '{[^{}]*}' <<<"$prt_json")
+      fi
+    fi
+    echo
+    printf '  %s speed ceiling   %s add/edit port limit   %s reset port quota   %s back\n' \
+      "$(key_label m)" "$(key_label e)" "$(key_label r)" "$(key_label b)"
+    key_read
+    case "$KEY" in
+      m)
+        echo
+        ask_ok "Global speed ceiling in MB/s (- or 0 or default = unset)" "$(cfg "$n" max-mbps)" v_mbps_adv || continue
+        case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
+        if [ -z "$REPLY_V" ]; then unset_value "$n" max-mbps; else set_value "$n" max-mbps "$REPLY_V"; fi
+        ok "Saved. Restart '$n' to apply."
+        pause ;;
+      e)
+        echo
+        ask_ok "Port to limit" "" v_port || continue
+        local lport=$REPLY_V
+        ask_ok "Rate limit (e.g. 5MB, 300k, 0 = none)" "0" v_pool_bytes || continue
+        local lrate=$REPLY_V
+        ask_ok "Quota limit (e.g. 100GB, 500MB, 0 = none)" "0" v_pool_bytes || continue
+        local lquota=$REPLY_V
+        set_port_limit "$n" "$lport" "$lrate" "$lquota"
+        ok "Saved limit for port $lport. Hot-reloaded automatically by engine."
+        pause ;;
+      r)
+        echo
+        ask_ok "Port to reset quota for" "" v_port || continue
+        local rport=$REPLY_V
+        if [ -n "$m" ]; then
+          local rres
+          rres=$(curl -fs --noproxy '*' --max-time 3 -X POST "http://$m/quota/reset?port=$rport" 2>/dev/null)
+          if [ -n "$rres" ]; then
+            ok "Quota for port $rport reset."
+          else
+            err "Failed to reset quota on metrics server http://$m."
+          fi
+        else
+          warn "Tunnel '$n' has no metrics endpoint configured."
+        fi
+        pause ;;
+      b|0|q|enter|esc) break ;;
+    esac
+  done
+}
+
 tunnel_page() {
   local n=$1 r run
   while :; do
@@ -4597,24 +5472,31 @@ tunnel_page() {
     run=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null)
     echo
     printf '  %sStatus%s      %s diagnose + speed test   %s speed test only   %s logs\n' "$BOLD" "$RST" "$(key_label d)" "$(key_label v)" "$(key_label l)"
-    printf '  %sPorts%s       %s edit port mappings\n' "$BOLD" "$RST" "$(key_label p)"
-    if [ "$r" = Kharej ]; then printf '  %sConnection%s  %s show token   %s new key + token   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label k)" "$(key_label o)"
-    else printf '  %sConnection%s  %s paste new token   %s change Kharej address   %s anti-censor   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label a)" "$(key_label k)" "$(key_label o)"; fi
+    printf '  %sPorts%s       %s edit port mappings      %s quotas & rate limits\n' "$BOLD" "$RST" "$(key_label p)" "$(key_label q)"
+    if [ "$r" = Kharej ]; then
+      printf '  %sConnection%s  %s show token   %s new key + token   %s bonding manager   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label k)" "$(key_label b)" "$(key_label o)"
+    else
+      printf '  %sConnection%s  %s paste token  %s Kharej address    %s anti-censor       %s auto mode & SLA\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label h)" "$(key_label k)" "$(key_label a)"
+      printf '              %s bonding manager   %s advanced settings\n' "$(key_label b)" "$(key_label o)"
+    fi
     printf '              %s change connection type (icmp, udp, tcp, CDN... or several at once)\n' "$(key_label m)"
     printf '  %sService%s     %s restart  %s %s  %s start at boot on/off  %s edit file\n' "$BOLD" "$RST" "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
-    printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label x)" "$(key_label b)"
+    printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label x)" "$(key_label 0)"
     key_read
     case "$KEY" in
       d) page "Diagnose" "$n"; run_flow test_tunnel "$n"; pause ;;
       v) page "Speed test" "$n"; run_flow speed_test "$n"; pause ;;
       l) page "Logs" "$n"; run_flow logs_menu "$n"; pause ;;
       p) run_flow edit_ports "$n"; pause ;;
+      q) run_flow limits_menu "$n" ;;
+      b) run_flow bonding_menu "$n" ;;
+      a) [ "$r" = Iran ] && run_flow auto_menu "$n" ;;
+      h) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
       t) if [ "$r" = Kharej ]; then
            page "Token" "$n"; echo; say "  Paste this on the Iran server ($SELF → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
          else page "New token" "$n"; echo; run_flow change_key "$n"; fi
          pause ;;
       k) if [ "$r" = Kharej ]; then page "New key" "$n"; run_flow change_key "$n"; pause; else anticensor_menu "$n"; fi ;;
-      a) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
       o) run_flow adv_menu "$n" ;;
       m) page "Connection type" "$n"; run_flow change_type "$n"; pause ;;
       r) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; sleep 1; fi ;;
@@ -4627,7 +5509,7 @@ tunnel_page() {
          sleep 1 ;;
       c) ${EDITOR:-nano} "$CONF/$n.yml"; echo; confirm "Restart to apply? (port changes apply without restart)" n && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n" ;;
       x|X) page "Delete tunnel" "$n"; echo; run_flow delete_tunnel "$n"; pause ;;
-      b|0|q|enter|esc) return 0 ;;
+      0|esc|enter) return 0 ;;
       *) : ;;
     esac
   done
@@ -4657,15 +5539,48 @@ EOF
   systemctl daemon-reload && systemctl enable --now "$HEAL_UNIT.timer" >/dev/null 2>&1 && ok "Auto-heal enabled."
 }
 heal_disable() { systemctl disable --now "$HEAL_UNIT.timer" >/dev/null 2>&1; ok "Auto-heal disabled."; }
-heal() { # restart Iran tunnels whose link is down 3 checks in a row
-  local n cnt f st cyc
+heal() { # restart Iran tunnels whose link is down or breaches SLA 3 checks in a row
+  local n cnt f st cyc sla_f b_f
   mkdir -p "$RUN"
   for n in $(tunnels); do
     [ "$(role "$n")" = Iran ] && systemctl is-enabled -q "${WAT_PREFIX}@$n" || continue
     f="$RUN/$n.down"
+    b_f="$RUN/$n.sla_breach"
     st=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null)
-    if [ "$st" = inactive ]; then rm -f "$f" "$RUN/$n.cycles"; continue; fi # stopped on purpose: leave it alone
-    if [ "$(jget "$(stats "$n")" alive)" = true ]; then rm -f "$f" "$RUN/$n.cycles"; continue; fi
+    if [ "$st" = inactive ]; then rm -f "$f" "$RUN/$n.cycles" "$b_f"; continue; fi # stopped on purpose: leave it alone
+    local s_raw; s_raw=$(stats "$n")
+    local rx_age; rx_age=$(jget "$s_raw" last_rx_age_ms 2>/dev/null || echo -1)
+    if [ "$(jget "$s_raw" alive)" = true ] && [ "$rx_age" -ge 0 ] && [ "$rx_age" -lt 35000 ]; then
+      rm -f "$f" "$RUN/$n.cycles"
+      sla_f="$CONF/$n.sla"
+      if [ -f "$sla_f" ]; then
+        local min_r max_rtt max_loss rtt loss rate_kbps breached=0
+        min_r=$(grep '^sla_min_rate_kbps=' "$sla_f" 2>/dev/null | cut -d= -f2)
+        max_rtt=$(grep '^sla_max_rtt_ms=' "$sla_f" 2>/dev/null | cut -d= -f2)
+        max_loss=$(grep '^sla_max_loss_pct=' "$sla_f" 2>/dev/null | cut -d= -f2)
+        rtt=$(jget "$s_raw" srtt_ms)
+        loss=$(jget "$s_raw" loss_pct)
+        rate_kbps=$(( $(jget "$s_raw" rate_bps) / 1000 ))
+        [ -n "$max_rtt" ] && [ "$max_rtt" -gt 0 ] && [ "${rtt%.*}" -gt "$max_rtt" ] 2>/dev/null && breached=1
+        [ -n "$max_loss" ] && [ "$max_loss" -gt 0 ] && [ "${loss%.*}" -gt "$max_loss" ] 2>/dev/null && breached=1
+        [ -n "$min_r" ] && [ "$min_r" -gt 0 ] && [ "$rate_kbps" -lt "$min_r" ] 2>/dev/null && breached=1
+        if [ "$breached" = 1 ]; then
+          local b_cnt=$(( $(cat "$b_f" 2>/dev/null || echo 0) + 1 ))
+          echo "$b_cnt" >"$b_f"
+          if [ "$b_cnt" -ge 3 ]; then
+            logger -t wattun-heal "tunnel $n breached SLA for 3 consecutive checks (rtt=${rtt}ms, loss=${loss}%, rate=${rate_kbps}kbps), triggering re-evaluation"
+            rm -f "$b_f"
+            touch "$RUN/$n.sla_triggered"
+            if [ -f "$CONF/$n.auto" ]; then
+              heal_retest "$n"
+            fi
+          fi
+        else
+          rm -f "$b_f"
+        fi
+      fi
+      continue
+    fi
     cnt=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$cnt" >"$f"
     if [ "$cnt" -ge 3 ]; then
       logger -t wattun-heal "tunnel $n down for $cnt checks, restarting"
@@ -4818,10 +5733,11 @@ settings_menu() {
     say "  Auto-heal   $heal_on   ${GRY}restarts an Iran tunnel whose link stays down for 3 minutes${RST}"
     say "  Animations  $anim_on   ${GRY}spinners and the intro (WAT_NO_ANIM=1 also turns them off)${RST}"
     echo
-    printf '  %s toggle auto-heal   %s toggle animations   %s restart all tunnels\n' "$(key_label h)" "$(key_label a)" "$(key_label r)"
+    printf '  %s toggle auto-heal   %s toggle animations   %s kernel speed boost (/boost)\n' "$(key_label h)" "$(key_label a)" "$(key_label b)"
+    printf '  %s restart all tunnels\n' "$(key_label r)"
     echo
     say "  ${BOLD}Maintenance${RST}"
-    printf '  %s roll back to the previous version   %s uninstall WatTunnel   %s back\n' "$(key_label v)" "$(key_label x)" "$(key_label b)"
+    printf '  %s roll back to the previous version   %s uninstall WatTunnel   %s back\n' "$(key_label v)" "$(key_label x)" "$(key_label 0)"
     key_read
     case "$KEY" in
       v|V) page "Roll back"; echo; run_flow rollback; pause ;;
@@ -4829,7 +5745,8 @@ settings_menu() {
       h) echo; if systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null; then heal_disable; else heal_enable; fi; sleep 1 ;;
       r) echo; if confirm "Restart all tunnels? Open connections drop." n; then restart_all; sleep 1; fi ;;
       a) if [ "$(conf_get anim 1)" = 1 ]; then conf_set anim 0; ANIM=0; else conf_set anim 1; [ "$IS_TTY" = 1 ] && [ "${WAT_NO_ANIM:-0}" != 1 ] && ANIM=1; fi ;;
-      b|0|q|enter|esc) return 0 ;;
+      b|B) boost_menu ;;
+      0|q|enter|esc) return 0 ;;
       *) : ;;
     esac
   done
@@ -4860,6 +5777,7 @@ main_menu() {
           if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#DASH_N[@]}" ]; then tunnel_page "${DASH_N[$((num-1))]}"; break
           else flash "No tunnel number $num."; fi ;;
         n|N) new_tunnel; break ;;
+        a|A) batch_actions_menu; break ;;
         m|M) if [ "${#DASH_N[@]}" -gt 0 ]; then run_flow live_monitor; fi; break ;;
         s|S) settings_menu; break ;;
         u|U) page "Update"; echo; if update; then echo; hint "The manager reloads itself to show the new version."; pause; exec "$MGR"; fi; pause; break ;;
@@ -4892,7 +5810,7 @@ ni_parse() {
         else
           NI_GOVERNOR=true
         fi; continue ;;
-      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--sessions|--fake-sni|--fake-mode|--fake-ttl|--pool-rotate|--pool-rotate-bytes|--preset|--ech|--dns-listen|--src-ip)
+      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--sessions|--conns|--mtu|--policy|--fake-sni|--fake-mode|--fake-ttl|--pool-rotate|--pool-rotate-bytes|--preset|--ech|--dns-listen|--src-ip)
         if [ "$hasv" = 0 ]; then
           [ $# -gt 0 ] || { err "$f needs a value"; return 1; }
           v=$1; shift
@@ -4901,7 +5819,7 @@ ni_parse() {
       *) NI_POS+=("$f"); continue ;;
     esac
     case "$f" in
-      --carrier) case "$v" in wss|grpc|tcp|tls|ws|h2|h2c|udp|icmp|auto) NI_CARRIER=$v ;; *) err "--carrier: use wss, grpc, tcp, tls, ws, h2, h2c, udp, icmp or auto (got '$v')"; return 1 ;; esac ;;
+      --carrier) case "$v" in wss|grpc|tcp|tls|ws|h2|h2c|udp|icmp|auto|fortress) NI_CARRIER=$v ;; *) err "--carrier: use wss, grpc, tcp, tls, ws, h2, h2c, udp, icmp, auto or fortress (got '$v')"; return 1 ;; esac ;;
       --preset) v_preset "$v" || return 1; NI_PRESET=$(preset_canonical "$v") ;;
       --ech)
         v_ech "$v" || return 1
@@ -4926,6 +5844,9 @@ ni_parse() {
       --map) [ -n "$v" ] || { err "--map needs a list such as 39901:18999,8443:443"; return 1; }; NI_MAP=$v ;;
       --pick) case "$v" in best|bond) NI_PICK=$v ;; *,*) [[ "$v" =~ ^[0-9]+(,[0-9]+)+$ ]] || { err "--pick: rows joined with commas, such as 1,3 (got '$v')"; return 1; }; NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond, a row number or rows such as 1,3 (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
       --sessions) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$v))" -ge 1 ] || { err "--sessions: use a number of sessions, 1 or more (got '$v')"; return 1; }; NI_SESSIONS=$((10#$v)) ;;
+      --conns) v_conns "$v" || return 1; NI_CONNS=$((10#$v)) ;;
+      --mtu) v_mtu "$v" || return 1; NI_MTU=$((10#$v)) ;;
+      --policy) case "$v" in speed|latency|direct|bond) NI_POLICY=$v ;; *) err "--policy: use speed, latency, direct or bond (got '$v')"; return 1 ;; esac ;;
       --dns-listen) v_dns_listen "$v" || return 1; NI_DNSLISTEN=$v ;;
       --src-ip) v_src_ip "$v" || return 1; NI_SRCIP=$v ;;
     esac
@@ -4965,9 +5886,18 @@ Usage: $SELF [command]
   blackout NAME [SNI|PRESET] turn on resilience: accepts operator preset (mci, irancell, blackout, conservative)
                         or custom allowlisted SNI (e.g. mci.ir), restarts, tests filter bypass.
                         Fine-tuning (mode, ttl, pool-rotate, ech): tunnel page -> o -> k. Linux only.
+  arm-blackout NAME     arm Kharej in Fortress mode (multi-carrier listeners, sysctls, firewall)
+                        or arm Iran for autonomous failover (silence detection, heal timer)
+  audit-blackout NAME   audit blackout readiness (capabilities, sysctls, port conflicts, DNS relay)
   matrix NAME           anti-censor matrix: test EVERY resilience combination (fake-SNI x mode x ECH)
                         from this Iran server with throw-away clients, apply the best that connects.
                         Kharej is never contacted except through the tunnel itself. Linux only.
+  boost [--status|--undo|--yes]  kernel speed boost (BBR, 64MB buffers, FQ)
+  backup [dest.tar.gz]  backup all tunnel configs and keys to archive
+  restore <archive.tar.gz> restore tunnel configs and keys from archive
+  start-all | stop-all  bulk start or stop all tunnels
+  restart-all           restart all tunnels
+  auto-optimize         run off-peak carrier re-evaluation for auto tunnels
   auto-test NAME        test every connection type again for an auto Iran tunnel, offer to switch
   auto-ip NAME IP       auto Kharej tunnel: set Iran's IP by hand (creates NAME-r, the reverse side)
   cdn-tune NAME [full]  Iran CDN tunnel (ws/wss/h2/h2c/grpc): find the Cloudflare edges that serve the domain over ECH + TLS settings, apply (needs wattun 2.2.0)
@@ -5011,7 +5941,7 @@ EOF
 main() {
   [ -x "$BIN" ] && VER=$("$BIN" -version 2>/dev/null | awk '{print $2; exit}')
   case "${1:-}" in help|-h|--help) usage; return 0 ;; esac
-  case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall|preset|blackout|test-bypass|test-anticensor|matrix) ni_parse "${@:2}" || exit 1 ;; esac
+  case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall|preset|blackout|test-bypass|test-anticensor|matrix|arm-blackout|audit-blackout|boost) ni_parse "${@:2}" || exit 1 ;; esac
   case "${1:-}" in auto-retest) [ "${2:-}" = --yes ] && NONINTERACTIVE=1 ;; esac
   if [ "$NONINTERACTIVE" = 1 ]; then
     case "${1:-}" in ''|new|monitor|ports|logs) err "'${1:-(no command)}' needs a terminal; unattended use: kharej, iran, cdn-tune, auto-test, delete, uninstall, status, test, token, matrix (see: help)"; exit 1 ;; esac
@@ -5038,6 +5968,14 @@ main() {
     delete) need_tunnel "${NI_POS[0]:?name}" && if [ "$NONINTERACTIVE" = 1 ]; then ni_run delete_tunnel "${NI_POS[0]}"; else run_flow delete_tunnel "${NI_POS[0]}"; fi ;;
     uninstall) if [ "$NONINTERACTIVE" = 1 ]; then ni_run uninstall_all; else run_flow uninstall_all; fi ;;
     status|list) status_all ;;
+    start-all) start_all ;;
+    stop-all) stop_all ;;
+    restart-all) restart_all ;;
+    status-all) status_all ;;
+    backup) shift; backup_cmd "$@" ;;
+    restore) shift; restore_cmd "$@" ;;
+    boost) shift; boost_cmd "$@" ;;
+    auto-optimize) auto_optimize_all ;;
     monitor) live_monitor ;;
     ports) need_tunnel "${2:?name}" && run_flow edit_ports "$2" ;;
     test) need_tunnel "${2:?name}" && test_tunnel "$2" ;;
@@ -5048,6 +5986,8 @@ main() {
     test-anticensor|test-bypass) need_tunnel "${NI_POS[0]:-${2:-}}" && ni_run anticensor_test "${NI_POS[0]:-${2:-}}" ;;
     profile) shift; profile_cmd "$@" ;;
     blackout) need_tunnel "${NI_POS[0]:-${2:-}}" && ni_run blackout_cmd "${NI_POS[0]:-${2:-}}" "${NI_POS[1]:-${3:-}}" ;;
+    arm-blackout) need_tunnel "${NI_POS[0]:-${2:-}}" && ni_run arm_blackout_cmd "${NI_POS[0]:-${2:-}}" ;;
+    audit-blackout) need_tunnel "${NI_POS[0]:-${2:-}}" && ni_run audit_blackout_cmd "${NI_POS[0]:-${2:-}}" ;;
     matrix|anti-censor-matrix) need_tunnel "${NI_POS[0]:-${2:-}}" && ni_run ac_matrix_cmd "${NI_POS[0]:-${2:-}}" ;;
     heal) heal ;;
     auto-test) need_tunnel "${NI_POS[0]:?name}" && ni_run auto_test_cmd "${NI_POS[0]}" ;;

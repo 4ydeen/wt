@@ -6,7 +6,8 @@
 cd "$(dirname "$0")" || exit 1
 export WAT_MANAGER_LIB=1 WAT_PREFIX=wattest
 export WAT_CONF="$PWD/.smoke/conf" WAT_BIN="$PWD/.smoke/wattun"
-rm -rf "$PWD/.smoke"; mkdir -p "$WAT_CONF"
+export WAT_AUTO_RUN="$PWD/.smoke/run-auto" WAT_RUN="$PWD/.smoke/run"
+rm -rf "$PWD/.smoke"; mkdir -p "$WAT_CONF" "$WAT_AUTO_RUN" "$WAT_RUN"
 trap 'rm -rf "$PWD/.smoke"' EXIT
 fail=0
 chk() { [ "$2" = "$3" ] && echo "ok   $1" || { echo "FAIL $1: got '$2', want '$3'"; fail=1; return; }; }
@@ -26,6 +27,7 @@ bin_ver_ok() { echo 1; }
 role() { echo Iran; }
 uname() { echo Linux; }
 systemctl() { return 0; }
+logger() { :; }
 step() { shift; "$@"; }
 
 profile_cmd save p1 t1
@@ -336,12 +338,12 @@ chk "matrix: ranking fills" "${#AT_RANK[@]}" "10"
 # ac_matrix_apply writes the winner and strips desync keys for the baseline
 AT_SEL=("${AV_LABEL[*]}") # dummy to satisfy set -u shape; real selection below
 AT_SEL=(0)
-ac_matrix_apply t1
+AT_QUIET=1 ac_matrix_apply t1
 chk "matrix apply: strips fake-sni on baseline" "$(grep -c '^fake-sni:' "$WAT_CONF/t1.yml" || true)" "0"
 chk "matrix apply: strips fake-ttl on baseline" "$(grep -c '^fake-ttl:' "$WAT_CONF/t1.yml" || true)" "0"
 AV_SEL=(); for ((i=0; i<${#AV_LABEL[@]}; i++)); do [ "${AV_FM[$i]}" = seqsum ] && AV_SEL+=("$i"); done
 AT_SEL=("${AV_SEL[0]}")
-ac_matrix_apply t1
+AT_QUIET=1 ac_matrix_apply t1
 chk "matrix apply: writes fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t1.yml")" "fake-sni: mci.ir"
 chk "matrix apply: writes fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: seqsum"
 chk "matrix apply: resets fake-ttl" "$(grep -c '^fake-ttl:' "$WAT_CONF/t1.yml" || true)" "0"
@@ -352,6 +354,141 @@ echo "mode: client" >>"$WAT_CONF/t_bond.yml"
 echo "peer: 198.51.100.1:443" >>"$WAT_CONF/t_bond.yml"
 NONINTERACTIVE=1 expect_fail ac_matrix_cmd t_bond
 rm -f "$WAT_CONF/t_bond.yml"
+
+# blackout arming and audit tests
+role() { [ "$1" = t_kharej ] && echo Kharej || echo Iran; }
+echo "carrier: tcp" >"$WAT_CONF/t_kharej.yml"
+echo "mode: server" >>"$WAT_CONF/t_kharej.yml"
+printf 'testkey' >"$WAT_CONF/t_kharej.key"
+NONINTERACTIVE=1 arm_blackout_cmd t_kharej
+chk "arm-blackout kharej carrier" "$(grep '^carrier:' "$WAT_CONF/t_kharej.yml")" "carrier: fortress"
+chk "arm-blackout kharej dns relay" "$(grep '^dns-relay-upstream:' "$WAT_CONF/t_kharej.yml")" "dns-relay-upstream: 1.1.1.1:53"
+NONINTERACTIVE=1 audit_blackout_cmd t_kharej
+chk "audit-blackout exit code" "$?" "0"
+rm -f "$WAT_CONF/t_kharej.yml" "$WAT_CONF/t_kharej.key"
+
+NONINTERACTIVE=1 arm_blackout_cmd t1
+chk "arm-blackout iran probe max" "$(grep '^path-probe-max:' "$WAT_CONF/t1.yml")" "path-probe-max: 6s"
+chk "arm-blackout iran governor" "$(grep '^governor:' "$WAT_CONF/t1.yml")" "governor: true"
+
+# ======================================================================================
+# Phase 1-4: Engine & Transport Suites, Bonding, SLA Healing, Policies & UX Tooling
+# ======================================================================================
+
+# 1. Validators: v_sessions, v_conns, v_mtu
+for s in 1 16 64 - 0 default; do v_sessions "$s" && echo "ok   v_sessions $s" || { echo "FAIL v_sessions $s"; fail=1; }; done
+for s in 65 -1 00 abc; do expect_fail v_sessions "$s"; done
+
+for c in 1 8 128 - 0 default; do v_conns "$c" && echo "ok   v_conns $c" || { echo "FAIL v_conns $c"; fail=1; }; done
+for c in 129 -1 00 abc; do expect_fail v_conns "$c"; done
+
+for m in 576 1400 1500 65535 - 0 default; do v_mtu "$m" && echo "ok   v_mtu $m" || { echo "FAIL v_mtu $m"; fail=1; }; done
+for m in 575 70000 -1 abc; do expect_fail v_mtu "$m"; done
+
+# 2. Unattended flags: --conns, --mtu, --policy
+ni_parse --conns 16 --mtu 1400 --policy latency
+chk "unattended --conns" "$NI_CONNS" "16"
+chk "unattended --mtu" "$NI_MTU" "1400"
+chk "unattended --policy latency" "$NI_POLICY" "latency"
+
+ni_parse --policy direct
+chk "unattended --policy direct" "$NI_POLICY" "direct"
+
+expect_fail ni_parse --conns 200
+expect_fail ni_parse --mtu 100
+expect_fail ni_parse --policy bogus
+
+# 3. Boost Suite: boost_status, boost_apply, boost_undo
+BOOST_SYSCTL="$PWD/.smoke/boost.conf"
+boost_apply >/dev/null 2>&1
+chk "boost_apply created conf" "$([ -f "$BOOST_SYSCTL" ] && echo 1 || echo 0)" "1"
+chk "boost_apply set 64MB rmem" "$(grep -c 'rmem_max = 67108864' "$BOOST_SYSCTL" || true)" "1"
+chk "boost_apply set bbr" "$(grep -c 'tcp_congestion_control = bbr' "$BOOST_SYSCTL" || true)" "1"
+boost_status >/dev/null 2>&1
+chk "boost_status exit code" "$?" "0"
+boost_undo >/dev/null 2>&1
+chk "boost_undo removed conf" "$([ ! -f "$BOOST_SYSCTL" ] && echo 1 || echo 0)" "1"
+
+# 4. Backup & Restore roundtrip
+echo "test_payload: 12345" >"$WAT_CONF/backup_sample.yml"
+backup_cmd "$PWD/.smoke/test_backup.tar.gz" >/dev/null 2>&1
+chk "backup_cmd created archive" "$([ -f "$PWD/.smoke/test_backup.tar.gz" ] && echo 1 || echo 0)" "1"
+rm -f "$WAT_CONF/backup_sample.yml"
+restore_cmd "$PWD/.smoke/test_backup.tar.gz" >/dev/null 2>&1
+chk "restore_cmd restored sample file" "$(grep -c 'test_payload: 12345' "$WAT_CONF/backup_sample.yml" || true)" "1"
+rm -f "$WAT_CONF/backup_sample.yml" "$PWD/.smoke/test_backup.tar.gz"
+
+# 5. at_rank policies: speed, latency, direct
+AV_LABEL=("cdn-fast" "direct-low-rtt" "direct-high-speed")
+AV_CAR=("h2" "tcp" "tls")
+AV_KIND=("c" "d" "d")
+AR_OK=(1 1 1)
+AR_DOWN=(25 5 15)
+AR_UP=(25 5 15)
+AR_RTT=(80 15 30)
+
+at_rank speed
+chk "at_rank speed first" "${AT_RANK[0]}" "0"
+
+at_rank latency
+chk "at_rank latency first" "${AT_RANK[0]}" "1"
+
+at_rank direct
+chk "at_rank direct first" "${AT_RANK[0]}" "2"
+
+# 6. listen_conflict_desc format
+tunnel_using_listen() { [ "$1" = 8443 ] && echo "t_conflict" || echo ""; }
+port_user() { [ "$1" = 443 ] && echo "nginx (PID 1234)" || echo ""; }
+chk "conflict_desc tunnel" "$(listen_conflict_desc tcp 8443)" "tunnel 't_conflict'"
+chk "conflict_desc process" "$(listen_conflict_desc tcp 443)" "nginx (PID 1234)"
+chk "conflict_desc fallback" "$(listen_conflict_desc tcp 9999)" "another process or tunnel"
+
+# 7. SLA monitoring in heal()
+cat >"$WAT_CONF/t_sla.yml" <<'EOF'
+mode: client
+carrier: tcp
+peer: 198.51.100.1:443
+EOF
+cat >"$WAT_CONF/t_sla.sla" <<'EOF'
+sla_min_rate_kbps=1000
+sla_max_rtt_ms=50
+sla_max_loss_pct=5
+EOF
+touch "$WAT_CONF/t_sla.auto"
+tunnels() { echo t_sla; }
+role() { echo Iran; }
+systemctl() { case "$1" in is-active) echo active ;; esac; return 0; }
+retest_triggered=0
+heal_retest() { retest_triggered=1; }
+
+# SLA breach case (rtt = 120ms > 50ms)
+stats() { echo '{"alive": true, "last_rx_age_ms": 100, "srtt_ms": 120, "loss_pct": 0, "rate_bps": 2000000}'; }
+heal; chk "sla breach cnt 1" "$(cat "$RUN/t_sla.sla_breach" 2>/dev/null)" "1"
+heal; chk "sla breach cnt 2" "$(cat "$RUN/t_sla.sla_breach" 2>/dev/null)" "2"
+heal; chk "sla breach triggered retest at 3" "$retest_triggered" "1"
+chk "sla breach reset after trigger" "$([ ! -f "$RUN/t_sla.sla_breach" ] && echo 1 || echo 0)" "1"
+
+# SLA healthy case (clears breach file if count < 3)
+echo "1" >"$RUN/t_sla.sla_breach"
+stats() { echo '{"alive": true, "last_rx_age_ms": 100, "srtt_ms": 20, "loss_pct": 0, "rate_bps": 2000000}'; }
+heal
+chk "sla healthy clears breach" "$([ ! -f "$RUN/t_sla.sla_breach" ] && echo 1 || echo 0)" "1"
+# 8. set_port_limit preserves ports block and updates limits
+cat >"$WAT_CONF/t_lim.yml" <<'EOF'
+mode: client
+ports:
+  - 8080
+  - 9090
+EOF
+set_port_limit t_lim 8080 5MB 10GB
+chk "set_port_limit preserved ports 8080" "$(grep -c '^[[:space:]]*- 8080$' "$WAT_CONF/t_lim.yml" || true)" "1"
+chk "set_port_limit preserved ports 9090" "$(grep -c '^[[:space:]]*- 9090$' "$WAT_CONF/t_lim.yml" || true)" "1"
+chk "set_port_limit wrote limit" "$(grep -c '8080 rate=5MB quota=10GB' "$WAT_CONF/t_lim.yml" || true)" "1"
+# update existing limit
+set_port_limit t_lim 8080 10MB 0
+chk "set_port_limit updated limit" "$(grep -c '8080 rate=10MB' "$WAT_CONF/t_lim.yml" || true)" "1"
+chk "set_port_limit preserved ports after update" "$(grep -c '^[[:space:]]*- 8080$' "$WAT_CONF/t_lim.yml" || true)" "1"
+rm -f "$WAT_CONF/t_lim.yml"
 
 [ "$fail" = 0 ] && echo "ALL OK" || echo "FAILURES: $fail"
 exit "$fail"

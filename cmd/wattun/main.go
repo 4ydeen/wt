@@ -507,6 +507,18 @@ func main() {
 			log.Printf("-sessions is a client option, ignored on the server")
 		}
 		srv = wat.NewServer(cfg, raw)
+		revEngine := wat.NewReviveEngine(k, func(action uint8, src net.Addr) {
+			log.Printf("emergency revive: action 0x%02x signal from %s", action, src)
+			switch action {
+			case wat.ReviveReloadListeners:
+				log.Printf("emergency revive: cycling listeners")
+			case wat.ReviveReverseCompanion:
+				log.Printf("emergency revive: reverse companion trigger from %s", src)
+			case wat.ReviveFlushRateLimits:
+				log.Printf("emergency revive: flushing rate limits")
+			}
+		})
+		srv.SetRevive(revEngine)
 	} else {
 		pios := []wat.PacketIO{pio}
 		for k := 1; k < *nSess; k++ { // -sessions: more independent carriers to the same peer(s)
