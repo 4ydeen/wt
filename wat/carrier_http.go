@@ -147,11 +147,15 @@ type httpListener struct {
 }
 
 func (l *httpListener) push(c net.Conn) {
+	// The 30 s bound (not a shorter one): closing here kills a FINISHED stream, so the session
+	// resends everything it held and the client redials — amplifying the very overload that
+	// stalled the consumer. 30 s exceeds any legitimate accept stall; a genuinely stuck server
+	// still reclaims the conn and the slot (audit 2026-10-22).
 	select {
 	case l.ch <- c:
 	case <-l.done:
 		c.Close()
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		c.Close()
 	}
 }
