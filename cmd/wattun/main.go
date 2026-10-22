@@ -693,19 +693,21 @@ func main() {
 			}
 		}()
 		usr := make(chan os.Signal, 1)
-		signal.Notify(usr, drainSignal)
-		go func() { // SIGUSR1: stop taking new client sessions, exit once the current ones are gone (handover)
-			<-usr
-			srv.Drain()
-			log.Printf("draining: no new sessions; %d active", srv.Sessions())
-			for range time.Tick(2 * time.Second) {
-				if srv.Sessions() == 0 {
-					log.Printf("drained, exiting")
-					portReg.save() // the handover exit skips the signal path's save (audit 2026-10-21)
-					os.Exit(0)
+		if drainSignal != nil {
+			signal.Notify(usr, drainSignal)
+			go func() { // SIGUSR1: stop taking new client sessions, exit once the current ones are gone (handover)
+				<-usr
+				srv.Drain()
+				log.Printf("draining: no new sessions; %d active", srv.Sessions())
+				for range time.Tick(2 * time.Second) {
+					if srv.Sessions() == 0 {
+						log.Printf("drained, exiting")
+						portReg.save() // the handover exit skips the signal path's save (audit 2026-10-21)
+						os.Exit(0)
+					}
 				}
-			}
-		}()
+			}()
+		}
 	} else {
 		cfgPorts := fileCfg != nil && fileCfg.PortsSet
 		if *maps != "" || !cfgPorts && *udpMaps == "" { // without -map and without ports: keep the old "bad -map entry" failure
