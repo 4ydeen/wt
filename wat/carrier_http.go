@@ -221,7 +221,13 @@ func newHTTPPoolServer(addr string, o HTTPServerOptions, mk func(*httpListener) 
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
-		serve()
+		if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// The HTTP server died (accept failure, TLS misconfig): close the pool listener so Accept
+			// returns net.ErrClosed instead of blocking forever on a listener nothing feeds (audit
+			// 2026-10-22: the error used to be discarded and the carrier looked up but never worked).
+			log.Printf("wat: %s http pool server failed: %v", l.addr, err)
+			l.Close()
+		}
 	}()
 	return newPoolServer(l), nil
 }
