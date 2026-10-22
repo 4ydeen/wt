@@ -35,7 +35,10 @@ import (
 
 var carrierNames = []string{"icmp", "udp", "tcp", "tls", "ws", "wss", "h2", "h2c", "grpc"}
 
-var validCarrier = map[string]bool{"icmp": true, "udp": true, "tcp": true, "tls": true, "ws": true, "wss": true, "h2": true, "h2c": true, "grpc": true}
+var validCarrier = map[string]bool{
+	"icmp": true, "udp": true, "tcp": true, "tls": true, "ws": true, "wss": true, "h2": true, "h2c": true, "grpc": true,
+	"fortress": true,
+}
 
 var poolCarriers = map[string]bool{"tcp": true, "tls": true, "ws": true, "wss": true, "h2": true, "h2c": true, "grpc": true}
 
@@ -67,6 +70,7 @@ func main() {
 	hedge := flag.Bool("hedge", false, "send small young packets twice (extra packets, helps lossy tails)")
 	lossCeil := flag.Bool("loss-ceiling", false, "pacer: also cut the rate when loss jumps far above its learned baseline (opt-in; default: delay only)")
 	governor := flag.Bool("governor", false, "pacer, ICMP paths: learn the path's volume ceiling from the reroute signature (a sudden base-RTT jump after sustained bulk) and hold the rate under it (opt-in; replaces hand-tuned max-mbps on routes where ICMP above ~30 MB/s total triggers a reroute inside Iran; 2.9.0)")
+	pingEvery := flag.Int("ping-every", 2, "idle keepalive interval, seconds (raise on paths whose filter rate-limits steady periodic packets into a penalty box: live 2026-10-22 saw 30 echo req/min collapse to 95% loss until a ~5 min cooldown; both ends use their own value)")
 	dnsUpstream := flag.String("dns-relay-upstream", "8.8.8.8:53", "Kharej recursive resolver used by the internal DNS relay (port 53, -ech ladder); empty = 8.8.8.8:53")
 	icmpType := flag.String("icmp-type", "echo", "icmp carrier: echo|timestamp|info|mask - the ICMP request type the client sends (the server answers with the matching reply: 8/0, 13/14, 15/16, 17/18); both ends must use the same")
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
@@ -95,6 +99,7 @@ func main() {
 	srcIP := flag.String("src-ip", "", "client: outbound source IP address for carriers (or per-carrier -src-ip-NAME)")
 	dnsListen := flag.String("dns-listen", "", "client: local address to listen for DNS queries (e.g. 127.0.0.1:53 or 127.0.0.1:5353) and forward them via the tunnel's DNS relay (2.9.0)")
 	pathProbeMax := flag.Duration("path-probe-max", 0, "client, bonded carriers: maximum probe backoff for dead paths (default 30s; blackout mode: 6s)")
+	bondMode := flag.String("bond-mode", "balanced", "client/server, bonded carriers: balanced|active-backup|replicate (default: balanced)")
 	peerBy, listenBy, srcIPBy := map[string]*string{}, map[string]*string{}, map[string]*string{}
 	for _, c := range carrierNames {
 		peerBy[c] = flag.String("peer-"+c, "", "client, bonded carriers: server address of the "+c+" carrier (default: -peer)")
@@ -174,6 +179,21 @@ func main() {
 		os.Exit(2)
 	}
 	server := *mode == "server"
+	if *carrier == "fortress" {
+		*carrier = "icmp+tcp+tls+wss+udp"
+		if v := listenBy["tcp"]; v != nil && *v == "" {
+			*v = ":80"
+		}
+		if v := listenBy["tls"]; v != nil && *v == "" {
+			*v = ":443"
+		}
+		if v := listenBy["wss"]; v != nil && *v == "" {
+			*v = ":8443"
+		}
+		if v := listenBy["udp"]; v != nil && *v == "" {
+			*v = ":53"
+		}
+	}
 	names := strings.Split(*carrier, "+")
 	seen := map[string]bool{}
 	anyPool := false
@@ -451,6 +471,7 @@ func main() {
 	if *pathProbeMax > 0 {
 		tm.ProbeMax = *pathProbeMax
 	}
+	tm.Mode = *bondMode
 	if len(names) == 1 {
 		pio, raw = build(names[0])
 	} else { // bonded: one session over all of them
@@ -468,15 +489,16 @@ func main() {
 		var err error
 		if server {
 			raw = wat.NewMultiRaw(names, raws)
-		} else if pio, err = wat.NewBondIO(kids, wat.BondOptions{Names: names, Lanes: lanesPer, Timings: tm}); err != nil {
+		} else if pio, err = wat.NewBondIO(kids, wat.BondOptions{Names: names, Lanes: lanesPer, Timings: tm, Mode: *bondMode}); err != nil {
 			log.Fatal(err)
 		}
 	}
 	cfg := wat.Config{
 		Server: server, Key: k, Paths: *lanes, MaxBps: *maxMB * 1e6, Slack: time.Duration(*slackMs) * time.Millisecond,
+		PingEvery: time.Duration(*pingEvery) * time.Second,
 		Logf: log.Printf, Hedge: *hedge, FEC: *fecMode == "auto", MaxPayload: *mtu, Bond: tm,
 		// no CDN can sit in a reverse pool (Kharej dials Iran's IP) or in front of raw tcp/tls: TCP paces (2.4.18)
-		Direct: len(names) == 1 && (*reverse && poolCarriers[names[0]] || names[0] == "tcp" || names[0] == "tls"),
+		Direct: allReliableDirect(names, *reverse),
 	}
 	var tun *tunnel
 	var srv *wat.Server
@@ -586,6 +608,38 @@ func main() {
 				json.NewEncoder(w).Encode(portReg.snapshot(side))
 			})
 			mux.HandleFunc("/quota/reset", quotaResetHandler)
+			mux.HandleFunc("/carrier/toggle", func(w http.ResponseWriter, r *http.Request) {
+				pStr := r.URL.Query().Get("path")
+				cName := r.URL.Query().Get("carrier")
+				idx := -1
+				if pStr != "" {
+					if n, err := strconv.Atoi(pStr); err == nil {
+						idx = n
+					}
+				} else if cName != "" {
+					for i, n := range names {
+						if n == cName {
+							idx = i
+							break
+						}
+					}
+				}
+				if idx < 0 || idx >= len(names) {
+					http.Error(w, "invalid path or carrier", http.StatusBadRequest)
+					return
+				}
+				muted := false
+				if pm, ok := pio.(wat.PathMuter); ok {
+					muted = pm.ToggleMute(idx)
+				} else if srv != nil {
+					muted = srv.ToggleMute(idx)
+				} else {
+					http.Error(w, "carrier muting not supported on this tunnel", http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"path":%d,"carrier":%q,"muted":%t}`+"\n", idx, names[idx], muted)
+			})
 			if tun != nil {
 				mux.HandleFunc("/speedtest", speedTestHandler(tun))
 			}
@@ -1198,4 +1252,22 @@ func clientsJSON(list []wat.ClientInfo) []clientJSON {
 		out = append(out, clientJSON{c.IP, c.Carrier, c.Age.Milliseconds()})
 	}
 	return out
+}
+
+func allReliableDirect(names []string, reverse bool) bool {
+	if len(names) == 0 {
+		return false
+	}
+	for _, n := range names {
+		if reverse {
+			if !poolCarriers[n] {
+				return false
+			}
+		} else {
+			if n != "tcp" && n != "tls" {
+				return false
+			}
+		}
+	}
+	return true
 }

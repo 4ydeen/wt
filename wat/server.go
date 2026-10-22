@@ -42,6 +42,8 @@ type Server struct {
 
 	lastRx atomic.Int64 // unix nanoseconds of the newest authenticated packet of any session, kept after it closes
 
+	revive *ReviveEngine // optional handler for out-of-band emergency revival knocks
+
 	statMu  sync.Mutex
 	seen    map[*Session]Stats // each live session's counters at the last Stats call
 	retired Stats              // counters of sessions that have closed, so the totals never go backwards
@@ -139,6 +141,9 @@ func (srv *Server) Drain() { srv.draining.Store(true) }
 
 func (srv *Server) Draining() bool { return srv.draining.Load() }
 
+// SetRevive attaches an emergency revive engine to handle out-of-band revival knocks.
+func (srv *Server) SetRevive(r *ReviveEngine) { srv.revive = r }
+
 func (srv *Server) Sessions() int {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
@@ -230,6 +235,19 @@ func (srv *Server) Clients() []ClientInfo {
 		out = append(out, ci)
 	}
 	return out
+}
+
+// ToggleMute toggles mute on the given path across active sessions.
+func (srv *Server) ToggleMute(idx int) bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	muted := false
+	for _, ss := range srv.sessions {
+		if pm, ok := ss.s.IO().(PathMuter); ok {
+			muted = pm.ToggleMute(idx)
+		}
+	}
+	return muted
 }
 
 func addrIP(a net.Addr) string {
@@ -362,6 +380,17 @@ func (srv *Server) run() {
 			}
 		}
 		bo.ok()
+		if srv.revive != nil {
+			if len(p) >= 36 && binary.BigEndian.Uint32(p[:4]) == ReviveMagic {
+				if _, err := srv.revive.VerifyKnock(p, src); err == nil {
+					continue
+				}
+			} else if knock, ok := ParseDNSQueryKnock(p); ok {
+				if _, err := srv.revive.VerifyKnock(knock, src); err == nil {
+					continue
+				}
+			}
+		}
 		if len(p) < hdrLen+tagLen+1 {
 			continue
 		}
@@ -379,7 +408,7 @@ func (srv *Server) run() {
 			if srv.draining.Load() {
 				continue
 			}
-			ss = srv.admit(sid, p)
+			ss = srv.admit(sid, p, src)
 			if ss == nil {
 				continue
 			}
@@ -393,7 +422,7 @@ func (srv *Server) run() {
 }
 
 // admit creates a session for an unknown id, but only if this very packet authenticates under that id's key.
-func (srv *Server) admit(sid uint64, p []byte) *srvSess {
+func (srv *Server) admit(sid uint64, p []byte, src net.Addr) *srvSess {
 	pn := binary.BigEndian.Uint64(p[8:])
 	if pn&dirServerBit != 0 {
 		return nil
@@ -418,9 +447,17 @@ func (srv *Server) admit(sid uint64, p []byte) *srvSess {
 	io := &subIO{srv: srv, sid: sid, inbox: make(chan rxPkt, 8192), done: make(chan struct{})}
 	cfg := srv.cfg
 	cfg.SID = sid
+	admittingIdx := -1
+	if t, ok := src.(*TaggedAddr); ok {
+		admittingIdx = t.Idx
+	}
 	var pio PacketIO = io
 	if mr, ok := srv.raw.(*MultiRaw); ok { // bonded server: reply on the best live carrier of this client
-		pio = newMultiSubIO(io, mr, cfg.Bond)
+		pio = newMultiSubIO(io, mr, cfg.Bond, admittingIdx)
+	}
+	// Direct TCP auto-promotion: if admitted on TCP/TLS pool and reliable, activate directMTU (16384)
+	if prof := profileOf(pio); prof.Reliable && prof.MaxMTU >= directMTU {
+		cfg.Direct = true
 	}
 	s, err := NewSession(cfg, pio)
 	if err != nil {

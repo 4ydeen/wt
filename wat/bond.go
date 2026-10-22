@@ -22,6 +22,7 @@ type BondOptions struct {
 	Names   []string
 	Lanes   []int
 	Timings PathTimings
+	Mode    string
 }
 
 type bondPkt struct {
@@ -64,7 +65,11 @@ func NewBondIO(kids []PacketIO, opt BondOptions) (*BondIO, error) {
 		b.profs = append(b.profs, profileOf(k))
 	}
 	b.prof = mergeProfiles(b.profs)
-	b.ps = newPathSet(names, true, opt.Timings)
+	tm := opt.Timings
+	if opt.Mode != "" {
+		tm.Mode = opt.Mode
+	}
+	b.ps = newPathSet(names, true, tm)
 	for i := range kids {
 		go b.recvKid(i)
 	}
@@ -120,7 +125,20 @@ func (b *BondIO) Send(p []byte, path int) error {
 	if n := b.lanes[path]; n > 1 {
 		lane = int(b.laneRR[path].Add(1) % uint32(n))
 	}
-	return b.kids[path].Send(p, lane)
+	err := b.kids[path].Send(p, lane)
+	if b.ps.Mode() == "replicate" {
+		for i, kid := range b.kids {
+			if i != path && b.ps.isLiveOrSuspect(i) {
+				b.ps.onSend(i)
+				l := 0
+				if n := b.lanes[i]; n > 1 {
+					l = int(b.laneRR[i].Add(1) % uint32(n))
+				}
+				_ = kid.Send(p, l)
+			}
+		}
+	}
+	return err
 }
 
 func (b *BondIO) Recv() ([]byte, int, net.Addr, error) {
@@ -148,6 +166,8 @@ func (b *BondIO) Profile() Profile                         { return b.prof }
 func (b *BondIO) NumPaths() int                            { return len(b.kids) }
 func (b *BondIO) PathProfile(i int) Profile                { return b.profs[i] }
 func (b *BondIO) ChoosePath(_ int, inter bool) int         { return b.ps.choose(inter) }
+func (b *BondIO) NextPath(inter bool) int                  { return b.ps.nextPath(inter) }
+func (b *BondIO) ToggleMute(path int) bool                 { return b.ps.ToggleMute(path) }
 func (b *BondIO) OnAck(path int, rtt time.Duration, _ int) { b.ps.onAck(path, rtt) }
 func (b *BondIO) OnLoss(path int)                          { b.ps.onLoss(path) }
 func (b *BondIO) SetProber(f func(int))                    { b.prober.Store(f) }
@@ -256,11 +276,12 @@ func (m *MultiRaw) Profile() Profile {
 // over another, the replies follow it (live migration) without any signalling.
 type multiSubIO struct {
 	*subIO
-	mr     *MultiRaw
-	ps     *pathSet
-	mu     sync.Mutex
-	slots  []peerSlot
-	prober atomic.Value // func(int)
+	mr              *MultiRaw
+	ps              *pathSet
+	mu              sync.Mutex
+	slots           []peerSlot
+	prober          atomic.Value // func(int)
+	admittedCarrier int          // carrier slot index on which first packet arrived (-1 if unset)
 }
 
 type peerSlot struct {
@@ -269,8 +290,8 @@ type peerSlot struct {
 	rr    int
 }
 
-func newMultiSubIO(base *subIO, mr *MultiRaw, tm PathTimings) *multiSubIO {
-	m := &multiSubIO{subIO: base, mr: mr, slots: make([]peerSlot, len(mr.raws))}
+func newMultiSubIO(base *subIO, mr *MultiRaw, tm PathTimings, admittingIdx int) *multiSubIO {
+	m := &multiSubIO{subIO: base, mr: mr, slots: make([]peerSlot, len(mr.raws)), admittedCarrier: admittingIdx}
 	m.ps = newPathSet(mr.names, false, tm)
 	go func() {
 		tk := time.NewTicker(50 * time.Millisecond)
@@ -336,15 +357,67 @@ func (m *multiSubIO) Send(p []byte, path int) error {
 		s.rr++
 		lane = s.lanes[s.rr%len(s.lanes)]
 	}
+	type dupItem struct {
+		idx  int
+		raw  RawIO
+		lane int
+		addr net.Addr
+	}
+	var dups []dupItem
+	if m.ps.Mode() == "replicate" {
+		for i := range m.slots {
+			if i != path && m.slots[i].dst != nil && m.ps.isLiveOrSuspect(i) {
+				ds := &m.slots[i]
+				dl := 0
+				if len(ds.lanes) > 0 {
+					ds.rr++
+					dl = ds.lanes[ds.rr%len(ds.lanes)]
+				}
+				dups = append(dups, dupItem{idx: i, raw: m.mr.raws[i], lane: dl, addr: ds.dst.Addr})
+			}
+		}
+	}
 	m.mu.Unlock()
 	m.ps.onSend(path)
-	return m.mr.raws[path].SendTo(p, lane, dst.Addr)
+	err := m.mr.raws[path].SendTo(p, lane, dst.Addr)
+	for _, d := range dups {
+		m.ps.onSend(d.idx)
+		_ = d.raw.SendTo(p, d.lane, d.addr)
+	}
+	return err
 }
 
 func (m *multiSubIO) NumPaths() int                            { return len(m.slots) }
 func (m *multiSubIO) PathProfile(i int) Profile                { return profileOf(m.mr.raws[i]) }
 func (m *multiSubIO) ChoosePath(_ int, inter bool) int         { return m.ps.choose(inter) }
+func (m *multiSubIO) NextPath(inter bool) int                  { return m.ps.nextPath(inter) }
+func (m *multiSubIO) ToggleMute(path int) bool                 { return m.ps.ToggleMute(path) }
 func (m *multiSubIO) OnAck(path int, rtt time.Duration, _ int) { m.ps.onAck(path, rtt) }
 func (m *multiSubIO) OnLoss(path int)                          { m.ps.onLoss(path) }
 func (m *multiSubIO) SetProber(f func(int))                    { m.prober.Store(f) }
 func (m *multiSubIO) PathStats() []CarrierStat                 { return m.ps.stats() }
+
+// Profile reports the active carrier's native profile if the client connects on one carrier
+// (e.g. TCP pool), or the conservative merged profile if multiple carriers are active.
+// ponytail: single-active fast path avoids MTU collapse without dynamic renegotiation.
+func (m *multiSubIO) Profile() Profile {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	active := -1
+	for i, s := range m.slots {
+		if s.dst != nil {
+			if active == -1 {
+				active = i
+			} else {
+				return m.mr.Profile()
+			}
+		}
+	}
+	if active >= 0 && active < len(m.mr.raws) {
+		return profileOf(m.mr.raws[active])
+	}
+	if m.admittedCarrier >= 0 && m.admittedCarrier < len(m.mr.raws) {
+		return profileOf(m.mr.raws[m.admittedCarrier])
+	}
+	return m.mr.Profile()
+}

@@ -318,3 +318,42 @@ func TestListenersRetarget(t *testing.T) {
 		t.Fatalf("retarget: %v target=%d", errs, ls.target(p))
 	}
 }
+
+func TestPortRangeForwarding(t *testing.T) {
+	txt := "ports:\n  - 10000-10003:20000-20003\n  - 30000-30002\n  - 40000-40001/udp\n"
+	c, err := parseConfig(txt, nil)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(c.Ports) != 9 {
+		t.Fatalf("expected 9 ports, got %d: %+v", len(c.Ports), c.Ports)
+	}
+	for i := 0; i < 4; i++ {
+		p := c.Ports[i]
+		if p.Port != 10000+i || p.Target != 20000+i || p.UDP {
+			t.Errorf("Ports[%d] = %+v, want Port=%d Target=%d UDP=false", i, p, 10000+i, 20000+i)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		p := c.Ports[4+i]
+		if p.Port != 30000+i || p.Target != 30000+i || p.UDP {
+			t.Errorf("Ports[%d] = %+v, want Port=%d Target=%d UDP=false", 4+i, p, 30000+i, 30000+i)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		p := c.Ports[7+i]
+		if p.Port != 40000+i || p.Target != 40000+i || !p.UDP {
+			t.Errorf("Ports[%d] = %+v, want Port=%d Target=%d UDP=true", 7+i, p, 40000+i, 40000+i)
+		}
+	}
+
+	bad := "ports:\n  - 10000-10003:20000-20001\n"
+	if _, err := parseConfig(bad, nil); err == nil || !strings.Contains(err.Error(), "lengths must match") {
+		t.Errorf("expected lengths must match error, got %v", err)
+	}
+
+	badInv := "ports:\n  - 10003-10000\n"
+	if _, err := parseConfig(badInv, nil); err == nil {
+		t.Errorf("expected inverted range to fail, got nil")
+	}
+}

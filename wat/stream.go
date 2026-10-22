@@ -433,12 +433,20 @@ func (st *Stream) emit(p []byte, sp *sentPkt, room int) (np []byte, sent, fit bo
 			cut := int(st.sbase - off)
 			off, n = st.sbase, n-cut
 		}
+		fin := f.fin
 		if hdr+n > room {
-			return p, false, false
+			piece := room - hdr
+			if piece <= 0 {
+				return p, false, false
+			}
+			st.retx[0] = frameRef{sid: st.id, off: off + uint64(piece), n: n - piece, fin: f.fin}
+			n = piece
+			fin = false
+		} else {
+			st.retx = st.retx[1:]
 		}
-		st.retx = st.retx[1:]
-		p = st.appendFrame(p, off, n, f.fin)
-		sp.frames = append(sp.frames, frameRef{st.id, off, n, f.fin})
+		p = st.appendFrame(p, off, n, fin)
+		sp.frames = append(sp.frames, frameRef{st.id, off, n, fin})
 		sp.rtx = true
 		return p, true, true
 	}

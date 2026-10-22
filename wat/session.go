@@ -49,6 +49,11 @@ const (
 	ipIcmpHdr         = 28
 )
 
+// PathNextChooser queries the next scheduled path before packet serialization.
+type PathNextChooser interface {
+	NextPath(interactive bool) int
+}
+
 var ErrSessionDead = errors.New("wat: session closed")
 
 type Config struct {
@@ -70,7 +75,12 @@ type Config struct {
 	// could buffer in between. The only queues are our pool's and the sockets', which push back (Backlogger), so the
 	// session lets TCP set the pace: a window of about a second of delivery and a long loss timer (2.4.18, see cc.go).
 	Direct bool
-	Logf   func(string, ...any)
+	// PingEvery: idle keepalive interval (default 2 s). Raise it on paths whose filter rate-limits steady
+	// periodic packets into a penalty box (observed live 2026-10-22: 30 ICMP echo req/min to one host
+	// collapsed to 95% loss until a ~5 min cooldown). Both ends need it only if BOTH are idle-quiet;
+	// a single-sided raise already halves the rate.
+	PingEvery time.Duration
+	Logf      func(string, ...any)
 }
 
 type Stats struct {
@@ -259,6 +269,9 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	}
 	if cfg.Slack == 0 {
 		cfg.Slack = 8 * time.Millisecond
+	}
+	if cfg.PingEvery <= 0 {
+		cfg.PingEvery = 2 * time.Second
 	}
 	hi := MaxPayloadHi
 	if prof.MaxMTU > hi {
@@ -881,7 +894,24 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 			dbuf = s.takeDgrams(dbuf, s.maxPlain-len(p), s.hasStreamWork())
 			s.dbuf = dbuf[:0]
 		}
-		room := s.maxPlain - len(dbuf)
+		pathMTU := s.maxPlain
+		if nc, ok := s.chooser.(PathNextChooser); ok {
+			p := nc.NextPath(false)
+			prof := s.chooser.PathProfile(p)
+			if prof.MaxMTU > 0 {
+				limit := prof.MaxMTU - overhead
+				if prof.MTU > 0 && prof.MTU-overhead > pathMTU {
+					pathMTU = prof.MTU - overhead
+				}
+				if prof.Reliable && limit >= directMTU-overhead {
+					pathMTU = directMTU - overhead
+				}
+				if pathMTU > limit {
+					pathMTU = limit
+				}
+			}
+		}
+		room := pathMTU - len(dbuf)
 		for room-len(p) > 40 {
 			st := s.pick()
 			if st == nil {
@@ -1195,7 +1225,7 @@ func (s *Session) timers(now time.Time) {
 		}
 		s.compact()
 	}
-	if now.Sub(s.lastSend) > 2*time.Second {
+	if now.Sub(s.lastSend) > s.cfg.PingEvery {
 		s.wantPing = true
 	}
 	if !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > 30*time.Second {
@@ -1690,6 +1720,9 @@ func (s *Session) CarrierStats() []CarrierStat {
 	}
 	return nil
 }
+
+// IO returns the underlying PacketIO of the session.
+func (s *Session) IO() PacketIO { return s.io }
 
 // Alive reports whether an authenticated packet from the peer arrived in the last 10 s. The peer pings at least
 // every 2 s, so an idle but working link stays alive.

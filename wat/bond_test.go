@@ -528,3 +528,245 @@ func TestBondUnequalCapacity(t *testing.T) {
 		t.Errorf("the 8 MB/s carrier should carry well over the 2 MB/s one: %+v", cs)
 	}
 }
+
+type mockRawWithProfile struct {
+	RawIO
+	prof Profile
+}
+
+func (m *mockRawWithProfile) Profile() Profile { return m.prof }
+func (m *mockRawWithProfile) Recv() ([]byte, int, net.Addr, error) {
+	select {}
+}
+func (m *mockRawWithProfile) SendTo([]byte, int, net.Addr) error { return nil }
+func (m *mockRawWithProfile) Close() error                       { return nil }
+
+func TestMultiRawProfilePreservation(t *testing.T) {
+	icmpRaw := &mockRawWithProfile{prof: Profile{MTU: 640, MaxMTU: 1400, Reliable: false, InitBps: 1.5e6}}
+	tcpRaw := &mockRawWithProfile{prof: Profile{MTU: 16384, MaxMTU: 16384, Reliable: true, InitBps: 2.5e6}}
+
+	mr := NewMultiRaw([]string{"icmp", "tcp"}, []RawIO{icmpRaw, tcpRaw})
+	defer mr.Close()
+
+	if prof := mr.Profile(); prof.MTU != 640 || prof.Reliable {
+		t.Fatalf("expected MultiRaw conservative profile (MTU 640, unreliable), got %+v", prof)
+	}
+
+	sub := newMultiSubIO(&subIO{done: make(chan struct{})}, mr, PathTimings{}, 1)
+	if prof := sub.Profile(); prof.MTU != 16384 || !prof.Reliable {
+		t.Fatalf("expected single-carrier TCP subIO profile (MTU 16384, reliable), got %+v", prof)
+	}
+
+	// Client sends traffic on ICMP as well -> multi-carrier bonding becomes active
+	sub.SetPeer(&TaggedAddr{Idx: 0, Addr: &net.IPAddr{IP: net.ParseIP("127.0.0.1")}, Lane: 0})
+	sub.SetPeer(&TaggedAddr{Idx: 1, Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4443}, Lane: 0})
+	if prof := sub.Profile(); prof.MTU != 640 || prof.Reliable {
+		t.Fatalf("expected multi-carrier active profile to merge conservatively, got %+v", prof)
+	}
+}
+
+type mockKidPacketIO struct {
+	mu   sync.Mutex
+	sent [][]byte
+	prof Profile
+	in   chan []byte
+	done chan struct{}
+	once sync.Once
+}
+
+func newMockKid(prof Profile) *mockKidPacketIO {
+	return &mockKidPacketIO{
+		prof: prof,
+		in:   make(chan []byte, 16),
+		done: make(chan struct{}),
+	}
+}
+
+func (m *mockKidPacketIO) Send(p []byte, _ int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, append([]byte(nil), p...))
+	return nil
+}
+
+func (m *mockKidPacketIO) Recv() ([]byte, int, net.Addr, error) {
+	select {
+	case p := <-m.in:
+		return p, 0, nil, nil
+	case <-m.done:
+		return nil, 0, nil, net.ErrClosed
+	}
+}
+
+func (m *mockKidPacketIO) SetPeer(net.Addr) {}
+func (m *mockKidPacketIO) Close() error {
+	m.once.Do(func() { close(m.done) })
+	return nil
+}
+func (m *mockKidPacketIO) Profile() Profile { return m.prof }
+
+func TestBondModes(t *testing.T) {
+	// 1. active-backup mode
+	ps := newPathSet([]string{"p0", "p1"}, true, PathTimings{Mode: "active-backup"})
+	if m := ps.Mode(); m != "active-backup" {
+		t.Fatalf("expected mode active-backup, got %s", m)
+	}
+	if p := ps.choose(false); p != 0 {
+		t.Fatalf("expected primary path 0, got %d", p)
+	}
+	if p := ps.choose(true); p != 0 {
+		t.Fatalf("expected primary path 0 for interactive, got %d", p)
+	}
+
+	// Mute primary path -> immediate failover to backup
+	ps.ToggleMute(0)
+	if p := ps.choose(false); p != 1 {
+		t.Fatalf("expected failover to path 1 when path 0 muted, got %d", p)
+	}
+	ps.ToggleMute(0) // unmute
+	if p := ps.choose(false); p != 0 {
+		t.Fatalf("expected failback to path 0 when unmuted, got %d", p)
+	}
+
+	// Primary path dies -> failover to path 1
+	ps.mu.Lock()
+	ps.p[0].state = pDead
+	ps.mu.Unlock()
+	if p := ps.choose(false); p != 1 {
+		t.Fatalf("expected failover to path 1 when path 0 dead, got %d", p)
+	}
+
+	// Primary path revives with ack -> failback to path 0
+	ps.onAck(0, 20*time.Millisecond)
+	if p := ps.choose(false); p != 0 {
+		t.Fatalf("expected failback to path 0 upon ack, got %d", p)
+	}
+
+	// 2. replicate mode
+	k0 := newMockKid(Profile{MTU: 1400, MaxMTU: 1400})
+	k1 := newMockKid(Profile{MTU: 1400, MaxMTU: 1400})
+	defer k0.Close()
+	defer k1.Close()
+
+	bond, err := NewBondIO([]PacketIO{k0, k1}, BondOptions{
+		Names: []string{"k0", "k1"},
+		Mode:  "replicate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bond.Close()
+
+	if bond.ps.Mode() != "replicate" {
+		t.Fatalf("expected bond mode replicate, got %s", bond.ps.Mode())
+	}
+
+	testPayload := []byte("critical-replicated-datagram")
+	if err := bond.Send(testPayload, 0); err != nil {
+		t.Fatalf("bond Send failed: %v", err)
+	}
+
+	k0.mu.Lock()
+	n0 := len(k0.sent)
+	k0.mu.Unlock()
+	k1.mu.Lock()
+	n1 := len(k1.sent)
+	k1.mu.Unlock()
+
+	if n0 != 1 || n1 != 1 {
+		t.Fatalf("expected packet sent to both kids in replicate mode, got k0=%d k1=%d", n0, n1)
+	}
+}
+
+func TestBondMuting(t *testing.T) {
+	k0 := newMockKid(Profile{MTU: 1400, MaxMTU: 1400})
+	k1 := newMockKid(Profile{MTU: 1400, MaxMTU: 1400})
+	defer k0.Close()
+	defer k1.Close()
+
+	bond, err := NewBondIO([]PacketIO{k0, k1}, BondOptions{
+		Names: []string{"carrier0", "carrier1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bond.Close()
+
+	stats := bond.PathStats()
+	if len(stats) != 2 || stats[0].Muted || stats[1].Muted {
+		t.Fatalf("expected both carriers unmuted, got %+v", stats)
+	}
+
+	// Toggle mute on carrier 0
+	muted := bond.ToggleMute(0)
+	if !muted {
+		t.Fatalf("expected ToggleMute(0) to return true")
+	}
+
+	stats = bond.PathStats()
+	if !stats[0].Muted || stats[0].Alive {
+		t.Fatalf("expected carrier 0 muted and not alive, got %+v", stats[0])
+	}
+	if stats[1].Muted || !stats[1].Alive {
+		t.Fatalf("expected carrier 1 unmuted and alive, got %+v", stats[1])
+	}
+
+	// Toggle mute off
+	muted = bond.ToggleMute(0)
+	if muted {
+		t.Fatalf("expected ToggleMute(0) to return false (unmuted)")
+	}
+	stats = bond.PathStats()
+	if stats[0].Muted {
+		t.Fatalf("expected carrier 0 unmuted, got %+v", stats[0])
+	}
+}
+
+func TestRetxFrameReslicing(t *testing.T) {
+	st := &Stream{
+		id:    1,
+		sbase: 0,
+		sbuf:  make([]byte, 16384),
+		peerMax: 16384,
+	}
+	copy(st.sbuf, bytes.Repeat([]byte("A"), 16384))
+
+	// Simulate a lost 16KB frame
+	st.retx = []frameRef{
+		{sid: 1, off: 0, n: 16000, fin: true},
+	}
+
+	// Attempt emit with only 1000 bytes of room
+	sp := &sentPkt{}
+	p := make([]byte, 0, 2048)
+	np, sent, fit := st.emit(p, sp, 1000)
+
+	if !sent || !fit {
+		t.Fatalf("expected frame to be sliced and emitted, got sent=%t fit=%t", sent, fit)
+	}
+	if len(sp.frames) != 1 {
+		t.Fatalf("expected 1 frame recorded in sp, got %d", len(sp.frames))
+	}
+	firstSlice := sp.frames[0]
+	if firstSlice.fin {
+		t.Errorf("intermediate slice should have fin=false")
+	}
+	if len(np) > 1000 {
+		t.Errorf("emitted frame size %d > room 1000", len(np))
+	}
+
+	// Check that remainder is preserved in st.retx[0] with fin=true
+	if len(st.retx) != 1 {
+		t.Fatalf("expected 1 frame remaining in retx queue, got %d", len(st.retx))
+	}
+	rem := st.retx[0]
+	if rem.off != uint64(firstSlice.n) {
+		t.Errorf("remainder offset %d != first slice len %d", rem.off, firstSlice.n)
+	}
+	if rem.n != 16000-firstSlice.n {
+		t.Errorf("remainder len %d != 16000 - %d", rem.n, firstSlice.n)
+	}
+	if !rem.fin {
+		t.Errorf("remainder frame should preserve fin=true")
+	}
+}

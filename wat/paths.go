@@ -35,10 +35,14 @@ type PathProber interface{ SetProber(func(path int)) }
 // PathStatser exposes per-carrier numbers for /stats.
 type PathStatser interface{ PathStats() []CarrierStat }
 
+// PathMuter allows live path muting/unmuting without session restart.
+type PathMuter interface{ ToggleMute(path int) bool }
+
 // CarrierStat is one carrier of a bond, as seen from this end.
 type CarrierStat struct {
 	Name    string  `json:"name"`
 	Alive   bool    `json:"alive"`
+	Muted   bool    `json:"muted"`
 	SRTTms  float64 `json:"srtt_ms"`
 	Share   float64 `json:"share"`
 	Sent    uint64  `json:"sent"`
@@ -54,6 +58,7 @@ type PathTimings struct {
 	ProbeMax   time.Duration // ... up to this (default 30 s)
 	Ramp       time.Duration // a revived path goes from a 10 % to a full share over this (default 3 s)
 	IdleProbe  time.Duration // a live path with nothing sent for this long gets a PING (default 5 s)
+	Mode       string        // "balanced" (default), "active-backup", "replicate"
 }
 
 func (t PathTimings) norm() PathTimings {
@@ -75,6 +80,9 @@ func (t PathTimings) norm() PathTimings {
 	if t.IdleProbe <= 0 {
 		t.IdleProbe = 5 * time.Second
 	}
+	if t.Mode == "" {
+		t.Mode = "balanced"
+	}
 	return t
 }
 
@@ -91,6 +99,7 @@ type pathState struct {
 	name    string
 	present bool
 	state   int
+	muted   bool
 
 	srtt, minRTT time.Duration
 	minAt        time.Time
@@ -112,19 +121,85 @@ type pathState struct {
 // pathSet is the scoring and health state of the paths of one session end. It is shared by BondIO (client) and
 // the per-session send side of a MultiRaw server.
 type pathSet struct {
-	mu  sync.Mutex
-	cfg PathTimings
-	p   []pathState
+	mu   sync.Mutex
+	cfg  PathTimings
+	mode string
+	p    []pathState
 
 	burstPath, burstLeft int
 }
 
 func newPathSet(names []string, present bool, cfg PathTimings) *pathSet {
-	ps := &pathSet{cfg: cfg.norm(), p: make([]pathState, len(names))}
+	norm := cfg.norm()
+	ps := &pathSet{cfg: norm, mode: norm.Mode, p: make([]pathState, len(names))}
 	for i, n := range names {
 		ps.p[i] = pathState{name: n, present: present, w: 1, gap: ps.cfg.ProbeFirst}
 	}
 	return ps
+}
+
+func (ps *pathSet) Mode() string {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.mode
+}
+
+func (ps *pathSet) SetMode(m string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if m != "" {
+		ps.mode = m
+	}
+}
+
+func (ps *pathSet) ToggleMute(i int) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if i >= 0 && i < len(ps.p) {
+		ps.p[i].muted = !ps.p[i].muted
+		return ps.p[i].muted
+	}
+	return false
+}
+
+func (ps *pathSet) isLive(i int) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if i >= 0 && i < len(ps.p) {
+		return ps.p[i].present && ps.p[i].state == pLive && !ps.p[i].muted
+	}
+	return false
+}
+
+func (ps *pathSet) isLiveOrSuspect(i int) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if i >= 0 && i < len(ps.p) {
+		return ps.p[i].present && ps.p[i].state != pDead && !ps.p[i].muted
+	}
+	return false
+}
+
+func (ps *pathSet) nextPath(interactive bool) int {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.mode == "active-backup" {
+		if len(ps.p) > 0 && ps.p[0].present && ps.p[0].state != pDead && !ps.p[0].muted {
+			return 0
+		}
+		for i := 1; i < len(ps.p); i++ {
+			if ps.p[i].present && ps.p[i].state != pDead && !ps.p[i].muted {
+				return i
+			}
+		}
+		return 0
+	}
+	if !interactive && ps.burstLeft > 0 {
+		if p := &ps.p[ps.burstPath]; p.present && p.state != pDead && !p.muted {
+			return ps.burstPath
+		}
+	}
+	return ps.burstPath
 }
 
 func (ps *pathSet) markPresent(i int) {
@@ -225,6 +300,10 @@ func (ps *pathSet) eval(now time.Time) {
 		if !ps.witness(i, p.firstUnacked) {
 			continue
 		}
+		if ps.mode == "active-backup" && i == 0 && (silent > 100*time.Millisecond || p.lossRun >= 3) {
+			p.state, p.gap, p.nextProbe = pDead, ps.cfg.ProbeFirst, now.Add(ps.cfg.ProbeFirst)
+			continue
+		}
 		switch {
 		case silent > 2*thr || p.lossRun >= 12 && silent > 400*time.Millisecond:
 			p.state, p.gap, p.nextProbe = pDead, ps.cfg.ProbeFirst, now.Add(ps.cfg.ProbeFirst)
@@ -281,12 +360,23 @@ func (ps *pathSet) choose(interactive bool) int {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	ps.eval(now)
+	if ps.mode == "active-backup" {
+		if len(ps.p) > 0 && ps.p[0].present && ps.p[0].state != pDead && !ps.p[0].muted {
+			return 0
+		}
+		for i := 1; i < len(ps.p); i++ {
+			if ps.p[i].present && ps.p[i].state != pDead && !ps.p[i].muted {
+				return i
+			}
+		}
+		return 0
+	}
 	if interactive {
 		// the live paths whose delay is within 25 % (+5 ms) of the best share the interactive packets: acks and
 		// requests must not all ride one carrier, or its silent death would also starve every other path of acks
 		bs := time.Duration(math.MaxInt64)
 		for i := range ps.p {
-			if p := &ps.p[i]; p.present && p.state == pLive && p.ramped(now, ps.cfg.Ramp) {
+			if p := &ps.p[i]; p.present && p.state == pLive && !p.muted && p.ramped(now, ps.cfg.Ramp) {
 				if sc := p.score(); sc < bs {
 					bs = sc
 				}
@@ -295,7 +385,7 @@ func (ps *pathSet) choose(interactive bool) int {
 		best, sum := -1, 0.0
 		for i := range ps.p {
 			p := &ps.p[i]
-			if !p.present || p.state != pLive || !p.ramped(now, ps.cfg.Ramp) || p.score() > bs+bs/4+5*time.Millisecond {
+			if !p.present || p.state != pLive || p.muted || !p.ramped(now, ps.cfg.Ramp) || p.score() > bs+bs/4+5*time.Millisecond {
 				continue
 			}
 			p.icredit += p.w
@@ -314,7 +404,7 @@ func (ps *pathSet) choose(interactive bool) int {
 	// the slow path's packets out of the reported ranges (they were then retransmitted although they arrived: 23 %
 	// of all packets on a 40 ms + 150 ms bond, measured).
 	if ps.burstLeft > 0 {
-		if p := &ps.p[ps.burstPath]; p.present && p.state != pDead {
+		if p := &ps.p[ps.burstPath]; p.present && p.state != pDead && !p.muted {
 			ps.burstLeft--
 			return ps.burstPath
 		}
@@ -324,7 +414,7 @@ func (ps *pathSet) choose(interactive bool) int {
 		best, sum := -1, 0.0
 		for i := range ps.p {
 			p := &ps.p[i]
-			if !p.present || p.state == pDead && pass == 0 {
+			if !p.present || p.muted || (p.state == pDead && pass == 0) {
 				continue
 			}
 			w := 1.0
@@ -355,8 +445,15 @@ func (ps *pathSet) tick() []int {
 	var out []int
 	for i := range ps.p {
 		p := &ps.p[i]
-		if !p.present {
+		if !p.present || p.muted {
 			continue
+		}
+		if ps.mode == "active-backup" && i > 0 && p.state == pLive {
+			if now.Sub(p.lastSend) >= 50*time.Millisecond {
+				p.lastSend = now
+				out = append(out, i)
+				continue
+			}
 		}
 		switch {
 		case p.state == pSuspect && !now.Before(p.nextProbe):
@@ -380,16 +477,16 @@ func (ps *pathSet) stats() []CarrierStat {
 	defer ps.mu.Unlock()
 	sum := 0.0
 	for i := range ps.p {
-		if p := &ps.p[i]; p.present && p.state != pDead {
+		if p := &ps.p[i]; p.present && p.state != pDead && !p.muted {
 			sum += p.weight(now, ps.cfg.Ramp)
 		}
 	}
 	out := make([]CarrierStat, len(ps.p))
 	for i := range ps.p {
 		p := &ps.p[i]
-		cs := CarrierStat{Name: p.name, Alive: p.present && p.state == pLive, SRTTms: float64(p.srtt) / 1e6,
+		cs := CarrierStat{Name: p.name, Alive: p.present && p.state == pLive && !p.muted, Muted: p.muted, SRTTms: float64(p.srtt) / 1e6,
 			Sent: p.sent, Acked: p.acked, Lost: p.lost, Present: p.present}
-		if p.present && p.state != pDead && sum > 0 {
+		if p.present && p.state != pDead && !p.muted && sum > 0 {
 			cs.Share = p.weight(now, ps.cfg.Ramp) / sum
 		}
 		out[i] = cs
@@ -402,6 +499,9 @@ func (ps *pathSet) stats() []CarrierStat {
 func mergeProfiles(ps []Profile) Profile {
 	if len(ps) == 0 {
 		return Profile{MTU: MaxPayload, MaxMTU: MaxPayloadHi, InitBps: 1.5e6}
+	}
+	if len(ps) == 1 {
+		return ps[0]
 	}
 	out := Profile{Reliable: len(ps) > 0}
 	for i, p := range ps {

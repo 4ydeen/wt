@@ -104,20 +104,22 @@ func parseConfig(txt string, known func(string) bool) (*fileConfig, error) {
 			item := unquote(strings.TrimSpace(t[1:]))
 			switch list {
 			case "ports":
-				ps, err := parsePortItem(item)
+				specs, err := parsePortItem(item)
 				if err != nil {
 					return nil, fmt.Errorf("line %d: %v", ln, err)
 				}
-				for _, o := range cfg.Ports {
-					if o.Port == ps.Port && o.UDP == ps.UDP {
-						proto := "tcp"
-						if ps.UDP {
-							proto = "udp"
+				for _, ps := range specs {
+					for _, o := range cfg.Ports {
+						if o.Port == ps.Port && o.UDP == ps.UDP {
+							proto := "tcp"
+							if ps.UDP {
+								proto = "udp"
+							}
+							return nil, fmt.Errorf("line %d: duplicate listen port %d/%s", ln, ps.Port, proto)
 						}
-						return nil, fmt.Errorf("line %d: duplicate listen port %d/%s", ln, ps.Port, proto)
 					}
+					cfg.Ports = append(cfg.Ports, ps)
 				}
-				cfg.Ports = append(cfg.Ports, ps)
 			case "limits":
 				ls, err := parseLimitItem(item)
 				if err != nil {
@@ -202,10 +204,10 @@ func unquote(v string) string {
 	return v
 }
 
-func parsePortItem(s string) (portSpec, error) {
-	var ps portSpec
+func parsePortItem(s string) ([]portSpec, error) {
+	var udp bool
 	if p, ok := strings.CutSuffix(s, "/udp"); ok {
-		s, ps.UDP = p, true
+		s, udp = p, true
 	} else if p, ok := strings.CutSuffix(s, "/tcp"); ok {
 		s = p
 	}
@@ -217,17 +219,43 @@ func parsePortItem(s string) (portSpec, error) {
 		}
 		return n, nil
 	}
-	var err error
-	if ps.Port, err = port(l); err != nil {
-		return ps, err
-	}
-	ps.Target = ps.Port
-	if mapped {
-		if ps.Target, err = port(t); err != nil {
-			return ps, err
+	parseRange := func(x string) (int, int, error) {
+		x = strings.TrimSpace(x)
+		if strings.Contains(x, "-") {
+			s1, s2, _ := strings.Cut(x, "-")
+			p1, err1 := port(s1)
+			p2, err2 := port(s2)
+			if err1 != nil || err2 != nil || p1 > p2 {
+				return 0, 0, fmt.Errorf("bad port range %q", x)
+			}
+			return p1, p2, nil
 		}
+		p, err := port(x)
+		return p, p, err
 	}
-	return ps, nil
+	lStart, lEnd, err := parseRange(l)
+	if err != nil {
+		return nil, err
+	}
+	countL := lEnd - lStart + 1
+	var tStart, tEnd int
+	if mapped {
+		tStart, tEnd, err = parseRange(t)
+		if err != nil {
+			return nil, err
+		}
+		countT := tEnd - tStart + 1
+		if countL != countT {
+			return nil, fmt.Errorf("port range lengths must match: %q (%d ports) vs %q (%d ports)", l, countL, t, countT)
+		}
+	} else {
+		tStart = lStart
+	}
+	out := make([]portSpec, 0, countL)
+	for i := 0; i < countL; i++ {
+		out = append(out, portSpec{Port: lStart + i, Target: tStart + i, UDP: udp})
+	}
+	return out, nil
 }
 
 // cfgWatcher polls the config file like -allow-file: a changed ports list is handed to onPorts, any other changed

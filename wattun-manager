@@ -78,7 +78,8 @@ ExecStart=$BIN -config $CONF/%i.yml
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
