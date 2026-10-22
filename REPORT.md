@@ -211,3 +211,19 @@ AS56971 "Cloud", Amsterdam-registered, fully filtered both directions during thi
 - [ ] Delete local `D:\tmpgo\deploykey{,.pub}`
 - [ ] Rotate root passwords on both temp VPS (credentials were shared in chat)
 - [ ] Tear down or keep the VPS (owner's call — they were bought for this test)
+
+## 7f. Tuning round — what was tried on the live pair, in order
+
+All of the following ran on the real Tehran→NL pair with 2.10.5 (both ends), the wss origin up on kharej:443 and Cloudflare in front of `test.xoamrz.ir`:
+
+| Attempt | Result |
+|---|---|
+| `wss` through CF, `tls-small-ch`, `fp go`, conns 1/2/4 | conns ESTAB, ClientHello+upgrade sent, `Send-Q` grows 131→226→416→511→701 B in 15 s while CF never ACKs; `alive:false`, zero sessions at the origin |
+| Same via 188.114.98.0 (the Irancell-recommended edge) | 98.0 is dead for stock clients too (python times out); 188.114.99.0 answers python with 101 |
+| `wss` through CF, 12 conns over three edges (172.67.194.106 / 104.21.20.209 / 104.16.132.229), `pool-rotate 4s` | `alive:false`, 586 B out, speedtest `tunnel is not connected` |
+| `wss` direct to the origin (no CF), `tls-small-ch`, 2 conns | conns hold 4750/4845 B of unACKed data → the same sustained-flow drop as every other carrier |
+| Loopback `ws` carrier on kharej (127.0.0.1→127.0.0.1) | **works**: session forms, `srtt` 1 ms, forwarded SSH reaches the host — the carrier itself is healthy |
+| Stock clients through the same CF edge, same SNI, same request | python: 101 + a WS frame echoed back; Go probe (TLS 1.3, ALPN http/1.1, X25519+P-256): 101. Go with default (PQ) curves: i/o timeout |
+| Every fake-SNI mode on the direct path (`seq`, `hlen0`, `split`, `all`, `fakeip`, `synrst`, baseline) | all `alive:true`, `srtt` 85–95 ms, `bytes_in` freezes within seconds, speedtest `session closed` |
+
+**What that adds up to:** the marker type is not the limiter on this route — the flow survives the handshake and then loses its data channel in every configuration, with a per-flow budget of a few hundred bytes to a few hundred kilobytes. Stock clients pass only because they finish inside that budget. The engine's own ceiling, measured on the bench DPI that accepts the injected SNI, is 29–31 MB/s; this route never lets a flow get there.
