@@ -298,18 +298,30 @@ func (m *multiSubIO) SetPeer(a net.Addr) {
 		return
 	}
 	m.subIO.peer.Store(a) // newest source, for Server.Clients (Send is overridden here, so nothing else reads it)
-	m.mu.Lock()
+	// Fast path: nothing changed. handle() calls this for every authenticated packet; this
+	// goroutine is the only writer of dst/lanes, so the check needs no lock (Send only reads
+	// them under m.mu). The old code took m.mu and scanned for every packet (audit 2026-10-22).
 	s := &m.slots[t.Idx]
-	s.dst = t
-	have := false
-	for _, l := range s.lanes {
-		have = have || l == t.Lane
+	if s.dst == t && (containsLane(s.lanes, t.Lane) || len(s.lanes) >= 8) {
+		m.ps.markPresent(t.Idx)
+		return
 	}
-	if !have && len(s.lanes) < 8 {
+	m.mu.Lock()
+	s.dst = t
+	if !containsLane(s.lanes, t.Lane) && len(s.lanes) < 8 {
 		s.lanes = append(s.lanes, t.Lane)
 	}
 	m.mu.Unlock()
 	m.ps.markPresent(t.Idx)
+}
+
+func containsLane(lanes []int, lane int) bool {
+	for _, l := range lanes {
+		if l == lane {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *multiSubIO) Send(p []byte, path int) error {
