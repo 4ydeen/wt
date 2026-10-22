@@ -13,7 +13,7 @@
 [![Telegram Channel](https://img.shields.io/badge/Channel-@WatxDev-26A5E4?style=flat-square&logo=telegram)](https://t.me/WatxDev)
 [![Telegram](https://img.shields.io/badge/Contact-@watxox-26A5E4?style=flat-square&logo=telegram)](https://t.me/watxox)
 
-**English** Â· [فارسی](README.fa.md)
+**English** · [فارسی](README.fa.md)
 
 </div>
 
@@ -92,15 +92,14 @@ Under load, the tunnel adds +0.25 % to the bytes your users move on `tcp` (16 KB
 
 [Idle and bandwidth details](docs/TECHNICAL.md#resource-usage-idle-ram-cpu-and-bandwidth)
 
-## Latest release: 2.5.1
+## Latest release: 2.10.2
 
-**Download through one TCP tunnel went from 53 to 157 MB/s, and 195 MB/s on long transfers. Upload from 150 to
-276 MB/s.** The receiving end used to spend about a quarter of its CPU re-growing and copying stream buffers. Data
-now goes into reused 64 KB chunks, and memory stays flat under load. Update the Iran server for the download gain
-and Kharej for its sending side; old and new versions work together.
-
-Also since 2.5.0: WireGuard and other large UDP packets pass every connection type, traffic totals survive
-restarts, a Windows binary, and **m** on a tunnel's page switches its connection type at any time.
+**A matrix tester now measures every anti-censor method against the live filter, and connection quality
+became self-healing.** `wattun-manager ac-matrix` walks fake-SNI modes, fingerprints and edge counts
+against the real link and applies the best one (`wattun-manager auto-retest` keeps it fresh), while the
+governor watches the rate ceiling and the TCP pools drop stalled connections before they can stall a
+session. Update both ends for the matrix and the X25519 forward secrecy it rides on; old and new
+versions still work together.
 [Full release history](docs/TECHNICAL.md#release-history).
 
 ## Setup
@@ -189,15 +188,15 @@ network: the server's address, and the volume and timing of packets. Details:
 ## More
 
 Everything else is in [docs/TECHNICAL.md](docs/TECHNICAL.md):
-[reverse mode](docs/TECHNICAL.md#reverse-mode) Â·
-[auto mode](docs/TECHNICAL.md#auto-mode) Â·
-[Cloudflare / CDN](docs/TECHNICAL.md#cdn-tuning) Â·
-[bonding](docs/TECHNICAL.md#bonding) Â·
-[managing tunnels](docs/TECHNICAL.md#managing-tunnels) Â·
-[config file](docs/TECHNICAL.md#config-file) Â·
-[monitoring](docs/TECHNICAL.md#metrics) Â·
-[troubleshooting](docs/TECHNICAL.md#troubleshooting) Â·
-[security](docs/TECHNICAL.md#security-model) Â·
+[reverse mode](docs/TECHNICAL.md#reverse-mode) ·
+[auto mode](docs/TECHNICAL.md#auto-mode) ·
+[Cloudflare / CDN](docs/TECHNICAL.md#cdn-tuning) ·
+[bonding](docs/TECHNICAL.md#bonding) ·
+[managing tunnels](docs/TECHNICAL.md#managing-tunnels) ·
+[config file](docs/TECHNICAL.md#config-file) ·
+[monitoring](docs/TECHNICAL.md#metrics) ·
+[troubleshooting](docs/TECHNICAL.md#troubleshooting) ·
+[security](docs/TECHNICAL.md#security-model) ·
 [Windows and building from source](docs/TECHNICAL.md#build-and-test)
 
 - Telegram channel (news and releases): [@WatxDev](https://t.me/WatxDev), developer: [@watxox](https://t.me/watxox)

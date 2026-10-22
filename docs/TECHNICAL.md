@@ -864,7 +864,7 @@ domain) it runs, without questions:
    variants (plain, fragmentation) only if it does not. Through Cloudflare only `wss` and `grpc` are tested.
 4. Write the winner (`fp`, `ech`, `tls-frag`, `peer`) into the config and restart.
 
-In Auto mode this is part of the CDN phase; the table labels look like `wss Â· chrome Â· 3 edges`.
+In Auto mode this is part of the CDN phase; the table labels look like `wss · chrome · 3 edges`.
 `wattun cdn-tune NAME [full]` repeats the tuning at any time. Auto-heal refreshes dead edges.
 
 **DoH behaviour (2.2.1).** `ech: auto` looks up the domain's HTTPS record by racing all four DoH servers (1.1.1.1,
@@ -883,7 +883,8 @@ The ladder in full: direct DoH (the raced public servers) → the tunnel relay �
 
 - Both ends need 2.9.0. An old server treats target 53 as a local dial to `127.0.0.1:53`, which fails and
   resets the stream; the ladder falls back to no ECH exactly as before — the tunnel still comes up.
-- The relay answers one query per stream, bounded at 512-byte queries and 6 s per exchange; a query is no more
+- The relay answers one query per stream, bounded at 4096-byte queries (RFC 6891 EDNS0 maximum) and 6 s per
+  exchange; a query is no more
   sensitive than the tunnel's own handshake. Only the client's `ech: ladder` ever opens port 53; normal
   forwarding is untouched.
 - `ech-cache` still applies: a config from before the DoH block is used at once while the ladder refreshes.
