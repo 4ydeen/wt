@@ -678,6 +678,10 @@ func main() {
 		if *cfgPath != "" {
 			w := &cfgWatcher{path: *cfgPath, known: known, skip: func(k string) bool { return explicit[k] }, interval: 3 * time.Second,
 				onPorts: func(c *fileConfig) []error {
+					if !c.PortsSet { // ports: removed: fall back to -allow-ports/-allow-file, not an empty list
+					al.reset(*allowList)
+					return nil
+				}
 					al.setPorts(c.tcpPorts())
 					al.setUDPPorts(c.udpPorts())
 					return nil
@@ -1030,6 +1034,16 @@ func parseUDPPorts(txt string) map[int]bool {
 		}
 	}
 	return m
+}
+
+// reset reinstalls list as the allowlist, undoing an authoritative config ports: list. A running
+// allow-file poller resumes applying the file on its next tick (reload skips only while a.cfg).
+func (a *allow) reset(list string) {
+	m, um := parsePorts(list), parseUDPPorts(list)
+	a.mu.Lock()
+	a.ports, a.udp, a.cfg = m, um, false
+	a.mu.Unlock()
+	log.Printf("allowed target ports: %d", len(m))
 }
 
 func newAllow(list, file string) *allow {

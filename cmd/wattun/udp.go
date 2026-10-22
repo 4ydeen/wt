@@ -341,7 +341,9 @@ func serveDgrams(sess *wat.Session, lo, hi int, al *allow, idle time.Duration) {
 
 // replyPump sends what the target answers back through the session until the flow's socket is closed.
 func replyPump(sess *wat.Session, id uint64, f *sflow) {
-	buf := make([]byte, 64<<10)
+	// 4 KB fits DNS (EDNS0 max) and QUIC/WireGuard replies; 4096 flows x 64 KB was a 256 MB-per-session
+	// OOM vector (audit 2026-10-22). A larger UDP reply is truncated (UDP has no partial read).
+	buf := make([]byte, 4096)
 	for {
 		n, err := f.conn.Read(buf)
 		if err != nil {

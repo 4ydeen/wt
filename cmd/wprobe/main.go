@@ -235,6 +235,9 @@ func custom(dstIP, steps string) {
 		a := make([]int, 6)
 		a[5] = 4
 		for i := range f {
+			if i >= len(a) { // extra fields: ignore instead of panicking
+				break
+			}
 			a[i], _ = strconv.Atoi(f[i])
 		}
 		run(c, dst, a[0], a[1], a[2], byte(a[3]), byte(a[4]), time.Duration(a[5])*time.Second, "custom")

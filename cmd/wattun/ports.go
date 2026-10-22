@@ -164,10 +164,10 @@ func (p *portStat) add(up bool, n int) {
 	} else {
 		p.bytesDown.Add(int64(n))
 	}
+	// qused counts only traffic served under an active quota: bytes from an unlimited period
+	// must not be charged when a quota later appears by hot-reload (audit 2026-10-22).
 	if q := p.quota.Load(); q > 0 && p.qused.Add(int64(n)) >= q {
 		p.kill()
-	} else if q == 0 {
-		p.qused.Add(int64(n))
 	}
 }
 
