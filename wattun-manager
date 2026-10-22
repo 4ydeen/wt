@@ -120,9 +120,9 @@ if [ "$USE_COLOR" = 1 ]; then
 fi
 if [ "$USE_COLOR" = 1 ]; then
   RST=$'\e[0m'; BOLD=$'\e[1m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'
-  CYN=$'\e[36m'; GRY=$'\e[90m'
+  CYN=$'\e[36m'; BLU=$'\e[34m'; GRY=$'\e[90m'
 else
-  RST=''; BOLD=''; RED=''; GRN=''; YEL=''; CYN=''; GRY=''
+  RST=''; BOLD=''; RED=''; GRN=''; YEL=''; CYN=''; BLU=''; GRY=''
 fi
 
 conf_get() { local v; v=$(sed -n "s/^$1=//p" "$MCONF" 2>/dev/null | tail -1); echo "${v:-$2}"; }
@@ -2910,17 +2910,17 @@ ac_matrix() { # name : needs T_* loaded from the tunnel (ac_load); fills AV_*, A
   AV_FS=(); AV_FM=()
   AR_OK=(); AR_DOWN=(); AR_UP=(); AR_RTT=(); AR_WHY=()
   at_prep || return 1
-  # 0. baseline: the tunnel as it runs now (no desync) � tells whether the censor even needs the kit
+  # 0. baseline: the tunnel as it runs now (no desync) → tells whether the censor even needs the kit
   av_add "base (no desync)" "$car" d "$T_PEER" '' "$T_SNI"
   # 1. every fake-mode for the first curated SNI
   for fm in $AC_MODES; do
-    av_add "desync ${AC_SNIS%%,*} � $fm" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "${AC_SNIS%%,*}" "$fm"
+    av_add "desync ${AC_SNIS%%,*} → $fm" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "${AC_SNIS%%,*}" "$fm"
   done
   # 2. the strongest mode (seqsum) against every other curated SNI
   local fs rest=${AC_SNIS#*,}
   for fs in ${rest//,/ }; do
     [ -n "$fs" ] || continue
-    av_add "desync $fs � seqsum" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "$fs" seqsum
+    av_add "desync $fs → seqsum" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "$fs" seqsum
   done
   # 3. ECH ladder (TLS carriers only): hides the real SNI from the DPI, works when SNIs are filtered
   case "$car" in tls|wss|h2|grpc)
@@ -2996,7 +2996,7 @@ ac_matrix_cmd() { # name : test every anti-censor combination, apply the best th
   at_table
   if [ "${#AT_RANK[@]}" -eq 0 ]; then
     echo
-    err "Nothing connects right now � not even the baseline. The censor is dropping the carrier itself (L3/IP block)."
+    err "Nothing connects right now → not even the baseline. The censor is dropping the carrier itself (L3/IP block)."
     hint "The desync kit cannot fix a blocked IP: switch carrier (m), use the CDN (cdn-tune), or wait out the blackout."
     return 1
   fi
