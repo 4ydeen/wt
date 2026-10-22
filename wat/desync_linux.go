@@ -87,11 +87,14 @@ func NewDesync(cfg DesyncConfig, peer string) (*Desync, error) {
 	return &Desync{inj: inj}, nil
 }
 
+// PeerTTL reports the inbound TTL the sniffer learned from the peer's SYN-ACK (0 = none seen): the probe
+// uses it so its sum marker mirrors what the production marker would send.
+func (d *Desync) PeerTTL() int { return int(d.inj.tr.peerTTL()) }
+
 // Wrap announces the connection to the sniffer, waits for the fake to fire, and returns the connection unchanged.
 // A connection that is not a plain IPv4 TCP connection passes through unwrapped; a handshake the sniffer never
 // sees (offload paths) passes through after 2 s.
-func (d *Desync) Wrap(c net.Conn) (net.Conn, error) {
-	// the tls/wss/h2 carriers hand their hook an already-handshaked *tls.Conn (or a WS/HTTP framing wrapper);
+func (d *Desync) Wrap(c net.Conn) (net.Conn, error) {	// the tls/wss/h2 carriers hand their hook an already-handshaked *tls.Conn (or a WS/HTTP framing wrapper);
 	// unwrap to the socket underneath, like newPoolConn does (rawTCP)
 	tc := rawTCP(c)
 	if tc == nil {

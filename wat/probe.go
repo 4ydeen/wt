@@ -183,7 +183,11 @@ func (p *filterProbe) sumProbe(c *net.TCPConn) bool {
 	copy(s[:], la.IP.To4())
 	copy(d[:], ra.IP.To4())
 	k := desyncKey{s, d, uint16(la.Port), uint16(ra.Port)}
-	pkt := fakePacket(k, isn, 0, 64, hello)
+	ttl := 64
+	if pt := p.d.PeerTTL(); pt > 0 { // the learned inbound TTL: the marker must mirror the production fire
+		ttl = pt
+	}
+	pkt := fakePacket(k, isn, 0, ttl, hello)
 	damageChecksum(pkt)
 	sendRawProbe(pkt)
 	// the flow surviving the marker is the signal; the marker's ack=0 is wrong on purpose — the filter's
