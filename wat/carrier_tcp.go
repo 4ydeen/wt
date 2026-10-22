@@ -1020,11 +1020,33 @@ func (c *TCPPoolClient) SetRotate(d time.Duration, bytes int64) {
 
 // Backlogged reports whether the pool's send queues are full (Backlogger).
 func (c *TCPPoolClient) Backlogged() bool {
-	conns := make([]*poolConn, len(c.slots))
-	for i := range c.slots {
-		conns[i] = c.slots[i].Load()
+	now := time.Now().UnixNano()
+	best, anyQ, n := 1<<30, 1<<30, 0
+	for i := range c.slots { // inline backlogged(): no per-tick allocation on the 1 kHz pump path (audit 2026-10-22)
+		pc := c.slots[i].Load()
+		if pc == nil {
+			continue
+		}
+		select {
+		case <-pc.done:
+			continue
+		default:
+		}
+		n++
+		l := len(pc.q)
+		anyQ = min(anyQ, l)
+		if pc.stalledFor(now) > poolStall {
+			continue
+		}
+		best = min(best, l)
 	}
-	return backlogged(conns)
+	if n == 0 {
+		return false
+	}
+	if best == 1<<30 {
+		best = anyQ
+	}
+	return best >= poolBacklog
 }
 
 // Clone returns a new pool client to the same peer(s) with the same dial function, and with it the same TLS engine
@@ -1098,11 +1120,12 @@ type TCPPoolServer struct {
 	wg    sync.WaitGroup
 	rr    atomic.Uint32
 	once  sync.Once
-	mu    sync.Mutex
-	pools map[string]map[*poolConn]struct{}
-	all   map[net.Conn]struct{} // every accepted conn, so Close also reaches ones still in their hello
-	merge atomic.Bool           // reverse mode: every conn joins one pool whatever its hello id says
-	keep  atomic.Bool           // never close a connection for delivering below its share (SetKeepSlow)
+	mu      sync.Mutex
+	pools   map[string]map[*poolConn]struct{}
+	ordered map[string][]*poolConn // the same pools in born order, kept under mu by add/remove for the hot SendTo
+	all     map[net.Conn]struct{}  // every accepted conn, so Close also reaches ones still in their hello
+	merge   atomic.Bool            // reverse mode: every conn joins one pool whatever its hello id says
+	keep    atomic.Bool            // never close a connection for delivering below its share (SetKeepSlow)
 }
 
 // SetKeepSlow turns off the slow-connection check (2.4.7) for a direct path (2.4.18). It exists for a CDN edge whose
@@ -1122,7 +1145,7 @@ func NewTCPPoolServer(addr string) (*TCPPoolServer, error) {
 
 func newPoolServer(ln net.Listener) *TCPPoolServer {
 	s := &TCPPoolServer{ln: ln, rx: make(chan rxPkt, poolRxQueue), done: make(chan struct{}),
-		pools: map[string]map[*poolConn]struct{}{}, all: map[net.Conn]struct{}{}}
+		pools: map[string]map[*poolConn]struct{}{}, ordered: map[string][]*poolConn{}, all: map[net.Conn]struct{}{}}
 	s.wg.Add(2)
 	go s.acceptLoop()
 	go s.healthLoop()
@@ -1251,6 +1274,7 @@ func (s *TCPPoolServer) add(key string, pc *poolConn) bool {
 		return false
 	}
 	set[pc] = struct{}{}
+	s.ordered[key] = append(s.ordered[key], pc) // born order kept on change: SendTo must not sort per packet
 	return true
 }
 
@@ -1261,6 +1285,14 @@ func (s *TCPPoolServer) remove(key string, pc *poolConn) {
 		delete(set, pc)
 		if len(set) == 0 {
 			delete(s.pools, key)
+			delete(s.ordered, key)
+		} else if o := s.ordered[key]; o != nil {
+			for i, x := range o {
+				if x == pc {
+					s.ordered[key] = append(o[:i], o[i+1:]...)
+					break
+				}
+			}
 		}
 	}
 }
@@ -1280,14 +1312,10 @@ func (s *TCPPoolServer) SendTo(p []byte, lane int, dst net.Addr) error {
 		return net.ErrClosed
 	}
 	s.mu.Lock()
-	conns := make([]*poolConn, 0, len(s.pools[a.key]))
-	for pc := range s.pools[a.key] {
-		conns = append(conns, pc)
-	}
+	conns := s.ordered[a.key] // born-ordered copy kept by add/remove: no per-packet slice + sort
 	s.mu.Unlock()
 	var pc *poolConn
-	if lane >= PinLaneBase { // a stable order, so a stream keeps its connection (map order is random)
-		slices.SortFunc(conns, func(a, b *poolConn) int { return a.born.Compare(b.born) })
+	if lane >= PinLaneBase && len(conns) > 0 { // a stable order, so a stream keeps its connection
 		pc = pinnedConn(conns, lane)
 	}
 	if pc == nil {
@@ -1306,10 +1334,7 @@ func (s *TCPPoolServer) BackloggedTo(dst net.Addr) bool {
 		return false
 	}
 	s.mu.Lock()
-	conns := make([]*poolConn, 0, len(s.pools[a.key]))
-	for pc := range s.pools[a.key] {
-		conns = append(conns, pc)
-	}
+	conns := s.ordered[a.key]
 	s.mu.Unlock()
 	return backlogged(conns)
 }
