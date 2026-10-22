@@ -704,7 +704,11 @@ func (s *Session) sendEach(batch []outPkt) {
 			s.mu.Unlock()
 		}
 		if o.dupLane >= 0 {
-			s.io.Send(o.p, o.dupLane)
+			if err := s.io.Send(o.p, o.dupLane); err != nil { // both lanes' drops must be visible in /stats
+				s.mu.Lock()
+				s.stats.Dropped++
+				s.mu.Unlock()
+			}
 		}
 		s.putOut(o.p)
 	}
@@ -1349,14 +1353,7 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 		return
 	}
 	s.mu.Lock()
-	dup := s.rxDup(pn)
-	if dup {
-		if s.rxLargest-pn >= s.replayWin {
-			s.stats.RxTooOld++
-		} else {
-			s.stats.RxDup++
-		}
-	}
+	dup := s.rxDup(pn) // fast path: a dup is still opened below (cheap to skip only after auth held); see re-check
 	// snapshot the keys: onKex and the switch below replace them under this same lock
 	first, fall := s.aead, s.oldAead
 	freshRx := s.kexAead // server between offer and switch: the client's fresh key opens first
@@ -1368,7 +1365,7 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	}
 	s.mu.Unlock()
 	if dup {
-		return
+		return // not counted: unauthenticated junk with a known sid/pn must not pollute the loss stats (audit 2026-10-22)
 	}
 	copy(s.rxNonce[4:], raw[8:16])
 	plain, err := first.Open(s.openBuf[:0], s.rxNonce[:], raw[hdrLen:], raw[:8])
@@ -1387,7 +1384,12 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	if freshRx != nil { // a packet only the fresh key opens: the peer has switched, so we seal our own packets with it too
 		s.oldAead, s.aead, s.kexAead, s.kexAt, s.kexDone = fall, first, nil, now, true
 	}
-	if s.rxDup(pn) { // re-check under the lock
+	if s.rxDup(pn) { // re-check under the lock: only authenticated duplicates count (audit 2026-10-22)
+		if s.rxLargest-pn >= s.replayWin {
+			s.stats.RxTooOld++
+		} else {
+			s.stats.RxDup++
+		}
 		return
 	}
 	if !s.rxAny || pn > s.rxLargest {
