@@ -25,10 +25,10 @@ up from one pasted token. It rides whatever your route lets through: `icmp` (pin
 `wss`, `h2`, `h2c`, `grpc`, Cloudflare with ECH, reverse mode, several of them bonded into one tunnel, or
 fake-SNI desync (`fake-sni`) when the route permit-lists flows by their TLS name (2.6.0; on the wss, h2 and grpc
 carriers too since 2.7.0, with automatic TTL calibration, NAT-sequence follow, a checksum mode for routes that
-validate sequence numbers (2.7.1), and both markers at once (`seqsum`, 2.8.0)), plus optional `pool-rotate` churn
+validate sequence numbers (2.7.1), and both markers at once (`seqsum`, 2.8.0); then five more in 2.10.5: `split` cuts the fake hello across segments, `hlen0` is the F&F-style empty TLS record, `fakeip` aims the fake at a whitelisted CDN address (`fake-ip`), `synrst` clears flow tables harder and `all` fires three markers), plus optional `pool-rotate` churn
 so no single connection shows a months-stable lifetime (2.8.0; optional byte budget `pool-rotate-bytes`, 2.8.1).
 The filter can be probed and the marker mode picked automatically (`fake-mode: auto`, 2.9.0); `wattun blackout
-NAME [SNI]` turns the kit on with one command when a censor starts blocking. `ech: ladder` (2.9.0) fetches the
+NAME [SNI]` turns the kit on with one command when a censor starts blocking. `tls-small-ch` (2.10.5) keeps the ClientHello at ~250 B (no post-quantum key share) for DPIs that drop large hellos, `ech: ladder` (2.9.0) fetches the
 ECH config through the tunnel itself when every public DNS-over-HTTPS server is blocked, and `-governor` (2.9.0)
 learns an ICMP path's volume ceiling from its reroute signature.
 
