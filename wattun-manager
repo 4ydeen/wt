@@ -176,43 +176,62 @@ gfg() { # index -> GFG escape
   if [ "$NCOL" -ge 256 ]; then printf -v GFG '\e[1;38;5;%sm' "${GR_N[$i]}"; else printf -v GFG '\e[1;%sm' "${GR_F[$i]}"; fi
 }
 WATTUN_BANNER=(
-  '   _       __      __  ______            '
-  '  | |     / /___ _/ /_/_  __/_  ______   '
-  '  | | /| / / __ `/ __/ / / / / / / __ \  '
-  '  | |/ |/ / /_/ / /_  / / / /_/ / / / /  '
-  '  |__/|__/\__,_/\__/ /_/  \__,_/_/ /_/   '
+  '██     ██  ▄▄▄ ▄▄▄▄▄▄ ██████ ▄▄ ▄▄ ▄▄  ▄▄ ▄▄  ▄▄ '
+  '██ ▄█▄ ██ ██▀██  ██     ██   ██ ██ ███▄██ ███▄██ '
+  ' ▀██▀██▀  ██▀██  ██     ██   ▀███▀ ██ ▀██ ██ ▀██ '
 )
 META_GITHUB='https://github.com/JohnWatsoon'
 META_TELEGRAM='@Watdevs'
 
 banner() { # [1 = animated reveal]
-  local i cols kc GFG
+  local i cols GFG
   cols=$(tput cols 2>/dev/null || echo 80)
-  if [ "$cols" -ge 80 ]; then
+  if [ "$cols" -ge 84 ]; then
     local side=(
-      "┌─ WatTun Community ────────────────┐"
-      "│ GitHub:   github.com/JohnWatsoon  │"
-      "│ Telegram: @Watdevs                │"
-      "│ Core:     Autonomous Failover     │"
-      "└───────────────────────────────────┘"
+      "┌─ WatTun Community ─────────┐"
+      "│ GitHub:   github.com/JohnWatsoon"
+      "│ Telegram: @Watdevs"
+      "└────────────────────────────┘"
     )
-    for i in 0 1 2 3 4; do
+    for i in 0 1 2; do
       gfg "$i"
       local left="${WATTUN_BANNER[$i]}"
       local right="${side[$i]}"
       if [ "$USE_COLOR" = 1 ]; then
         case "$i" in
-          0|4) right="${GRY}${side[$i]}${RST}" ;;
-          1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   github.com/JohnWatsoon  ${GRY}│${RST}" ;;
-          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}                ${GRY}│${RST}" ;;
-          3) right="${GRY}│${RST} ${GRY}Core:${RST}     Autonomous Failover     ${GRY}│${RST}" ;;
+          0) right="${GRY}┌─ ${CYN}WatTun Community${GRY} ─────────┐${RST}" ;;
+          1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   github.com/JohnWatsoon" ;;
+          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}" ;;
         esac
       fi
-      printf '  %s%s%s %s\n' "$GFG" "$left" "$RST" "$right"
+      printf '  %s%s%s  %s\n' "$GFG" "$left" "$RST" "$right"
       [ "${1:-0}" = 1 ] && sleep 0.03
     done
+    printf '  %*s  %s\n' 49 '' "${GRY}└────────────────────────────┘${RST}"
+  elif [ "$cols" -ge 80 ]; then
+    local side=(
+      "┌─ WatTun Community ──────┐"
+      "│ GitHub:   JohnWatsoon   │"
+      "│ Telegram: @Watdevs      │"
+      "└─────────────────────────┘"
+    )
+    for i in 0 1 2; do
+      gfg "$i"
+      local left="${WATTUN_BANNER[$i]}"
+      local right="${side[$i]}"
+      if [ "$USE_COLOR" = 1 ]; then
+        case "$i" in
+          0) right="${GRY}┌─ ${CYN}WatTun Community${GRY} ──────┐${RST}" ;;
+          1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   JohnWatsoon   ${GRY}│${RST}" ;;
+          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}      ${GRY}│${RST}" ;;
+        esac
+      fi
+      printf ' %s%s%s %s\n' "$GFG" "$left" "$RST" "$right"
+      [ "${1:-0}" = 1 ] && sleep 0.03
+    done
+    printf ' %*s %s\n' 49 '' "${GRY}└─────────────────────────┘${RST}"
   else
-    for i in 0 1 2 3 4; do
+    for i in 0 1 2; do
       gfg "$i"
       printf '  %s%s%s\n' "$GFG" "${WATTUN_BANNER[$i]}" "$RST"
       [ "${1:-0}" = 1 ] && sleep 0.03
@@ -244,6 +263,37 @@ render_header() { # title [subtitle] [animated=0]
   hr; echo
 }
 
+render_subpage_header() { # title [subtitle]
+  if [ "$NONINTERACTIVE" = 1 ]; then printf '== %s%s ==\n' "$1" "${2:+ ($2)}"; return 0; fi
+  clear_screen; echo
+  local cols w ctx pad
+  cols=$(tput cols 2>/dev/null || echo 80)
+  w=$((cols - 4))
+  [ "$w" -gt 74 ] && w=74
+  [ "$w" -lt 56 ] && w=56
+  
+  local ver_tag="WatTun"
+  [ -n "$VER" ] && ver_tag="WatTun v$VER"
+  local top_left="╭─ ${CYN}${BOLD}${ver_tag}${RST} "
+  local top_mid="${GRY}── @Watdevs ── "
+  local top_right="github.com/JohnWatsoon ─╮${RST}"
+  
+  local raw_left="╭─ ${ver_tag} "
+  local raw_mid="── @Watdevs ── "
+  local raw_right="github.com/JohnWatsoon ─╮"
+  local fill_len=$((w - ${#raw_left} - ${#raw_mid} - ${#raw_right}))
+  [ "$fill_len" -lt 1 ] && fill_len=1
+  
+  ctx="Context: $1${2:+ ($2)}"
+  vlen "$ctx"
+  pad=$((w - 2 - VLEN))
+  [ "$pad" -lt 0 ] && pad=0
+
+  printf '  %s%s%s%s\n' "$top_left" "${GRY}$(rep ─ $fill_len)${RST}" "$top_mid" "$top_right"
+  printf '  %s│%s %s%s%s%*s %s│%s\n' "$GRY" "$RST" "$BOLD" "$ctx" "$RST" "$pad" '' "$GRY" "$RST"
+  printf '  %s╰%s╯%s\n\n' "$GRY" "$(rep ─ "$w")" "$RST"
+}
+
 page_full() { # title [subtitle]
   local anim=0
   if [ "$ANIM" = 1 ] && [ "$INTRO_DONE" = 0 ]; then anim=1; fi
@@ -252,14 +302,22 @@ page_full() { # title [subtitle]
 }
 
 page() { # title [subtitle]
-  render_header "$1" "${2:-}" 0
+  render_subpage_header "$1" "${2:-}"
 }
 
 # ---- boxes ----
 BOXW=74
-box_top() { printf '  %s┌─ %s%s%s%s %s┐%s\n' "$GRY" "$RST" "$BOLD$1" "$RST" "$GRY" "$(rep ─ $((BOXW-${#1}-3)))" "$RST"; }
+box_top() { printf '  %s╭─ %s%s%s%s %s╮%s\n' "$GRY" "$RST" "$BOLD$1" "$RST" "$GRY" "$(rep ─ $((BOXW-${#1}-3)))" "$RST"; }
+box_mid() { printf '  %s├%s┤%s\n' "$GRY" "$(rep ─ "$BOXW")" "$RST"; }
 box_row() { vlen "$1"; local pad=$((BOXW-2-VLEN)); [ "$pad" -lt 0 ] && pad=0; printf '  %s│%s %s%*s %s│%s\n' "$GRY" "$RST" "$1" "$pad" '' "$GRY" "$RST"; }
-box_bot() { printf '  %s└%s┘%s\n' "$GRY" "$(rep ─ "$BOXW")" "$RST"; }
+row_2col() {
+  local left=$1 right=$2 w_left=36 pad
+  vlen "$left"
+  pad=$((w_left - VLEN))
+  [ "$pad" -lt 0 ] && pad=0
+  box_row "${left}$(rep ' ' "$pad")  ${right}"
+}
+box_bot() { printf '  %s╰%s╯%s\n' "$GRY" "$(rep ─ "$BOXW")" "$RST"; }
 
 # ---- spinner / progress ----
 SPIN_FR=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
@@ -4025,44 +4083,67 @@ status_row() {
     "$([ "$TI_STATE" = up ] && printf '%.0fms' "$TI_RTT" || echo -)" "$load" "$(ports_summary "$n" 17)"
 }
 tunnel_card() {
-  local n=$1 r cr peer lis line par sub=''
+  local n=$1 r cr peer lis par sub='' srv_act srv_up srv_en routing_txt
   r=$(role "$n"); cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer); lis=$(cfg "$n" listen)
   par=$(companion_of "$n")
   tinfo "$n"; state_cell "$r" "$TI_STATE"
-  if [ -n "$par" ]; then box_top "$n (auto: reverse side of $par)"; else box_top "$n"; fi
-  line="$SC_COL$SC_DOT $SC_TXT$RST   $r · $cr"
-  if [ -n "$par" ]; then line="$SC_COL$SC_DOT $SC_TXT$RST   $r · auto reverse → Iran $(cfg "$n" peer-icmp)"
+  srv_act=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null || echo inactive)
+  srv_up=$(uptime_of "$n")
+  srv_en=$(systemctl is-enabled "${WAT_PREFIX}@$n" 2>/dev/null | head -1)
+
+  if [ "$r" = Kharej ]; then routing_txt="Allows: $(ports_summary "$n" 24)"; else routing_txt="Ports: $(ports_summary "$n" 25)"; fi
+  if [ -n "$par" ]; then box_top "Tunnel Overview: $n (reverse side of $par)"; else box_top "Tunnel Overview: $n"; fi
+
+  # Section 1: Overview & System
+  row_2col "Status:  ${SC_COL}${SC_DOT} ${SC_TXT}${RST}" "Role:      ${BOLD}$r${RST}"
+  row_2col "Service: ● ${srv_act} (${srv_up})" "Autostart: ${srv_en:-disabled}"
+  row_2col "Carrier: ${BOLD}$cr${RST}" "$routing_txt"
+
+  # Sub-role details
+  if [ -n "$par" ]; then
+    box_row "  ${GRY}auto reverse → Iran $(cfg "$n" peer-icmp)${RST}"
   elif is_auto_kharej "$n"; then
-    line="$SC_COL$SC_DOT $SC_TXT$RST   $r · auto (every carrier at once)"
     if [ -f "$CONF/$n-r.yml" ]; then sub="reverse side: $n-r (Iran $(cfg "$n-r" peer-icmp))"
     elif systemctl is-active -q "${WAT_PREFIX}-autowatch-$n.service" 2>/dev/null; then sub="watching for Iran's first connection (then $n-r is created)"
     else sub="Iran's IP not learned yet: $SELF auto-ip $n IRAN_IP"; fi
+    box_row "  ${GRY}$sub${RST}"
   elif [ "$cr" = icmp ] && is_reverse "$n"; then
-    if [ "$r" = Iran ]; then line="$line (reverse) ← pinged by ${peer:--}"; else line="$line (reverse) → pings Iran ${peer:--}"; fi
+    if [ "$r" = Iran ]; then box_row "  ${GRY}(reverse) ← pinged by ${peer:--}${RST}"; else box_row "  ${GRY}(reverse) → pings Iran ${peer:--}${RST}"; fi
   elif is_pool "$cr" && is_reverse "$n"; then
-    if [ "$r" = Iran ]; then line="$line (reverse) ← Kharej connects on ${lis:-:-}"; else line="$line (reverse) → connects to Iran ${peer:--}"; fi
-  elif [ "$r" = Iran ]; then line="$line → ${peer:--}"; else line="$line${lis:+ listening on $lis}"; fi
-  box_row "$line"
-  [ -n "$sub" ] && box_row "${GRY}$sub${RST}"
-  sub=$(cdn_summary "$n"); [ -n "$sub" ] && box_row "${GRY}CDN: $sub${RST}"
+    if [ "$r" = Iran ]; then box_row "  ${GRY}(reverse) ← Kharej connects on ${lis:-:-}${RST}"; else box_row "  ${GRY}(reverse) → connects to Iran ${peer:--}${RST}"; fi
+  elif [ "$r" = Iran ]; then
+    box_row "  ${GRY}→ remote peer: ${peer:--}${RST}"
+  else
+    [ -n "$lis" ] && box_row "  ${GRY}listening on ${lis}${RST}"
+  fi
+
+  sub=$(cdn_summary "$n"); [ -n "$sub" ] && box_row "  ${GRY}CDN: $sub${RST}"
   if [ "$r" = Iran ] && [ "$(uname -s)" = Linux ]; then
     local fks=$(cfg "$n" fake-sni) gov=$(cfg "$n" governor) rot=$(cfg "$n" pool-rotate) dl=$(cfg "$n" dns-listen)
     if [ -n "$fks" ] || [ "$gov" = true ] || [ -n "$rot" ] || [ -n "$dl" ]; then
-      box_row "Anti-censor: $(detect_preset "$n")${fks:+ (fake-sni $fks)}${dl:+ (dns $dl)}"
+      box_row "  Anti-Censor: $(detect_preset "$n")${fks:+ (fake-sni $fks)}${dl:+ (dns $dl)}"
     fi
   fi
-  box_row "${GRY}service $(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null) ($(uptime_of "$n")) · at boot: $(systemctl is-enabled "${WAT_PREFIX}@$n" 2>/dev/null | head -1)${RST}"
+  local bmode=$(cfg "$n" bond-mode)
+  [ -n "$bmode" ] && box_row "  Bond Mode: ${BOLD}$bmode${RST}"
+  if [ -f "$CONF/$n.sla" ]; then
+    local min_r=$(grep '^sla_min_rate_kbps=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
+    local max_rtt=$(grep '^sla_max_rtt_ms=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
+    local max_l=$(grep '^sla_max_loss_pct=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
+    box_row "  SLA Target: min ${min_r:-0}kbps · max ${max_rtt:-0}ms · max ${max_l:-0}% loss"
+  fi
+
+  # Section 2: Real-time telemetry (when not stopped)
   if [ "$TI_STATE" != stopped ]; then
-    local bmode=$(cfg "$n" bond-mode)
-    [ -n "$bmode" ] && box_row "Bond Mode: ${BOLD}$bmode${RST}"
-    if [ -f "$CONF/$n.sla" ]; then
-      local min_r=$(grep '^sla_min_rate_kbps=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
-      local max_rtt=$(grep '^sla_max_rtt_ms=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
-      local max_l=$(grep '^sla_max_loss_pct=' "$CONF/$n.sla" 2>/dev/null | cut -d= -f2)
-      box_row "SLA Target: min ${min_r:-0}kbps · max ${max_rtt:-0}ms · max ${max_l:-0}% loss"
-    fi
-    box_row "rtt $(ms "$TI_RTT") ms (min $(ms "$(jget "$TI_RAW" min_rtt_ms)"))   rate $(human "$TI_RATE")/s   loss $(jget "$TI_RAW" loss_pct)%   retrans $(jget "$TI_RAW" retrans)"
+    box_mid
+    box_row "${BOLD}Real-Time Network Telemetry:${RST}"
+    row_2col "  Latency:     $(ms "$TI_RTT") ms (min $(ms "$(jget "$TI_RAW" min_rtt_ms)"))" "Throughput:  rate $(human "$TI_RATE")/s"
+    row_2col "  Packet Loss: $(jget "$TI_RAW" loss_pct)%" "Retrans:     $(jget "$TI_RAW" retrans) pkts"
+    row_2col "  Streams:     $TI_STREAMS active" "UDP Flows:   $(jget "$TI_RAW" dgram_flows) active"
+    row_2col "  Total Data:  ↓$(human "$TI_IN")  ↑$(human "$TI_OUT")" "Sessions:    $TI_SESS active"
     if [ "$TI_CAR_COUNT" -gt 0 ]; then
+      box_mid
+      box_row "${BOLD}Bonded Carrier Paths:${RST}"
       local ci ccol cdot ctxt c_pct
       for ((ci=0; ci<TI_CAR_COUNT; ci++)); do
         if [ "${CAR_MUTED[$ci]}" = true ]; then
@@ -4076,9 +4157,7 @@ tunnel_card() {
         box_row "  ${ccol}${cdot} ${ctxt}${RST} [path $ci] ${CAR_NAME[$ci]} · rtt $(ms "${CAR_RTT[$ci]}") ms · loss $(awk -v l="${CAR_LOSS[$ci]:-0}" 'BEGIN{printf "%.1f", l*100}')% · traffic share ${c_pct}%"
       done
     fi
-    box_row "streams $TI_STREAMS   clients $TI_SESS   udp flows $(jget "$TI_RAW" dgram_flows)   ↓$(human "$TI_IN") ↑$(human "$TI_OUT")"
   fi
-  if [ "$r" = Kharej ]; then box_row "Iran may reach: $(ports_summary "$n" 48)"; else box_row "Publishes: $(ports_summary "$n" 56)"; fi
   box_bot
 }
 show_token() {
@@ -5470,54 +5549,55 @@ tunnel_page() {
     page "Tunnel $n" "$r"
     tunnel_card "$n"
     run=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null)
+    local run_txt; [ "$run" = active ] && run_txt="Stop Tunnel Daemon" || run_txt="Start Tunnel Daemon"
     echo
-    printf '  %s• Diagnostics & Logs%s\n' "$CYN" "$RST"
-    printf '    %s diagnose + speed test    %s speed test only    %s logs\n' "$(key_label d)" "$(key_label v)" "$(key_label l)"
-    echo
-    printf '  %s• Traffic & Ports%s\n' "$CYN" "$RST"
-    printf '    %s edit port mappings       %s quotas & rate limits\n' "$(key_label p)" "$(key_label q)"
-    echo
-    printf '  %s• Connection & Resilience%s\n' "$CYN" "$RST"
+    printf '  %s[Actions & Diagnostics]%s                 %s[Configuration & Network]%s\n' "$CYN$BOLD" "$RST" "$CYN$BOLD" "$RST"
+    printf '    %s Live Logs                           %s Port Forwarding Mappings\n' "$(key_label l)" "$(key_label p)"
+    printf '    %s Live Throughput Monitor             %s Change Carrier & Desync Mode\n' "$(key_label m)" "$(key_label c)"
+    printf '    %s Built-in Speedtest                  %s Bonding Manager (Multi-Path)\n' "$(key_label v)" "$(key_label b)"
+    printf '    %s Full Link Diagnostics               %s Quotas & Bandwidth Ceilings\n' "$(key_label d)" "$(key_label q)"
     if [ "$r" = Kharej ]; then
-      printf '    %s show token   %s new key/token   %s bonding manager   %s advanced settings\n' "$(key_label t)" "$(key_label k)" "$(key_label b)" "$(key_label o)"
+      printf '                                           %s Show Emergency Token / Key\n' "$(key_label t)"
     else
-      printf '    %s paste token  %s Kharej address  %s anti-censor       %s auto mode & SLA\n' "$(key_label t)" "$(key_label h)" "$(key_label k)" "$(key_label a)"
-      printf '    %s bonding manager                 %s advanced settings\n' "$(key_label b)" "$(key_label o)"
+      printf '                                           %s Auto Mode & SLA Settings\n' "$(key_label a)"
     fi
-    printf '    %s change connection type (icmp, udp, tcp, CDN... or bonded)\n' "$(key_label m)"
     echo
-    printf '  %s• Service Controls%s\n' "$CYN" "$RST"
-    printf '    %s restart      %s %-5s           %s boot autostart     %s edit YAML\n' "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
+    printf '  %s[Service Lifecycle]%s                     %s[Danger Zone]%s\n' "$CYN$BOLD" "$RST" "$RED$BOLD" "$RST"
+    printf '    %s Restart Tunnel Daemon               %s %sDelete Tunnel Permanently%s\n' "$(key_label r)" "$(key_label x)" "$RED" "$RST"
+    printf '    %s %-32s  %s Advanced YAML Settings\n' "$(key_label s)" "$run_txt" "$(key_label o)"
+    printf '    %s Toggle Autostart at Boot\n' "$(key_label e)"
     echo
-    printf '  %s delete this tunnel                   %s back\n' "$(key_label x)" "$(key_label 0)"
+    hr
+    printf '    %s Back to Dashboard                                        %s Help\n' "$(key_label 0)" "$(key_label '?')"
     key_read
     case "$KEY" in
-      d) page "Diagnose" "$n"; run_flow test_tunnel "$n"; pause ;;
-      v) page "Speed test" "$n"; run_flow speed_test "$n"; pause ;;
-      l) page "Logs" "$n"; run_flow logs_menu "$n"; pause ;;
-      p) run_flow edit_ports "$n"; pause ;;
-      q) run_flow limits_menu "$n" ;;
-      b) run_flow bonding_menu "$n" ;;
-      a) [ "$r" = Iran ] && run_flow auto_menu "$n" ;;
-      h) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
-      t) if [ "$r" = Kharej ]; then
+      d|D) page "Diagnose" "$n"; run_flow test_tunnel "$n"; pause ;;
+      v|V) page "Speed test" "$n"; run_flow speed_test "$n"; pause ;;
+      l|L) page "Logs" "$n"; run_flow logs_menu "$n"; pause ;;
+      m|M) run_flow live_monitor ;;
+      p|P) run_flow edit_ports "$n"; pause ;;
+      q|Q) run_flow limits_menu "$n" ;;
+      c|C) page "Connection type" "$n"; run_flow change_type "$n"; pause ;;
+      b|B) run_flow bonding_menu "$n" ;;
+      a|A) [ "$r" = Iran ] && run_flow auto_menu "$n" ;;
+      h|H) [ "$r" = Iran ] && { page "Kharej address" "$n"; echo; run_flow change_peer "$n"; pause; } ;;
+      t|T) if [ "$r" = Kharej ]; then
            page "Token" "$n"; echo; say "  Paste this on the Iran server ($SELF → n → Iran):"; echo; show_token "$n"; echo; warn "The token contains the key. Share it privately."
          else page "New token" "$n"; echo; run_flow change_key "$n"; fi
          pause ;;
-      k) if [ "$r" = Kharej ]; then page "New key" "$n"; run_flow change_key "$n"; pause; else anticensor_menu "$n"; fi ;;
-      o) run_flow adv_menu "$n" ;;
-      m) page "Connection type" "$n"; run_flow change_type "$n"; pause ;;
-      r) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; sleep 1; fi ;;
-      s) echo
+      k|K) if [ "$r" = Kharej ]; then page "New key" "$n"; run_flow change_key "$n"; pause; else anticensor_menu "$n"; fi ;;
+      o|O) run_flow adv_menu "$n" ;;
+      r|R) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; sleep 1; fi ;;
+      s|S) echo
          if [ "$run" = active ]; then systemctl stop "${WAT_PREFIX}@$n" 2>/dev/null; ok "Stopped (it still starts at boot if enabled)."; sleep 1
          else start_unit "$n"; sleep 1; fi ;;
-      e) echo
+      e|E) echo
          if systemctl is-enabled -q "${WAT_PREFIX}@$n" 2>/dev/null; then systemctl disable "${WAT_PREFIX}@$n" >/dev/null 2>&1; ok "Will NOT start at boot."
          else systemctl enable "${WAT_PREFIX}@$n" >/dev/null 2>&1; ok "Will start at boot."; fi
          sleep 1 ;;
-      c) ${EDITOR:-nano} "$CONF/$n.yml"; echo; confirm "Restart to apply? (port changes apply without restart)" n && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n" ;;
       x|X) page "Delete tunnel" "$n"; echo; run_flow delete_tunnel "$n"; pause ;;
-      0|esc|enter) return 0 ;;
+      0|esc) return 0 ;;
+      \?|\/|help) flash "Keys: l=logs, m=monitor, v=speedtest, d=diagnostics, p=ports, c=carrier, b=bonding, q=limits, r=restart, s=stop, x=delete, 0=back" ;;
       *) : ;;
     esac
   done
