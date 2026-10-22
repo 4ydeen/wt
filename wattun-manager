@@ -3626,11 +3626,11 @@ new_tunnel() { # [kharej|iran]
     page "New tunnel" "which server is this?"
     step_diagram
     echo
-    say "  A tunnel needs ${BOLD}two${RST} servers, set up in this order:"
-    say "    ${CYN}1${RST}  ${BOLD}Kharej${RST}  outside server, where your service runs  ${YEL}<- do this FIRST${RST}"
-    say "    ${CYN}2${RST}  ${BOLD}Iran${RST}    inside server that users connect to      (needs the token from 1)"
+    say "  A tunnel connects two nodes across international network boundaries:"
+    printf '    %s  %sKharej (Foreign VPS)%s   Where real service lives (Xray/panel)  %s[STEP 1 - DO FIRST]%s\n' "$(key_label 1)" "$BOLD" "$RST" "$YEL$BOLD" "$RST"
+    printf '    %s  %sIran (Domestic VPS)%s    Where users/clients connect            %s(Needs token from step 1)%s\n' "$(key_label 2)" "$BOLD" "$RST" "$GRY" "$RST"
     echo
-    printf '  %s?%s Which one is THIS server? %s[1/2, b = back]%s ' "$CYN" "$RST" "$GRY" "$RST"
+    printf '  %s?%s Which role does THIS server perform? %s[1=Kharej, 2=Iran, b=back]%s ' "$CYN" "$RST" "$GRY" "$RST"
     key_read; echo
     case "$KEY" in 1|k|K) pick=kharej ;; 2|i|I) pick=iran ;; *) return 0 ;; esac
   fi
@@ -4443,27 +4443,27 @@ anticensor_menu() {
 
     say "  ${BOLD}Anti-Censorship Configuration for '$n'${RST}"
     echo
-    printf '    %s1%s  Preset Profile         %s\n' "$CYN" "$RST" "$(detect_preset "$n")"
+    printf '    %s  Preset Profile         %s\n' "$(key_label 1)" "$(detect_preset "$n")"
     if is_pool "$cr"; then
-      printf '    %s2%s  Fake SNI               %s\n' "$CYN" "$RST" "${fs:-${GRY}off (disabled)${RST}}"
-      printf '    %s3%s  Fake Desync Mode       %s\n' "$CYN" "$RST" "$([ -n "$fs" ] && echo "$fm" || echo "${GRY}n/a (fake-sni off)${RST}")"
-      printf '    %s4%s  Fake TTL Hop Count     %s\n' "$CYN" "$RST" "$([ -n "$fs" ] && [ "$fm" = ttl ] && echo "${ft:-auto}" || echo "${GRY}n/a${RST}")"
-      printf '    %s5%s  Pool Rotate (Time)     %s\n' "$CYN" "$RST" "${pr:-${GRY}off (disabled)${RST}}"
-      printf '    %s6%s  Pool Rotate (Bytes)    %s\n' "$CYN" "$RST" "${pb:-${GRY}off (disabled)${RST}}"
+      printf '    %s  Fake SNI               %s\n' "$(key_label 2)" "${fs:-${GRY}off (disabled)${RST}}"
+      printf '    %s  Fake Desync Mode       %s\n' "$(key_label 3)" "$([ -n "$fs" ] && echo "$fm" || echo "${GRY}n/a (fake-sni off)${RST}")"
+      printf '    %s  Fake TTL Hop Count     %s\n' "$(key_label 4)" "$([ -n "$fs" ] && [ "$fm" = ttl ] && echo "${ft:-auto}" || echo "${GRY}n/a${RST}")"
+      printf '    %s  Pool Rotate (Time)     %s\n' "$(key_label 5)" "${pr:-${GRY}off (disabled)${RST}}"
+      printf '    %s  Pool Rotate (Bytes)    %s\n' "$(key_label 6)" "${pb:-${GRY}off (disabled)${RST}}"
     elif [ "$cr" = icmp ]; then
-      printf '    %s2%s  Volume Governor        %s\n' "$CYN" "$RST" "$([ "$gov" = true ] && echo "${GRN}ON (active)${RST}" || echo "${GRY}OFF${RST}")"
+      printf '    %s  Volume Governor        %s\n' "$(key_label 2)" "$([ "$gov" = true ] && echo "${GRN}ON (active)${RST}" || echo "${GRY}OFF${RST}")"
     fi
     case "$cr" in
       tls|wss|h2|grpc)
-        printf '    %s7%s  ECH Mode               %s\n' "$CYN" "$RST" "${ech:-${GRY}off (disabled)${RST}}" ;;
+        printf '    %s  ECH Mode               %s\n' "$(key_label 7)" "${ech:-${GRY}off (disabled)${RST}}" ;;
     esac
-    printf '    %s8%s  DNS Forwarder          %s\n' "$CYN" "$RST" "${dl:-${GRY}off (disabled)${RST}}"
-    printf '    %s9%s  Carrier Source IP      %s\n' "$CYN" "$RST" "${sip:-${GRY}off (default route)${RST}}"
+    printf '    %s  DNS Forwarder          %s\n' "$(key_label 8)" "${dl:-${GRY}off (disabled)${RST}}"
+    printf '    %s  Carrier Source IP      %s\n' "$(key_label 9)" "${sip:-${GRY}off (default route)${RST}}"
     echo
-    printf '    %st%s  Test Filter Bypass & Link Status\n' "$CYN" "$RST"
-    printf '    %sm%s  Anti-Censor Matrix      (test every combination, apply the best)\n' "$CYN" "$RST"
-    printf '    %sp%s  Save Current as Custom Profile\n' "$CYN" "$RST"
-    printf '    %sb%s  Back to Advanced Settings\n' "$CYN" "$RST"
+    printf '    %s  Test Filter Bypass & Link Status\n' "$(key_label t)"
+    printf '    %s  Anti-Censor Matrix      (test every combination, apply the best)\n' "$(key_label m)"
+    printf '    %s  Save Current as Custom Profile\n' "$(key_label p)"
+    printf '    %s  Back to Advanced Settings\n' "$(key_label b)"
     echo
     key_read
     case "$KEY" in
@@ -5471,17 +5471,25 @@ tunnel_page() {
     tunnel_card "$n"
     run=$(systemctl is-active "${WAT_PREFIX}@$n" 2>/dev/null)
     echo
-    printf '  %sStatus%s      %s diagnose + speed test   %s speed test only   %s logs\n' "$BOLD" "$RST" "$(key_label d)" "$(key_label v)" "$(key_label l)"
-    printf '  %sPorts%s       %s edit port mappings      %s quotas & rate limits\n' "$BOLD" "$RST" "$(key_label p)" "$(key_label q)"
+    printf '  %s• Diagnostics & Logs%s\n' "$CYN" "$RST"
+    printf '    %s diagnose + speed test    %s speed test only    %s logs\n' "$(key_label d)" "$(key_label v)" "$(key_label l)"
+    echo
+    printf '  %s• Traffic & Ports%s\n' "$CYN" "$RST"
+    printf '    %s edit port mappings       %s quotas & rate limits\n' "$(key_label p)" "$(key_label q)"
+    echo
+    printf '  %s• Connection & Resilience%s\n' "$CYN" "$RST"
     if [ "$r" = Kharej ]; then
-      printf '  %sConnection%s  %s show token   %s new key + token   %s bonding manager   %s advanced settings\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label k)" "$(key_label b)" "$(key_label o)"
+      printf '    %s show token   %s new key/token   %s bonding manager   %s advanced settings\n' "$(key_label t)" "$(key_label k)" "$(key_label b)" "$(key_label o)"
     else
-      printf '  %sConnection%s  %s paste token  %s Kharej address    %s anti-censor       %s auto mode & SLA\n' "$BOLD" "$RST" "$(key_label t)" "$(key_label h)" "$(key_label k)" "$(key_label a)"
-      printf '              %s bonding manager   %s advanced settings\n' "$(key_label b)" "$(key_label o)"
+      printf '    %s paste token  %s Kharej address  %s anti-censor       %s auto mode & SLA\n' "$(key_label t)" "$(key_label h)" "$(key_label k)" "$(key_label a)"
+      printf '    %s bonding manager                 %s advanced settings\n' "$(key_label b)" "$(key_label o)"
     fi
-    printf '              %s change connection type (icmp, udp, tcp, CDN... or several at once)\n' "$(key_label m)"
-    printf '  %sService%s     %s restart  %s %s  %s start at boot on/off  %s edit file\n' "$BOLD" "$RST" "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
-    printf '  %sDanger%s      %s delete this tunnel                   %s back\n' "$RED$BOLD" "$RST" "$(key_label x)" "$(key_label 0)"
+    printf '    %s change connection type (icmp, udp, tcp, CDN... or bonded)\n' "$(key_label m)"
+    echo
+    printf '  %s• Service Controls%s\n' "$CYN" "$RST"
+    printf '    %s restart      %s %-5s           %s boot autostart     %s edit YAML\n' "$(key_label r)" "$(key_label s)" "$([ "$run" = active ] && echo stop || echo start)" "$(key_label e)" "$(key_label c)"
+    echo
+    printf '  %s delete this tunnel                   %s back\n' "$(key_label x)" "$(key_label 0)"
     key_read
     case "$KEY" in
       d) page "Diagnose" "$n"; run_flow test_tunnel "$n"; pause ;;
