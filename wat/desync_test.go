@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -268,6 +269,8 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *sentLog) {
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "fakeip"}
 	case "synrst":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "synrst"}
+	case "ff":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "ff"}
 	case "all":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "all"}
 	}
@@ -1185,11 +1188,17 @@ func TestDesyncOptsCapture(t *testing.T) {
 }
 
 // TestValidateDesyncNewModes pins validation for the modes added with the F&F round: split/hlen0/fakeip/synrst/
-// all, the -fake-ip IPv4 check and the -fake-split range.
+// ff/all, the -fake-ip IPv4 check and the -fake-split range.
 func TestValidateDesyncNewModes(t *testing.T) {
-	for _, m := range []string{"split", "hlen0", "fakeip", "synrst", "all"} {
+	for _, m := range []string{"split", "hlen0", "fakeip", "synrst", "ff", "all"} {
 		if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: m}); err != nil {
 			t.Fatalf("%s: %v", m, err)
+		}
+	}
+	// ff reuses -fake-split for its segment count; 0 means the preset's 11
+	for _, n := range []int{3, 11, 16} {
+		if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "ff", Split: n}); err != nil {
+			t.Fatalf("ff split %d: %v", n, err)
 		}
 	}
 	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "188.114.98.0"}); err != nil {
@@ -1475,10 +1484,10 @@ func TestDesyncSYNRSTClearsFlowHarder(t *testing.T) {
 	}
 }
 
-// TestDesyncAllFiresThreeMarkers: all mode fires seq + sum + hlen0 markers ~1 ms apart. Classify the three sent
-// packets by their properties (below-window/valid, in-window/damaged, below-window/zero-record) rather than by
-// arrival order, so the ~1 ms timer scheduling cannot make the test flaky.
-func TestDesyncAllFiresThreeMarkers(t *testing.T) {
+// TestDesyncAllFiresAllMarkers: all mode fires the seq + sum + hlen0 single markers ~1 ms apart and then the true
+// F&F record/segment plan from 3 ms. Single markers are classified by packet shape rather than arrival order, so
+// the timer scheduling cannot make the test flaky; the F&F run is checked as a whole.
+func TestDesyncAllFiresAllMarkers(t *testing.T) {
 	tr, sent := desyncTestTracker("all", 0)
 	defer tr.close()
 	k := testClientKey()
@@ -1493,17 +1502,23 @@ func TestDesyncAllFiresThreeMarkers(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatalf("all fired counter %d, want 1", tr.fired())
 	}
-	deadline := time.Now().Add(time.Second)
-	for sent.n() < 3 {
+	streamStart := isn + 1
+	rLen := ffFirstSeg + 6*(len(tr.hello)-5-ffChunk)
+	wantFF := len(ffSegs(make([]byte, rLen), 0))
+	deadline := time.Now().Add(2 * time.Second)
+	for sent.n() < 3+wantFF {
 		if time.Now().After(deadline) {
-			t.Fatalf("all sent %d markers, want 3 (a timer marker never arrived)", sent.n())
+			t.Fatalf("all sent %d packets, want %d (3 single markers + %d F&F segments)", sent.n(), 3+wantFF, wantFF)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	streamStart := isn + 1
+	if sent.n() != 3+wantFF {
+		t.Fatalf("all sent %d packets, want %d", sent.n(), 3+wantFF)
+	}
 	belowSeq := streamStart - uint32(len(tr.hello))
 	var sawSeq, sawSum, sawHLen bool
-	for i := 0; i < 3; i++ {
+	var ffPkts [][]byte
+	for i := 0; i < sent.n(); i++ {
 		pkt := sent.at(i)
 		payload := payloadOf(pkt)
 		seq := binary.BigEndian.Uint32(pkt[24:])
@@ -1516,11 +1531,270 @@ func TestDesyncAllFiresThreeMarkers(t *testing.T) {
 		case len(payload) == len(tr.hello) && seq == streamStart && !valid:
 			sawSum = true
 		default:
-			t.Fatalf("marker %d matches no expected shape (seq %d, len %d, valid %v)", i, seq, len(payload), valid)
+			ffPkts = append(ffPkts, pkt)
 		}
 	}
 	if !sawSeq || !sawSum || !sawHLen {
-		t.Fatalf("all markers missing: seq=%v sum=%v hlen0=%v (want all three)", sawSeq, sawSum, sawHLen)
+		t.Fatalf("all single markers missing: seq=%v sum=%v hlen0=%v (want all three)", sawSeq, sawSum, sawHLen)
+	}
+	if len(ffPkts) != wantFF {
+		t.Fatalf("all sent %d F&F segments, want %d", len(ffPkts), wantFF)
+	}
+	sort.Slice(ffPkts, func(i, j int) bool {
+		return binary.BigEndian.Uint32(ffPkts[i][24:]) < binary.BigEndian.Uint32(ffPkts[j][24:])
+	})
+	checkFFStream(t, ffPkts, streamStart, len(tr.hello), srvSeq+1)
+}
+
+// checkFFStream verifies one fired F&F run: the [114,1] mask-2 segment plan, contiguous sequence numbers all below
+// the stream start and ending exactly at it, valid checksums, and the [0,104,1] record plan inside the payloads.
+func checkFFStream(t *testing.T, pkts [][]byte, streamStart uint32, helloLen int, ack uint32) {
+	t.Helper()
+	if len(pkts) == 0 {
+		t.Fatal("F&F run has no packets")
+	}
+	body := helloLen - 5
+	rLen := ffFirstSeg + 6*(body-ffChunk)
+	want := ffSegs(make([]byte, rLen), 0)
+	if len(pkts) != len(want) {
+		t.Fatalf("F&F run has %d segments, want %d (the [114,1] plan, maxSplit %d)", len(pkts), len(want), ffDefaultSegs)
+	}
+	firstSeq := streamStart - uint32(rLen)
+	var r []byte
+	for i, pkt := range pkts {
+		payload := payloadOf(pkt)
+		if len(payload) != len(want[i]) {
+			t.Fatalf("F&F segment %d is %d bytes, want %d", i, len(payload), len(want[i]))
+		}
+		seq := binary.BigEndian.Uint32(pkt[24:])
+		if wantSeq := firstSeq + uint32(len(r)); seq != wantSeq {
+			t.Fatalf("F&F segment %d seq %d, want %d (contiguous, below the stream start)", i, seq, wantSeq)
+		}
+		if got := binary.BigEndian.Uint32(pkt[28:]); got != ack {
+			t.Fatalf("F&F segment %d ack %d, want %d", i, got, ack)
+		}
+		if flags := pkt[20+13]; flags != 0x18 {
+			t.Fatalf("F&F segment %d flags 0x%02x, want 0x18 (PSH|ACK)", i, flags)
+		}
+		if !tcpChecksumOK(pkt) {
+			t.Fatalf("F&F segment %d carries an invalid TCP checksum", i)
+		}
+		if csum(pkt[:20]) != 0 {
+			t.Fatalf("F&F segment %d carries an invalid IPv4 checksum", i)
+		}
+		r = append(r, payload...)
+	}
+	if end := firstSeq + uint32(len(r)); end != streamStart {
+		t.Fatalf("F&F run ends at seq %d, want %d (the real stream's ISN+1)", end, streamStart)
+	}
+	// record plan: empty record, 104-byte record, then one 1-byte record per remaining handshake byte
+	var rebuilt []byte
+	rec := 0
+	for off := 0; off+5 <= len(r); {
+		if r[off] != 0x16 || r[off+1] != 0x03 || r[off+2] != 0x01 {
+			t.Fatalf("record %d header % x, want 16 03 01 ...", rec, r[off:off+3])
+		}
+		l := int(binary.BigEndian.Uint16(r[off+3 : off+5]))
+		if off+5+l > len(r) {
+			t.Fatalf("record %d: length %d overruns the stream", rec, l)
+		}
+		switch {
+		case rec == 0 && l != 0:
+			t.Fatalf("first record length %d, want 0 (the empty F&F record)", l)
+		case rec == 1 && l != ffChunk:
+			t.Fatalf("second record length %d, want %d", l, ffChunk)
+		case rec >= 2 && l != 1:
+			t.Fatalf("record %d length %d, want 1", rec, l)
+		}
+		rebuilt = append(rebuilt, r[off+5:off+5+l]...)
+		off += 5 + l
+		rec++
+	}
+	if len(rebuilt) != body {
+		t.Fatalf("reframed handshake body is %d bytes, want %d", len(rebuilt), body)
+	}
+	if rec != 2+(body-ffChunk) {
+		t.Fatalf("record count %d, want %d (empty + 104 B + one per remaining byte)", rec, 2+(body-ffChunk))
+	}
+	// the first segment must not expose a parseable ClientHello/SNI — that is the point of the plan
+	if _, err := parseSNIOf(payloadOf(pkts[0])); err == nil {
+		t.Fatal("the first F&F segment parses as a ClientHello with an SNI")
+	}
+}
+
+// TestDesyncFFRecordPlan pins mask 1 (lengths [0,104,1]) on a real fake ClientHello: an empty record first, a
+// second record of 104 bytes, then one 1-byte record per remaining handshake byte. The record payloads concatenate
+// back to the untouched handshake body, so a DPI that reassembles records still sees the original ClientHello.
+func TestDesyncFFRecordPlan(t *testing.T) {
+	hello := FakeClientHello("mci.ir")
+	body := hello[5:]
+	r := recordReframe(hello)
+	if len(r) == 0 {
+		t.Fatal("recordReframe returned nothing for a full fake ClientHello")
+	}
+	if want := ffFirstSeg + 6*(len(body)-ffChunk); len(r) != want {
+		t.Fatalf("reframed length %d, want %d (114 + 6·(|H|−104))", len(r), want)
+	}
+	if !bytes.Equal(r[0:5], []byte{0x16, 0x03, 0x01, 0, 0}) {
+		t.Fatalf("first record header % x, want 16 03 01 00 00 (empty record)", r[0:5])
+	}
+	if !bytes.Equal(r[5:10], []byte{0x16, 0x03, 0x01, 0x00, byte(ffChunk)}) {
+		t.Fatalf("second record header % x, want 16 03 01 00 68 (length 104)", r[5:10])
+	}
+	if !bytes.Equal(r[10:10+ffChunk], body[:ffChunk]) {
+		t.Fatal("the second record does not carry H[0:104]")
+	}
+	if !bytes.Equal(r[ffFirstSeg:ffFirstSeg+5], []byte{0x16, 0x03, 0x01, 0, 1}) {
+		t.Fatalf("third record header % x, want 16 03 01 00 01", r[ffFirstSeg:ffFirstSeg+5])
+	}
+	var lens []int
+	var rebuilt []byte
+	for off := 0; off+5 <= len(r); {
+		if r[off] != 0x16 || r[off+1] != 0x03 || r[off+2] != 0x01 {
+			t.Fatalf("record at %d has header % x", off, r[off:off+3])
+		}
+		l := int(binary.BigEndian.Uint16(r[off+3 : off+5]))
+		if off+5+l > len(r) {
+			t.Fatalf("record at %d: length %d overruns", off, l)
+		}
+		lens = append(lens, l)
+		rebuilt = append(rebuilt, r[off+5:off+5+l]...)
+		off += 5 + l
+	}
+	if len(lens) != 2+(len(body)-ffChunk) {
+		t.Fatalf("record count %d, want %d", len(lens), 2+(len(body)-ffChunk))
+	}
+	if lens[0] != 0 || lens[1] != ffChunk {
+		t.Fatalf("first two record lengths %v, want [0 %d]", lens[:2], ffChunk)
+	}
+	for i := 2; i < len(lens); i++ {
+		if lens[i] != 1 {
+			t.Fatalf("record %d length %d, want 1", i, lens[i])
+		}
+	}
+	if !bytes.Equal(rebuilt, body) {
+		t.Fatal("the record payloads do not reassemble to the handshake body")
+	}
+	if recordReframe(hello[:5+ffChunk-1]) != nil {
+		t.Fatal("a hello shorter than 104 handshake bytes must not reframe")
+	}
+}
+
+// TestDesyncFFSegmentPlan pins mask 2 (lengths [114,1], maxSplit 11) as a pure byte cutter, plus the MTU-safe
+// split of an oversized final remainder: consecutive TCP pieces with contiguous offsets, total bytes unchanged.
+func TestDesyncFFSegmentPlan(t *testing.T) {
+	r := make([]byte, 960) // the research's |R| for a 245-byte hello
+	check := func(split int, want []int) {
+		t.Helper()
+		segs := ffSegs(r, split)
+		if len(segs) != len(want) {
+			t.Fatalf("split %d: %d segments, want %d", split, len(segs), len(want))
+		}
+		var got []byte
+		for i, seg := range segs {
+			if len(seg) != want[i] {
+				t.Fatalf("split %d: segment %d is %d bytes, want %d", split, i, len(seg), want[i])
+			}
+			got = append(got, seg...)
+		}
+		if !bytes.Equal(got, r) {
+			t.Fatalf("split %d: segments do not reassemble the stream", split)
+		}
+	}
+	check(0, []int{ffFirstSeg, 1, 1, 1, 1, 1, 1, 1, 1, 1, 837}) // preset default: 114 B, nine 1-byte pieces, remainder
+	check(3, []int{ffFirstSeg, 1, 845})
+	big := make([]byte, 5000)
+	segs := ffSegs(big, 0)
+	var total int
+	for i, seg := range segs {
+		if len(seg) > ffMaxPayload {
+			t.Fatalf("segment %d is %d bytes, over the MTU-safe payload cap %d", i, len(seg), ffMaxPayload)
+		}
+		total += len(seg)
+	}
+	if total != len(big) {
+		t.Fatalf("oversized stream reassembles to %d bytes, want %d", total, len(big))
+	}
+	if len(segs) != 14 { // 114 + nine 1-byte pieces + 3×1440 + 557
+		t.Fatalf("oversized stream cut into %d segments, want 14", len(segs))
+	}
+	if ffSegs(nil, 0) != nil {
+		t.Fatal("an empty stream must cut nothing")
+	}
+}
+
+// TestDesyncFFFiresPlan: ff fires the whole [0,104,1] record plan as the [114,1] segment plan on the wire, all
+// below the stream start and ending exactly at ISN+1, with valid checksums.
+func TestDesyncFFFiresPlan(t *testing.T) {
+	tr, sent := desyncTestTracker("ff", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(17000), uint32(1400)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("ff fake never fired")
+	}
+	if tr.fired() != 1 {
+		t.Fatalf("ff fired counter %d, want 1", tr.fired())
+	}
+	rLen := ffFirstSeg + 6*(len(tr.hello)-5-ffChunk)
+	want := len(ffSegs(make([]byte, rLen), 0))
+	deadline := time.Now().Add(2 * time.Second)
+	for sent.n() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("ff sent %d segments, want %d (a timer segment never arrived)", sent.n(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	pkts := make([][]byte, sent.n())
+	for i := range pkts {
+		pkts[i] = sent.at(i)
+	}
+	sort.Slice(pkts, func(i, j int) bool {
+		return binary.BigEndian.Uint32(pkts[i][24:]) < binary.BigEndian.Uint32(pkts[j][24:])
+	})
+	checkFFStream(t, pkts, isn+1, len(tr.hello), srvSeq+1)
+	// the preset's first segment carries exactly the empty + 104-byte records
+	if got := len(payloadOf(pkts[0])); got != ffFirstSeg {
+		t.Fatalf("first ff segment is %d bytes, want %d", got, ffFirstSeg)
+	}
+	if got := len(payloadOf(pkts[len(pkts)-1])); got != rLen-ffFirstSeg-(ffDefaultSegs-2) {
+		t.Fatalf("last ff segment is %d bytes, want the remainder %d", got, rLen-ffFirstSeg-(ffDefaultSegs-2))
+	}
+}
+
+// TestDesyncFFShortHelloFallsBack: a hello shorter than the record plan's 104-byte chunk cannot be reframed; the
+// marker degrades to the plain seq packet instead of sending nothing (only reachable with a hand-built tracker:
+// FakeClientHello is always longer).
+func TestDesyncFFShortHelloFallsBack(t *testing.T) {
+	tr, sent := desyncTestTracker("ff", 0)
+	defer tr.close()
+	tr.hello = []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x00}
+	tr.snis = nil
+	k := testClientKey()
+	const isn, srvSeq = uint32(18000), uint32(1500)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("ff fallback never fired")
+	}
+	if tr.fired() != 1 || sent.n() != 1 {
+		t.Fatalf("short-hello ff: fired %d, sent %d; want the single seq fallback marker", tr.fired(), sent.n())
+	}
+	pkt := sent.at(0)
+	if payload := payloadOf(pkt); !bytes.Equal(payload, tr.hello) {
+		t.Fatalf("fallback payload % x, want the plain fake hello % x", payload, tr.hello)
+	}
+	if got := binary.BigEndian.Uint32(pkt[24:]); got != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("fallback seq %d, want %d (seq-mode placement)", got, isn+1-uint32(len(tr.hello)))
+	}
+	if !tcpChecksumOK(pkt) {
+		t.Fatal("fallback marker must carry a valid checksum (plain seq mode)")
 	}
 }
 

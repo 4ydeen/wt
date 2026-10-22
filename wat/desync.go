@@ -57,11 +57,12 @@ type DesyncConfig struct {
 	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL), "sum" (valid window, bad checksum),
 	// "seqsum" (both markers per connection, ~1 ms apart; experimental, 2.8.0), "rst" (bad-checksum RST),
 	// "split" (the fake hello cut across TCP segments), "hlen0" (F&F zero-length TLS record header),
-	// "fakeip" (SYN + hello to a whitelisted CDN IP), "synrst" (SYN|RST, bad checksum), or "all"
-	// (seq + sum + hlen0 markers, ~1 ms apart)
+	// "fakeip" (SYN + hello to a whitelisted CDN IP), "synrst" (SYN|RST, bad checksum), "ff" (the true F&F
+	// record + segment plan: empty record, 104-byte record, 1-byte records, then ≤Split TCP pieces), or "all"
+	// (seq + sum + hlen0 + ff markers, ~1 ms apart)
 	TTL    int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
 	FakeIP string // fakeip mode: whitelisted destination IPv4 the fake flow names ("" = 104.16.0.1, a Cloudflare edge)
-	Split  int    // split mode: how many TCP segments the fake hello is cut into (0 = 3)
+	Split  int    // split/ff mode: TCP segment count (0 = 3 for split, 11 for ff)
 }
 
 // splitSNIs splits a comma-separated list of SNIs into trimmed domain names.
@@ -88,9 +89,9 @@ func validateDesync(cfg DesyncConfig) error {
 		}
 	}
 	switch cfg.Mode {
-	case "", "seq", "ttl", "sum", "seqsum", "rst", "split", "hlen0", "fakeip", "synrst", "all":
+	case "", "seq", "ttl", "sum", "seqsum", "rst", "split", "hlen0", "fakeip", "synrst", "ff", "all":
 	default:
-		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum, rst, split, hlen0, fakeip, synrst or all, got %q", cfg.Mode)
+		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum, rst, split, hlen0, fakeip, synrst, ff or all, got %q", cfg.Mode)
 	}
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
@@ -363,6 +364,84 @@ func fakeHelloZeroRecord(hello []byte) []byte {
 	copy(out, hello)
 	out[3], out[4] = 0, 0
 	return out
+}
+
+// The true F&F ("Fragment + Fingerprint") plan of the Irancell preset, decoded in
+// docs/SNI-SPOOFING-RESEARCH.md §3.3 from the owner's config (pattng-tlshello-0-len):
+//
+//	finalMask mask 1 — "tlshello", lengths [0,104,1]: reframe the ClientHello record into an RFC-violating
+//	empty handshake record, then a first record carrying H[0:104], then one record per remaining handshake byte;
+//	finalMask mask 2 — "1-1", lengths [114,1], maxSplit 11: write that stream as 114 B, then nine 1-byte
+//	pieces, then the remainder (11 pieces max).
+//
+// H is the handshake body (the fake hello without its 5-byte record header). |R| = 114 + 6·(|H|−104), e.g.
+// ~960 B for a 245 B hello, so the stream needs several segments and the last one is the ~4/5 of it.
+const (
+	ffChunk       = 104 // handshake bytes in the first non-empty record (mask 1's middle length)
+	ffFirstSeg    = 114 // mask 2's first write: the 5-byte empty record + the 104-byte record
+	ffDefaultSegs = 11  // mask 2's maxSplit, i.e. ff's default -fake-split
+	// ffMaxPayload caps one injected IP packet's TCP payload. The preset's last piece is one application-level
+	// write, which a real TCP stack would segment to the path MTU; a raw packet must stay under a standard
+	// 1500-byte MTU (20 IP + up to 40 TCP options + payload), so a larger remainder is split into consecutive
+	// TCP segments with contiguous sequence numbers.
+	ffMaxPayload = 1440
+)
+
+// recordReframe rewrites a fake ClientHello (5-byte TLS record header + handshake body H) into the F&F
+// "tlshello" record stream: [16 03 01 00 00] (empty handshake record), [16 03 01 00 68] H[0:104], then one
+// [16 03 01 00 01] H[i] record per remaining handshake byte. Every field except the leading empty record's
+// length is truthful, so a DPI that concatenates record payloads still reassembles the original ClientHello,
+// while a DPI that triages the first record/segment sees no SNI. Only the DPI ever sees this: the fake is
+// injected below the stream start and the server drops the run by sequence. Returns nil when H is shorter than
+// ffChunk (the preset cannot be cut).
+func recordReframe(hello []byte) []byte {
+	if len(hello) < 5+ffChunk {
+		return nil
+	}
+	hdr := hello[:3] // 16 03 01: the fake hello's record version
+	body := hello[5:]
+	out := make([]byte, 0, ffFirstSeg+6*(len(body)-ffChunk))
+	out = append(out, hdr[0], hdr[1], hdr[2], 0, 0)                            // mask 1's "0": empty record
+	out = append(out, hdr[0], hdr[1], hdr[2], byte(ffChunk>>8), byte(ffChunk)) // mask 1's "104"
+	out = append(out, body[:ffChunk]...)
+	for _, b := range body[ffChunk:] { // mask 1's "1": one record per remaining handshake byte
+		out = append(out, hdr[0], hdr[1], hdr[2], 0, 1, b)
+	}
+	return out
+}
+
+// ffSegs cuts the F&F record stream into the preset's TCP segmentation plan: the first piece carries the empty
+// and 104-byte records (ffFirstSeg bytes), the next split-2 pieces are one byte each (mask 2's lengths
+// ["114","1"]), and the rest of the stream is the final piece (chunked to ffMaxPayload for the MTU reason
+// above). split<=0 means the preset's 11; fewer pieces are produced when the stream runs out first.
+func ffSegs(r []byte, split int) [][]byte {
+	if len(r) == 0 {
+		return nil
+	}
+	if split <= 0 {
+		split = ffDefaultSegs
+	}
+	if split < 2 {
+		split = 2
+	}
+	if len(r) <= ffFirstSeg {
+		return [][]byte{r}
+	}
+	segs := [][]byte{r[:ffFirstSeg]}
+	from := ffFirstSeg
+	for ones := split - 2; ones > 0 && from < len(r); ones-- {
+		segs = append(segs, r[from:from+1])
+		from++
+	}
+	for from < len(r) {
+		to := from + ffMaxPayload
+		if to > len(r) {
+			to = len(r)
+		}
+		segs = append(segs, r[from:to])
+		from = to
+	}
+	return segs
 }
 
 // desyncPeerIP extracts the IP of a host:port peer (empty when unresolvable).
@@ -834,16 +913,38 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		pkt := fakeFlagPacket(k, base, ack, ttl, 0x06) // SYN|RST
 		damageChecksum(pkt)
 		t.send(pkt)
+	case "ff":
+		// ff mode: the real F&F record + segment plan (docs/SNI-SPOOFING-RESEARCH.md §3.3, the Irancell
+		// pattng-tlshello-0-len preset). The fake ClientHello is re-framed into an empty record + a 104-byte
+		// record + one 1-byte record per remaining handshake byte, then sent as ≤Split TCP segments (default 11:
+		// 114 B carrying the first two records, then nine 1-byte pieces, then the remainder) with contiguous
+		// below-window sequence numbers ending exactly at the real stream's ISN+1, so the server drops the whole
+		// run as old duplicates while a record/segment-triage DPI (Irancell/MCI) never sees a parseable SNI.
+		// Targets: the field recipe's working DPI class (first-record / first-segment triage).
+		if !t.fireFFLocked(k, c, base, ack, ttl, hello, 0) {
+			// the preset needs H[0:104]: too short (only reachable with a hand-built tracker, FakeClientHello is
+			// always longer) -> keep the flow classified with the plain seq marker instead of sending nothing.
+			t.miss++
+			if !t.missNoted {
+				t.missNoted = true
+				if t.logf != nil {
+					t.logf("wat: fake-sni ff: the fake ClientHello is shorter than the F&F record plan (%d < %d bytes), sending the plain seq marker", len(hello), 5+ffChunk)
+				}
+			}
+			t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+		}
 	case "all":
-		// all mode (kitchen sink): the seq + sum + hlen0 markers ~1 ms apart, so a filter has to mishandle all
-		// three signal classes (below-window junk, bad checksums, zero-length records) to miss the SNI. The
-		// time.AfterFunc spacing is seqsum's: the sniffer lock is never held across a sleep (audit 2026-10-21).
+		// all mode (kitchen sink): the seq + sum + hlen0 markers ~1 ms apart, then the true F&F record/segment
+		// plan from 3 ms, so a filter has to mishandle every signal class (below-window junk, bad checksums,
+		// zero-length records, the F&F record/segment shape) to miss the SNI. The time.AfterFunc spacing is
+		// seqsum's: the sniffer lock is never held across a sleep (audit 2026-10-21).
 		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts)) // seq: below window, valid checksum
 		sumPkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 		damageChecksum(sumPkt)
 		hlenPkt := fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts)
 		time.AfterFunc(time.Millisecond, func() { t.send(sumPkt) })
 		time.AfterFunc(2*time.Millisecond, func() { t.send(hlenPkt) })
+		_ = t.fireFFLocked(k, c, base, ack, ttl, hello, 3*time.Millisecond)
 	case "seqsum":
 		// dual marker (2.8.0): the below-window seq fake first, then the in-window bad-checksum mirror
 		// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
@@ -864,6 +965,31 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 	default:
 		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 	}
+}
+
+// fireFFLocked builds the F&F record re-frame + segment plan for one fake hello and injects it below the stream
+// start (mu held): the first piece goes out now, the rest at the preset's 1 ms "delays" via time.AfterFunc — a
+// sleep here would stall every concurrent fire and Wrap announce (audit 2026-10-21). startDelay shifts the whole
+// run later so all mode can put it after its single markers. Every sequence number is < the stream start the
+// server holds, and the last piece ends exactly at it, so the server drops the run as old duplicates. Returns
+// false (sending nothing) when the hello is too short for the 104-byte record.
+func (t *desyncTracker) fireFFLocked(k desyncKey, c *desyncConn, base, ack uint32, ttl int, hello []byte, startDelay time.Duration) bool {
+	r := recordReframe(hello)
+	if len(r) == 0 {
+		return false
+	}
+	seq := base - uint32(len(r)) // the first fragment starts below the stream start
+	off := 0
+	for i, seg := range ffSegs(r, t.cfg.Split) {
+		pkt := fakePacketWithOptions(k, seq+uint32(off), ack, ttl, seg, c.tcpOpts)
+		off += len(seg)
+		if d := startDelay + time.Duration(i)*time.Millisecond; d <= 0 {
+			t.send(pkt)
+		} else {
+			time.AfterFunc(d, func() { t.send(pkt) }) // the preset's 1 ms spacing; frames arrive in sequence order
+		}
+	}
+	return true
 }
 
 // damageChecksum rewrites a valid TCP checksum into an invalid one, unconditionally: s-1, but when that would
