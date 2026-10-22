@@ -429,11 +429,13 @@ func (srv *Server) admit(sid uint64, p []byte) *srvSess {
 	ss := &srvSess{s: s, io: io}
 	ss.last.Store(time.Now().UnixNano())
 	srv.sessions[sid] = ss
-	select {
-	case srv.New <- s:
-	default:
-		go func() { srv.New <- s }()
-	}
+	go func() { // never blocks admit: a slow New consumer only delays the handoff (select on stop: no leak on Close)
+		select {
+		case srv.New <- s:
+		case <-srv.stop:
+			s.Close()
+		}
+	}()
 	if srv.cfg.Logf != nil {
 		srv.cfg.Logf("new client session %016x (%d active)", sid, len(srv.sessions))
 	}
@@ -475,6 +477,7 @@ func (srv *Server) getBuf(p []byte) []byte {
 		if cap(b) >= len(p) {
 			return append(b[:0], p...)
 		}
+		srv.free <- b // too small: hand it back, never drain the pool (audit 2026-10-22)
 	default:
 	}
 	return append(make([]byte, 0, max(len(p), 2048)), p...)
