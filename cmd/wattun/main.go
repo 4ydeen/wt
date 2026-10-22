@@ -157,6 +157,9 @@ func main() {
 	if *fecMode != "off" && *fecMode != "auto" {
 		log.Fatalf("-fec must be off or auto, got %q", *fecMode)
 	}
+	if *udpIdle < time.Second { // a shorter idle makes the janitor reap flows mid-burst and UDP silently dies (audit 2026-10-22)
+		log.Fatalf("-udp-idle must be at least 1s, got %v", *udpIdle)
+	}
 
 	k := []byte(*key)
 	if *keyFile != "" {
@@ -674,7 +677,11 @@ func main() {
 		}
 		if *cfgPath != "" {
 			w := &cfgWatcher{path: *cfgPath, known: known, skip: func(k string) bool { return explicit[k] }, interval: 3 * time.Second,
-				onPorts:  func(c *fileConfig) { al.setPorts(c.tcpPorts()); al.setUDPPorts(c.udpPorts()) },
+				onPorts: func(c *fileConfig) []error {
+					al.setPorts(c.tcpPorts())
+					al.setUDPPorts(c.udpPorts())
+					return nil
+				},
 				onLimits: func(c *fileConfig) { portReg.applyLimits(c.Limits) }}
 			w.start(fileCfg)
 			go w.run()
@@ -771,13 +778,13 @@ func main() {
 			}
 			w := &cfgWatcher{path: *cfgPath, known: known, skip: func(k string) bool { return explicit[k] }, interval: 3 * time.Second,
 				onLimits: func(c *fileConfig) { portReg.applyLimits(c.Limits) },
-				onPorts: func(c *fileConfig) {
-					for _, e := range ls.apply(c.tcpMaps()) {
+				onPorts: func(c *fileConfig) []error {
+					var errs []error
+					for _, e := range append(ls.apply(c.tcpMaps()), uls.apply(c.udpMaps())...) {
+						errs = append(errs, e)
 						log.Print(e)
 					}
-					for _, e := range uls.apply(c.udpMaps()) {
-						log.Print(e)
-					}
+					return errs
 				}}
 			w.start(fileCfg)
 			go w.run()
@@ -1048,6 +1055,11 @@ func (a *allow) reload() {
 	}
 	m, um := parsePorts(string(b)), parseUDPPorts(string(b))
 	a.mu.Lock()
+	if a.cfg { // the config's ports: list is authoritative; only note the file mtime, never apply its contents
+		a.mtime, a.size = st.ModTime(), st.Size()
+		a.mu.Unlock()
+		return
+	}
 	a.ports, a.udp, a.mtime, a.size = m, um, st.ModTime(), st.Size()
 	a.mu.Unlock()
 	log.Printf("allowed target ports: %d", len(m))
@@ -1099,11 +1111,15 @@ func (a *allow) ok(port, lo, hi int) bool {
 // relayFor: the built-in DNS relay owns target 53 unless an explicit allowlist forwards it to a real local
 // resolver. The default 1-65535 range does not count as explicit — otherwise the ladder's relay rung (2.9.0)
 // is dead on every default-config server, because 53 then dials a local resolver that is usually not there.
+// A narrowed -allow-min/-allow-max range is explicit (audit 2026-10-22): the operator picked what to forward.
 func (a *allow) relayFor(port, lo, hi int) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.file != "" || a.cfg || len(a.ports) > 0 {
 		return !a.ports[port]
+	}
+	if lo != 1 || hi != 65535 {
+		return !(port >= lo && port <= hi)
 	}
 	return true
 }

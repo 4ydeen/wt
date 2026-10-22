@@ -65,6 +65,35 @@ func TestParseConfigErrors(t *testing.T) {
 	}
 }
 
+func TestAllowFileVsConfigPorts(t *testing.T) {
+	// The config's ports: list is authoritative once setPorts ran; the allow-file poller must never stomp it
+	// (audit 2026-10-22 finding 1: the ticker reverted hot-reloaded config ports within 3 s).
+	afile := filepath.Join(t.TempDir(), "allow.txt")
+	os.WriteFile(afile, []byte("100\n200\n"), 0o644)
+	path := filepath.Join(t.TempDir(), "wat.yml")
+	writeCfg(t, path, "mode: server\nports:\n  - 300\n", 1)
+	c, err := parseConfig(mustRead(t, path), knownKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	al := newAllow("", afile) // starts the 3 s poller with the file's list
+	if !al.ok(100, 1, 65535) {
+		t.Fatal("file list not applied initially")
+	}
+	al.setPorts(c.tcpPorts()) // config ports: arrives (hot reload)
+	al.setUDPPorts(nil)
+	if al.ok(100, 1, 65535) || !al.ok(300, 1, 65535) {
+		t.Fatal("config ports not authoritative")
+	}
+	os.WriteFile(afile, []byte("999\n"), 0o644) // change the file: the poller will see it
+	mt := time.Now().Add(time.Minute)
+	os.Chtimes(afile, mt, mt)
+	al.reload() // what the poller does on its tick
+	if al.ok(999, 1, 65535) || !al.ok(300, 1, 65535) {
+		t.Fatal("allow-file poller overrode the config's authoritative ports")
+	}
+}
+
 func writeCfg(t *testing.T, path, txt string, bump int) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(txt), 0o644); err != nil {
@@ -93,7 +122,7 @@ func TestHotReloadServerAllow(t *testing.T) {
 	}
 	al := newAllow("", "")
 	al.setPorts(c.tcpPorts())
-	w := &cfgWatcher{path: path, known: knownKeys, onPorts: func(c *fileConfig) { al.setPorts(c.tcpPorts()) }}
+	w := &cfgWatcher{path: path, known: knownKeys, onPorts: func(c *fileConfig) []error { al.setPorts(c.tcpPorts()); return nil }}
 	w.start(c)
 	if !al.ok(100, 1, 65535) || al.ok(200, 1, 65535) || al.ok(300, 1, 65535) {
 		t.Fatal("initial allowlist wrong")
@@ -164,10 +193,13 @@ func TestHotReloadClientListeners(t *testing.T) {
 		t.Fatal(errs)
 	}
 	w := &cfgWatcher{path: path, known: knownKeys, interval: 20 * time.Millisecond,
-		onPorts: func(c *fileConfig) {
+		onPorts: func(c *fileConfig) []error {
+			var errs []error
 			for _, e := range ls.apply(c.tcpMaps()) {
 				t.Log(e)
+				errs = append(errs, e)
 			}
+			return errs
 		}}
 	w.start(c)
 	go w.run() // exercises the real poll loop too

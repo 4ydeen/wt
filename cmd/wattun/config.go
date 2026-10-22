@@ -232,7 +232,7 @@ type cfgWatcher struct {
 	path     string
 	known    func(string) bool
 	skip     func(key string) bool // keys overridden on the command line: the file value is not in effect
-	onPorts  func(*fileConfig)
+	onPorts  func(*fileConfig) []error
 	onLimits func(*fileConfig) // optional
 	interval time.Duration
 
@@ -242,6 +242,7 @@ type cfgWatcher struct {
 	base   map[string]string // effective non-port values (key -> joined values) at startup
 	ports  string
 	limits string
+	retry  bool // the last onPorts failed to open a port: re-apply on every tick until it succeeds
 }
 
 func flatten(c *fileConfig) map[string]string {
@@ -310,9 +311,10 @@ func (w *cfgWatcher) check() {
 			delete(w.base, k)
 		}
 	}
-	if pk := portsKey(cfg); pk != w.ports {
+	if pk := portsKey(cfg); pk != w.ports || w.retry {
 		w.ports = pk
-		w.onPorts(cfg)
+		errs := w.onPorts(cfg)
+		w.retry = len(errs) > 0 // retry a failed listen on every tick, not only on the next edit (audit 2026-10-22)
 	}
 	if lk := limitsKey(cfg); lk != w.limits {
 		w.limits = lk

@@ -235,7 +235,7 @@ func TestLimitsConfigAndHotReload(t *testing.T) {
 	c, _ = parseConfig(mustRead(t, path), knownKeys)
 	r.applyLimits(c.Limits)
 	st := r.get("c", 7003)
-	w := &cfgWatcher{path: path, known: knownKeys, interval: 20 * time.Millisecond, onPorts: func(*fileConfig) {},
+	w := &cfgWatcher{path: path, known: knownKeys, interval: 20 * time.Millisecond, onPorts: func(*fileConfig) []error { return nil },
 		onLimits: func(c *fileConfig) { r.applyLimits(c.Limits) }}
 	w.start(c)
 	go w.run()
