@@ -126,10 +126,10 @@ func (s *Session) takeDgrams(dst []byte, room int, shared bool) []byte {
 		s.dq[0] = nil
 		s.dq = s.dq[1:]
 		s.dqBytes -= len(f)
+		s.stats.DgramSent++ // a fragmented piece counts too: a dropped /stats undercounted UDP (audit 2026-10-22)
 		if f[0] == frDgramFrag {
 			break // a piece is always the last frame: an older peer stops parsing at it
 		}
-		s.stats.DgramSent++
 		if shared {
 			limit = room / 2
 		}
