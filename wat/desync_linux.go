@@ -157,7 +157,10 @@ func (d *desyncInjector) close() {
 
 // loop reads ethernet frames and feeds them to the tracker.
 func (d *desyncInjector) loop() {
-	buf := make([]byte, 2048)
+	// 64 KB: AF_PACKET delivers one frame per read, and TSO/GRO can hand the tap multi-KB
+	// super-frames; a 2048-byte read silently truncated them and the fake trigger was missed
+	// intermittently (audit 2026-10-22).
+	buf := make([]byte, 65536)
 	pfd := []unix.PollFd{{Fd: int32(d.fd), Events: unix.POLLIN}}
 	for {
 		// Poll with 200 ms timeout so the goroutine sleeps in the kernel when idle instead of spinning on EAGAIN.
