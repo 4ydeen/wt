@@ -31,11 +31,19 @@ type TLSClientOptions struct {
 	DialHook    func(net.Conn) (net.Conn, error) // dial hook on the raw TCP socket before TLS handshake (fake-SNI)
 	LocalAddr   net.Addr                         // client local address for multi-homing / dual-WAN bonding
 	Frag        int                              // split the ClientHello into this many bytes per TCP segment (0 = off)
+	NoPQ        bool                             // skip the post-quantum hybrid key share, keeping the ClientHello small (2.10.4)
 	Logf        func(string, ...any) // optional: one-time notes (ECH lookups, fallbacks)
 }
 
 func (o TLSClientOptions) config() *tls.Config {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: o.ServerName, InsecureSkipVerify: !o.Verify}
+	if o.NoPQ {
+		// Go 1.24+ offers X25519MLKEM768 by default, which makes the ClientHello ~1.5 KB. Some DPIs
+		// drop such large hellos outright (measured on a live Iranian path 2026-10-22: 1474 B and
+		// 1812 B hellos vanished while 250-512 B ones passed untouched), so this keeps the offer
+		// classical for paths where a small hello is the difference between blocked and connected.
+		cfg.CurvePreferences = []tls.CurveID{tls.X25519, tls.CurveP256}
+	}
 	if len(o.PinSHA256) > 0 {
 		cfg.VerifyPeerCertificate = pinVerifier(o.PinSHA256)
 	}

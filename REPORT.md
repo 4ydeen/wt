@@ -102,9 +102,69 @@ Ordered attempt to find any full-duplex channel on the Tehran→31.57.185.20 rou
 | IPv6 | kharej has 2a14:7c0::/64 global; **iran has no v6 at all** (link-local only, no route) | dead |
 | CDN-fronted wss+ECH | untestable: no domain in this bench | **the one remaining weapon** |
 
-**Structural verdict:** a tunnel needs payload both ways. This filter blocks client→server payload in every form (POST bodies, tunnel hellos, SSH streams) while allowing brief server→client response windows. No camouflage protocol can bridge an asymmetric channel. Combined with round 1 (tcp/tls/h2c/ws/fake-sni all killed in ~30–60 s; ICMP rate-shaped into a penalty box), the route is conclusively unusable for wattun. The ~1 MB/s one-directional ceiling from parallel fresh GETs is ~50× below the 50 MB/s target.
+**Structural verdict (round 2):** a tunnel needs payload both ways. This filter blocks client→server payload in every form (POST bodies, tunnel hellos, SSH streams) while allowing brief server→client response windows. Combined with round 1 (tcp/tls/h2c/ws/fake-sni all killed in ~30–60 s; ICMP rate-shaped into a penalty box), the direct route looked unusable.
 
-**Path forward (needs user input):** a domain + CDN front to deploy the wss+ECH ladder (the blackout branch's designed answer to exactly this DPI class), or a different kharej endpoint whose route does not DPI-kill binary flows.
+## 7b. Round 3 — CDN front + SNI spoofing (2026-10-22, 17:45–21:40)
+
+The owner supplied `test.xoamrz.ir`, already proxied by Cloudflare (A records 172.67.194.106 / 104.21.20.209, plus two `2a06:98c1::` v6 edges), with the origin pointing at the kharej VPS. Results:
+
+| Test | Result |
+|---|---|
+| DNS from iran for the domain | returns `188.114.98.0` / `188.114.99.0` (dead edges) and `2a06:98c1::` v6 — the working edge is not in iran's answer |
+| TCP to CF edges 104.16.132.229 / 172.67.194.106 / 104.21.20.209 :443 from iran | all OPEN |
+| `openssl s_client` to 172.67.194.106:443 SNI `test.xoamrz.ir` | **handshake completes**, cert `CN=xoamrz.ir`, verified OK |
+| Plain HTTP GET over that TLS | `HTTP/1.1 404` (CF reached the origin) |
+| Full WS upgrade from iran through CF | **`HTTP/1.1 101 Switching Protocols`** — iran → CF → kharej origin works |
+| WS upgrade + 250 B binary frame | 101, frame accepted, 590 B came back |
+| 5 rapid wss probes (1 s apart) | 5/5 101 |
+| CF → origin dials (captured on kharej) | CF edges 172.71.x / 172.69.x arrive; earlier 521s were caused by the origin binding `127.0.0.1` instead of `0.0.0.0` |
+| wattun `wss` client through CF (fp go / chrome, conns 1/2) | TLS handshake + CF reach the edge, but the tunnel's first data records stall; `alive:false`, no origin session |
+| Direct TLS to kharej with spoofed SNI `auth.vercel.com` | handshake completes (self-signed cert accepted, verify off), then post-handshake data is dropped |
+| Direct TLS + `-fake-sni` (`seqsum`, SNIs `auth.vercel.com` / `cdn.jsdelivr.net`) | fake 354 B CH and real 1474 B CH are both injected on the wire and ServerHellos come back, but the tunnel's first data packet is still dropped |
+| `-mtu 256` / `-mtu 400` on the TLS carrier | no change |
+| Loopback TLS carrier on kharej (client→127.0.0.1:443) | **session forms** — the carrier itself is healthy; the failure is path-side |
+| **Plain `ws` (no TLS) direct on :80** | **session forms and stays `alive:true`** — first working session since round 1, but data flow stops after ~10 s (`out` grows, `in` freezes) |
+| h2c direct on :80 | conns reach kharej, return path dropped |
+
+**Where this leaves the path:** every carrier establishes or handshakes, and every one of them loses the data channel ~10–60 s in. The DPI allows the connection setup and the first few records, then blocks the flow.
+
+## 7c. Round 4 — root cause found in the ClientHello, and the fix (2026-10-22, 21:45–22:30)
+
+Byte-level comparison of the hellos on the wire explained the failures that no configuration change could fix:
+
+| Sender | ClientHello record | Result on this path |
+|---|---|---|
+| Python / OpenSSL (`cc.dial`) | 240–512 B | passes every time, TLS handshake completes |
+| curl (OpenSSL) | 512 B | passes (HTTP 404/101 returned) |
+| wattun (Go 1.26, default curves) | **1474 B** (and 1812 B with ALPN h2) | **dropped in transit** — the segment sits in `Send-Q` unACKed, far longer than a retransmit window |
+| wattun with the fake-SNI desync active | 1474 B real + 354 B fake | real hello still dropped, ServerHello never returns consistently |
+
+Go 1.24+ offers the post-quantum hybrid `X25519MLKEM768` by default, which is what inflates the hello to ~1.5 KB. This DPI drops hellos of that size outright — that is the wall every earlier round hit, and it is *not* a protocol-camouflage problem.
+
+**Fix shipped in 2.10.4 (`-tls-small-ch` / `tls-small-ch: true`):** the TLS client keeps the classical offer (`CurvePreferences: [X25519, P-256]`), so the hello is ~250 B. Verified live on this path:
+
+| Check | Before | After `tls-small-ch` |
+|---|---|---|
+| ClientHello on the wire | 1474 B, never ACKed | ~250 B, ACKed |
+| `alive` on the tls carrier to kharej | false, zero sessions | **true**, `srtt_ms` 88 |
+| Established socket state | `Send-Q` stuck at 267 B | `Send-Q` 0 |
+| Unit test | — | `TestSmallClientHello` (curves pinned + real handshake) |
+
+What it does **not** fix: once the tunnel starts moving bulk data on that flow, the filter still throttles/kills it (streams stall, `retrans` climbs, rate parks at the 200 KB/s floor). The handshake is now a fair fight; the data phase is not.
+
+**Measured ceiling on this route (all carriers, best case):**
+
+| Path | Best observed |
+|---|---|
+| tls + small CH, direct | tunnel alive, srtt 88 ms, streams stall |
+| ws:80 direct, 8 conns, rotate 7 s | `alive:true`, ~300 KB–1.5 MB moved, then stalls |
+| ws:80 direct, 4 sessions + 16 conns, rotate 5 s | `iperf3` 131 kbit/s |
+| wss through Cloudflare | handshake + 101 verified with stock clients; wattun's own data records stall |
+| Speedtest through any carrier | `tunnel is not connected` / `session closed` |
+
+That is ~3000× short of the 50 MB/s target, and it is the path, not the software: the same binary moves data fine on loopback and on an unfiltered route.
+
+**Path forward (needs user input):** a kharej endpoint whose route does not DPI-kill bulk flows — the CDN front is already proven to reach the origin, but the iran→CF leg throttles sustained data the same way. A different provider/IP is the remaining lever.
 
 ## 8. Artifacts
 

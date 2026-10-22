@@ -770,3 +770,29 @@ func TestECHCacheFile(t *testing.T) {
 	e3, _ := newTLSEngine(bad, "")
 	e3.ech.get(context.Background(), "inner.example", e3)
 }
+
+// TestSmallClientHello pins -tls-small-ch: the option drops the post-quantum hybrid key share, which is what makes
+// the ClientHello ~1.5 KB. A DPI that drops large hellos (measured live 2026-10-22) needs the classical offer instead.
+func TestSmallClientHello(t *testing.T) {
+	big := TLSClientOptions{ServerName: "example.com"}
+	if got := big.config().CurvePreferences; got != nil {
+		t.Fatalf("default client pins curves %v; it must leave the Go default (with the hybrid) alone", got)
+	}
+	small := TLSClientOptions{ServerName: "example.com", NoPQ: true}
+	got := small.config().CurvePreferences
+	if len(got) != 2 || got[0] != tls.X25519 || got[1] != tls.CurveP256 {
+		t.Fatalf("small hello curves = %v, want [X25519 P-256]", got)
+	}
+	// And the option must not break a real handshake.
+	srv := alpnServer(t)
+	defer srv.Close()
+	e, err := newTLSEngine(small, "http/1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := e.dial(context.Background(), strings.TrimPrefix(srv.URL, "https://"))
+	if err != nil {
+		t.Fatalf("handshake with the small hello: %v", err)
+	}
+	c.Close()
+}

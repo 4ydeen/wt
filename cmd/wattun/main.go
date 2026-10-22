@@ -70,6 +70,7 @@ func main() {
 	hedge := flag.Bool("hedge", false, "send small young packets twice (extra packets, helps lossy tails)")
 	lossCeil := flag.Bool("loss-ceiling", false, "pacer: also cut the rate when loss jumps far above its learned baseline (opt-in; default: delay only)")
 	governor := flag.Bool("governor", false, "pacer, ICMP paths: learn the path's volume ceiling from the reroute signature (a sudden base-RTT jump after sustained bulk) and hold the rate under it (opt-in; replaces hand-tuned max-mbps on routes where ICMP above ~30 MB/s total triggers a reroute inside Iran; 2.9.0)")
+	tlsSmallCH := flag.Bool("tls-small-ch", false, "client, tls|wss|h2|grpc: keep the ClientHello small (skip the post-quantum hybrid key share; ~250 B instead of ~1.5 KB). Some DPIs drop large hellos outright (measured 2026-10-22 on a live Iranian path)")
 	pingEvery := flag.Int("ping-every", 2, "idle keepalive interval, seconds (raise on paths whose filter rate-limits steady periodic packets into a penalty box: live 2026-10-22 saw 30 echo req/min collapse to 95% loss until a ~5 min cooldown; both ends use their own value)")
 	dnsUpstream := flag.String("dns-relay-upstream", "8.8.8.8:53", "Kharej recursive resolver used by the internal DNS relay (port 53, -ech ladder); empty = 8.8.8.8:53")
 	icmpType := flag.String("icmp-type", "echo", "icmp carrier: echo|timestamp|info|mask - the ICMP request type the client sends (the server answers with the matching reply: 8/0, 13/14, 15/16, 17/18); both ends must use the same")
@@ -372,7 +373,7 @@ func main() {
 				if derr != nil {
 					log.Fatalf("fake-sni: %v", derr)
 				}
-				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin,
+				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin, NoPQ: *tlsSmallCH,
 					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf,
 					ECHLadder: ladderHook}
 				if srcNetIP != nil {
@@ -401,6 +402,7 @@ func main() {
 			} else {
 				co := wat.HTTPClientOptions{Path: *path, Host: *host, Secure: secure, Headers: map[string]string{}}
 				co.TLS.ServerName = *sni
+				co.TLS.NoPQ = *tlsSmallCH
 				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				co.TLS.ECHCache = *echCache
 				co.TLS.ECHLadder = ladderHook
