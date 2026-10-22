@@ -55,6 +55,7 @@ func TestParseConfigErrors(t *testing.T) {
 		"inline ports":   "ports: 5\n",
 		"dup ports":      "ports:\n  - 1\nports:\n  - 2\n",
 		"item after key": "ports:\n  - 1\nmode: x\n  - 2\n",
+		"indented key in list": "ports:\n  - 1\n  mode: client\n", // an indented key inside a list is a mistake, not a setting
 	} {
 		if _, err := parseConfig(txt, knownKeys); err == nil {
 			t.Errorf("%s: want an error", name)
@@ -62,6 +63,9 @@ func TestParseConfigErrors(t *testing.T) {
 	}
 	if c, err := parseConfig("ports:\n", knownKeys); err != nil || !c.PortsSet || len(c.Ports) != 0 {
 		t.Errorf("empty ports list: %+v %v", c, err)
+	}
+	if c, err := parseConfig("\xef\xbb\xbfmode: client\n", knownKeys); err != nil || flatten(c)["mode"] != "client" {
+		t.Errorf("BOM not stripped: %+v %v", c, err)
 	}
 }
 

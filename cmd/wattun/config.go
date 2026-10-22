@@ -88,6 +88,7 @@ func (c *fileConfig) get(key string) (string, bool) {
 
 // parseConfig parses txt; known (if non-nil) says which keys exist - anything else is an error.
 func parseConfig(txt string, known func(string) bool) (*fileConfig, error) {
+	txt = strings.TrimPrefix(txt, "\xef\xbb\xbf") // a BOM (Notepad, PowerShell) must not corrupt the first key
 	cfg := &fileConfig{}
 	seen := map[string]bool{}
 	limitsSeen := false
@@ -131,6 +132,9 @@ func parseConfig(txt string, known func(string) bool) (*fileConfig, error) {
 		if raw[0] == ' ' || raw[0] == '\t' {
 			if list == "" {
 				return nil, fmt.Errorf("line %d: unexpected indentation", ln)
+			}
+			if !strings.HasPrefix(t, "- ") && t != "-" { // inside a list only list items may be indented
+				return nil, fmt.Errorf("line %d: indented line inside %s: is not a '- item'", ln, list)
 			}
 		}
 		list = ""
