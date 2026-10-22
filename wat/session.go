@@ -12,6 +12,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -147,7 +148,8 @@ type Session struct {
 	kexStart     time.Time   // client: when the current offer round began (10 s without a reply re-arms with fresh keys)
 	kexAt        time.Time   // when the fresh key took over in both directions
 	kexDone      bool
-	kexGrace     time.Duration // old-key grace / stale-exchange expiry (a copy of the kexGrace default; a field so tests can shrink it per session without racing other sessions' pumps)
+	rxKeys       atomic.Pointer[[2]cipher.AEAD] // {aead, oldAead} while kexDone, else nil: handle's lock-free open (pubRxKeys)
+	kexGrace    time.Duration // old-key grace / stale-exchange expiry (a copy of the kexGrace default; a field so tests can shrink it per session without racing other sessions' pumps)
 	kexGiveUp    time.Duration // client: how long to keep offering before re-arming with fresh keys (same reasoning)
 	mu           sync.Mutex
 	now          time.Time
@@ -462,6 +464,7 @@ func (s *Session) onKex(pub []byte, now time.Time) {
 			return
 		}
 		s.oldAead, s.aead, s.kexAt, s.kexDone = s.aead, fresh, now, true
+		s.pubRxKeys()
 		return
 	}
 	if s.kexPeerPub != nil && s.kexAead != nil && bytes.Equal(s.kexPeerPub, pub) {
@@ -1253,6 +1256,7 @@ func (s *Session) timers(now time.Time) {
 	}
 	if s.oldAead != nil && now.Sub(s.kexAt) > s.kexGrace {
 		s.oldAead = nil // long past the switch: in-flight old-key packets are gone, and the PSK must not authenticate anything again
+		s.pubRxKeys()
 	}
 	if !s.cfg.Server && s.kexPriv != nil && !s.kexDone && now.Sub(s.kexStart) > s.kexGiveUp {
 		// no reply within the window: re-arm with FRESH keys instead of giving up forever, so an
@@ -1280,6 +1284,7 @@ func (s *Session) timers(now time.Time) {
 		s.probeUntil = now.Add(kexProbeFor)
 		s.kexDone = false
 		s.oldAead = nil // the PSK key takes over as the receive fallback while probing
+		s.pubRxKeys()
 	}
 	if s.cfg.Server && !s.kexDone && s.kexAead != nil && now.Sub(s.kexOfferAt) > s.kexGrace {
 		// the client never switched: stop paying one failed fresh-key open per packet for the rest of
@@ -1397,9 +1402,10 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	}
 	var first, fall cipher.AEAD
 	var freshRx cipher.AEAD
-	if s.kexDone {
-		// Steady state: KEX is completed and AEAD cipher is established. Read with 0 locks.
-		first, fall = s.aead, s.oldAead
+	if k := s.rxKeys.Load(); k != nil {
+		// steady state: the kex is done; timers() (pump goroutine) changes these keys under s.mu, so they are
+		// published atomically instead of read as plain fields here
+		first, fall = k[0], k[1]
 	} else {
 		// Handshake phase: snapshot under lock
 		s.mu.Lock()
@@ -1429,6 +1435,7 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	s.now = now
 	if freshRx != nil { // a packet only the fresh key opens: the peer has switched, so we seal our own packets with it too
 		s.oldAead, s.aead, s.kexAead, s.kexAt, s.kexDone = fall, first, nil, now, true
+		s.pubRxKeys()
 	}
 	if s.rxDup(pn) { // re-check under the lock: only authenticated duplicates count (audit 2026-10-22)
 		if s.rxLargest-pn >= s.replayWin {
@@ -1468,6 +1475,16 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 		}
 		s.ackPend++
 		s.kick()
+	}
+}
+
+// pubRxKeys publishes the receive keys for handle's lock-free path (s.mu held); call after every change to
+// aead, oldAead or kexDone.
+func (s *Session) pubRxKeys() {
+	if s.kexDone {
+		s.rxKeys.Store(&[2]cipher.AEAD{s.aead, s.oldAead})
+	} else {
+		s.rxKeys.Store(nil)
 	}
 }
 

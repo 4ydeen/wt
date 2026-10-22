@@ -164,10 +164,7 @@ func (b *BondIO) SetPeer(net.Addr) {}
 func (b *BondIO) Close() error {
 	b.once.Do(func() {
 		close(b.done)
-		if b.prev != nil {
-			putPkt(b.prev)
-			b.prev = nil
-		}
+		// b.prev stays: it belongs to the Recv goroutine, which may still be handling it (left to the GC)
 		for {
 			select {
 			case r := <-b.in:
@@ -287,10 +284,7 @@ func (m *MultiRaw) SendTo(p []byte, lane int, dst net.Addr) error {
 func (m *MultiRaw) Close() error {
 	m.once.Do(func() {
 		close(m.done)
-		if m.prev != nil {
-			putPkt(m.prev)
-			m.prev = nil
-		}
+		// m.prev stays: it belongs to the Recv goroutine, which may still be handling it (left to the GC)
 		for {
 			select {
 			case r := <-m.in:
