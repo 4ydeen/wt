@@ -382,3 +382,51 @@ func TestCloseReadReapsLingeringStream(t *testing.T) {
 		waitStreams(t, srv, 0) // the RST reaches the server and it reaps too
 	})
 }
+
+// TestSilenceWatchdogRearms pins the 30 s silence watchdog fix (audit 2026-10-22): the watchdog used to
+// zero lastRecv after one reset and so fired exactly once — a session that stayed silent afterward kept
+// accepting streams whose writes blocked forever. After a reset the watchdog must fire again in the next
+// silence window, and a stream opened across a dead link must fail instead of hanging.
+func TestSilenceWatchdogRearms(t *testing.T) {
+	cli, srv, _, _ := newPair(t, 0, time.Millisecond, 10e6, Config{})
+	_ = srv
+	st, _ := cli.OpenStream()
+	st.Write([]byte("hi"))
+	waitStreams(t, cli, 1)
+	// simulate 30 s of silence without waiting: rewind lastRecv on both ends
+	rewind := func(s *Session) {
+		s.mu.Lock()
+		s.lastRecv = time.Now().Add(-31 * time.Second)
+		s.mu.Unlock()
+	}
+	rewind(cli)
+	rewind(srv)
+	// one pump tick on each end resets the stream tables
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && streamCount(cli) != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if streamCount(cli) != 0 {
+		t.Fatal("watchdog did not fire on the first silence")
+	}
+	// the path stays silent: the watchdog must fire AGAIN (before the fix it was disarmed)
+	rewind(cli)
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cli.mu.Lock()
+		armed := !cli.lastRecv.IsZero()
+		cli.mu.Unlock()
+		if !armed { // lastRecv zeroed would mean the old one-shot path ran
+			t.Fatal("watchdog was disarmed again (one-shot regression)")
+		}
+		// after the second window it must have reset again: lastRecv re-armed to now each time
+		cli.mu.Lock()
+		fired := time.Since(cli.lastRecv) < time.Second
+		cli.mu.Unlock()
+		if fired {
+			return // second reset ran and re-armed: the fix holds
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("watchdog did not re-arm after the first reset")
+}

@@ -1188,7 +1188,11 @@ func (s *Session) timers(now time.Time) {
 	}
 	if !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > 30*time.Second {
 		s.resetAll(ErrSessionDead)
-		s.lastRecv = time.Time{}
+		// Re-arm with now, not zero: zeroing lastRecv disarmed the watchdog permanently (audit
+		// 2026-10-22), so a client session that never recovered kept streams opened after the
+		// reset blocked forever. Alive() now blips true for <=10 s per 30 s cycle; LastRecv()
+		// and monitors read lastAuth, which stays honest.
+		s.lastRecv = now
 	}
 	if len(s.tomb) > 0 && now.Sub(s.lastTombPrune) >= 5*time.Second {
 		s.lastTombPrune = now
