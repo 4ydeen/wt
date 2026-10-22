@@ -5727,8 +5727,8 @@ uninstall_all() {
 settings_menu() {
   local heal_on anim_on
   while :; do
-    systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && heal_on="${GRN}on${RST}" || heal_on="${GRY}off${RST}"
-    [ "$(conf_get anim 1)" = 1 ] && anim_on="${GRN}on${RST}" || anim_on="${GRY}off${RST}"
+    systemctl is-enabled -q "$HEAL_UNIT.timer" 2>/dev/null && heal_on="${GRN}[ON]${RST}" || heal_on="${GRY}[OFF]${RST}"
+    [ "$(conf_get anim 1)" = 1 ] && anim_on="${GRN}[ON]${RST}" || anim_on="${GRY}[OFF]${RST}"
     page "Settings"
     say "  Auto-heal   $heal_on   ${GRY}restarts an Iran tunnel whose link stays down for 3 minutes${RST}"
     say "  Animations  $anim_on   ${GRY}spinners and the intro (WAT_NO_ANIM=1 also turns them off)${RST}"
@@ -5737,7 +5737,7 @@ settings_menu() {
     printf '  %s restart all tunnels\n' "$(key_label r)"
     echo
     say "  ${BOLD}Maintenance${RST}"
-    printf '  %s roll back to the previous version   %s uninstall WatTunnel   %s back\n' "$(key_label v)" "$(key_label x)" "$(key_label 0)"
+    printf '  %s roll back to the previous version   %s uninstall WatTun   %s back\n' "$(key_label v)" "$(key_label x)" "$(key_label 0)"
     key_read
     case "$KEY" in
       v|V) page "Roll back"; echo; run_flow rollback; pause ;;
@@ -5865,7 +5865,7 @@ ni_run() { # fn args...
 
 usage() {
   cat <<EOF
-WatTunnel manager $VER
+WatTun manager $VER
 
 Usage: $SELF [command]
 
@@ -5904,7 +5904,7 @@ Usage: $SELF [command]
   heal                  restart Iran tunnels whose link is down (used by the timer)
   update | rollback     install the latest release / go back one version
   delete NAME           stop a tunnel and delete its config, key and token (asks you to type the name)
-  uninstall             remove WatTunnel from this server (asks first)
+  uninstall             remove WatTun from this server (asks first)
   help                  this text
 
 Unattended mode (no tty, nothing is asked; --yes turns it on, and so does any --flag when stdin is not a tty;
