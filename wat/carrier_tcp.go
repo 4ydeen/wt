@@ -909,13 +909,49 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 		return net.ErrClosed
 	default:
 	}
-	conns := make([]*poolConn, len(c.slots))
-	for i := range c.slots {
-		conns[i] = c.slots[i].Load()
+	// inline the snapshot: the pump calls this thousands of times a second and the old
+	// make()+copy per packet was pure GC pressure (audit 2026-10-22, transport #4).
+	// pinnedConn and leastQueued keep their slice form for the server/tests; here the
+	// selection is written out against c.slots directly.
+	now := time.Now().UnixNano()
+	var pc *poolConn
+	if path >= PinLaneBase && len(c.slots) > 0 { // pinned first, exactly like pinnedConn
+		if cand := c.slots[(path-PinLaneBase)%len(c.slots)].Load(); cand != nil &&
+			len(cand.q) < poolBacklog && cand.stalledFor(now) <= poolStall {
+			select {
+			case <-cand.done:
+			default:
+				pc = cand
+			}
+		}
 	}
-	pc := pinnedConn(conns, path)
-	if pc == nil {
-		pc = leastQueued(conns, int(c.rr.Add(1)))
+	if pc == nil { // leastQueued: rotate start, prefer unstalled, then shortest queue
+		start := int(c.rr.Add(1))
+		var best, any *poolConn
+		bl, al := 1<<30, 1<<30
+		for i := range c.slots {
+			cand := c.slots[(start+i)%len(c.slots)].Load()
+			if cand == nil {
+				continue
+			}
+			select {
+			case <-cand.done:
+				continue
+			default:
+			}
+			l := len(cand.q)
+			if cand.stalledFor(now) <= poolStall && l < bl {
+				best, bl = cand, l
+			}
+			if l < al {
+				any, al = cand, l
+			}
+		}
+		if best == nil {
+			pc = any // every conn stalled: judge by the shortest queue, as leastQueued does
+		} else {
+			pc = best
+		}
 	}
 	if pc != nil {
 		pc.enqueue(append(getPkt(len(p))[:0], p...)) // full queue: drop, the session repairs it
@@ -990,7 +1026,7 @@ func (c *TCPPoolClient) rotatePick(now time.Time) *poolConn {
 			}
 		}
 	}
-	if usable == 0 || (usable <= 1 && len(c.slots) > 1) {
+	if usable <= 1 { // never strip the last usable conn: on a 1-slot pool every recycle is a full outage
 		return nil
 	}
 	var best *poolConn
@@ -1294,7 +1330,10 @@ func (s *TCPPoolServer) remove(key string, pc *poolConn) {
 		} else if o := s.ordered[key]; o != nil {
 			for i, x := range o {
 				if x == pc {
-					s.ordered[key] = append(o[:i], o[i+1:]...)
+					// fresh array, never shift in place: SendTo reads the old slice without s.mu,
+					// and append(o[:i], ...) would move entries under its feet (race, audit 2026-10-22)
+					no := append([]*poolConn(nil), o[:i]...)
+					s.ordered[key] = append(no, o[i+1:]...)
 					break
 				}
 			}
