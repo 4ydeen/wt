@@ -1535,11 +1535,15 @@ func (s *Session) onStream(sid, off uint64, data []byte, fin bool) {
 		s.acceptQ = append(s.acceptQ, st)
 		s.acceptC.Signal()
 	}
-	if off+uint64(len(data)) > max(st.advMax, st.consumed+streamWindow)+s.winSlack { // slack for the largest datagram any peer may send
+	end := off + uint64(len(data))
+	if end < off { // offset+len wrapped: an authenticated but hostile peer must not bypass the window check
+		return
+	}
+	if end > max(st.advMax, st.consumed+streamWindow)+s.winSlack { // slack for the largest datagram any peer may send
 		return // beyond the advertised window
 	}
 	if fin {
-		st.peerFin, st.peerFinO = true, off+uint64(len(data))
+		st.peerFin, st.peerFinO = true, end
 	}
 	st.insert(off, data)
 }
