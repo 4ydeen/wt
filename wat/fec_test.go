@@ -38,8 +38,12 @@ func TestFecReconstruct(t *testing.T) {
 		snd.mu.Lock()
 		snd.cc.tokens = 1e9
 		snd.fec.loss = 0.001 // k = 16: the whole group is covered
+		var sealed [][]byte
 		for i, p := range plains {
-			snd.fecNoteSent(pn0+uint64(i*2), p) // gaps in the pn sequence, like acks-only packets in between
+			snd.nextPN = pn0 + uint64(i*2) // gaps in the pn sequence, like acks-only packets in between
+			pkt, pn := snd.seal(p)
+			sealed = append(sealed, append([]byte(nil), pkt...))
+			snd.fecNoteSent(pn, p)
 		}
 		snd.nextPN = pn0 + uint64(2*n) // the parity pn must sit near the covered ones (replay window)
 		o, ok := snd.fecDue(time.Now())
@@ -47,19 +51,13 @@ func TestFecReconstruct(t *testing.T) {
 		if !ok {
 			t.Fatal("no parity built")
 		}
-		rcv.mu.Lock()
-		for i, p := range plains {
-			if i == miss {
-				continue
+		parity := append([]byte(nil), o.p...)
+		for i, pkt := range sealed { // through rcv's own recvLoop: its rx state is recvLoop-owned (no lock on the dup check)
+			if i != miss {
+				up.out <- pkt
 			}
-			pn := pn0 + uint64(i*2)
-			rcv.rxAny, rcv.rxLargest = true, max(rcv.rxLargest, pn)
-			rcv.rxRing[pn%rcv.replayWin] = pn + 1
-			rcv.fecKeep(pn, p)
-			rcv.parse(p, time.Now())
 		}
-		rcv.mu.Unlock()
-		up.out <- o.p
+		up.out <- parity
 		st, err := rcv.Accept()
 		if err != nil {
 			t.Fatal(err)
@@ -80,29 +78,25 @@ func TestFecReconstruct(t *testing.T) {
 // Two missing packets in one group cannot be rebuilt (and must not corrupt anything).
 func TestFecTwoMissing(t *testing.T) {
 	snd, rcv, up, _ := newPair(t, 0, time.Millisecond, 10e6, Config{FEC: true})
-	var plains [][]byte
+	var sealed [][]byte
 	snd.mu.Lock()
 	snd.cc.tokens = 1e9
+	snd.nextPN = 500
 	for i := 0; i < 4; i++ {
 		p := append([]byte{frStream, 1, byte(i * 10), 10}, pattern(10, byte(i))...)
-		plains = append(plains, p)
-		snd.fecNoteSent(uint64(500+i), p)
+		pkt, pn := snd.seal(p)
+		sealed = append(sealed, append([]byte(nil), pkt...))
+		snd.fecNoteSent(pn, p)
 	}
-	snd.nextPN = 504
 	o, _ := snd.fecDue(time.Now())
+	parity := append([]byte(nil), o.p...)
 	snd.mu.Unlock()
-	rcv.mu.Lock()
-	for _, i := range []int{0, 3} {
-		pn := uint64(500 + i)
-		rcv.rxAny, rcv.rxLargest = true, 503
-		rcv.rxRing[pn%rcv.replayWin] = pn + 1
-		rcv.fecKeep(pn, plains[i])
-	}
-	rcv.mu.Unlock()
 	n0 := rcv.Stats().PktsIn
-	up.out <- o.p // same injection route as TestFecReconstruct
+	up.out <- sealed[0] // packets 1 and 2 are lost; same injection route as TestFecReconstruct
+	up.out <- sealed[3]
+	up.out <- parity
 	deadline := time.Now().Add(5 * time.Second)
-	for rcv.Stats().PktsIn <= n0 && time.Now().Before(deadline) {
+	for rcv.Stats().PktsIn < n0+3 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if r := rcv.Stats().FecRecovered; r != 0 {
