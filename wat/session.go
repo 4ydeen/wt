@@ -203,6 +203,7 @@ type Session struct {
 	rxNonce       [12]byte // handle runs on the receive goroutine only
 	copier        bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
 	outFree       chan []byte
+	outStack      [][]byte // fast L1-cached buffer recycler for pump goroutine
 	batcher       BatchSender   // nil: send one datagram at a time
 	backlog       Backlogger    // nil: the carrier has no send queues of its own to report
 	deathIO       DeathReporter // the carrier's own connection-death counter, when it has one (pool carriers)
@@ -1390,20 +1391,27 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	if (pn&dirServerBit != 0) == s.cfg.Server { // our own direction: reflected or foreign
 		return
 	}
-	s.mu.Lock()
-	dup := s.rxDup(pn) // fast path: a dup is still opened below (cheap to skip only after auth held); see re-check
-	// snapshot the keys: onKex and the switch below replace them under this same lock
-	first, fall := s.aead, s.oldAead
-	freshRx := s.kexAead // server between offer and switch: the client's fresh key opens first
-	if freshRx != nil {
-		first, fall = freshRx, s.aead
-	}
-	if !s.cfg.Server && s.probeUntil.After(time.Now()) {
-		fall = s.pskAead // restart probe: the peer's answer may only be sealed with the PSK key
-	}
-	s.mu.Unlock()
+	dup := s.rxDup(pn) // fast path: rxRing and rxLargest are owned by recvLoop; checked with 0 locks
 	if dup {
-		return // not counted: unauthenticated junk with a known sid/pn must not pollute the loss stats (audit 2026-10-22)
+		return // not counted: unauthenticated junk with a known sid/pn must not pollute the loss stats
+	}
+	var first, fall cipher.AEAD
+	var freshRx cipher.AEAD
+	if s.kexDone {
+		// Steady state: KEX is completed and AEAD cipher is established. Read with 0 locks.
+		first, fall = s.aead, s.oldAead
+	} else {
+		// Handshake phase: snapshot under lock
+		s.mu.Lock()
+		first, fall = s.aead, s.oldAead
+		freshRx = s.kexAead
+		if freshRx != nil {
+			first, fall = freshRx, s.aead
+		}
+		if !s.cfg.Server && s.probeUntil.After(time.Now()) {
+			fall = s.pskAead
+		}
+		s.mu.Unlock()
 	}
 	copy(s.rxNonce[4:], raw[8:16])
 	plain, err := first.Open(s.openBuf[:0], s.rxNonce[:], raw[hdrLen:], raw[:8])

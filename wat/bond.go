@@ -43,6 +43,7 @@ type BondIO struct {
 	done   chan struct{}
 	once   sync.Once
 	prober atomic.Value // func(int)
+	prev   []byte
 }
 
 func NewBondIO(kids []PacketIO, opt BondOptions) (*BondIO, error) {
@@ -91,9 +92,12 @@ func (b *BondIO) recvKid(i int) {
 			continue
 		}
 		backoff = time.Millisecond
+		buf := getPkt(len(p))
+		copy(buf, p)
 		select {
-		case b.in <- bondPkt{append([]byte(nil), p...), i, src}:
+		case b.in <- bondPkt{buf, i, src}:
 		default: // overloaded: a dropped datagram is just loss
+			putPkt(buf)
 		}
 	}
 }
@@ -142,8 +146,13 @@ func (b *BondIO) Send(p []byte, path int) error {
 }
 
 func (b *BondIO) Recv() ([]byte, int, net.Addr, error) {
+	if b.prev != nil {
+		putPkt(b.prev)
+		b.prev = nil
+	}
 	select {
 	case r := <-b.in:
+		b.prev = r.p
 		return r.p, r.path, r.src, nil
 	case <-b.done:
 		return nil, 0, nil, net.ErrClosed
@@ -155,6 +164,19 @@ func (b *BondIO) SetPeer(net.Addr) {}
 func (b *BondIO) Close() error {
 	b.once.Do(func() {
 		close(b.done)
+		if b.prev != nil {
+			putPkt(b.prev)
+			b.prev = nil
+		}
+		for {
+			select {
+			case r := <-b.in:
+				putPkt(r.p)
+			default:
+				goto drained
+			}
+		}
+	drained:
 		for _, k := range b.kids {
 			k.Close()
 		}
@@ -202,6 +224,7 @@ type MultiRaw struct {
 	in    chan multiPkt
 	done  chan struct{}
 	once  sync.Once
+	prev  []byte
 }
 
 func NewMultiRaw(names []string, raws []RawIO) *MultiRaw {
@@ -229,16 +252,24 @@ func (m *MultiRaw) readLoop(i int) {
 			continue
 		}
 		backoff = time.Millisecond
+		buf := getPkt(len(p))
+		copy(buf, p)
 		select {
-		case m.in <- multiPkt{append([]byte(nil), p...), lane, &TaggedAddr{i, src, lane}}:
+		case m.in <- multiPkt{buf, lane, &TaggedAddr{i, src, lane}}:
 		default:
+			putPkt(buf)
 		}
 	}
 }
 
 func (m *MultiRaw) Recv() ([]byte, int, net.Addr, error) {
+	if m.prev != nil {
+		putPkt(m.prev)
+		m.prev = nil
+	}
 	select {
 	case r := <-m.in:
+		m.prev = r.p
 		return r.p, r.lane, r.src, nil
 	case <-m.done:
 		return nil, 0, nil, net.ErrClosed
@@ -256,6 +287,19 @@ func (m *MultiRaw) SendTo(p []byte, lane int, dst net.Addr) error {
 func (m *MultiRaw) Close() error {
 	m.once.Do(func() {
 		close(m.done)
+		if m.prev != nil {
+			putPkt(m.prev)
+			m.prev = nil
+		}
+		for {
+			select {
+			case r := <-m.in:
+				putPkt(r.p)
+			default:
+				goto drained
+			}
+		}
+	drained:
 		for _, r := range m.raws {
 			r.Close()
 		}

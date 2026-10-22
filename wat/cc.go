@@ -405,10 +405,14 @@ func newCC(initRate, minRate, maxRate float64, slack time.Duration) cc {
 
 func (c *cc) refill(dt time.Duration) {
 	c.tokens += c.rate * dt.Seconds()
-	// Clamp token headroom to 2 ms (CBS guard) to prevent line-rate bursts
-	// from exceeding border router Committed Burst Size (64-256 KB) after pauses.
-	if max := c.rate*0.002 + 4000; c.tokens > max {
-		c.tokens = max
+	burst := c.rate*0.005 + 64<<10
+	if c.direct {
+		// Direct TCP carriers rely on kernel socket buffers and BBR pacing. Allow sufficient
+		// token burst headroom (50 ms or 512 KB) so the userspace pacer does not starve socket buffers.
+		burst = max(c.rate*0.05, 512<<10)
+	}
+	if c.tokens > burst {
+		c.tokens = burst
 	}
 }
 

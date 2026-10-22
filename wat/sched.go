@@ -144,21 +144,36 @@ func copies(x any) bool {
 var pingFrame = []byte{frPing} // shared: control frames are never modified
 
 func (s *Session) getOut(n int) []byte {
-	select {
-	case b := <-s.outFree: // nil channel (carrier retains buffers): never ready
+	if len(s.outStack) > 0 {
+		b := s.outStack[len(s.outStack)-1]
 		if cap(b) >= n {
+			s.outStack = s.outStack[:len(s.outStack)-1]
 			return b[:hdrLen]
 		}
-	default:
 	}
-	return make([]byte, hdrLen, max(n, s.maxPlain+overhead))
+	if s.outFree != nil {
+		select {
+		case b := <-s.outFree:
+			if cap(b) >= n {
+				return b[:hdrLen]
+			}
+		default:
+		}
+	}
+	return make([]byte, hdrLen, max(n, s.maxPlain+overhead, directMTU+overhead))
 }
 
 func (s *Session) putOut(b []byte) {
-	if s.outFree != nil {
-		select {
-		case s.outFree <- b:
-		default:
+	if s.copier {
+		if len(s.outStack) < 256 {
+			s.outStack = append(s.outStack, b)
+			return
+		}
+		if s.outFree != nil {
+			select {
+			case s.outFree <- b:
+			default:
+			}
 		}
 	}
 }

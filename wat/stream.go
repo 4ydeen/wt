@@ -182,12 +182,11 @@ func (st *Stream) tuneSlow(now time.Time) {
 // window doubles toward 2x the observed bytes per RTT (cap maxStreamWin per stream, maxSessionWin extra per session).
 // A reader that lags (more than a quarter of the window unread) stops the growth. The advertised limit never moves
 // back, so nothing already granted is refused.
-func (st *Stream) tuneWindow() {
+func (st *Stream) tuneWindow(now time.Time) {
 	s := st.s
 	if s.noWinTune {
 		return
 	}
-	now := time.Now()
 	if st.tuneAt.IsZero() {
 		st.tuneAt, st.tuneRx = now, st.rnext
 		return
@@ -253,8 +252,9 @@ func (st *Stream) Read(b []byte) (int, error) {
 	}
 	n := st.ready.read(b)
 	st.consumed += uint64(n)
-	st.tuneWindow()
-	st.tuneSlow(time.Now())
+	now := time.Now()
+	st.tuneWindow(now)
+	st.tuneSlow(now)
 	lim := st.win
 	if st.slowWin > 0 {
 		lim = st.slowWin
@@ -367,8 +367,8 @@ func (st *Stream) onAcked(f frameRef) {
 			}
 			st.sbuf = st.sbuf[drop:]
 			if len(st.sbuf) == 0 {
-				if cap(st.sroot) > keepBuf {
-					st.sroot, st.sbuf = nil, nil // do not pin a big buffer on an idle stream
+				if cap(st.sroot) > keepBuf && (st.finQueued || st.dead) {
+					st.sroot, st.sbuf = nil, nil // do not pin a big buffer on a finished or dead stream
 				} else {
 					st.sbuf = st.sroot[:0]
 				}
@@ -552,7 +552,11 @@ func (st *Stream) insert(off uint64, data []byte) {
 	for len(st.segs) > 0 && st.segs[0].off == st.rnext {
 		st.appendReady(st.segs[0].data)
 		st.rnext += uint64(len(st.segs[0].data))
+		st.segs[0].data = nil
 		st.segs = st.segs[1:]
+	}
+	if len(st.segs) == 0 {
+		st.segs = st.segs[:0]
 	}
 	if st.peerFin && st.rnext == st.peerFinO {
 		st.eof = true
@@ -582,7 +586,8 @@ func (st *Stream) makeRoom(n int) {
 	// about twice at most. A buffer kept just at the cap moved all its live bytes for every write when the front had
 	// freed a little: 56 % of the sending end's copying on a download (field profile 2026-10-16). It grows instead,
 	// up to twice the cap, which leaves room for the front to free up.
-	if gap := cap(st.sroot) - cap(st.sbuf); cap(st.sroot) >= live+n && gap >= live/2 {
+	gap := cap(st.sroot) - cap(st.sbuf)
+	if cap(st.sroot) >= live+n && (gap >= live/2 || cap(st.sroot) >= 2*st.sendCap()) {
 		copy(st.sroot[:live], st.sbuf)
 		st.sbuf = st.sroot[:live]
 		return

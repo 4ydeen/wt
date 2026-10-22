@@ -1161,7 +1161,7 @@ type TCPPoolServer struct {
 	wg      sync.WaitGroup
 	rr      atomic.Uint32
 	once    sync.Once
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	pools   map[string]map[*poolConn]struct{}
 	ordered map[string][]*poolConn // the same pools in born order, kept under mu by add/remove for the hot SendTo
 	all     map[net.Conn]struct{}  // every accepted conn, so Close also reaches ones still in their hello
@@ -1355,9 +1355,9 @@ func (s *TCPPoolServer) SendTo(p []byte, lane int, dst net.Addr) error {
 	if !ok {
 		return net.ErrClosed
 	}
-	s.mu.Lock()
-	conns := s.ordered[a.key] // born-ordered copy kept by add/remove: no per-packet slice + sort
-	s.mu.Unlock()
+	s.mu.RLock()
+	conns := s.ordered[a.key] // born-ordered copy kept by add/remove: read-locked without writer contention
+	s.mu.RUnlock()
 	var pc *poolConn
 	if lane >= PinLaneBase && len(conns) > 0 { // a stable order, so a stream keeps its connection
 		pc = pinnedConn(conns, lane)
@@ -1377,9 +1377,9 @@ func (s *TCPPoolServer) BackloggedTo(dst net.Addr) bool {
 	if !ok {
 		return false
 	}
-	s.mu.Lock()
+	s.mu.RLock()
 	conns := s.ordered[a.key]
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return backlogged(conns)
 }
 
@@ -1390,14 +1390,14 @@ func (s *TCPPoolServer) Profile() Profile { return poolProfile }
 
 // Pools and Conns report the live pool and connection counts.
 func (s *TCPPoolServer) Pools() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.pools)
 }
 
 func (s *TCPPoolServer) Conns() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	n := 0
 	for _, set := range s.pools {
 		n += len(set)

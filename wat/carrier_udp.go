@@ -37,7 +37,7 @@ func NewUDPClientAddr(peer string, laddr *net.UDPAddr) (*UDPClient, error) {
 	}
 	c.SetReadBuffer(udpSockBuf)
 	c.SetWriteBuffer(udpSockBuf)
-	return &UDPClient{c: c, rbuf: make([]byte, 2048), bx: newUDPBatch(c)}, nil
+	return &UDPClient{c: c, rbuf: make([]byte, 65536), bx: newUDPBatch(c)}, nil
 }
 
 func (u *UDPClient) Send(p []byte, path int) error {
@@ -98,7 +98,7 @@ func NewUDPServer(addr string) (*UDPServer, error) {
 	}
 	c.SetReadBuffer(udpSockBuf)
 	c.SetWriteBuffer(udpSockBuf)
-	return &UDPServer{c: c, rbuf: make([]byte, 2048), bx: newUDPBatch(c)}, nil
+	return &UDPServer{c: c, rbuf: make([]byte, 65536), bx: newUDPBatch(c)}, nil
 }
 
 func (u *UDPServer) CopiesOnSend() bool { return true }
