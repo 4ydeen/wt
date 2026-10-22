@@ -85,16 +85,37 @@ All verified with `go build ./...`, `go vet ./...`, `go test ./cmd/...` (14.5 s)
 - Both hosts still hold the `wat-deploy` authorized key; remove it and rotate the root passwords (they appeared in chat).
 - Kharej currently runs the `ws` carrier on :80 (last test state); iran's client is stopped.Configs live at `/etc/wattun/{kh,ir}.yml`, keys at `/etc/wattun/t.key`, kharej TLS cert pair (self-signed `www.mci.ir`, sha256 pin `372d3cff…f2c1`) at `/etc/wattun/cert.{pem,key}`.
 
-## 7. Artifacts
+## 7. Round 2 — "beat the filter" exhaustive vector test (2026-10-22, 15:30–17:30)
+
+Ordered attempt to find any full-duplex channel on the Tehran→31.57.185.20 route. Every vector measured to zero sustained capacity.
+
+| Vector | Measurement | Verdict |
+|---|---|---|
+| Raw UDP (high rate, 1000 B × 2938) | 6 delivered (0.2 %) | dead |
+| DNS-shaped UDP, single legit query | passes once after a ~5 min cooldown (NOERROR, 84 ms) | whitelist window only |
+| DNS-shaped UDP, paced 1 qps × 15 | 0/15 round-trips | dead |
+| DNS-shaped UDP, blast 195,050 × ~450 B (88 MB in 10 s) | **0 delivered** | dead; flood also poisons the tuple |
+| HTTP GET body, per-size (1 KB → 50 MB) | hard cap **14,480 B per fresh connection**; 8 KB GETs 500/500 reliable in parallel (x25) ≈ 0.5 MB/s | server→client only, tiny |
+| HTTP GET on one keep-alive conn | 50 GETs / 400 KB in 13 s, then throttled | same 14 KB-class budget |
+| HTTP POST (8 KB → 1 MB, fresh conns) | **all time out** — request bodies unconditionally blocked | client→server payload impossible |
+| SSH :22 data carry | worked early in round 1, later dead — penalty box escalates with use | dead |
+| IPv6 | kharej has 2a14:7c0::/64 global; **iran has no v6 at all** (link-local only, no route) | dead |
+| CDN-fronted wss+ECH | untestable: no domain in this bench | **the one remaining weapon** |
+
+**Structural verdict:** a tunnel needs payload both ways. This filter blocks client→server payload in every form (POST bodies, tunnel hellos, SSH streams) while allowing brief server→client response windows. No camouflage protocol can bridge an asymmetric channel. Combined with round 1 (tcp/tls/h2c/ws/fake-sni all killed in ~30–60 s; ICMP rate-shaped into a penalty box), the route is conclusively unusable for wattun. The ~1 MB/s one-directional ceiling from parallel fresh GETs is ~50× below the 50 MB/s target.
+
+**Path forward (needs user input):** a domain + CDN front to deploy the wss+ECH ladder (the blackout branch's designed answer to exactly this DPI class), or a different kharej endpoint whose route does not DPI-kill binary flows.
+
+## 8. Artifacts
 
 - `REPORT.md` (this file)
 - `bugs.md` / `RESEARCH.md` / `AGENT-HANDOFF.md`: updated on the next docs pass with this round's entries.
 
-## 8. Old kharej (94.183.177.122) — out of scope, recorded for completeness
+## 9. Old kharej (94.183.177.122) — out of scope, recorded for completeness
 
 AS56971 "Cloud", Amsterdam-registered, fully filtered both directions during this session (TCP 22/80/443/4443, ICMP, UDP all dead from/to Iran). The user supplied 31.57.185.20 as its replacement.
 
-## 9. Cleanup checklist (pending)
+## 10. Cleanup checklist (pending)
 
 - [ ] Remove `wat-deploy` line from `/root/.ssh/authorized_keys` on 31.57.185.20 and 185.84.158.163
 - [ ] Delete local `D:\tmpgo\deploykey{,.pub}`
