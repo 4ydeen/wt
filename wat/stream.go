@@ -529,9 +529,16 @@ func (st *Stream) insert(off uint64, data []byte) {
 			limit = st.segs[i].off - off
 		}
 		cp := append([]byte(nil), data[:limit]...)
-		st.segs = append(st.segs, seg{})
-		copy(st.segs[i+1:], st.segs[i:])
-		st.segs[i] = seg{off, cp}
+		// Fast append: arrivals behind a hole usually ascend (retransmit stream order), so appending
+		// skips the O(n) shift-insert that dominated the out-of-order path at a 4 MB window (audit
+		// 2026-10-22); the shift stays for a true middle insert.
+		if i == len(st.segs) {
+			st.segs = append(st.segs, seg{off, cp})
+		} else {
+			st.segs = append(st.segs, seg{})
+			copy(st.segs[i+1:], st.segs[i:])
+			st.segs[i] = seg{off, cp}
+		}
 		data, off = data[limit:], off+limit
 	}
 	for len(st.segs) > 0 && st.segs[0].off == st.rnext {
