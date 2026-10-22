@@ -260,13 +260,46 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *sentLog) {
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "seqsum"}
 	case "rst":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "rst"}
+	case "split":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "split"}
+	case "hlen0":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "hlen0"}
+	case "fakeip":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "fakeip"}
+	case "synrst":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "synrst"}
+	case "all":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "all"}
 	}
+	return desyncTestTrackerCfg(cfg)
+}
+
+// desyncTestTrackerCfg builds a tracker for an arbitrary config with a collected send path and the fixed
+// 192.168.1.2 -> 10.8.0.1 peer pair.
+func desyncTestTrackerCfg(cfg DesyncConfig) (*desyncTracker, *sentLog) {
 	var p [4]byte
 	copy(p[:], net.ParseIP("10.8.0.1").To4())
 	tr := newDesyncTracker(cfg, p)
 	sent := &sentLog{}
 	tr.send = sent.add
 	return tr, sent
+}
+
+// tcpChecksumOK reports whether an IPv4+TCP packet (header included) carries a valid TCP checksum.
+func tcpChecksumOK(pkt []byte) bool {
+	c := append([]byte(nil), pkt...)
+	stored := binary.BigEndian.Uint16(c[20+16:])
+	binary.BigEndian.PutUint16(c[20+16:], 0)
+	return tcpChecksum(c[20:], c[12:16], c[16:20]) == stored
+}
+
+// payloadOf returns the TCP payload of an IPv4+TCP packet, honoring the data offset.
+func payloadOf(pkt []byte) []byte {
+	off := 20 + int(pkt[20+12]>>4)*4
+	if off > len(pkt) {
+		return nil
+	}
+	return pkt[off:]
 }
 
 // testClientKey is one outgoing 4-tuple: 192.168.1.2:5000 -> 10.8.0.1:443.
@@ -1151,3 +1184,383 @@ func TestDesyncOptsCapture(t *testing.T) {
 	}
 }
 
+// TestValidateDesyncNewModes pins validation for the modes added with the F&F round: split/hlen0/fakeip/synrst/
+// all, the -fake-ip IPv4 check and the -fake-split range.
+func TestValidateDesyncNewModes(t *testing.T) {
+	for _, m := range []string{"split", "hlen0", "fakeip", "synrst", "all"} {
+		if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: m}); err != nil {
+			t.Fatalf("%s: %v", m, err)
+		}
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "188.114.98.0"}); err != nil {
+		t.Fatalf("fakeip with an explicit IPv4: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: " 104.16.0.1 "}); err != nil {
+		t.Fatalf("fakeip FakeIP with surrounding whitespace: %v", err)
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "cdn.example.com"}); err == nil {
+		t.Fatal("a non-IPv4 FakeIP must fail")
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "2a06:98c1:3101::6812:202f"}); err == nil {
+		t.Fatal("an IPv6 FakeIP must fail (the packet builders write IPv4 headers)")
+	}
+	for _, n := range []int{2, 3, 16} {
+		if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "split", Split: n}); err != nil {
+			t.Fatalf("split %d: %v", n, err)
+		}
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "split", Split: 1}); err == nil {
+		t.Fatal("split 1 must fail")
+	}
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "split", Split: 17}); err == nil {
+		t.Fatal("split > 16 must fail")
+	}
+}
+
+// TestDesyncSplitMode: split cuts the fake ClientHello across TCP segments: the first payload segment is the
+// record byte alone, a segment boundary lands on the SNI extension, the fragments' seq numbers are contiguous and
+// the whole ghost stays below the stream start. Reassembled in seq order the fragments still form the allowlisted
+// ClientHello, so a reassembling receiver is fooled while a per-packet parser sees no complete record.
+func TestDesyncSplitMode(t *testing.T) {
+	tr, sent := desyncTestTracker("split", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(9000), uint32(400)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("split fake never fired")
+	}
+	if tr.fired() != 1 {
+		t.Fatalf("split fired counter %d, want 1", tr.fired())
+	}
+	if sent.n() != 3 {
+		t.Fatalf("default split sent %d segments, want 3", sent.n())
+	}
+	streamStart := isn + 1
+	wantSeq := streamStart - uint32(len(tr.hello))
+	var reassembled []byte
+	var bounds []int
+	for i := 0; i < sent.n(); i++ {
+		pkt := sent.at(i)
+		payload := payloadOf(pkt)
+		if i == 0 && len(payload) != 1 {
+			t.Fatalf("split segment 1 is %d bytes, want 1 (the TLS record byte alone)", len(payload))
+		}
+		if got := binary.BigEndian.Uint16(pkt[22:]); got != k.dstPt {
+			t.Fatalf("segment %d dport %d", i, got)
+		}
+		if got := binary.BigEndian.Uint32(pkt[24:]); got != wantSeq+uint32(len(reassembled)) {
+			t.Fatalf("segment %d seq %d, want %d (contiguous fragments)", i, got, wantSeq+uint32(len(reassembled)))
+		}
+		if got := binary.BigEndian.Uint32(pkt[28:]); got != srvSeq+1 {
+			t.Fatalf("segment %d ack %d, want %d", i, got, srvSeq+1)
+		}
+		if !tcpChecksumOK(pkt) {
+			t.Fatalf("segment %d carries an invalid checksum (split fragments must be plain seq markers)", i)
+		}
+		reassembled = append(reassembled, payload...)
+		bounds = append(bounds, len(reassembled))
+	}
+	// every fragment sits below the stream start, so the server kernel drops each one as an old duplicate
+	if wantSeq+uint32(len(reassembled)) != streamStart {
+		t.Fatalf("reassembled fake ends at %d, want %d (the stream start)", wantSeq+uint32(len(reassembled)), streamStart)
+	}
+	if len(reassembled) != len(tr.hello) {
+		t.Fatalf("split reassembles to %d bytes, want %d", len(reassembled), len(tr.hello))
+	}
+	got, err := parseSNIOf(reassembled)
+	if err != nil || got != "mci.ir" {
+		t.Fatalf("reassembled split SNI: got %q err %v, want mci.ir", got, err)
+	}
+	// the SNI extension starts exactly on a fragment boundary: no payload segment carries a complete record header
+	// together with the server_name extension header.
+	off := sniExtOffset(reassembled)
+	if off == 0 {
+		t.Fatal("SNI extension not found in the reassembled fake")
+	}
+	onBoundary := false
+	for _, b := range bounds {
+		if b == off {
+			onBoundary = true
+		}
+	}
+	if !onBoundary {
+		t.Fatalf("no segment boundary at the SNI extension offset %d (bounds %v)", off, bounds)
+	}
+}
+
+// TestDesyncSplitHonoursConfiguredCount: -fake-split sets the segment count (0 = default 3, 2..16 otherwise).
+func TestDesyncSplitHonoursConfiguredCount(t *testing.T) {
+	for _, tc := range []struct{ split, want int }{{0, 3}, {2, 2}, {4, 4}, {16, 16}} {
+		tr, sent := desyncTestTrackerCfg(DesyncConfig{SNI: "mci.ir", Mode: "split", Split: tc.split})
+		k := testClientKey()
+		ch := tr.announce(k, 1001, true)
+		feedFullHandshake(tr, k, 1000, 500)
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			tr.close()
+			t.Fatalf("split %d: fake never fired", tc.split)
+		}
+		if sent.n() != tc.want {
+			tr.close()
+			t.Fatalf("split %d sent %d segments, want %d", tc.split, sent.n(), tc.want)
+		}
+		// the fragments still add up to exactly one fake ClientHello
+		total := 0
+		for i := 0; i < sent.n(); i++ {
+			total += len(payloadOf(sent.at(i)))
+		}
+		if total != len(tr.hello) {
+			tr.close()
+			t.Fatalf("split %d reassembles to %d bytes, want %d", tc.split, total, len(tr.hello))
+		}
+		tr.close()
+	}
+}
+
+// TestDesyncHlen0ZeroRecord: hlen0 leaves the record length field at 0 (F&F tlshello-0-len) while the body still
+// carries the allowlisted SNI, at the plain seq-mode placement (below the stream start, valid checksum, TTL 64).
+func TestDesyncHlen0ZeroRecord(t *testing.T) {
+	tr, sent := desyncTestTracker("hlen0", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(11000), uint32(600)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("hlen0 fake never fired")
+	}
+	if tr.fired() != 1 || sent.n() != 1 {
+		t.Fatalf("hlen0 fired %d, sent %d; want 1 and 1", tr.fired(), sent.n())
+	}
+	pkt := sent.at(0)
+	payload := payloadOf(pkt)
+	if len(payload) != len(tr.hello) {
+		t.Fatalf("hlen0 payload %d bytes, want %d (the mask keeps the body)", len(payload), len(tr.hello))
+	}
+	if payload[0] != 0x16 {
+		t.Fatalf("hlen0 payload does not start with a TLS handshake byte: %02x", payload[0])
+	}
+	if payload[3] != 0 || payload[4] != 0 {
+		t.Fatalf("hlen0 record length % x, want 00 00 (F&F tlshello-0-len)", payload[3:5])
+	}
+	// a per-packet sniffer that ignores the length field still reads the allowlisted name
+	if got, err := parseSNIOf(payload); err != nil || got != "mci.ir" {
+		t.Fatalf("hlen0 SNI: got %q err %v, want mci.ir", got, err)
+	}
+	if got := binary.BigEndian.Uint32(pkt[24:]); got != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("hlen0 seq %d, want %d (seq-mode placement)", got, isn+1-uint32(len(tr.hello)))
+	}
+	if pkt[8] != 64 {
+		t.Fatalf("hlen0 ttl %d, want 64 (seq-mode placement)", pkt[8])
+	}
+	if !tcpChecksumOK(pkt) {
+		t.Fatal("hlen0 must carry a valid checksum: its marker is the zeroed record length, not a bad checksum")
+	}
+}
+
+// TestDesyncFakeIPMirrorsWhitelistedIP: fakeip sends a well-formed SYN and ClientHello for the same client port
+// but a whitelisted CDN destination (configured, and the 104.16.0.1 default). Both packets are checksum-valid,
+// so an IP-allowlist DPI records the flow as allowed-CDN traffic; the destination is not the real server, so the
+// tunnel never sees them.
+func TestDesyncFakeIPMirrorsWhitelistedIP(t *testing.T) {
+	tr, sent := desyncTestTrackerCfg(DesyncConfig{SNI: "mci.ir", Mode: "fakeip", FakeIP: "188.114.98.1"})
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(12000), uint32(700)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fakeip fake never fired")
+	}
+	if tr.fired() != 1 {
+		t.Fatalf("fakeip fired counter %d, want 1", tr.fired())
+	}
+	if sent.n() != 2 {
+		t.Fatalf("fakeip sent %d packets, want 2 (SYN + ClientHello)", sent.n())
+	}
+	wantIP := []byte{188, 114, 98, 1}
+	for i := 0; i < sent.n(); i++ {
+		pkt := sent.at(i)
+		if ip := pkt[16:20]; !bytes.Equal(ip, wantIP) {
+			t.Fatalf("packet %d dst % x, want the whitelisted CDN IP % x", i, ip, wantIP)
+		}
+		if got := binary.BigEndian.Uint16(pkt[20:]); got != k.srcPt {
+			t.Fatalf("packet %d sport %d, want the client's real port %d", i, got, k.srcPt)
+		}
+		if got := binary.BigEndian.Uint16(pkt[22:]); got != 443 {
+			t.Fatalf("packet %d dport %d, want 443", i, got)
+		}
+		if csum(pkt[:20]) != 0 {
+			t.Fatalf("packet %d IP header checksum invalid", i)
+		}
+		if !tcpChecksumOK(pkt) {
+			t.Fatalf("packet %d carries an invalid TCP checksum (fakeip must look like real CDN traffic)", i)
+		}
+	}
+	syn := sent.at(0)
+	if flags := syn[20+13]; flags != 0x02 {
+		t.Fatalf("packet 1 flags 0x%02x, want 0x02 (SYN)", flags)
+	}
+	helloPkt := sent.at(1)
+	if flags := helloPkt[20+13]; flags != 0x18 {
+		t.Fatalf("packet 2 flags 0x%02x, want 0x18 (PSH|ACK)", flags)
+	}
+	synSeq := binary.BigEndian.Uint32(syn[24:])
+	if got := binary.BigEndian.Uint32(helloPkt[24:]); got != synSeq+1 {
+		t.Fatalf("hello seq %d, want %d (SYN+1)", got, synSeq+1)
+	}
+	// the fake flow's bytes also end at the real stream start: even a DPI that merged the keys sees old duplicates
+	if got := binary.BigEndian.Uint32(helloPkt[24:]) + uint32(len(payloadOf(helloPkt))); got != isn+1 {
+		t.Fatalf("fakeip synthetic stream ends at %d, want %d (the real stream start)", got, isn+1)
+	}
+	if got, err := parseSNIOf(payloadOf(helloPkt)); err != nil || got != "mci.ir" {
+		t.Fatalf("fakeip hello SNI: got %q err %v, want mci.ir", got, err)
+	}
+
+	// the default FakeIP is the Cloudflare edge
+	tr2, sent2 := desyncTestTracker("fakeip", 0)
+	defer tr2.close()
+	k2 := testClientKey()
+	ch2 := tr2.announce(k2, 20001, true)
+	feedFullHandshake(tr2, k2, 20000, 900)
+	select {
+	case <-ch2:
+	case <-time.After(time.Second):
+		t.Fatal("default-fakeip fake never fired")
+	}
+	if got := sent2.at(0)[16:20]; !bytes.Equal(got, []byte{104, 16, 0, 1}) {
+		t.Fatalf("default fakeip dst % x, want 104.16.0.1 (a Cloudflare edge)", got)
+	}
+}
+
+// TestDesyncSYNRSTClearsFlowHarder: synrst sends an in-window SYN|RST with a damaged checksum: a protocol-invalid
+// combination that stateful middleboxes purge harder than a plain RST, and that the server kernel drops at
+// checksum validation before reading flags.
+func TestDesyncSYNRSTClearsFlowHarder(t *testing.T) {
+	tr, sent := desyncTestTracker("synrst", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(13000), uint32(800)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("synrst fake never fired")
+	}
+	if tr.fired() != 1 || sent.n() != 1 {
+		t.Fatalf("synrst fired %d, sent %d; want 1 and 1", tr.fired(), sent.n())
+	}
+	pkt := sent.at(0)
+	if len(pkt) != 40 {
+		t.Fatalf("synrst packet len %d, want 40 (header only)", len(pkt))
+	}
+	if flags := pkt[20+13]; flags != 0x06 {
+		t.Fatalf("synrst flags 0x%02x, want 0x06 (SYN|RST)", flags)
+	}
+	if got := binary.BigEndian.Uint32(pkt[24:]); got != isn+1 {
+		t.Fatalf("synrst seq %d, want %d (in-window)", got, isn+1)
+	}
+	if tcpChecksumOK(pkt) {
+		t.Fatal("synrst carries a VALID checksum (must be damaged so the server kernel drops it)")
+	}
+}
+
+// TestDesyncAllFiresThreeMarkers: all mode fires seq + sum + hlen0 markers ~1 ms apart. Classify the three sent
+// packets by their properties (below-window/valid, in-window/damaged, below-window/zero-record) rather than by
+// arrival order, so the ~1 ms timer scheduling cannot make the test flaky.
+func TestDesyncAllFiresThreeMarkers(t *testing.T) {
+	tr, sent := desyncTestTracker("all", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(15000), uint32(300)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("all fake never fired")
+	}
+	if tr.fired() != 1 {
+		t.Fatalf("all fired counter %d, want 1", tr.fired())
+	}
+	deadline := time.Now().Add(time.Second)
+	for sent.n() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("all sent %d markers, want 3 (a timer marker never arrived)", sent.n())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	streamStart := isn + 1
+	belowSeq := streamStart - uint32(len(tr.hello))
+	var sawSeq, sawSum, sawHLen bool
+	for i := 0; i < 3; i++ {
+		pkt := sent.at(i)
+		payload := payloadOf(pkt)
+		seq := binary.BigEndian.Uint32(pkt[24:])
+		valid := tcpChecksumOK(pkt)
+		switch {
+		case len(payload) == len(tr.hello) && payload[3] == 0 && payload[4] == 0 && seq == belowSeq && valid:
+			sawHLen = true
+		case len(payload) == len(tr.hello) && seq == belowSeq && valid:
+			sawSeq = true
+		case len(payload) == len(tr.hello) && seq == streamStart && !valid:
+			sawSum = true
+		default:
+			t.Fatalf("marker %d matches no expected shape (seq %d, len %d, valid %v)", i, seq, len(payload), valid)
+		}
+	}
+	if !sawSeq || !sawSum || !sawHLen {
+		t.Fatalf("all markers missing: seq=%v sum=%v hlen0=%v (want all three)", sawSeq, sawSum, sawHLen)
+	}
+}
+
+// TestDesyncExistingModesFireUnchangedBytes: the new-mode work must not perturb what the older modes put on the
+// wire. Each fire of seq / sum / rst must be byte-identical to the same shared builder the release before this
+// change used (the existing mode tests above pin the individual fields; this pins the whole packet).
+func TestDesyncExistingModesFireUnchangedBytes(t *testing.T) {
+	k := testClientKey()
+	const isn, srvSeq = uint32(16000), uint32(1200)
+
+	fireOne := func(mode string) []byte {
+		tr, sent := desyncTestTracker(mode, 0)
+		defer tr.close()
+		ch := tr.announce(k, isn+1, true)
+		feedFullHandshake(tr, k, isn, srvSeq)
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("%s: fake never fired", mode)
+		}
+		if sent.n() != 1 {
+			t.Fatalf("%s: sent %d packets, want 1", mode, sent.n())
+		}
+		return sent.at(0)
+	}
+
+	seqPkt := fireOne("seq")
+	if want := fakePacket(k, isn+1-uint32(len(payloadOf(seqPkt))), srvSeq+1, 64, payloadOf(seqPkt)); !bytes.Equal(seqPkt, want) {
+		t.Fatal("seq mode fire bytes changed")
+	}
+	sumPkt := fireOne("sum")
+	wantSum := fakePacket(k, isn+1, srvSeq+1, 64, payloadOf(sumPkt))
+	damageChecksum(wantSum)
+	if !bytes.Equal(sumPkt, wantSum) {
+		t.Fatal("sum mode fire bytes changed")
+	}
+	rstPkt := fireOne("rst")
+	wantRST := fakeRSTPacket(k, isn+1, srvSeq+1, 64)
+	damageChecksum(wantRST)
+	if !bytes.Equal(rstPkt, wantRST) {
+		t.Fatal("rst mode fire bytes changed")
+	}
+}

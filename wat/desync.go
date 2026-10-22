@@ -55,8 +55,13 @@ func tcpChecksum(th, src, dst []byte) uint16 {
 type DesyncConfig struct {
 	SNI  string // allowlisted server name the fake ClientHello carries
 	Mode string // "seq" (wrong sequence number, default), "ttl" (small TTL), "sum" (valid window, bad checksum),
-	             // "seqsum" (both markers per connection, ~1 ms apart; experimental, 2.8.0), or "rst" (bad-checksum RST)
-	TTL  int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
+	// "seqsum" (both markers per connection, ~1 ms apart; experimental, 2.8.0), "rst" (bad-checksum RST),
+	// "split" (the fake hello cut across TCP segments), "hlen0" (F&F zero-length TLS record header),
+	// "fakeip" (SYN + hello to a whitelisted CDN IP), "synrst" (SYN|RST, bad checksum), or "all"
+	// (seq + sum + hlen0 markers, ~1 ms apart)
+	TTL    int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
+	FakeIP string // fakeip mode: whitelisted destination IPv4 the fake flow names ("" = 104.16.0.1, a Cloudflare edge)
+	Split  int    // split mode: how many TCP segments the fake hello is cut into (0 = 3)
 }
 
 // splitSNIs splits a comma-separated list of SNIs into trimmed domain names.
@@ -83,14 +88,48 @@ func validateDesync(cfg DesyncConfig) error {
 		}
 	}
 	switch cfg.Mode {
-	case "", "seq", "ttl", "sum", "seqsum", "rst":
+	case "", "seq", "ttl", "sum", "seqsum", "rst", "split", "hlen0", "fakeip", "synrst", "all":
 	default:
-		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum or rst, got %q", cfg.Mode)
+		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum, rst, split, hlen0, fakeip, synrst or all, got %q", cfg.Mode)
 	}
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
 	}
+	if cfg.FakeIP != "" {
+		if ip := net.ParseIP(strings.TrimSpace(cfg.FakeIP)); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("wat: -fake-ip must be an IPv4 address, got %q", cfg.FakeIP)
+		}
+	}
+	if cfg.Split != 0 && (cfg.Split < 2 || cfg.Split > 16) {
+		return fmt.Errorf("wat: -fake-split must be 0 (default 3) or 2..16, got %d", cfg.Split)
+	}
 	return nil
+}
+
+// defaultFakeIP is what fakeip mode names when -fake-ip is unset: 104.16.0.1 is a Cloudflare anycast edge, an
+// address the censor's allowlist has to pass for the whole CDN to stay reachable.
+var defaultFakeIP = [4]byte{104, 16, 0, 1}
+
+// desyncFakeIP resolves cfg.FakeIP (validateDesync has already accepted it); anything unparseable falls back to
+// the default so a tracker built directly by a test or a probe still behaves.
+func desyncFakeIP(cfg DesyncConfig) [4]byte {
+	if ip := net.ParseIP(strings.TrimSpace(cfg.FakeIP)); ip != nil && ip.To4() != nil {
+		var p [4]byte
+		copy(p[:], ip.To4())
+		return p
+	}
+	return defaultFakeIP
+}
+
+// sumMirrorMode reports whether the mode mirrors the triggering segment in-window (base = the segment's own seq)
+// instead of sitting below the stream start. rst/synrst also use the stream-start seq, but only the mirror
+// family needs handleIPv4 to record c.sumSeq for the late path.
+func sumMirrorMode(mode string) bool {
+	switch mode {
+	case "sum", "seqsum", "rst", "all":
+		return true
+	}
+	return false
 }
 
 // FakeClientHello builds a realistic, RFC 8446-compliant TLS 1.3/1.2 ClientHello carrying sni.
@@ -133,9 +172,9 @@ func FakeClientHello(sni string) []byte {
 	// Middleboxes cannot decrypt inner ClientHellos, forcing allowlist classifiers to evaluate the
 	// outer server_name, while JA4 heuristic analyzers validate authentic browser extension composition.
 	echData := make([]byte, 0, 138)
-	echData = append(echData, 0x00)                     // outer
+	echData = append(echData, 0x00)                   // outer
 	echData = append(echData, 0x00, 0x01, 0x00, 0x01) // HKDF-SHA256, AES-128-GCM
-	echData = append(echData, 0x00)                     // config_id
+	echData = append(echData, 0x00)                   // config_id
 	var echEnc [32]byte
 	_, _ = rand.Read(echEnc[:])
 	echData = append(echData, 0x00, 32)
@@ -225,6 +264,107 @@ func parseSNIOf(rec []byte) (string, error) {
 	return "", fmt.Errorf("no sni")
 }
 
+// sniExtOffset returns the absolute offset of the server_name extension (its 2-byte type field) inside a record
+// built by FakeClientHello, or 0 when the record cannot be walked. split mode cuts at this offset so the SNI
+// extension never shares a TCP segment with the record header a DPI needs to start parsing a ClientHello.
+func sniExtOffset(rec []byte) int {
+	if len(rec) < 5 || rec[0] != 0x16 {
+		return 0
+	}
+	hs := rec[5:]
+	if len(hs) < 4 || hs[0] != 1 {
+		return 0
+	}
+	p := 4 + 2 + 32 // handshake header + client version + client random
+	if len(hs) < p+1 {
+		return 0
+	}
+	p += 1 + int(hs[p]) // session id
+	if len(hs) < p+2 {
+		return 0
+	}
+	cs := int(hs[p])<<8 | int(hs[p+1])
+	p += 2 + cs // cipher suites
+	if len(hs) < p+1 {
+		return 0
+	}
+	p += 1 + int(hs[p]) // compression methods
+	if len(hs) < p+2 {
+		return 0
+	}
+	el := int(hs[p])<<8 | int(hs[p+1])
+	p += 2
+	for off := 0; off+4 <= el && p+off+4 <= len(hs); {
+		typ := int(hs[p+off])<<8 | int(hs[p+off+1])
+		szl := int(hs[p+off+2])<<8 | int(hs[p+off+3])
+		if typ == 0 {
+			return 5 + p + off
+		}
+		off += 4 + szl
+	}
+	return 0
+}
+
+// splitHello cuts a fake ClientHello into n TCP payload segments for split mode: the first record byte alone,
+// then a boundary at the server_name extension so no single segment carries a parseable TLS record, then the rest
+// divided evenly. A per-packet DPI never sees a complete ClientHello / SNI; the segments' seq numbers concatenate
+// to the same below-window fake, so a reassembling receiver still gets the allowlisted name (and the server
+// discards the lot as old duplicates). n<=0 means the default 3.
+func splitHello(hello []byte, n int) [][]byte {
+	if len(hello) == 0 {
+		return nil
+	}
+	if n <= 0 {
+		n = 3
+	}
+	if n > len(hello) {
+		n = len(hello)
+	}
+	if n > 16 {
+		n = 16
+	}
+	cuts := []int{0, 1}
+	if off := sniExtOffset(hello); off > 1 && off < len(hello) && len(cuts) < n {
+		cuts = append(cuts, off)
+	}
+	for len(cuts) < n { // split the widest gap until there are n segments (or no gap has room left)
+		best, gap := 0, 0
+		for i := 0; i+1 < len(cuts); i++ {
+			if g := cuts[i+1] - cuts[i]; g > gap {
+				best, gap = i, g
+			}
+		}
+		if gap < 2 {
+			break
+		}
+		mid := (cuts[best] + cuts[best+1]) / 2
+		cuts = append(cuts, 0)
+		copy(cuts[best+2:], cuts[best+1:])
+		cuts[best+1] = mid
+	}
+	cuts = append(cuts, len(hello))
+	segs := make([][]byte, 0, len(cuts)-1)
+	for i := 0; i+1 < len(cuts); i++ {
+		segs = append(segs, hello[cuts[i]:cuts[i+1]])
+	}
+	return segs
+}
+
+// fakeHelloZeroRecord returns a copy of hello whose TLS record length field is zeroed: the F&F tlshello-0-len
+// mask. A stateful DPI that trusts the length field latches an empty handshake record (no SNI to match) and
+// stops parsing the flow, while a per-packet sniffer that ignores the field still reads the allowlisted SNI from
+// the bytes that follow the header. The packet keeps the plain seq-mode placement, so a server-side kernel that
+// did read it would drop it as an old duplicate.
+func fakeHelloZeroRecord(hello []byte) []byte {
+	if len(hello) < 5 {
+		return hello
+	}
+	out := make([]byte, len(hello))
+	copy(out, hello)
+	out[3], out[4] = 0, 0
+	return out
+}
+
 // desyncPeerIP extracts the IP of a host:port peer (empty when unresolvable).
 func desyncPeerIP(peer string) string {
 	ip, _ := desyncPeerHostPort(peer)
@@ -307,8 +447,9 @@ func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
 	return fakePacketWithOptions(k, seq, ack, ttl, hello, nil)
 }
 
-// fakeRSTPacket builds an in-window TCP RST+ACK packet with no payload. Pure: the same inputs build the same packet.
-func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
+// fakeFlagPacket builds an IPv4+TCP header-only packet (no payload) carrying the given TCP flags. Pure: the same
+// inputs build the same packet.
+func fakeFlagPacket(k desyncKey, seq, ack uint32, ttl int, flags byte) []byte {
 	pkt := make([]byte, 20+20)
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
@@ -324,10 +465,15 @@ func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
 	binary.BigEndian.PutUint32(th[4:], seq)
 	binary.BigEndian.PutUint32(th[8:], ack)
 	th[12] = 0x50
-	th[13] = 0x14 // RST|ACK
+	th[13] = flags
 	binary.BigEndian.PutUint16(th[14:], 0)
 	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
 	return pkt
+}
+
+// fakeRSTPacket builds an in-window TCP RST+ACK packet with no payload. Pure: the same inputs build the same packet.
+func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
+	return fakeFlagPacket(k, seq, ack, ttl, 0x14) // RST|ACK
 }
 
 // parseEthIPv4 returns the IPv4 packet carried by an ethernet, SLL, or raw frame, or nil.
@@ -377,6 +523,7 @@ func parseEthIPv4(frame []byte) []byte {
 type desyncTracker struct {
 	cfg       DesyncConfig
 	peerIP    [4]byte
+	fakeIP    [4]byte // fakeip mode's whitelisted destination (cfg.FakeIP, else defaultFakeIP)
 	hello     []byte
 	snis      []string // SNIs with a non-empty hello; pickHello rebuilds fresh bytes per fire
 	helloIdx  atomic.Uint32
@@ -416,7 +563,7 @@ func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
 			}
 		}
 	}
-	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: hello, snis: good,
+	return &desyncTracker{cfg: cfg, peerIP: peerIP, fakeIP: desyncFakeIP(cfg), hello: hello, snis: good,
 		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}}
 }
 
@@ -582,7 +729,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		// nothing to mirror). The mirror base lives on the connection (2.8.1): it was tracker-global, so two
 		// pool connections opening at once cross-set it and the second fire mirrored the wrong segment.
 		if !syn && ackf && seq-c.synSeq+1 < 0x80000000 {
-			if sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst"; sumMode {
+			if sumMode := sumMirrorMode(t.cfg.Mode); sumMode {
 				c.sumSeq = c.synSeq + 1
 			}
 			t.fireLocked(out, c, c.synSeq+1, ackv)
@@ -590,7 +737,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	default:
 		// late: the first outbound data segment is the anchor (its seq IS the stream start)
 		if payload > 0 && ackf && !syn {
-			if t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst" {
+			if sumMirrorMode(t.cfg.Mode) {
 				c.sumSeq = seq
 			}
 			t.fireLocked(out, c, seq, ackv)
@@ -618,14 +765,13 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			}
 		}
 	}
-	// sum mode mirrors the triggering data segment: identical seq (so the fake sits in the receiver window where
-	// the DPI's reassembler is already collecting), identical ack, but a deliberately damaged TCP checksum — the
-	// same fooling as GoodbyeDPI's --wrong-chksum and zapret's badsum. The server's kernel drops it at checksum
-	// validation; a DPI that parses before checksumming reads the SNI. NATs that validate checksums
-	// (nf_conntrack_checksum=1 + an INVALID-drop FORWARD rule) kill this mode; ISPs usually pass (zapret's
-	// documented field observation).
-	sumMode := t.cfg.Mode == "sum" || t.cfg.Mode == "seqsum" || t.cfg.Mode == "rst"
-	if sumMode {
+	// The sum family (sum, seqsum, rst, all) mirrors the triggering data segment: identical seq (so the fake sits
+	// in the receiver window where the DPI's reassembler is already collecting), identical ack, but a deliberately
+	// damaged TCP checksum — the same fooling as GoodbyeDPI's --wrong-chksum and zapret's badsum. The server's
+	// kernel drops it at checksum validation; a DPI that parses before checksumming reads the SNI. NATs that
+	// validate checksums (nf_conntrack_checksum=1 + an INVALID-drop FORWARD rule) kill these modes; ISPs usually
+	// pass (zapret's documented field observation).
+	if sumMirrorMode(t.cfg.Mode) {
 		base = c.sumSeq
 	}
 	// seq = base - len(fake): the fake lands exactly below the stream start. The server holds snd_una at the
@@ -636,39 +782,87 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		delete(t.wait, k)
 		close(ch)
 	}
-	if t.send != nil {
-		if t.cfg.Mode == "rst" {
-			// rst mode sends an in-window RST|ACK with damaged checksum: middleboxes clear flow state,
-			// while the server kernel drops corrupted checksum packets before parsing flags.
-			pkt := fakeRSTPacket(k, base, ack, ttl)
-			damageChecksum(pkt)
-			t.send(pkt)
-			return
-		}
-		hello := t.pickHello()
-		if t.cfg.Mode == "seqsum" {
-			// dual marker (2.8.0): the below-window seq fake first, then the in-window bad-checksum mirror
-			// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
-			// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
-			// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
-			t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
-			pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
-			damageChecksum(pkt)
-			// the second marker goes out after the 1 ms gap WITHOUT sleeping under t.mu: fireLocked runs
-			// inside the sniffer's lock and a sleep here stalls every concurrent fire and Wrap announce
-			// (audit 2026-10-21). close() never nils t.send, so a fire racing shutdown is a dropped packet.
-			time.AfterFunc(time.Millisecond, func() { t.send(pkt) })
-			return
-		}
-		if t.cfg.Mode == "sum" {
-			// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
-			pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
-			damageChecksum(pkt)
-			t.send(pkt)
-			return
-		}
-		pkt := fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts)
+	if t.send == nil {
+		return
+	}
+	if t.cfg.Mode == "rst" {
+		// rst mode sends an in-window RST|ACK with damaged checksum: middleboxes clear flow state,
+		// while the server kernel drops corrupted checksum packets before parsing flags.
+		pkt := fakeRSTPacket(k, base, ack, ttl)
+		damageChecksum(pkt)
 		t.send(pkt)
+		return
+	}
+	hello := t.pickHello()
+	switch t.cfg.Mode {
+	case "split":
+		// split mode: the same below-window fake ClientHello, but cut across t.cfg.Split TCP segments (default 3:
+		// first record byte alone, then a boundary at the SNI extension, then the remainder). The seq numbers
+		// concatenate, so the server still discards the whole ghost as old duplicates and a reassembling DPI still
+		// reads the allowlisted SNI; a per-packet DPI (the MCI/Irancell TLS parsers that inspect each first payload
+		// segment) never gets a parseable record or SNI out of one segment. Targets: stateless SNI filters.
+		seq := base - uint32(len(hello))
+		off := 0
+		for _, seg := range splitHello(hello, t.cfg.Split) {
+			t.send(fakePacketWithOptions(k, seq+uint32(off), ack, ttl, seg, c.tcpOpts))
+			off += len(seg)
+		}
+	case "hlen0":
+		// hlen0 mode (F&F tlshello-0-len): a fake ClientHello whose TLS record length field is 0, placed below the
+		// stream start like seq mode. A stateful DPI that trusts the length field latches an empty handshake record
+		// with no SNI and stops parsing the flow; the bytes after the header still carry the allowlisted SNI for a
+		// per-packet sniffer, and the real first flight follows right behind the marker. Targets: the stateful
+		// TLS-SNI parsers of the MCI/Irancell filters.
+		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts))
+	case "fakeip":
+		// fakeip mode: a well-formed SYN and ClientHello for a flow from this same client port to a whitelisted CDN
+		// address (cfg.FakeIP, default 104.16.0.1 = a Cloudflare edge), with sequence numbers below the real stream
+		// start. The destination differs, so the packets leave toward the CDN (Cloudflare answers, the kernel RSTs
+		// it) and the real server never sees them; a DPI that keys its allowlist by destination IP has now recorded
+		// this client talking to an allowed CDN. Targets: IP-allowlist classifiers (Irancell's 188.114.98.0/CDN
+		// whitelist, MCI's CDN-fronting method).
+		fk := k
+		fk.dstIP, fk.dstPt = t.fakeIP, 443
+		syn := base - uint32(len(hello)) - 1
+		t.send(fakeFlagPacket(fk, syn, 0, ttl, 0x02)) // SYN
+		t.send(fakePacketWithOptions(fk, syn+1, 0, ttl, hello, c.tcpOpts))
+	case "synrst":
+		// synrst mode: an in-window SYN|RST with a damaged TCP checksum. SYN|RST is not a legal flag combination,
+		// so stateful middleboxes that keep a flow table treat it as a teardown-and-reset and purge the entry harder
+		// than a plain RST|ACK; the server's kernel drops the packet at checksum validation before reading flags.
+		// Targets: stateful flow tables that ignore a single in-window RST (the MCI/Irancell session trackers).
+		pkt := fakeFlagPacket(k, base, ack, ttl, 0x06) // SYN|RST
+		damageChecksum(pkt)
+		t.send(pkt)
+	case "all":
+		// all mode (kitchen sink): the seq + sum + hlen0 markers ~1 ms apart, so a filter has to mishandle all
+		// three signal classes (below-window junk, bad checksums, zero-length records) to miss the SNI. The
+		// time.AfterFunc spacing is seqsum's: the sniffer lock is never held across a sleep (audit 2026-10-21).
+		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts)) // seq: below window, valid checksum
+		sumPkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
+		damageChecksum(sumPkt)
+		hlenPkt := fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts)
+		time.AfterFunc(time.Millisecond, func() { t.send(sumPkt) })
+		time.AfterFunc(2*time.Millisecond, func() { t.send(hlenPkt) })
+	case "seqsum":
+		// dual marker (2.8.0): the below-window seq fake first, then the in-window bad-checksum mirror
+		// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
+		// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
+		// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
+		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
+		damageChecksum(pkt)
+		// the second marker goes out after the 1 ms gap WITHOUT sleeping under t.mu: fireLocked runs
+		// inside the sniffer's lock and a sleep here stalls every concurrent fire and Wrap announce
+		// (audit 2026-10-21). close() never nils t.send, so a fire racing shutdown is a dropped packet.
+		time.AfterFunc(time.Millisecond, func() { t.send(pkt) })
+	case "sum":
+		// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
+		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
+		damageChecksum(pkt)
+		t.send(pkt)
+	default:
+		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 	}
 }
 
