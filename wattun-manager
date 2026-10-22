@@ -561,7 +561,12 @@ set_value() { # name key value : set or add a top-level key
   grep -v "^$2:" "$f" | awk -v k="$2" -v v="$3" '/^(metrics|ports):/ && !d {print k ": " v; d=1} {print} END{if(!d) print k ": " v}' >"$tmp"
   chmod 600 "$tmp"; mv -f "$tmp" "$f"
 }
-unset_value() { sed -i "/^$2:/d" "$CONF/$1.yml"; }
+unset_value() { # same tmp+mv pattern as set_value: the 3 s hot-reloader must never see an interleaved rewrite
+  local f="$CONF/$1.yml" tmp
+  tmp=$(mktemp "$CONF/.tmp.XXXXXX") || return 1
+  grep -v "^$2:" "$f" >"$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+}
 
 # Connection token: wat1:BASE64("carrier|peer|key|path|sni|icmp-type|allowed-ports[|reverse]")
 # Field 7 (allowed ports on Kharej, comma list, empty = any) was added in 1.9.0; 6-field tokens still parse.
@@ -3127,7 +3132,9 @@ cdn_scan() { # domain port path carrier : pick the Cloudflare edges that serve t
   CS_PIDS=()
   for ip in "${cand[@]}"; do
     n=$((n+1))
-    ( t0=$(now_us); timeout 2 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null && echo $(( $(now_us) - t0 )) >"$CS_DIR/$n" ) &
+    local hip=$ip
+    [[ "$hip" == *:* ]] && hip="[$hip]" # bash /dev/tcp needs brackets for v6, else every AAAA fails the filter
+    ( t0=$(now_us); timeout 2 bash -c "exec 3<>/dev/tcp/$hip/$port" 2>/dev/null && echo $(( $(now_us) - t0 )) >"$CS_DIR/$n" ) &
     CS_PIDS+=($!)
   done
   wait "${CS_PIDS[@]}" 2>/dev/null
@@ -3856,7 +3863,7 @@ change_key() {
   if [ "$(role "$n")" = Kharej ]; then
     warn "A new key disconnects every Iran server until it gets the new token."
     confirm "Generate a NEW key and token?" n || return 0
-    k=$(new_key); printf '%s\n' "$k" >"$CONF/$n.key"
+    k=$(new_key); ( umask 077; printf '%s\n' "$k" >"$CONF/$n.key" )
     if [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
       make_token "$T_CARRIER" "$T_PEER" "$k" "$T_PATH" "$T_SNI" "$T_ICMP" "$T_PORTS" "$T_REV" "$T_AUTO" >"$CONF/$n.token"
     fi
@@ -3874,7 +3881,7 @@ change_key() {
       hint "This is an auto token. Test again and pick the best connection: $SELF auto-test $n"
       return 0
     fi
-    printf '%s\n' "$T_KEY" >"$CONF/$n.key"; set_value "$n" peer "$T_PEER"
+    ( umask 077; printf '%s\n' "$T_KEY" >"$CONF/$n.key" ); set_value "$n" peer "$T_PEER"
     step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n" || return 1
     wait_link "$n" 20 && ok "CONNECTED (RTT ${LINK_RTT} ms)" || warn "Not connected yet."
   fi
@@ -4720,6 +4727,7 @@ update() { # [installer args...]
   fi
   before=$(bin_ver); mbefore=$(cksum <"${imgr:-$MGR}" 2>/dev/null)
   tmp=$(mktemp /tmp/wattun-install.XXXXXX)
+  trap 'rm -f "$tmp" "$tmp.unit" ${mkeep:+"$mkeep"}' EXIT # a kill mid-update must not leave root-owned temp files
   [ "$SANDBOX" = 1 ] && ienv=(WAT_BIN="$BIN" WAT_MGR="$imgr" WAT_CONF="$CONF" WAT_UNIT="$tmp.unit" WAT_REQUIRE_SANDBOX=1) # the installer's unit file goes to a throwaway path
   # raw.githubusercontent.com caches main for minutes: resolve main to a commit sha and fetch everything by it
   local sha mref="" mkeep
@@ -4737,6 +4745,7 @@ update() { # [installer args...]
   ok "Installer downloaded${mref:+ (${mref:0:7})}"
   env ${ienv[@]+"${ienv[@]}"} WAT_FROM_MANAGER=1 bash "$tmp" "$@"; rc=$?
   rm -f "$tmp" "$tmp.unit"
+  trap - EXIT
   [ "$rc" -eq 0 ] || { rm -f "$mkeep"; err "The installer reported an error. Nothing was changed: still wattun ${before:-?}."; return 1; }
   # self-check: in a sandbox the new manager must understand WAT_PREFIX, or it would drive the production paths
   if [ "$SANDBOX" = 1 ] && [ -n "$mkeep" ] && ! grep -q 'WAT_PREFIX' "${imgr:-$MGR}" 2>/dev/null; then
