@@ -164,6 +164,36 @@ What it does **not** fix: once the tunnel starts moving bulk data on that flow, 
 
 That is ~3000× short of the 50 MB/s target, and it is the path, not the software: the same binary moves data fine on loopback and on an unfiltered route.
 
+## 7d. Round 5 — agent team: five new injection modes, F&F research, DPI bench (2026-10-22, 22:50–23:40)
+
+A three-agent team (research / engine / bench) worked the "more SNI-spoofing methods" brief in parallel; the Lead wired the flags, ran the live matrix and committed.
+
+**Shipped in 2.10.5 (commit `1ce6acc`, pushed to `blackout`):**
+
+| Mode | What it puts on the wire | Targets |
+|---|---|---|
+| `split` | fake ClientHello cut across `fake-split` TCP segments (default 3) | per-packet SNI parsers |
+| `hlen0` | F&F-style zero-length TLS record before the flow | stateful TLS parsers that latch and stop reading |
+| `fakeip` | checksum-valid SYN+hello addressed to `fake-ip` (default 104.16.0.1, a CF edge) | destination-IP allowlists |
+| `synrst` | in-window SYN\|RST with a damaged checksum | flow tables, harder than `rst` |
+| `all` | seq + sum + hlen0 markers ~1 ms apart | filters needing multiple signals |
+
+New keys `fake-ip` and `fake-split`; existing modes byte-identical; 8 new unit tests; `docs/SNI-SPOOFING-RESEARCH.md` (713 lines, 39 sources) decodes the owner's MCI/Irancell intel: F&F = Fragment + Fingerprint with the exact `tlshello` record plan (0/104/1 + 114/1, maxSplit 11), `fingerprint=unsafe` = Go stdlib TLS, `cipherSuites=semi-python` = OpenSSL's 13-suite set (a no-op under TLS-1.3-only), why a zero-length handshake record is only safe on a Cloudflare-terminated leg, and the IPv6 gaps in the injector (`desyncKey` is `[4]byte`). `testbench/` adds a userspace DPI emulator, `measure.sh` and the live `deploy.sh`.
+
+**Local bench (testbench/results.md):** against a DPI that accepts the injected SNI, `seq/ttl/sum/seqsum/split` carry **29–31 MB/s** each way — proof the engine itself can reach the 20 MB/s target once the filter whitelists the flow. `rst` and no-fake never whitelist; `seq`/`ttl` die under window validation, `sum` under checksum validation, `seqsum` under both, `split` needs reassembly.
+
+**Live matrix on the real path (tls carrier, small ClientHello, 4 conns):** every mode including the new ones reaches `alive:true` with `srtt` 85–95 ms, and `bytes_in` still freezes within seconds — the filter lets the flow exist but throttles sustained data regardless of marker type. No mode reached 20 MB/s live.
+
+**The one route with unthrottled bandwidth — and its blocker:** through Cloudflare (`test.xoamrz.ir`), stock clients work end-to-end. Python over the same CF edge: `101 Switching Protocols` plus a WS frame echoed back. Go with a small hello: `101`. wattun's `wss` pool through the same edge: the origin sees Cloudflare's connections but never a session, and a python WS echo on the origin receives wattun's upgrade request but never a frame. So the remaining work is in wattun's ws-pool path through a CDN, not in the DPI: that is where 20 MB/s lives.
+
+## 7e. Next steps, in value order (from the research brief §8)
+
+1. True F&F record plan for the **fake** hello (0/104/1 + 114/1, 11-piece TCP plan) — the recipe the owner's channel reports working on Irancell; ~100 LOC in `wat/desync.go`.
+2. Fix the `wss`-through-CDN pool path (frames never leave the client after the 101) — unlocks the unthrottled route.
+3. `-tls-frag-rec`: reframe the **real** ClientHello at the record layer, CDN-only, since a zero-length handshake record is illegal to wattun's own Go server.
+4. `-fp unsafe` equivalent (`fp: go` already) + `-tls-min 1.2` + `-tls-ciphers` so the cipher-suite camouflage is not a no-op.
+5. IPv6 fake-SNI parity (`desyncKey`, `parseEthIPv4`, peer parsing) — MCI's working recipe is IPv6-only.
+
 **Path forward (needs user input):** a kharej endpoint whose route does not DPI-kill bulk flows — the CDN front is already proven to reach the origin, but the iran→CF leg throttles sustained data the same way. A different provider/IP is the remaining lever.
 
 ## 8. Artifacts
