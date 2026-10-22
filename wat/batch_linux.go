@@ -3,11 +3,13 @@
 package wat
 
 import (
+	"errors"
 	"net"
 	"os"
 	"sync"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // recvmmsg / sendmmsg through x/net/ipv4. Off unless WAT_BATCH=1 (plain ReadFrom / WriteTo, the
@@ -41,6 +43,8 @@ func newMmsgRx(pc *ipv4.PacketConn) *mmsgRx {
 }
 
 // next returns the next datagram; it is valid until the next call that refills the batch.
+// A datagram larger than rxBufSz arrives truncated (MSG_TRUNC in m.Flags): drop it here rather
+// than hand out a cut packet that fails AEAD downstream with no explanation (audit 2026-10-22).
 func (r *mmsgRx) next() ([]byte, net.Addr, error) {
 	for r.i >= r.n {
 		n, err := r.pc.ReadBatch(r.msgs, 0)
@@ -51,8 +55,15 @@ func (r *mmsgRx) next() ([]byte, net.Addr, error) {
 	}
 	m := &r.msgs[r.i]
 	r.i++
+	if m.Flags&unix.MSG_TRUNC != 0 {
+		return nil, m.Addr, errTrunc
+	}
 	return m.Buffers[0][:m.N], m.Addr, nil
 }
+
+// errTrunc: the receive buffer was smaller than the datagram. Callers skip it like any junk packet;
+// the AEAD would reject the cut bytes anyway, but a named error keeps a -mtu misconfiguration diagnosable.
+var errTrunc = errors.New("wat: datagram truncated (receive buffer too small; lower -mtu)")
 
 // mmsgTx sends a burst with sendmmsg. Shared by every session of a server, hence the lock.
 type mmsgTx struct {

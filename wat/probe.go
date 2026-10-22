@@ -87,6 +87,10 @@ func ProbeFakeMode(cfg DesyncConfig, peer string, logf func(string, ...any)) str
 // note is a package-level log line the tests can silence; it keeps probe.go free of a logf thread.
 var note = func(format string, args ...any) {}
 
+// RawSendFails is how many fake-SNI fires could not be injected (raw socket open/bind/send failure).
+// A rising counter with healthy tunnels means the real SNI is going out unprotected: switch carrier.
+func RawSendFails() uint64 { return rawSendFails.Load() }
+
 type filterProbe struct {
 	cfg  DesyncConfig
 	peer string

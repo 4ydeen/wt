@@ -211,6 +211,9 @@ func (i *ICMPIO) Recv() ([]byte, int, net.Addr, error) {
 		if err != nil {
 			return nil, 0, nil, err
 		}
+		if n == len(i.rbuf) { // datagram cut to the buffer: an AEAD check would fail downstream with no clue
+			return nil, 0, src, errTrunc
+		}
 		if n < 9 {
 			continue
 		}

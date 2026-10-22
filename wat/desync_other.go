@@ -5,6 +5,7 @@ package wat
 import (
 	"errors"
 	"net"
+	"sync/atomic"
 )
 
 // The raw-packet half of the fake-SNI desync needs an AF_PACKET sniffer; only the Linux client (the Iran side)
@@ -27,3 +28,5 @@ func (d *Desync) PeerTTL() int                      { return 0 }
 // Stubs for probe.go (never reached off Linux: ProbeFakeMode bails at NewDesync) so the package compiles.
 func sendRawPacket(pkt []byte)                     {}
 func tcpStreamBase(tc *net.TCPConn) (uint32, bool) { return 0, false }
+
+var rawSendFails atomic.Uint64 // Linux has the real counter; nothing fails here

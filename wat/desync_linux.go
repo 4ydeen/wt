@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -94,7 +95,7 @@ func (d *Desync) PeerTTL() int { return int(d.inj.tr.peerTTL()) }
 // Wrap announces the connection to the sniffer, waits for the fake to fire, and returns the connection unchanged.
 // A connection that is not a plain IPv4 TCP connection passes through unwrapped; a handshake the sniffer never
 // sees (offload paths) passes through after 2 s.
-func (d *Desync) Wrap(c net.Conn) (net.Conn, error) {	// the tls/wss/h2 carriers hand their hook an already-handshaked *tls.Conn (or a WS/HTTP framing wrapper);
+func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers hand their hook an already-handshaked *tls.Conn (or a WS/HTTP framing wrapper);
 	// unwrap to the socket underneath, like newPoolConn does (rawTCP)
 	tc := rawTCP(c)
 	if tc == nil {
@@ -200,20 +201,39 @@ func (d *desyncInjector) sendRaw(pkt []byte) {
 }
 
 // sendRawPacket is the raw injector every fire path shares (the tracker's send seam and the startup probe).
+// A send failure means the fake never left the host and the real SNI went out unprotected: count it and say
+// so once - silently shipping the real SNI is the one failure this package must not hide (audit 2026-10-22).
+var rawSendFails atomic.Uint64
+
 func sendRawPacket(pkt []byte) {
 	if len(pkt) < 24 {
 		return
 	}
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
 	if err != nil {
+		rawSendFail(1)
 		return
 	}
 	defer unix.Close(fd)
 	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1)
 	src := pkt[12:16]
 	if src[0] != 0 || src[1] != 0 || src[2] != 0 || src[3] != 0 {
-		_ = unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{src[0], src[1], src[2], src[3]}})
+		if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{src[0], src[1], src[2], src[3]}}); err != nil {
+			// a re-homed host can lose the old source IP: send unbound (the kernel picks one)
+			// instead of dropping the fire
+			note("desync-bind", "wat: fake-sni could not bind the old source IP (%v); sending unbound", err)
+		}
 	}
 	dst := pkt[16:20]
-	_ = unix.Sendto(fd, pkt, 0, &unix.SockaddrInet4{Port: int(binary.BigEndian.Uint16(pkt[22:])), Addr: [4]byte{dst[0], dst[1], dst[2], dst[3]}})
+	if err := unix.Sendto(fd, pkt, 0, &unix.SockaddrInet4{Port: int(binary.BigEndian.Uint16(pkt[22:])), Addr: [4]byte{dst[0], dst[1], dst[2], dst[3]}}); err != nil {
+		rawSendFail(1)
+	}
+}
+
+// rawSendFail counts failed fires and complains once per process: raw egress can be filtered while the
+// AF_PACKET sniffer still works, and that is exactly the environment where silence is dangerous.
+func rawSendFail(n uint64) {
+	if rawSendFails.Add(n) == n { // first failure
+		note("desync-send", "wat: fake-sni raw send failed (%v so far); the real SNI may be going out unprotected", n)
+	}
 }

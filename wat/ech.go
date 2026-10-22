@@ -260,9 +260,9 @@ func (s *echState) rejected(name string, retry []byte, e *tlsEngine) bool {
 		}
 		return true
 	}
-	if s.mode == "auto" {
+	if s.mode == "auto" || s.mode == "ladder" { // ladder too: a reject-redial loop would never converge otherwise
 		s.m[name] = &echEntry{next: time.Now().Add(echNegTTL)}
-		e.note("ech-none:"+name, "ech auto: %s rejected ECH without new configs; connecting without ECH", name)
+		e.note("ech-none:"+name, "ech %s: %s rejected ECH without new configs; connecting without ECH", s.mode, name)
 		return true
 	}
 	return false
