@@ -117,16 +117,14 @@ func server(dur time.Duration) {
 }
 
 type result struct {
-	sent, got   uint64
-	rtts        []time.Duration
-	mu          sync.Mutex
-	extra, uniq uint64
+	sent, got uint64
+	rtts      []time.Duration
+	mu        sync.Mutex
 }
 
 // run sends reqPps requests/s of payload size on nIdent idents for dur and counts the replies.
 func run(c net.PacketConn, dst net.Addr, reqPps, size, nIdent int, k, variant byte, dur time.Duration, tag string) {
 	r := &result{}
-	seen := sync.Map{}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -150,11 +148,6 @@ func run(c net.PacketConn, dst net.Addr, reqPps, size, nIdent int, k, variant by
 			}
 			sent := int64(binary.BigEndian.Uint64(buf[8+12:]))
 			atomic.AddUint64(&r.got, 1)
-			key := uint64(id)<<48 | uint64(binary.BigEndian.Uint32(buf[8+8:]))<<8 | uint64(buf[8+5]&0)
-			_, dup := seen.LoadOrStore(key, true)
-			if !dup {
-				atomic.AddUint64(&r.uniq, 1)
-			}
 			r.mu.Lock()
 			if len(r.rtts) < 200000 {
 				r.rtts = append(r.rtts, time.Duration(time.Now().UnixNano()-sent))

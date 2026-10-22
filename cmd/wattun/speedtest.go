@@ -167,11 +167,14 @@ func speedOne(sess *wat.Session, dir string, size uint64, done <-chan struct{}) 
 	}
 	timer := time.AfterFunc(speedTestLimit, st.Reset)
 	defer timer.Stop()
+	fin := make(chan struct{})
+	defer close(fin) // the watcher below must not linger for the full limit after an early return
 	if done != nil {
 		go func() {
 			select {
 			case <-done:
 				st.Reset()
+			case <-fin:
 			case <-time.After(speedTestLimit):
 			}
 		}()
