@@ -50,6 +50,11 @@ type Backlogger interface{ Backlogged() bool }
 // RawBacklogger is the RawIO counterpart, per destination; the server's per-session IO turns it into a Backlogger.
 type RawBacklogger interface{ BackloggedTo(dst net.Addr) bool }
 
+// DeathReporter is the optional interface of a PacketIO whose own connections die independently (the pool
+// carriers): it counts the deaths of THIS io, so a session repairs only after its own carrier lost a
+// connection. The process-global counter it replaces also fired on every other pool's churn (audit 2026-10-22).
+type DeathReporter interface{ ConnDeaths() uint64 }
+
 // RawBatchSender is the server-side equivalent: one destination, several datagrams.
 type RawBatchSender interface {
 	SendBatchTo(ps [][]byte, lanes []int, dst net.Addr) error

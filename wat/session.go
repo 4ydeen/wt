@@ -170,39 +170,40 @@ type Session struct {
 	streams       map[uint64]*Stream
 	tomb          map[uint64]time.Time
 	lastTombPrune time.Time
-	nextSID   uint64
-	acceptQ   []*Stream
-	acceptC   *sync.Cond
-	prio      streamQ // interactive streams (sent < prioBytes), FIFO
-	bulk      fairQ   // bulk streams: fair between groups (public ports), round-robin inside a group
-	ctrl      [][]byte
-	sent      []*sentPkt
-	sentHead  int
-	inflight  int
-	cc        cc
-	lastSend  time.Time
-	wantPing  bool
-	stats     Stats
-	openBuf   []byte
-	noWinTune bool     // tests: behave like a peer that never advertises more than the implicit window
-	winExtra  uint64   // sum over streams of (win - streamWindow): the auto-tuned growth in use
-	winSlack  uint64   // bytes a peer's largest datagram may overshoot the advertised stream window
-	maxPlain  int      // plaintext bytes per datagram: cfg.MaxPayload - header - tag
-	plainBuf  []byte   // reused packet assembly buffer (nextPacket runs under s.mu)
-	txNonce   [12]byte // seal runs under s.mu; kept here because an array passed to the AEAD interface escapes to the heap
-	rxNonce   [12]byte // handle runs on the receive goroutine only
-	copier    bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
-	outFree   chan []byte
-	batcher   BatchSender // nil: send one datagram at a time
-	backlog   Backlogger  // nil: the carrier has no send queues of its own to report
-	held      bool        // this pump round: the carrier's send queues are full, no new data
-	pin       bool        // direct pool: send each packet on its first stream's own connection (PinLaneBase+slot)
-	pinNext   int         // next stream's connection slot: round-robin, so 8 streams over 8 connections use all 8
-	deaths    uint64      // pool connection deaths already handled (PoolConnDeaths), pool carriers only
-	bp        [][]byte
-	bl        []int
-	spFree    []*sentPkt
-	ackRs     []rng // parsed ACK ranges, valid for one parse
+	nextSID       uint64
+	acceptQ       []*Stream
+	acceptC       *sync.Cond
+	prio          streamQ // interactive streams (sent < prioBytes), FIFO
+	bulk          fairQ   // bulk streams: fair between groups (public ports), round-robin inside a group
+	ctrl          [][]byte
+	sent          []*sentPkt
+	sentHead      int
+	inflight      int
+	cc            cc
+	lastSend      time.Time
+	wantPing      bool
+	stats         Stats
+	openBuf       []byte
+	noWinTune     bool     // tests: behave like a peer that never advertises more than the implicit window
+	winExtra      uint64   // sum over streams of (win - streamWindow): the auto-tuned growth in use
+	winSlack      uint64   // bytes a peer's largest datagram may overshoot the advertised stream window
+	maxPlain      int      // plaintext bytes per datagram: cfg.MaxPayload - header - tag
+	plainBuf      []byte   // reused packet assembly buffer (nextPacket runs under s.mu)
+	txNonce       [12]byte // seal runs under s.mu; kept here because an array passed to the AEAD interface escapes to the heap
+	rxNonce       [12]byte // handle runs on the receive goroutine only
+	copier        bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
+	outFree       chan []byte
+	batcher       BatchSender   // nil: send one datagram at a time
+	backlog       Backlogger    // nil: the carrier has no send queues of its own to report
+	deathIO       DeathReporter // the carrier's own connection-death counter, when it has one (pool carriers)
+	held          bool          // this pump round: the carrier's send queues are full, no new data
+	pin           bool          // direct pool: send each packet on its first stream's own connection (PinLaneBase+slot)
+	pinNext       int           // next stream's connection slot: round-robin, so 8 streams over 8 connections use all 8
+	deaths        uint64        // connection deaths already handled (per-IO when the carrier reports, else global)
+	bp            [][]byte
+	bl            []int
+	spFree        []*sentPkt
+	ackRs         []rng // parsed ACK ranges, valid for one parse
 
 	fec      *fecState // nil unless Config.FEC
 	hedgeTok float64   // bytes of hedging allowed: ~8% of what was sent
@@ -317,6 +318,7 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	if b, ok := pio.(Backlogger); ok && !noBacklog {
 		s.backlog = b
 	}
+	s.deathIO, _ = pio.(DeathReporter) // per-IO death counter: repairs only after THIS carrier lost a conn
 	if b, ok := pio.(BatchSender); ok && !isChooser(pio) && batchWanted(pio) {
 		s.batcher = b // the multipath chooser has its own Send and never implements BatchSender
 	}
@@ -1164,7 +1166,13 @@ func (s *Session) timers(now time.Time) {
 	s.cc.inflight = s.inflight // PROBE_RTT drains until this reaches its floor
 	s.cc.tick(now)
 	if s.backlog != nil && s.cc.reliable { // a pool connection died: what it held is gone, resend old packets now
-		if d := poolConnDeaths.Load(); d != s.deaths {
+		var d uint64
+		if s.deathIO != nil {
+			d = s.deathIO.ConnDeaths() // only this carrier's churn wakes the repair
+		} else {
+			d = poolConnDeaths.Load()
+		}
+		if d != s.deaths {
 			s.deaths = d
 			s.repairAfterDeath(now)
 		}

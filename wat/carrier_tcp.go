@@ -45,7 +45,6 @@ var poolDrops atomic.Int64
 
 const poolMaxMTU = 16 << 10
 
-//
 // MTU 4096 and an 8 MB/s start are measured defaults (2026-10-09, bench link 40 ms / 0.2 % / 100 Mbit): 640 B datagrams
 // cost 4x the CPU per MB and a 1.5 MB/s start spends a quarter of a 32 MB transfer ramping up.
 var poolProfile = Profile{Reliable: true, MTU: 4096, MaxMTU: poolMaxMTU, InitBps: 8e6}
@@ -97,14 +96,14 @@ func putPkt(b []byte) {
 
 // poolConn is one framed connection with its own bounded send queue.
 type poolConn struct {
-	c     net.Conn
-	q     chan []byte
-	done  chan struct{}
-	once  sync.Once
-	wbusy atomic.Int64 // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
-	rx    atomic.Uint64 // datagrams received
-	tx     atomic.Uint64  // datagrams handed to the socket
-	txSize atomic.Uint64  // bytes handed to the socket (churn byte axis)
+	c      net.Conn
+	q      chan []byte
+	done   chan struct{}
+	once   sync.Once
+	wbusy  atomic.Int64  // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
+	rx     atomic.Uint64 // datagrams received
+	tx     atomic.Uint64 // datagrams handed to the socket
+	txSize atomic.Uint64 // bytes handed to the socket (churn byte axis)
 	born   time.Time
 
 	rxMark  uint64 // owned by the pool's health check (judgeSlow)
@@ -309,6 +308,10 @@ var poolConnDeaths atomic.Uint64
 
 // PoolConnDeaths is how many pool connections closed or failed in this process.
 func PoolConnDeaths() uint64 { return poolConnDeaths.Load() }
+
+// ConnDeaths is this pool's own connection-death count (DeathReporter): a session over this pool
+// repairs its in-flight packets only when one of ITS connections died, not on another pool's churn.
+func (c *TCPPoolClient) ConnDeaths() uint64 { return c.deaths.Load() }
 
 func (pc *poolConn) fail() {
 	pc.once.Do(func() {
@@ -584,7 +587,7 @@ type PoolDialFunc func(ctx context.Context) (net.Conn, error)
 type TCPPoolClient struct {
 	dial   func(ctx context.Context, slot int) (net.Conn, error)
 	hook   atomic.Pointer[func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)] // SetDialHook, wraps dial (fake-SNI)
-	tlsFn  func() (string, string, bool) // TLS fingerprint, mode and ECH state, nil for non-TLS carriers
+	tlsFn  func() (string, string, bool)                                                                                             // TLS fingerprint, mode and ECH state, nil for non-TLS carriers
 	ps     *peerSet
 	peer   poolAddr
 	remIP  atomic.Value // string: remote IP of the newest connection
@@ -604,8 +607,9 @@ type TCPPoolClient struct {
 	rotBytes   atomic.Int64               // churn: also recycle after this many bytes handed to the sockets (0: off)
 	logf       atomic.Pointer[dialLogger] // optional, see SetDialLog
 	logMu      sync.Mutex
-	lastLog    time.Time // last failure line
-	failing    bool      // a failure was logged and no connection came up since
+	lastLog    time.Time     // last failure line
+	failing    bool          // a failure was logged and no connection came up since
+	deaths     atomic.Uint64 // this pool's own connection deaths (ConnDeaths)
 }
 
 // SetDialHook wraps the pool's dial function (from the next redial on): the fake-SNI layer of the tcp and tls
@@ -885,6 +889,7 @@ func (c *TCPPoolClient) slotLoop(i int) {
 		t0 := time.Now()
 		pc.serve(&c.wg, c.push)
 		c.slots[i].Store(nil)
+		c.deaths.Add(1) // this pool's own death counter (DeathReporter), for repairAfterDeath
 		if time.Since(t0) > time.Second {
 			backoff = 100 * time.Millisecond
 		}
@@ -1114,12 +1119,12 @@ func (c *TCPPoolClient) Close() error {
 
 // TCPPoolServer is the server RawIO: one listener, many pools. Recv's src and SendTo's dst are poolAddr values.
 type TCPPoolServer struct {
-	ln    net.Listener
-	rx    chan rxPkt
-	done  chan struct{}
-	wg    sync.WaitGroup
-	rr    atomic.Uint32
-	once  sync.Once
+	ln      net.Listener
+	rx      chan rxPkt
+	done    chan struct{}
+	wg      sync.WaitGroup
+	rr      atomic.Uint32
+	once    sync.Once
 	mu      sync.Mutex
 	pools   map[string]map[*poolConn]struct{}
 	ordered map[string][]*poolConn // the same pools in born order, kept under mu by add/remove for the hot SendTo
