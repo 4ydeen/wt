@@ -250,3 +250,33 @@ Kharej ran one server per carrier at once (tcp :4443, tls :8443, wss :443 behind
 **Engine:** the 2.10.7 binary itself is healthy — the loopback control carried 50 MB each way at ~24.7 MB/s with both ends sharing kharej's single core, and every path session formed and keyed. No crash, no `-race`-class symptom in any log.
 
 **State left:** kharej runs the six `ft-*` servers above (transient systemd units, configs in `/etc/wattun/ft/`, the previous binary kept as `/usr/local/bin/wattun.prev-ft`); its old `kh443` wss process was stopped. Iran has 2.10.7 installed, `wattun-ir` stopped (its config was the mismatched one), raw results in `/root/ft-results.txt`.
+
+## 7h. Round 8 — wss through Cloudflare, the patterniha recipe, and what the filter on this path really keys on (2026-10-23, 06:56–07:40 UTC)
+
+**Verdict: `wss` through Cloudflare is not broken in wattun.** The earlier reading ("the ws-pool path never sends a frame after the 101") was wrong.
+
+| Check | Result |
+|---|---|
+| Control: wattun `wss` client on Kharej → Cloudflare edge → its own origin | session forms at once, **34.4 MB/s** down (20 MB, 8 streams) |
+| Iran: wattun `wss` → CF, 3 edges (172.67.194.106 / 188.114.99.0 / 188.114.98.0) × {none, seq, ff, seqsum}, fake `auth.vercel.com` | all 12 identical: `bytes_out` 781, `bytes_in` 0 |
+| Iran: stock Python websocket probe, same edge, same SNI, same request | **fails identically** (101 arrives, then everything the client sends is dropped) |
+| Packet capture, wattun and Python side by side | Cloudflare's handshake and the 101 arrive; client packets sent in the first ~0.3 s are ACKed, every later client packet (data and pure ACKs) vanishes; Cloudflare retransmits its 101 record forever |
+
+**What the filter keys on (measured, 6 keep-alive GETs 1 s apart, same edge IP 172.67.194.106):**
+
+| TLS SNI in the ClientHello | Result |
+|---|---|
+| `www.cloudflare.com`, `cdnjs.cloudflare.com` | 6/6 responses, flow lives |
+| `test.xoamrz.ir` (our domain) | first response, then the flow dies |
+| `www.mci.ir` to Kharej | first response, then dies (so it is an SNI allowlist, not a `.ir` rule) |
+
+So this network's filter decides on the **real** ClientHello's SNI. Cloudflare will not route an allowlisted SNI to our origin (every mismatched SNI/Host pair returned `403`, no domain fronting), and ECH (`ech: auto|ladder`, the 71-byte config for the zone is fetched) never completes a handshake here.
+
+**The patterniha recipe (fake hello with an allowlisted SNI before the real one) does not move this filter.** With the injection verified on the wire (below), fake SNI `www.cloudflare.com`, the modes `seq ttl sum seqsum ff hlen0 split all` all leave the tunnel at `bytes_in 0`. The recipe works on filters that latch on the first segment of a flow (the Irancell and MCI firewalls the channel describes); this VPS network's filter does not. Reproducing it needs a client on an Irancell/MCI line, not this pair.
+
+**Defects found while checking the recipe (fixed in 2.10.8):**
+- The fake did not fire reliably, and a connection could sit 2 s with no fake (`desyncWrapTimeout`). `Wrap` announces a connection after the kernel handshake and holds the first write; the tracker fired only on a *later* outbound packet, so it depended on the stray ACK that leaving `TCP_REPAIR` happens to emit. It now remembers handshakes toward the peer and fires inside `announce`. Verified on the wire: fake at t=0.086 s, real hello at 0.087 s (before: real hello at t=2.085 s).
+- `fake-mode ttl` with `fake-ttl 0` sent TTL = the SYN-ACK's arrival TTL − 1 (48 on this path), which still reaches the server. It is now the hop distance − 1 (14 here).
+- `-tls-small-ch` was ignored under `-fp chrome|edge|…` (the browser presets carry the post-quantum key share): a Chrome hello is 1782 B, now 560 B with `tls-small-ch`.
+
+**For an Irancell line (config to try, from the channel notes):** `carrier: wss`, `peer: 188.114.98.0:443`, `sni`/`host` = the proxied domain, `ech: off`, `fake-sni: auth.vercel.com`, `fake-mode: seq` (patterniha's `wrong_seq`) or `ff`, `tls-small-ch: true`, `fp: go` (the "unsafe" fingerprint). For MCI the notes use an IPv6 edge and a Chrome fingerprint; wattun's fake-SNI injector is IPv4 only (`desyncKey` is `[4]byte`), so that route needs IPv6 parity first.
