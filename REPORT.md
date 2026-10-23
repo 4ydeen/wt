@@ -280,3 +280,9 @@ So this network's filter decides on the **real** ClientHello's SNI. Cloudflare w
 - `-tls-small-ch` was ignored under `-fp chrome|edge|…` (the browser presets carry the post-quantum key share): a Chrome hello is 1782 B, now 560 B with `tls-small-ch`.
 
 **For an Irancell line (config to try, from the channel notes):** `carrier: wss`, `peer: 188.114.98.0:443`, `sni`/`host` = the proxied domain, `ech: off`, `fake-sni: auth.vercel.com`, `fake-mode: seq` (patterniha's `wrong_seq`) or `ff`, `tls-small-ch: true`, `fp: go` (the "unsafe" fingerprint). For MCI the notes use an IPv6 edge and a Chrome fingerprint; wattun's fake-SNI injector is IPv4 only (`desyncKey` is `[4]byte`), so that route needs IPv6 parity first.
+
+## 7i. IPv6 fake-SNI (2.10.9, 2026-10-23)
+
+The injector now works over IPv6 (R45–R48 in `bugs.md`). Tested on the Kharej server against its own global IPv6 address over loopback (the Iran test VPS has no IPv6, so the real Tehran→Cloudflare IPv6 leg could not be exercised): every mode puts the fake on the wire before the real hello, with correct checksums (`tcpdump -vv`), and the tunnel carries 26–44 MB/s with the fake active. Two bugs surfaced only on the wire: `sin6_port` must be 0 on a raw IPv6 socket, and `damageChecksum` corrupted the destination address of IPv6 packets. A failed raw send is now logged and counted in `/stats` (`raw_send_fails`); before, it was silent.
+
+For MCI the channel notes say to drop the ECH config, the cipher suites and the F&F mask and use an IPv6 Cloudflare address with a Chrome fingerprint, so that recipe is `fp: chrome` + `tls-small-ch: true` + an IPv6 `peer`, with or without a `fake-sni` marker.
