@@ -43,6 +43,14 @@ func csum(b []byte) uint16 {
 
 // tcpChecksum computes the TCP checksum over the pseudo header, TCP header and payload.
 func tcpChecksum(th, src, dst []byte) uint16 {
+	if len(src) == 16 { // IPv6 pseudo header (RFC 8200 8.1): src, dst, 32-bit TCP length, three zero bytes, next header
+		ph := make([]byte, 40, 40+len(th))
+		copy(ph[0:16], src)
+		copy(ph[16:32], dst)
+		binary.BigEndian.PutUint32(ph[32:], uint32(len(th)))
+		ph[39] = 6 // TCP
+		return csum(append(ph, th...))
+	}
 	ph := make([]byte, 12)
 	copy(ph[0:4], src)
 	copy(ph[4:8], dst)
@@ -61,7 +69,9 @@ type DesyncConfig struct {
 	// record + segment plan: empty record, 104-byte record, 1-byte records, then ≤Split TCP pieces), or "all"
 	// (seq + sum + hlen0 + ff markers, ~1 ms apart)
 	TTL    int    // ttl mode: hop count of the fake packet; 0 = calibrate it from the server's inbound TTL
-	FakeIP string // fakeip mode: whitelisted destination IPv4 the fake flow names ("" = 104.16.0.1, a Cloudflare edge)
+	FakeIP string // fakeip mode: whitelisted destination (v4 or v6) the fake flow names; must match the connection's
+	// own family or the matching default is used instead ("" or a mismatched family = 104.16.0.1 for a v4
+	// connection, 2606:4700::6810:1 for a v6 one, both Cloudflare edges)
 	Split  int    // split/ff mode: TCP segment count (0 = 3 for split, 11 for ff)
 }
 
@@ -96,10 +106,8 @@ func validateDesync(cfg DesyncConfig) error {
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)
 	}
-	if cfg.FakeIP != "" {
-		if ip := net.ParseIP(strings.TrimSpace(cfg.FakeIP)); ip == nil || ip.To4() == nil {
-			return fmt.Errorf("wat: -fake-ip must be an IPv4 address, got %q", cfg.FakeIP)
-		}
+	if cfg.FakeIP != "" && net.ParseIP(strings.TrimSpace(cfg.FakeIP)) == nil {
+		return fmt.Errorf("wat: -fake-ip must be an IP address, got %q", cfg.FakeIP)
 	}
 	if cfg.Split != 0 && (cfg.Split < 2 || cfg.Split > 16) {
 		return fmt.Errorf("wat: -fake-split must be 0 (default 3) or 2..16, got %d", cfg.Split)
@@ -107,24 +115,30 @@ func validateDesync(cfg DesyncConfig) error {
 	return nil
 }
 
-// defaultFakeIP is what fakeip mode names when -fake-ip is unset: 104.16.0.1 is a Cloudflare anycast edge, an
-// address the censor's allowlist has to pass for the whole CDN to stay reachable.
-var defaultFakeIP = [4]byte{104, 16, 0, 1}
+// defaultFakeIP is what fakeip mode names when -fake-ip is unset and the connection is IPv4: 104.16.0.1 is a
+// Cloudflare anycast edge, an address the censor's allowlist has to pass for the whole CDN to stay reachable.
+// defaultFakeIP6 is its IPv6 twin (2606:4700::6810:1, the same Cloudflare prefix), used over IPv6 connections.
+var (
+	defaultFakeIP  = addr4([4]byte{104, 16, 0, 1})
+	defaultFakeIP6 = ipAddr{0x26, 0x06, 0x47, 0x00, 12: 0x68, 13: 0x10, 15: 0x01}
+)
 
-// desyncFakeIP resolves cfg.FakeIP (validateDesync has already accepted it); anything unparseable falls back to
-// the default so a tracker built directly by a test or a probe still behaves.
-func desyncFakeIP(cfg DesyncConfig) [4]byte {
-	if ip := net.ParseIP(strings.TrimSpace(cfg.FakeIP)); ip != nil && ip.To4() != nil {
-		var p [4]byte
-		copy(p[:], ip.To4())
-		return p
+// desyncFakeIP resolves cfg.FakeIP (validateDesync has already accepted it) to the family the connection needs:
+// the configured address when it is of that family, else that family's default (a v4 flow cannot address a v6
+// edge, nor the reverse). v4 says which family to resolve for.
+func desyncFakeIP(cfg DesyncConfig, v4 bool) ipAddr {
+	if a, ok := ipAddrOf(net.ParseIP(strings.TrimSpace(cfg.FakeIP))); ok && a.is4() == v4 {
+		return a
 	}
-	return defaultFakeIP
+	if v4 {
+		return defaultFakeIP
+	}
+	return defaultFakeIP6
 }
 
 // sumMirrorMode reports whether the mode mirrors the triggering segment in-window (base = the segment's own seq)
 // instead of sitting below the stream start. rst/synrst also use the stream-start seq, but only the mirror
-// family needs handleIPv4 to record c.sumSeq for the late path.
+// family needs handleIP to record c.sumSeq for the late path.
 func sumMirrorMode(mode string) bool {
 	switch mode {
 	case "sum", "seqsum", "rst", "all":
@@ -450,7 +464,11 @@ func desyncPeerIP(peer string) string {
 	return ip
 }
 
-// desyncPeerHostPort splits a host:port peer into its IPv4 address and port (best effort, like desyncPeerIP).
+// desyncPeerHostPort splits a host:port peer into its IP address (v4 or v6; a literal passes straight through,
+// a bracketed v6 literal unwrapped by SplitHostPort) and port (best effort, like desyncPeerIP). A hostname
+// prefers whichever v4 answer DNS gives first, falling back to the first v6 one, since that was the historical
+// behaviour for a dual-stack name; passing the edge's address as a literal (the fake-SNI recipes always do, v4
+// or v6) skips this preference entirely.
 func desyncPeerHostPort(peer string) (ip, port string) {
 	if i := strings.IndexByte(peer, ','); i >= 0 {
 		peer = strings.TrimSpace(peer[:i])
@@ -473,16 +491,89 @@ func desyncPeerHostPort(peer string) (ip, port string) {
 	return "", p
 }
 
+// ipAddr holds an IPv4 or IPv6 address: 16 bytes always, IPv4 stored v4-mapped (::ffff:a.b.c.d, matching
+// net.IP.To16), so desyncKey and the packet builders need no separate family-specific copies.
+type ipAddr [16]byte
+
+// ipAddrOf converts a parsed net.IP; false means ip was nil (not a valid address).
+func ipAddrOf(ip net.IP) (ipAddr, bool) {
+	var a ipAddr
+	p := ip.To16()
+	if p == nil {
+		return a, false
+	}
+	copy(a[:], p)
+	return a, true
+}
+
+// addr4 builds the ipAddr of four IPv4 address bytes.
+func addr4(b [4]byte) ipAddr {
+	a := ipAddr{10: 0xff, 11: 0xff}
+	copy(a[12:], b[:])
+	return a
+}
+
+// is4 reports whether the address is IPv4 (stored v4-mapped, ::ffff:0:0/96).
+func (a ipAddr) is4() bool {
+	for _, b := range a[:10] {
+		if b != 0 {
+			return false
+		}
+	}
+	return a[10] == 0xff && a[11] == 0xff
+}
+
+// bytes is the address as it appears on the wire: 4 bytes for IPv4, 16 for IPv6.
+func (a ipAddr) bytes() []byte {
+	if a.is4() {
+		return append([]byte(nil), a[12:]...)
+	}
+	return append([]byte(nil), a[:]...)
+}
+
 // desyncKey is one connection's outgoing 4-tuple (src = us). Inbound frames match the reversed key.
 type desyncKey struct {
-	srcIP [4]byte
-	dstIP [4]byte
+	srcIP ipAddr
+	dstIP ipAddr
 	srcPt uint16
 	dstPt uint16
 }
 
-// fakePacketWithOptions builds the IPv4+TCP+options+payload packet of one fake ClientHello.
-// When opts is non-empty (e.g. Linux kernel TCP timestamps NOP, NOP, TSval, TSecr), the segment
+// ipHeader returns the IPv4 (20 B, DF set, header checksum filled) or IPv6 (40 B) header for tcpLen bytes of TCP
+// following it, picking the family from the key's addresses (both sides of a key are always the same family).
+func ipHeader(k desyncKey, ttl, tcpLen int) []byte {
+	if k.dstIP.is4() {
+		h := make([]byte, 20)
+		h[0] = 0x45
+		binary.BigEndian.PutUint16(h[2:], uint16(20+tcpLen))
+		h[6] = 0x40 // Don't Fragment
+		h[8] = byte(ttl)
+		h[9] = 6 // TCP
+		copy(h[12:16], k.srcIP[12:])
+		copy(h[16:20], k.dstIP[12:])
+		binary.BigEndian.PutUint16(h[10:], csum(h))
+		return h
+	}
+	h := make([]byte, 40)
+	h[0] = 0x60
+	binary.BigEndian.PutUint16(h[4:], uint16(tcpLen))
+	h[6] = 6 // next header: TCP
+	h[7] = byte(ttl)
+	copy(h[8:24], k.srcIP[:])
+	copy(h[24:40], k.dstIP[:])
+	return h
+}
+
+// ipHdrLen is the length of a header ipHeader built, read back off the version nibble.
+func ipHdrLen(pkt []byte) int {
+	if pkt[0]>>4 == 6 {
+		return 40
+	}
+	return 20
+}
+
+// fakePacketWithOptions builds the IP+TCP+options+payload packet of one fake ClientHello (IPv4 or IPv6, picked
+// from k). When opts is non-empty (e.g. Linux kernel TCP timestamps NOP, NOP, TSval, TSecr), the segment
 // mirrors standard kernel packet formatting (Data Offset > 5) so DPI appliances performing
 // TCP option consistency validation cannot distinguish the injected marker from normal traffic.
 func fakePacketWithOptions(k desyncKey, seq, ack uint32, ttl int, hello []byte, opts []byte) []byte {
@@ -491,17 +582,12 @@ func fakePacketWithOptions(k desyncKey, seq, ack uint32, ttl int, hello []byte, 
 	tcpHdrLen += pad
 	dataOffset := byte(tcpHdrLen / 4)
 
-	pkt := make([]byte, 20+tcpHdrLen+len(hello))
-	pkt[0] = 0x45
-	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
-	pkt[6] = 0x40 // Don't Fragment
-	pkt[8] = byte(ttl)
-	pkt[9] = 6 // TCP
-	copy(pkt[12:16], k.srcIP[:])
-	copy(pkt[16:20], k.dstIP[:])
-	binary.BigEndian.PutUint16(pkt[10:], csum(pkt[:20]))
+	ih := ipHeader(k, ttl, tcpHdrLen+len(hello))
+	hl := len(ih)
+	pkt := make([]byte, hl+tcpHdrLen+len(hello))
+	copy(pkt, ih)
 
-	th := pkt[20 : 20+tcpHdrLen]
+	th := pkt[hl : hl+tcpHdrLen]
 	binary.BigEndian.PutUint16(th[0:], k.srcPt)
 	binary.BigEndian.PutUint16(th[2:], k.dstPt)
 	binary.BigEndian.PutUint32(th[4:], seq)
@@ -515,30 +601,25 @@ func fakePacketWithOptions(k desyncKey, seq, ack uint32, ttl int, hello []byte, 
 			th[i] = 0x01 // TCP NOP option
 		}
 	}
-	copy(pkt[20+tcpHdrLen:], hello)
-	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
+	copy(pkt[hl+tcpHdrLen:], hello)
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[hl:], k.srcIP.bytes(), k.dstIP.bytes()))
 	return pkt
 }
 
-// fakePacket builds the IPv4+TCP+payload packet of one fake ClientHello without TCP options. Pure: the same inputs
+// fakePacket builds the IP+TCP+payload packet of one fake ClientHello without TCP options. Pure: the same inputs
 // build the same packet, so the tests pin it byte for byte (seq arithmetic, TTL, ack, checksum).
 func fakePacket(k desyncKey, seq, ack uint32, ttl int, hello []byte) []byte {
 	return fakePacketWithOptions(k, seq, ack, ttl, hello, nil)
 }
 
-// fakeFlagPacket builds an IPv4+TCP header-only packet (no payload) carrying the given TCP flags. Pure: the same
+// fakeFlagPacket builds an IP+TCP header-only packet (no payload) carrying the given TCP flags. Pure: the same
 // inputs build the same packet.
 func fakeFlagPacket(k desyncKey, seq, ack uint32, ttl int, flags byte) []byte {
-	pkt := make([]byte, 20+20)
-	pkt[0] = 0x45
-	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
-	pkt[6] = 0x40 // Don't Fragment
-	pkt[8] = byte(ttl)
-	pkt[9] = 6 // TCP
-	copy(pkt[12:16], k.srcIP[:])
-	copy(pkt[16:20], k.dstIP[:])
-	binary.BigEndian.PutUint16(pkt[10:], csum(pkt[:20]))
-	th := pkt[20:]
+	ih := ipHeader(k, ttl, 20)
+	hl := len(ih)
+	pkt := make([]byte, hl+20)
+	copy(pkt, ih)
+	th := pkt[hl:]
 	binary.BigEndian.PutUint16(th[0:], k.srcPt)
 	binary.BigEndian.PutUint16(th[2:], k.dstPt)
 	binary.BigEndian.PutUint32(th[4:], seq)
@@ -546,7 +627,7 @@ func fakeFlagPacket(k desyncKey, seq, ack uint32, ttl int, flags byte) []byte {
 	th[12] = 0x50
 	th[13] = flags
 	binary.BigEndian.PutUint16(th[14:], 0)
-	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]))
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[hl:], k.srcIP.bytes(), k.dstIP.bytes()))
 	return pkt
 }
 
@@ -555,8 +636,8 @@ func fakeRSTPacket(k desyncKey, seq, ack uint32, ttl int) []byte {
 	return fakeFlagPacket(k, seq, ack, ttl, 0x14) // RST|ACK
 }
 
-// parseEthIPv4 returns the IPv4 packet carried by an ethernet, SLL, or raw frame, or nil.
-func parseEthIPv4(frame []byte) []byte {
+// parseEthIP returns the IPv4 or IPv6 packet carried by an ethernet, VLAN, SLL, or raw frame, or nil.
+func parseEthIP(frame []byte) []byte {
 	// Standard Ethernet (14-byte header, EtherType 0x0800)
 	if len(frame) >= 34 && binary.BigEndian.Uint16(frame[12:]) == 0x0800 && frame[14]>>4 == 4 {
 		return frame[14:]
@@ -574,6 +655,20 @@ func parseEthIPv4(frame []byte) []byte {
 	}
 	// Linux cooked mode (SLL, 16-byte header)
 	if len(frame) >= 36 && binary.BigEndian.Uint16(frame[14:]) == 0x0800 && frame[16]>>4 == 4 {
+		return frame[16:]
+	}
+	// The same four framings, IPv6 (EtherType/SLL protocol 0x86dd, a 40-byte fixed header to check the version
+	// nibble): Ethernet, direct (tun/wg), VLAN, cooked mode.
+	if len(frame) >= 14+40 && binary.BigEndian.Uint16(frame[12:]) == 0x86dd && frame[14]>>4 == 6 {
+		return frame[14:]
+	}
+	if len(frame) >= 40 && frame[0]>>4 == 6 {
+		return frame
+	}
+	if len(frame) >= 18+40 && binary.BigEndian.Uint16(frame[12:]) == 0x8100 && binary.BigEndian.Uint16(frame[16:]) == 0x86dd && frame[18]>>4 == 6 {
+		return frame[18:]
+	}
+	if len(frame) >= 16+40 && binary.BigEndian.Uint16(frame[14:]) == 0x86dd && frame[16]>>4 == 6 {
 		return frame[16:]
 	}
 	return nil
@@ -601,8 +696,7 @@ func parseEthIPv4(frame []byte) []byte {
 // the peer IP, which is what calibrates -fake-mode ttl with -fake-ttl 0.
 type desyncTracker struct {
 	cfg       DesyncConfig
-	peerIP    [4]byte
-	fakeIP    [4]byte // fakeip mode's whitelisted destination (cfg.FakeIP, else defaultFakeIP)
+	peerIP    ipAddr
 	hello     []byte
 	snis      []string // SNIs with a non-empty hello; pickHello rebuilds fresh bytes per fire
 	helloIdx  atomic.Uint32
@@ -657,7 +751,7 @@ func hopTTL(arrived uint8) int {
 
 // newDesyncTracker prepares the state machine for one peer IP. Only SNIs that produce a hello are
 // kept; pickHello rebuilds the hello per fire from these.
-func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
+func newDesyncTracker(cfg DesyncConfig, peerIP ipAddr) *desyncTracker {
 	snis := splitSNIs(cfg.SNI)
 	good := make([]string, 0, len(snis))
 	var hello []byte
@@ -669,7 +763,7 @@ func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
 			}
 		}
 	}
-	return &desyncTracker{cfg: cfg, peerIP: peerIP, fakeIP: desyncFakeIP(cfg), hello: hello, snis: good,
+	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: hello, snis: good,
 		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}, recent: map[desyncKey]*desyncHS{}}
 }
 
@@ -728,7 +822,7 @@ func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struc
 }
 
 // noteHandshake remembers the packets of handshakes toward the peer that nobody announced (yet); mu held.
-func (t *desyncTracker) noteHandshake(out, in desyncKey, d, s [4]byte, th []byte, off int, seq, ackv uint32, syn, ackf bool, payload int, now time.Time) {
+func (t *desyncTracker) noteHandshake(out, in desyncKey, d, s ipAddr, th []byte, off int, seq, ackv uint32, syn, ackf bool, payload int, now time.Time) {
 	switch {
 	case d == t.peerIP && syn && !ackf && payload == 0:
 		if len(t.recent) > 64 {
@@ -793,26 +887,44 @@ func (t *desyncTracker) peerTTL() uint8 {
 	return t.peerTTLv
 }
 
-// handleIPv4 advances the state machine with one raw IPv4 packet (header included, no ethernet header).
-func (t *desyncTracker) handleIPv4(ip []byte) {
-	if len(ip) < 20 || ip[0]>>4 != 4 || ip[9] != 6 { // IPv4 TCP only, like the reference tool
+// parseIPTCP extracts what handleIP needs from an IPv4 or IPv6 packet: source and destination address, the
+// TTL/hop limit, and the TCP header+payload slice. ok is false for anything but plain IPv4/IPv6 TCP (an IPv6
+// packet with extension headers before TCP is not understood and is skipped, like a malformed IPv4 one).
+func parseIPTCP(ip []byte) (s, d ipAddr, ttl byte, th []byte, ok bool) {
+	if len(ip) < 20 {
 		return
 	}
-	ihl := int(ip[0]&0xf) * 4
-	if ihl < 20 || len(ip) < ihl+20 {
-		return
+	switch ip[0] >> 4 {
+	case 4:
+		if ip[9] != 6 { // TCP only, like the reference tool
+			return
+		}
+		ihl := int(ip[0]&0xf) * 4
+		if ihl < 20 || len(ip) < ihl {
+			return
+		}
+		return addr4([4]byte(ip[12:16])), addr4([4]byte(ip[16:20])), ip[8], ip[ihl:], true
+	case 6:
+		if len(ip) < 40 || ip[6] != 6 { // next header must be TCP directly, no extension headers
+			return
+		}
+		copy(s[:], ip[8:24])
+		copy(d[:], ip[24:40])
+		return s, d, ip[7], ip[40:], true
 	}
-	th := ip[ihl:]
-	if len(th) < 20 {
+	return
+}
+
+// handleIP advances the state machine with one raw IPv4 or IPv6 packet (header included, no ethernet header).
+func (t *desyncTracker) handleIP(ip []byte) {
+	s, d, ttl, th, ok := parseIPTCP(ip)
+	if !ok || len(th) < 20 {
 		return
 	}
 	off := int(th[12]>>4) * 4
 	if off < 20 || len(th) < off {
 		return
 	}
-	var s, d [4]byte
-	copy(s[:], ip[12:16])
-	copy(d[:], ip[16:20])
 	sport, dport := binary.BigEndian.Uint16(th[0:]), binary.BigEndian.Uint16(th[2:])
 	out := desyncKey{s, d, sport, dport}
 	in := desyncKey{d, s, dport, sport}
@@ -828,7 +940,7 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	now := time.Now()
 	// any SYN-ACK from the peer teaches the inbound TTL (ttl auto-calibration), tracked or not
 	if syn && ackf && payload == 0 && !rst && s == t.peerIP && t.peerTTLv == 0 {
-		t.peerTTLv = ip[8]
+		t.peerTTLv = ttl
 	}
 	if !rst && (t.conns[out] == nil && t.conns[in] == nil) {
 		t.noteHandshake(out, in, d, s, th, off, seq, ackv, syn, ackf, payload, now)
@@ -969,7 +1081,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// this client talking to an allowed CDN. Targets: IP-allowlist classifiers (Irancell's 188.114.98.0/CDN
 		// whitelist, MCI's CDN-fronting method).
 		fk := k
-		fk.dstIP, fk.dstPt = t.fakeIP, 443
+		fk.dstIP, fk.dstPt = desyncFakeIP(t.cfg, k.dstIP.is4()), 443
 		syn := base - uint32(len(hello)) - 1
 		t.send(fakeFlagPacket(fk, syn, 0, ttl, 0x02)) // SYN
 		t.send(fakePacketWithOptions(fk, syn+1, 0, ttl, hello, c.tcpOpts))
@@ -1066,10 +1178,11 @@ func (t *desyncTracker) fireFFLocked(k desyncKey, c *desyncConn, base, ack uint3
 // second sum-marker shipped with a fully valid checksum and the server would have accepted its payload as real
 // stream data. Found by the sum-mode test flaking with ~50 % frequency (the SNI random bytes decide the parity).
 func damageChecksum(pkt []byte) {
-	s := binary.BigEndian.Uint16(pkt[20+16:])
+	at := ipHdrLen(pkt) + 16 // the TCP checksum field, after a 20 B IPv4 or 40 B IPv6 header
+	s := binary.BigEndian.Uint16(pkt[at:])
 	d := s - 1
 	if d == 0xffff {
 		d = s - 2
 	}
-	binary.BigEndian.PutUint16(pkt[20+16:], d)
+	binary.BigEndian.PutUint16(pkt[at:], d)
 }

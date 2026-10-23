@@ -93,7 +93,7 @@ func main() {
 	tlsFrag := flag.Int("tls-frag", 0, "client, tls|wss|h2|grpc carriers: split the TLS ClientHello into N-byte TCP segments, 0 = off (client only, 2.2.0; server unchanged)")
 	fakeSNI := flag.String("fake-sni", "", "client, tcp|tls|wss|h2|grpc carriers: track every outgoing TCP handshake on the wire and inject a fake TLS ClientHello carrying this allowlisted SNI right after it, so the DPI classifies the flow as TLS to an allowed site; the server never sees the fake (raw socket, Linux, like the ICMP carrier; client only, 2.6.0; server unchanged)")
 	fakeMode := flag.String("fake-mode", "seq", "client, with -fake-sni: seq = wrong sequence number, the server drops the fake as an old duplicate (default); ttl = small TTL, the fake dies at the censor's hop (needs -fake-ttl N or 0 = calibrate it from the server's replies); sum = valid window, bad TCP checksum, the server's kernel drops the fake (fails behind NATs that validate checksums); seqsum = both markers per connection, ~1 ms apart (experimental, 2.8.0); rst = in-window RST with a damaged TCP checksum: stateful middleboxes clear the flow, the server kernel drops the packet before reading the flags (2.9.0); split = the fake hello cut across -fake-split segments so no single packet carries the SNI (2.10.5); hlen0 = F&F-style empty TLS record (length 0) that makes a stateful parser latch and stop reading the flow (2.10.5); fakeip = a checksum-valid SYN + hello to -fake-ip (a whitelisted CDN edge) so destination-IP allowlists classify the flow as CDN traffic (2.10.5); synrst = in-window SYN|RST with a damaged checksum, clears flow tables harder than rst (2.10.5); all = seq + sum + hlen0 markers ~1 ms apart (2.10.5); ff = the Irancell F&F record plan for the fake hello (a zero-length record + 104-byte record + 1-byte records, cut across -fake-split (default 11) segments), the shape the owner's channel reports working at full speed (2.10.6); auto = run a one-time startup probe (2.9.0): two throwaway markers next to a throwaway connection tell which marker class the filter tolerates, and the mode is picked from that (logs the verdict; also in /stats as filter_profile)")
-	fakeIP := flag.String("fake-ip", "", "client, -fake-mode fakeip: IPv4 the fake SYN+hello is addressed to, so a destination-IP allowlist files the flow as CDN traffic (empty = 104.16.0.1, a Cloudflare edge)")
+	fakeIP := flag.String("fake-ip", "", "client, -fake-mode fakeip: IPv4 or IPv6 address the fake SYN+hello is addressed to, so a destination-IP allowlist files the flow as CDN traffic; must match -peer's family, else the default for that family is used instead (empty = 104.16.0.1 for an IPv4 peer, 2606:4700::6810:1 for an IPv6 one, both Cloudflare edges; IPv6 support since 2.10.9)")
 	fakeSplit := flag.Int("fake-split", 0, "client, -fake-mode split: how many TCP segments the fake ClientHello is cut into (0 = 3, or 2..16)")
 	fakeTTL := flag.Int("fake-ttl", 0, "client, with -fake-sni -fake-mode ttl: hop count of the fake packet, 1 more than the distance to the censor's DPI box, 1 less than the distance to the server; 0 = calibrate from the server's replies (unused by the seq, sum and seqsum modes)")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
@@ -259,6 +259,7 @@ func main() {
 		if *fakeSNI == "" {
 			return nil, nil
 		}
+		wat.SetNote(log.Printf) // a failed raw send must be heard: the real SNI would go out unprotected
 		desyncMu.Lock()
 		defer desyncMu.Unlock()
 		if d := desyncByPeer[peer]; d != nil {
@@ -679,6 +680,7 @@ func main() {
 					"dgram_dropped_size": st.DgramDropSize, "dgram_dropped_rx": st.DgramDropRx, "dgram_fragmented": st.DgramFragmented, "dgram_reassembled": st.DgramReassembled, "dgram_flows": udpFlowsActive.Load(),
 					"dgram_rejected": udpRejected.Load(), "dgram_flow_cap_drops": udpFlowCapDrop.Load(), "pool_slow_closed": wat.PoolSlowKills(), "pool_conn_deaths": wat.PoolConnDeaths(), "pool_drops": wat.PoolDrops(), "tcp_cc": wat.PoolTCPCCInUse(), "pool_conns": wat.PoolConnStats(),
 					"filter_profile": wat.FilterProfileNow(), // fake-mode auto's startup verdict (2.9.0)
+					"raw_send_fails": wat.RawSendFails(),     // fake-SNI fires that never left the host (2.10.9)
 				}
 				out["cc"] = map[string]any{ // pacer diagnostics (2.4.10): what held the sender back, and why it slowed
 					"ticks": st.CC.Ticks, "tok_limited": st.CC.TokLimited, "cwnd_limited": st.CC.CwndLimited,

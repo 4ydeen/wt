@@ -203,14 +203,20 @@ func TestValidateDesync(t *testing.T) {
 }
 
 // desyncTestPkt builds one raw IPv4 TCP packet (header included) the way the wire delivers it.
-func desyncTestPkt(src, dst [4]byte, sport, dport uint16, seq, ack uint32, flags byte, payload []byte, ttl int) []byte {
+// testIP4 parses a dotted-quad into an ipAddr (v4-mapped).
+func testIP4(s string) ipAddr {
+	a, _ := ipAddrOf(net.ParseIP(s))
+	return a
+}
+
+func desyncTestPkt(src, dst ipAddr, sport, dport uint16, seq, ack uint32, flags byte, payload []byte, ttl int) []byte {
 	pkt := make([]byte, 20+20+len(payload))
 	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
 	pkt[8] = byte(ttl)
 	pkt[9] = 6
-	copy(pkt[12:16], src[:])
-	copy(pkt[16:20], dst[:])
+	copy(pkt[12:16], src.bytes())
+	copy(pkt[16:20], dst.bytes())
 	th := pkt[20:]
 	binary.BigEndian.PutUint16(th[0:], sport)
 	binary.BigEndian.PutUint16(th[2:], dport)
@@ -220,7 +226,7 @@ func desyncTestPkt(src, dst [4]byte, sport, dport uint16, seq, ack uint32, flags
 	th[13] = flags
 	binary.BigEndian.PutUint16(th[14:], 0xffff)
 	copy(th[20:], payload)
-	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], src[:], dst[:]))
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[20:], src.bytes(), dst.bytes()))
 	return pkt
 }
 
@@ -280,9 +286,7 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *sentLog) {
 // desyncTestTrackerCfg builds a tracker for an arbitrary config with a collected send path and the fixed
 // 192.168.1.2 -> 10.8.0.1 peer pair.
 func desyncTestTrackerCfg(cfg DesyncConfig) (*desyncTracker, *sentLog) {
-	var p [4]byte
-	copy(p[:], net.ParseIP("10.8.0.1").To4())
-	tr := newDesyncTracker(cfg, p)
+	tr := newDesyncTracker(cfg, testIP4("10.8.0.1"))
 	sent := &sentLog{}
 	tr.send = sent.add
 	return tr, sent
@@ -307,17 +311,14 @@ func payloadOf(pkt []byte) []byte {
 
 // testClientKey is one outgoing 4-tuple: 192.168.1.2:5000 -> 10.8.0.1:443.
 func testClientKey() desyncKey {
-	var s, d [4]byte
-	copy(s[:], net.ParseIP("192.168.1.2").To4())
-	copy(d[:], net.ParseIP("10.8.0.1").To4())
-	return desyncKey{s, d, 5000, 443}
+	return desyncKey{testIP4("192.168.1.2"), testIP4("10.8.0.1"), 5000, 443}
 }
 
 // feedFullHandshake drives a normal SYN / SYN-ACK / final-ACK exchange into the tracker.
 func feedFullHandshake(tr *desyncTracker, k desyncKey, isn, srvSeq uint32) {
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
 }
 
 // TestDesyncEarlyFiresBeforeData: the classic path — Wrap knows the ISN, the fake fires on the final ACK, one
@@ -369,10 +370,10 @@ func TestDesyncEarlyFiresOnFirstData(t *testing.T) {
 	k := testClientKey()
 	const isn, srvSeq = uint32(0xffff0000), uint32(17) // wrap-prone values
 	tr.announce(k, isn+1, true)
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
 	// the pool writes the session's first datagram BEFORE the final ACK would be seen on the wire
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 300), 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 300), 64))
 	if tr.fired() != 1 {
 		t.Fatalf("fake did not fire on first data (fired %d)", tr.fired())
 	}
@@ -391,8 +392,8 @@ func TestDesyncLateFiresOnData(t *testing.T) {
 	const isn, srvSeq = uint32(42000), uint32(900)
 	ch := tr.announce(k, 0, false) // not known
 	// handshake seen only as SYN-ACK + first data (SYN lost to the sniffer, e.g. offload path)
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 100), 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 100), 64))
 	select {
 	case <-ch:
 	case <-time.After(time.Second):
@@ -411,9 +412,9 @@ func TestDesyncLateNeedsData(t *testing.T) {
 	k := testClientKey()
 	const isn, srvSeq = uint32(42000), uint32(900)
 	tr.announce(k, 0, false)
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagACK, nil, 64))
 	if sent.n() != 0 {
 		t.Fatalf("late path fired on bare ACKs (%d fakes)", sent.n())
 	}
@@ -429,10 +430,10 @@ func TestDesyncNATRewrite(t *testing.T) {
 	const isn, srvSeq = uint32(1000), uint32(500000)
 	tr.announce(k, isn+1, true)
 	// NAT rewrote our ISN from 1000 to 2000 before the server saw it
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
 	const natISN = isn + 1000
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, natISN+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, natISN+1, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, natISN+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, natISN+1, srvSeq+1, testFlagACK, nil, 64))
 	if tr.fired() != 1 {
 		t.Fatal("fake did not fire after NAT rewrite")
 	}
@@ -470,7 +471,7 @@ func TestDesyncTTLCalibratedBeforeHandshake(t *testing.T) {
 	defer tr.close()
 	k := testClientKey()
 	// a stray SYN-ACK from the peer (another connection's) teaches the TTL first
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, 9999, 77, 88, testFlagSYN|testFlagACK, nil, 60))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, 9999, 77, 88, testFlagSYN|testFlagACK, nil, 60))
 	const isn, srvSeq = uint32(1000), uint32(500000)
 	tr.announce(k, isn+1, true)
 	feedFullHandshake(tr, k, isn, srvSeq)
@@ -491,8 +492,8 @@ func TestDesyncTTLCalibratedNotYet(t *testing.T) {
 	const isn, srvSeq = uint32(1000), uint32(500000)
 	ch := tr.announce(k, isn+1, true)
 	// handshake without a SYN-ACK on record (sniffer missed it): no TTL, no fake
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
 	if tr.fired() != 0 || sent.n() != 0 {
 		t.Fatal("auto-TTL fired without a learned TTL")
 	}
@@ -528,8 +529,8 @@ func TestDesyncOneFakePerConn(t *testing.T) {
 	const isn, srvSeq = uint32(1000), uint32(500000)
 	tr.announce(k, isn+1, true)
 	feedFullHandshake(tr, k, isn, srvSeq)
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 50), 64))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+60, srvSeq+1, testFlagACK, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+2, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 50), 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+60, srvSeq+1, testFlagACK, nil, 64))
 	if sent.n() != 1 {
 		t.Fatalf("want exactly 1 fake, got %d", sent.n())
 	}
@@ -552,10 +553,10 @@ func TestDesyncFakePacketRoundTrip(t *testing.T) {
 	k := testClientKey()
 	hello := FakeClientHello("mci.ir")
 	pkt := fakePacket(k, 799, 555, 63, hello)
-	if ip := parseEthIPv4(append([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00}, pkt...)); ip == nil {
-		t.Fatal("parseEthIPv4 rejected the fake")
+	if ip := parseEthIP(append([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00}, pkt...)); ip == nil {
+		t.Fatal("parseEthIP rejected the fake")
 	} else {
-		if got := binary.BigEndian.Uint32(ip[16:20]); got != binary.BigEndian.Uint32(k.dstIP[:]) {
+		if got := binary.BigEndian.Uint32(ip[16:20]); got != binary.BigEndian.Uint32(k.dstIP.bytes()) {
 			t.Fatalf("dst ip %x", got)
 		}
 		if ip[8] != 63 {
@@ -565,7 +566,7 @@ func TestDesyncFakePacketRoundTrip(t *testing.T) {
 	th := pkt[20:]
 	stored := binary.BigEndian.Uint16(pkt[20+16:])
 	binary.BigEndian.PutUint16(th[16:], 0)
-	if c := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); c != stored {
+	if c := tcpChecksum(pkt[20:], k.srcIP.bytes(), k.dstIP.bytes()); c != stored {
 		t.Fatalf("checksum mismatch: recomputed %04x, stored %04x", c, stored)
 	}
 	if !bytes.Equal(pkt[40:], hello) {
@@ -606,7 +607,7 @@ func TestDesyncRSTCleansConnection(t *testing.T) {
 	ch := tr.announce(k, 500, true)
 	// Outbound RST packet
 	rstPkt := desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 501, 0, testFlagRST, nil, 64)
-	tr.handleIPv4(rstPkt)
+	tr.handleIP(rstPkt)
 	select {
 	case <-ch: // channel closed on RST
 	case <-time.After(time.Second):
@@ -664,17 +665,17 @@ func TestDesyncStalePrune(t *testing.T) {
 func TestDesyncParseEthIPv4(t *testing.T) {
 	arp := make([]byte, 60)
 	binary.BigEndian.PutUint16(arp[12:], 0x0806)
-	if parseEthIPv4(arp) != nil {
+	if parseEthIP(arp) != nil {
 		t.Fatal("ARP frame accepted")
 	}
-	if parseEthIPv4([]byte{1, 2, 3}) != nil {
+	if parseEthIP([]byte{1, 2, 3}) != nil {
 		t.Fatal("short frame accepted")
 	}
 
 	// Raw IPv4 packet (tun/wg)
 	rawIP := make([]byte, 40)
 	rawIP[0] = 0x45 // IPv4, 20-byte IHL
-	if got := parseEthIPv4(rawIP); got == nil || len(got) != 40 {
+	if got := parseEthIP(rawIP); got == nil || len(got) != 40 {
 		t.Fatal("raw IPv4 packet rejected")
 	}
 
@@ -683,7 +684,7 @@ func TestDesyncParseEthIPv4(t *testing.T) {
 	binary.BigEndian.PutUint16(vlan[12:], 0x8100)
 	binary.BigEndian.PutUint16(vlan[16:], 0x0800)
 	vlan[18] = 0x45
-	if got := parseEthIPv4(vlan); got == nil || len(got) != 40 {
+	if got := parseEthIP(vlan); got == nil || len(got) != 40 {
 		t.Fatal("VLAN-tagged IPv4 packet rejected")
 	}
 
@@ -691,7 +692,7 @@ func TestDesyncParseEthIPv4(t *testing.T) {
 	sll := make([]byte, 16+40)
 	binary.BigEndian.PutUint16(sll[14:], 0x0800)
 	sll[16] = 0x45
-	if got := parseEthIPv4(sll); got == nil || len(got) != 40 {
+	if got := parseEthIP(sll); got == nil || len(got) != 40 {
 		t.Fatal("SLL IPv4 packet rejected")
 	}
 }
@@ -746,7 +747,7 @@ func TestDesyncSumModeFiresOnData(t *testing.T) {
 	// the checksum must be INVALID: recompute the correct one and require a difference
 	stored := binary.BigEndian.Uint16(pkt[20+16:])
 	binary.BigEndian.PutUint16(pkt[20+16:], 0)
-	if good := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); good == stored {
+	if good := tcpChecksum(pkt[20:], k.srcIP.bytes(), k.dstIP.bytes()); good == stored {
 		t.Fatalf("sum fake carries a VALID checksum %04x (must be damaged)", good)
 	}
 	// and the damage is non-zero
@@ -762,8 +763,8 @@ func TestDesyncSumModeLate(t *testing.T) {
 	k := testClientKey()
 	const isn, srvSeq = uint32(61000), uint32(90)
 	ch := tr.announce(k, 0, false)
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 60), 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 60), 64))
 	select {
 	case <-ch:
 	case <-time.After(time.Second):
@@ -809,7 +810,7 @@ func TestDesyncRSTModeFiresOnData(t *testing.T) {
 	}
 	stored := binary.BigEndian.Uint16(pkt[20+16:])
 	binary.BigEndian.PutUint16(pkt[20+16:], 0)
-	if good := tcpChecksum(pkt[20:], k.srcIP[:], k.dstIP[:]); good == stored {
+	if good := tcpChecksum(pkt[20:], k.srcIP.bytes(), k.dstIP.bytes()); good == stored {
 		t.Fatalf("rst fake carries a VALID checksum %04x (must be damaged)", good)
 	}
 }
@@ -821,8 +822,8 @@ func TestDesyncRSTModeLate(t *testing.T) {
 	k := testClientKey()
 	const isn, srvSeq = uint32(61000), uint32(90)
 	ch := tr.announce(k, 0, false)
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 60), 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 60), 64))
 	select {
 	case <-ch:
 	case <-time.After(time.Second):
@@ -875,7 +876,7 @@ func TestDesyncSeqSumSendsBoth(t *testing.T) {
 	}
 	stored1 := binary.BigEndian.Uint16(m1[20+16:])
 	binary.BigEndian.PutUint16(m1[20+16:], 0)
-	if good := tcpChecksum(m1[20:], k.srcIP[:], k.dstIP[:]); good != stored1 {
+	if good := tcpChecksum(m1[20:], k.srcIP.bytes(), k.dstIP.bytes()); good != stored1 {
 		t.Fatalf("seqsum marker1 checksum %04x, want the VALID value %04x", stored1, good)
 	}
 	// marker 2: in-window seq (the data segment's own), DAMAGED checksum
@@ -885,7 +886,7 @@ func TestDesyncSeqSumSendsBoth(t *testing.T) {
 	}
 	stored2 := binary.BigEndian.Uint16(m2[20+16:])
 	binary.BigEndian.PutUint16(m2[20+16:], 0)
-	if good := tcpChecksum(m2[20:], k.srcIP[:], k.dstIP[:]); good == stored2 {
+	if good := tcpChecksum(m2[20:], k.srcIP.bytes(), k.dstIP.bytes()); good == stored2 {
 		t.Fatalf("seqsum marker2 carries a VALID checksum %04x (must be damaged)", good)
 	}
 	// both carry the allowlisted SNI. pickHello rebuilds fresh randoms per fire, so compare the parsed
@@ -908,8 +909,8 @@ func TestDesyncSeqSumLateFiresBoth(t *testing.T) {
 	k := testClientKey()
 	const isn, srvSeq = uint32(41000), uint32(70)
 	ch := tr.announce(k, 0, false)
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 40), 64))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagPSH|testFlagACK, make([]byte, 40), 64))
 	select {
 	case <-ch:
 	case <-time.After(time.Second):
@@ -935,9 +936,7 @@ func TestDesyncSeqSumLateFiresBoth(t *testing.T) {
 // never replay byte-identical randoms (a censor correlating synthetic hellos across connections would
 // otherwise see the same client random / session id / key share). The per-SNI length stays constant.
 func TestDesyncPickHelloFreshRandoms(t *testing.T) {
-	var p [4]byte
-	copy(p[:], net.ParseIP("10.8.0.1").To4())
-	tr := newDesyncTracker(DesyncConfig{SNI: "mci.ir", Mode: "seq"}, p)
+	tr := newDesyncTracker(DesyncConfig{SNI: "mci.ir", Mode: "seq"}, testIP4("10.8.0.1"))
 	defer tr.close()
 	h1 := tr.pickHello()
 	h2 := tr.pickHello()
@@ -955,13 +954,11 @@ func TestDesyncPickHelloFreshRandoms(t *testing.T) {
 
 // TestDesyncMultiSNIRotation verifies that comma-separated SNIs rotate sequentially across connections.
 func TestDesyncMultiSNIRotation(t *testing.T) {
-	var p [4]byte
-	copy(p[:], net.ParseIP("10.8.0.1").To4())
 	cfg := DesyncConfig{
 		SNI:  "mci.ir,divar.ir,digikala.com",
 		Mode: "seq",
 	}
-	tr := newDesyncTracker(cfg, p)
+	tr := newDesyncTracker(cfg, testIP4("10.8.0.1"))
 	defer tr.close()
 	sent := &sentLog{}
 	tr.send = sent.add
@@ -1075,8 +1072,8 @@ func TestFakeClientHelloECHGREASE(t *testing.T) {
 // and checksum calculation when TCP options are mirrored from the kernel.
 func TestFakePacketWithOptions(t *testing.T) {
 	k := desyncKey{
-		srcIP: [4]byte{192, 168, 1, 50},
-		dstIP: [4]byte{1, 2, 3, 4},
+		srcIP: addr4([4]byte{192, 168, 1, 50}),
+		dstIP: addr4([4]byte{1, 2, 3, 4}),
 		srcPt: 12345,
 		dstPt: 443,
 	}
@@ -1113,8 +1110,8 @@ func TestFakePacketWithOptions(t *testing.T) {
 
 	// TCP checksum verification
 	ph := make([]byte, 12)
-	copy(ph[0:4], k.srcIP[:])
-	copy(ph[4:8], k.dstIP[:])
+	copy(ph[0:4], k.srcIP.bytes())
+	copy(ph[4:8], k.dstIP.bytes())
 	ph[9] = 6
 	binary.BigEndian.PutUint16(ph[10:], uint16(len(th)))
 	if csum(append(ph, th...)) != 0 {
@@ -1132,9 +1129,9 @@ func TestDesyncOptsCapture(t *testing.T) {
 	ch := tr.announce(k, isn+1, true)
 
 	// SYN (no options for simplicity)
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
 	// SYN-ACK from server
-	tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
 
 	// Final ACK with 12 bytes of TCP options (NOP, NOP, Timestamps)
 	opts := []byte{0x01, 0x01, 0x08, 0x0a, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22}
@@ -1143,8 +1140,8 @@ func TestDesyncOptsCapture(t *testing.T) {
 	binary.BigEndian.PutUint16(ackPkt[2:], uint16(len(ackPkt)))
 	ackPkt[8] = 64
 	ackPkt[9] = 6
-	copy(ackPkt[12:16], k.srcIP[:])
-	copy(ackPkt[16:20], k.dstIP[:])
+	copy(ackPkt[12:16], k.srcIP.bytes())
+	copy(ackPkt[16:20], k.dstIP.bytes())
 	binary.BigEndian.PutUint16(ackPkt[10:], csum(ackPkt[:20]))
 	ath := ackPkt[20:]
 	binary.BigEndian.PutUint16(ath[0:], k.srcPt)
@@ -1155,9 +1152,9 @@ func TestDesyncOptsCapture(t *testing.T) {
 	ath[13] = testFlagACK
 	binary.BigEndian.PutUint16(ath[14:], 0xffff)
 	copy(ath[20:], opts)
-	binary.BigEndian.PutUint16(ath[16:], tcpChecksum(ath, k.srcIP[:], k.dstIP[:]))
+	binary.BigEndian.PutUint16(ath[16:], tcpChecksum(ath, k.srcIP.bytes(), k.dstIP.bytes()))
 
-	tr.handleIPv4(ackPkt)
+	tr.handleIP(ackPkt)
 
 	select {
 	case <-ch:
@@ -1210,8 +1207,8 @@ func TestValidateDesyncNewModes(t *testing.T) {
 	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "cdn.example.com"}); err == nil {
 		t.Fatal("a non-IPv4 FakeIP must fail")
 	}
-	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "2a06:98c1:3101::6812:202f"}); err == nil {
-		t.Fatal("an IPv6 FakeIP must fail (the packet builders write IPv4 headers)")
+	if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "fakeip", FakeIP: "2a06:98c1:3101::6812:202f"}); err != nil {
+		t.Fatalf("an IPv6 FakeIP must be accepted (the packet builders handle both families): %v", err)
 	}
 	for _, n := range []int{2, 3, 16} {
 		if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: "split", Split: n}); err != nil {
@@ -1860,9 +1857,9 @@ func TestDesyncAnnounceAfterHandshakeFires(t *testing.T) {
 			k := testClientKey()
 			const isn, srvSeq = uint32(1000), uint32(500000)
 			// the whole handshake passes the sniffer first; the final ACK carries a timestamp option
-			tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
-			tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
-			tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+			tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+			tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+			tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
 			if tr.fired() != 0 || sent.n() != 0 {
 				t.Fatal("fired for a connection nobody announced")
 			}
@@ -1891,7 +1888,7 @@ func TestDesyncAnnounceWithoutSynAckWaits(t *testing.T) {
 	tr, sent := desyncTestTracker("seq", 0)
 	defer tr.close()
 	k := testClientKey()
-	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1000, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1000, 0, testFlagSYN, nil, 64))
 	ch := tr.announce(k, 1000, true)
 	select {
 	case <-ch:
@@ -1900,5 +1897,251 @@ func TestDesyncAnnounceWithoutSynAckWaits(t *testing.T) {
 	}
 	if sent.n() != 0 {
 		t.Fatal("sent a fake without an ack to anchor it")
+	}
+}
+
+// ---------------------------------------------------------------- IPv6 parity
+
+// testIP6 parses a colon-form address into an ipAddr.
+func testIP6(s string) ipAddr {
+	a, _ := ipAddrOf(net.ParseIP(s))
+	return a
+}
+
+// desyncTestPkt6 builds a minimal IPv6+TCP test packet (40-byte fixed header, TCP directly as next header, no
+// extension headers), the v6 twin of desyncTestPkt.
+func desyncTestPkt6(src, dst ipAddr, sport, dport uint16, seq, ack uint32, flags byte, payload []byte, hopLimit int) []byte {
+	pkt := make([]byte, 40+20+len(payload))
+	pkt[0] = 0x60
+	binary.BigEndian.PutUint16(pkt[4:], uint16(20+len(payload)))
+	pkt[6] = 6 // next header: TCP
+	pkt[7] = byte(hopLimit)
+	copy(pkt[8:24], src[:])
+	copy(pkt[24:40], dst[:])
+	th := pkt[40:]
+	binary.BigEndian.PutUint16(th[0:], sport)
+	binary.BigEndian.PutUint16(th[2:], dport)
+	binary.BigEndian.PutUint32(th[4:], seq)
+	binary.BigEndian.PutUint32(th[8:], ack)
+	th[12] = 0x50
+	th[13] = flags
+	binary.BigEndian.PutUint16(th[14:], 0xffff)
+	copy(th[20:], payload)
+	binary.BigEndian.PutUint16(th[16:], tcpChecksum(pkt[40:], src.bytes(), dst.bytes()))
+	return pkt
+}
+
+func TestIPAddrFamily(t *testing.T) {
+	v4 := testIP4("104.16.0.1")
+	if !v4.is4() {
+		t.Fatal("v4-mapped address not detected as IPv4")
+	}
+	if got := v4.bytes(); len(got) != 4 || !bytes.Equal(got, []byte{104, 16, 0, 1}) {
+		t.Fatalf("v4 bytes() = % x", got)
+	}
+	v6 := testIP6("2606:4700::6810:1")
+	if v6.is4() {
+		t.Fatal("a real IPv6 address detected as IPv4")
+	}
+	if got := v6.bytes(); len(got) != 16 {
+		t.Fatalf("v6 bytes() length %d, want 16", len(got))
+	}
+	if _, ok := ipAddrOf(nil); ok {
+		t.Fatal("ipAddrOf(nil) reported ok")
+	}
+}
+
+// TestDesyncIPv6Handshake runs the same handshake-and-fire path as TestDesyncEarlyFiresBeforeData, over IPv6:
+// the key, the checksum pseudo-header and the packet's IP header must all follow the v6 family.
+func TestDesyncIPv6Handshake(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := desyncKey{testIP6("2001:db8::2"), testIP6("2001:db8::1"), 5000, 443}
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	ch := tr.announce(k, isn+1, true)
+	tr.handleIP(desyncTestPkt6(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt6(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt6(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake never fired over IPv6")
+	}
+	if sent.n() != 1 {
+		t.Fatalf("want 1 fake, got %d", sent.n())
+	}
+	pkt := sent.at(0)
+	if pkt[0]>>4 != 6 {
+		t.Fatalf("fake IP version %d, want 6", pkt[0]>>4)
+	}
+	if len(pkt) != 40+20+len(tr.hello) {
+		t.Fatalf("fake length %d, want %d (40 B IPv6 header)", len(pkt), 40+20+len(tr.hello))
+	}
+	if !bytes.Equal(pkt[8:24], k.srcIP[:]) || !bytes.Equal(pkt[24:40], k.dstIP[:]) {
+		t.Fatal("fake carries the wrong IPv6 addresses")
+	}
+	if got := binary.BigEndian.Uint32(pkt[44:]); got != isn+1-uint32(len(tr.hello)) {
+		t.Fatalf("fake seq %d, want %d (below stream start)", got, isn+1-uint32(len(tr.hello)))
+	}
+	stored := binary.BigEndian.Uint16(pkt[40+16:])
+	binary.BigEndian.PutUint16(pkt[40+16:], 0)
+	if good := tcpChecksum(pkt[40:], k.srcIP.bytes(), k.dstIP.bytes()); good != stored {
+		t.Fatalf("fake IPv6 TCP checksum %x, want %x", stored, good)
+	}
+}
+
+// fakeip mode's destination must match the connection's own address family: a v6 flow gets defaultFakeIP6 (or a
+// configured v6 -fake-ip), never the v4 default.
+func TestDesyncFakeIPUsesMatchingFamily(t *testing.T) {
+	tr, sent := desyncTestTrackerCfg(DesyncConfig{SNI: "mci.ir", Mode: "fakeip"}) // no -fake-ip: defaults
+	defer tr.close()
+	k := desyncKey{testIP6("2001:db8::2"), testIP6("2001:db8::1"), 5000, 443}
+	ch := tr.announce(k, 1001, true)
+	tr.handleIP(desyncTestPkt6(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1000, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt6(k.dstIP, k.srcIP, k.dstPt, k.srcPt, 500000, 1001, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt6(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1001, 500001, testFlagACK, nil, 64))
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fakeip fake never fired over IPv6")
+	}
+	if sent.n() != 2 {
+		t.Fatalf("fakeip sent %d packets, want 2 (SYN + ClientHello)", sent.n())
+	}
+	for i := 0; i < sent.n(); i++ {
+		pkt := sent.at(i)
+		if pkt[0]>>4 != 6 {
+			t.Fatalf("packet %d IP version %d, want 6 (the connection's family)", i, pkt[0]>>4)
+		}
+		if !bytes.Equal(pkt[24:40], defaultFakeIP6[:]) {
+			t.Fatalf("packet %d dst % x, want the default IPv6 CDN edge % x", i, pkt[24:40], defaultFakeIP6)
+		}
+	}
+}
+
+// An explicit v4 -fake-ip must not be sent to a v6 connection (there is no address to put in the packet): fakeip
+// mode falls back to the v6 default instead of mis-addressing the fake.
+func TestDesyncFakeIPMismatchedFamilyFallsBack(t *testing.T) {
+	tr, sent := desyncTestTrackerCfg(DesyncConfig{SNI: "mci.ir", Mode: "fakeip", FakeIP: "104.16.0.1"})
+	defer tr.close()
+	k := desyncKey{testIP6("2001:db8::2"), testIP6("2001:db8::1"), 5000, 443}
+	tr.announce(k, 1001, true)
+	tr.handleIP(desyncTestPkt6(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1000, 0, testFlagSYN, nil, 64))
+	tr.handleIP(desyncTestPkt6(k.dstIP, k.srcIP, k.dstPt, k.srcPt, 500000, 1001, testFlagSYN|testFlagACK, nil, 52))
+	tr.handleIP(desyncTestPkt6(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1001, 500001, testFlagACK, nil, 64))
+	if sent.n() != 2 {
+		t.Fatalf("sent %d packets, want 2", sent.n())
+	}
+	if !bytes.Equal(sent.at(0)[24:40], defaultFakeIP6[:]) {
+		t.Fatalf("dst % x, want the v6 default (the configured -fake-ip is v4, wrong family)", sent.at(0)[24:40])
+	}
+}
+
+// parseEthIP must also recognise IPv6 inside every framing it already handles for IPv4.
+func TestDesyncParseEthIPv6(t *testing.T) {
+	rawIP6 := make([]byte, 40)
+	rawIP6[0] = 0x60
+	rawIP6[6] = 6 // next header TCP, so it is not confused with a non-TCP IPv6 packet
+	if got := parseEthIP(rawIP6); got == nil || len(got) != 40 {
+		t.Fatal("raw IPv6 packet rejected")
+	}
+
+	eth6 := make([]byte, 14+40)
+	binary.BigEndian.PutUint16(eth6[12:], 0x86dd)
+	eth6[14] = 0x60
+	if got := parseEthIP(eth6); got == nil || len(got) != 40 {
+		t.Fatal("Ethernet-framed IPv6 packet rejected")
+	}
+
+	vlan6 := make([]byte, 18+40)
+	binary.BigEndian.PutUint16(vlan6[12:], 0x8100)
+	binary.BigEndian.PutUint16(vlan6[16:], 0x86dd)
+	vlan6[18] = 0x60
+	if got := parseEthIP(vlan6); got == nil || len(got) != 40 {
+		t.Fatal("VLAN-tagged IPv6 packet rejected")
+	}
+
+	sll6 := make([]byte, 16+40)
+	binary.BigEndian.PutUint16(sll6[14:], 0x86dd)
+	sll6[16] = 0x60
+	if got := parseEthIP(sll6); got == nil || len(got) != 40 {
+		t.Fatal("SLL-framed IPv6 packet rejected")
+	}
+}
+
+// verifyV6TCP checks an IPv6+TCP packet the way a receiver does, with the pseudo header assembled by hand (not by
+// tcpChecksum): the ones' complement sum over pseudo header and segment, stored checksum included, must be 0xffff,
+// which csum reports as 0.
+func verifyV6TCP(pkt []byte) bool {
+	ph := make([]byte, 0, 40+len(pkt))
+	ph = append(ph, pkt[8:24]...)  // source
+	ph = append(ph, pkt[24:40]...) // destination
+	ph = append(ph, 0, 0, byte((len(pkt)-40)>>8), byte(len(pkt)-40)) // upper-layer length
+	ph = append(ph, 0, 0, 0, 6)                                        // zeros, next header TCP
+	return csum(append(ph, pkt[40:]...)) == 0
+}
+
+// Every IPv6 packet shape the builders emit must carry a TCP checksum a real receiver accepts.
+func TestFakePacketIPv6Checksum(t *testing.T) {
+	k := desyncKey{testIP6("2001:db8::2"), testIP6("2001:db8::1"), 5000, 443}
+	hello := FakeClientHello("mci.ir")
+	for name, pkt := range map[string][]byte{
+		"hello":      fakePacket(k, 1000, 2000, 64, hello),
+		"hello+opts": fakePacketWithOptions(k, 1000, 2000, 64, hello, []byte{1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2}),
+		"empty":      fakePacket(k, 1000, 2000, 64, nil),
+		"syn":        fakeFlagPacket(k, 1000, 0, 64, 0x02),
+		"rst":        fakeRSTPacket(k, 1000, 2000, 64),
+	} {
+		if pkt[0]>>4 != 6 {
+			t.Fatalf("%s: not an IPv6 packet", name)
+		}
+		if got := int(binary.BigEndian.Uint16(pkt[4:])); got != len(pkt)-40 {
+			t.Fatalf("%s: IPv6 payload length %d, want %d", name, got, len(pkt)-40)
+		}
+		if !verifyV6TCP(pkt) {
+			t.Fatalf("%s: TCP checksum does not verify against the IPv6 pseudo header", name)
+		}
+	}
+	// the IPv4 path is unchanged: same property, its own pseudo header
+	k4 := testClientKey()
+	p4 := fakePacket(k4, 1000, 2000, 64, hello)
+	ph := append(append(append([]byte{}, p4[12:20]...), 0, 6), byte((len(p4)-20)>>8), byte(len(p4)-20))
+	if csum(append(ph, p4[20:]...)) != 0 {
+		t.Fatal("IPv4 TCP checksum no longer verifies")
+	}
+}
+
+// damageChecksum must break the TCP checksum and nothing else: a write at the IPv4 offset into an IPv6 packet
+// corrupted the destination address (live, 2026-10-23: ::1 became ::fffe:1 and the marker never reached the peer).
+func TestDamageChecksumIPv6TouchesOnlyTheChecksum(t *testing.T) {
+	for name, k := range map[string]desyncKey{
+		"v6": {testIP6("2001:db8::2"), testIP6("2001:db8::1"), 5000, 443},
+		"v4": testClientKey(),
+	} {
+		pkt := fakePacket(k, 1000, 2000, 64, FakeClientHello("mci.ir"))
+		orig := append([]byte(nil), pkt...)
+		damageChecksum(pkt)
+		at := ipHdrLen(pkt) + 16
+		for i := range pkt {
+			if i != at && i != at+1 && pkt[i] != orig[i] {
+				t.Fatalf("%s: byte %d changed, but only the checksum field (%d..%d) may", name, i, at, at+1)
+			}
+		}
+		if binary.BigEndian.Uint16(pkt[at:]) == binary.BigEndian.Uint16(orig[at:]) {
+			t.Fatalf("%s: the checksum was not changed", name)
+		}
+		if name == "v6" && verifyV6TCP(pkt) {
+			t.Fatal("damaged IPv6 packet still verifies")
+		}
+	}
+}
+
+// The default fakeip destination for IPv6 is the documented 2606:4700::6810:1.
+func TestDefaultFakeIP6(t *testing.T) {
+	if want := testIP6("2606:4700::6810:1"); defaultFakeIP6 != want {
+		t.Fatalf("defaultFakeIP6 = %x, want 2606:4700::6810:1 (%x)", defaultFakeIP6, want)
+	}
+	if want := testIP4("104.16.0.1"); defaultFakeIP != want {
+		t.Fatalf("defaultFakeIP = %x, want 104.16.0.1", defaultFakeIP)
 	}
 }

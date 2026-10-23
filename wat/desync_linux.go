@@ -15,8 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Raw injection of the fake ClientHello (see desync.go): one AF_PACKET sniffer watches every IPv4 TCP packet of
-// the host and advances the portable tracker. Requires CAP_NET_RAW, like the ICMP carrier.
+// Raw injection of the fake ClientHello (see desync.go): one AF_PACKET sniffer watches every IPv4 and IPv6 TCP
+// packet of the host and advances the portable tracker. Requires CAP_NET_RAW, like the ICMP carrier.
 //
 // Wrap announces each pool connection the moment dial returns. The stream start is probed off the socket with
 // TCP_REPAIR + TCP_QUEUE_SEQ (the only kernel interface that reports a socket's sequence numbers; TCP_INFO does
@@ -76,12 +76,10 @@ func NewDesync(cfg DesyncConfig, peer string) (*Desync, error) {
 		return nil, err
 	}
 	ipStr, _ := desyncPeerHostPort(peer)
-	ip := net.ParseIP(ipStr)
-	if ip == nil || ip.To4() == nil {
-		return nil, errors.New("wat: desync needs an IPv4 -peer")
+	p, ok := ipAddrOf(net.ParseIP(ipStr))
+	if !ok {
+		return nil, errors.New("wat: desync needs an IP -peer")
 	}
-	var p [4]byte
-	copy(p[:], ip.To4())
 	inj, err := newDesyncInjector(cfg, p)
 	if err != nil {
 		return nil, err
@@ -94,8 +92,8 @@ func NewDesync(cfg DesyncConfig, peer string) (*Desync, error) {
 func (d *Desync) PeerTTL() int { return int(d.inj.tr.peerTTL()) }
 
 // Wrap announces the connection to the sniffer, waits for the fake to fire, and returns the connection unchanged.
-// A connection that is not a plain IPv4 TCP connection passes through unwrapped; a handshake the sniffer never
-// sees (offload paths) passes through after 2 s.
+// A connection that is not a plain TCP connection passes through unwrapped; a handshake the sniffer never
+// sees (offload paths) passes through after desyncWrapTimeout.
 func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers hand their hook an already-handshaked *tls.Conn (or a WS/HTTP framing wrapper);
 	// unwrap to the socket underneath, like newPoolConn does (rawTCP)
 	tc := rawTCP(c)
@@ -104,12 +102,14 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 	}
 	la, ok := tc.LocalAddr().(*net.TCPAddr)
 	ra, ok2 := tc.RemoteAddr().(*net.TCPAddr)
-	if !ok || !ok2 || la.IP.To4() == nil || ra.IP.To4() == nil {
+	if !ok || !ok2 {
 		return c, nil
 	}
-	var s, r [4]byte
-	copy(s[:], la.IP.To4())
-	copy(r[:], ra.IP.To4())
+	s, sok := ipAddrOf(la.IP)
+	r, rok := ipAddrOf(ra.IP)
+	if !sok || !rok {
+		return c, nil
+	}
 	k := desyncKey{s, r, uint16(la.Port), uint16(ra.Port)}
 	// The probe reports SND.NXT = the next unsent sequence number. The tracker's announce stores the ISN (the
 	// stream start minus one): the early fire compares segment seq against synSeq+1, and the NAT follow rebuilds
@@ -142,7 +142,7 @@ type desyncInjector struct {
 }
 
 // newDesyncInjector starts the sniffer. peerIP is the pool's server IP.
-func newDesyncInjector(cfg DesyncConfig, peerIP [4]byte) (*desyncInjector, error) {
+func newDesyncInjector(cfg DesyncConfig, peerIP ipAddr) (*desyncInjector, error) {
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_NONBLOCK, int(htons(unix.ETH_P_ALL)))
 	if err != nil {
 		return nil, fmt.Errorf("wat: -fake-sni needs CAP_NET_RAW: %w", err)
@@ -189,14 +189,15 @@ func (d *desyncInjector) loop() {
 			}
 			return
 		}
-		if ip := parseEthIPv4(buf[:n]); ip != nil {
-			d.tr.handleIPv4(ip)
+		if ip := parseEthIP(buf[:n]); ip != nil {
+			d.tr.handleIP(ip)
 		}
 	}
 }
 
-// sendRaw writes one crafted IPv4 packet through a raw IP socket (IP_HDRINCL, the kernel fills the checksum).
-// One socket per fire: a fire happens once per pool connection, orders of magnitude too rare to matter.
+// sendRaw writes one crafted IPv4 or IPv6 packet through a raw IP socket (HDRINCL, the kernel fills the IPv4
+// checksum; IPv6 has none to fill). One socket per fire: a fire happens once per pool connection, orders of
+// magnitude too rare to matter.
 func (d *desyncInjector) sendRaw(pkt []byte) {
 	sendRawPacket(pkt)
 }
@@ -210,9 +211,13 @@ func sendRawPacket(pkt []byte) {
 	if len(pkt) < 24 {
 		return
 	}
+	if pkt[0]>>4 == 6 {
+		sendRawPacket6(pkt)
+		return
+	}
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
 	if err != nil {
-		rawSendFail(1)
+		rawSendFail(1, err)
 		return
 	}
 	defer unix.Close(fd)
@@ -222,19 +227,47 @@ func sendRawPacket(pkt []byte) {
 		if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{src[0], src[1], src[2], src[3]}}); err != nil {
 			// a re-homed host can lose the old source IP: send unbound (the kernel picks one)
 			// instead of dropping the fire
-			note("desync-bind", "wat: fake-sni could not bind the old source IP (%v); sending unbound", err)
+			note("wat: fake-sni could not bind the old source IP (%v); sending unbound", err)
 		}
 	}
 	dst := pkt[16:20]
 	if err := unix.Sendto(fd, pkt, 0, &unix.SockaddrInet4{Port: int(binary.BigEndian.Uint16(pkt[22:])), Addr: [4]byte{dst[0], dst[1], dst[2], dst[3]}}); err != nil {
-		rawSendFail(1)
+		rawSendFail(1, err)
+	}
+}
+
+// sendRawPacket6 is sendRawPacket's IPv6 half: IPV6_HDRINCL (the IPv6 analogue of IP_HDRINCL — Linux still fills
+// the TCP checksum's pseudo-header contribution itself only for IPv4; fakePacketWithOptions/fakeFlagPacket compute
+// the IPv6 TCP checksum themselves via tcpChecksum, so nothing is left for the kernel to add here).
+func sendRawPacket6(pkt []byte) {
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_RAW)
+	if err != nil {
+		rawSendFail(1, err)
+		return
+	}
+	defer unix.Close(fd)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_HDRINCL, 1)
+	var src [16]byte
+	copy(src[:], pkt[8:24])
+	if src != ([16]byte{}) {
+		if err := unix.Bind(fd, &unix.SockaddrInet6{Addr: src}); err != nil {
+			note("wat: fake-sni could not bind the old source IP (%v); sending unbound", err)
+		}
+	}
+	var dst [16]byte
+	copy(dst[:], pkt[24:40])
+	// Port 0, unlike the IPv4 socket: on a raw IPv6 socket sin6_port is read as the protocol number (the kernel
+	// answers EINVAL above 255), and 0 means "the socket's own protocol"; the header's next-header field (TCP) is
+	// what actually goes out because of IPV6_HDRINCL.
+	if err := unix.Sendto(fd, pkt, 0, &unix.SockaddrInet6{Addr: dst}); err != nil {
+		rawSendFail(1, err)
 	}
 }
 
 // rawSendFail counts failed fires and complains once per process: raw egress can be filtered while the
 // AF_PACKET sniffer still works, and that is exactly the environment where silence is dangerous.
-func rawSendFail(n uint64) {
+func rawSendFail(n uint64, err error) {
 	if rawSendFails.Add(n) == n { // first failure
-		note("desync-send", "wat: fake-sni raw send failed (%v so far); the real SNI may be going out unprotected", n)
+		note("wat: fake-sni raw send failed (%v); the real SNI may be going out unprotected (counted as raw_send_fails)", err)
 	}
 }

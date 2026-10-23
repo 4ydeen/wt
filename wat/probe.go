@@ -61,9 +61,8 @@ const probeTimeout = 1500 * time.Millisecond
 func ProbeFakeMode(cfg DesyncConfig, peer string, logf func(string, ...any)) string {
 	mode := "seq"
 	ipStr, port := desyncPeerHostPort(peer)
-	ip := net.ParseIP(ipStr)
-	if ip == nil || ip.To4() == nil || port == "" {
-		note("probe: need an IPv4 host:port peer, keeping fake-mode seq")
+	if net.ParseIP(ipStr) == nil || port == "" {
+		note("probe: need an IP host:port peer, keeping fake-mode seq")
 		return mode
 	}
 	var d *Desync
@@ -84,8 +83,16 @@ func ProbeFakeMode(cfg DesyncConfig, peer string, logf func(string, ...any)) str
 	return mode
 }
 
-// note is a package-level log line the tests can silence; it keeps probe.go free of a logf thread.
+// note is the package-level log line of the fake-SNI layer (raw-send failures, the probe's fallbacks); it keeps
+// probe.go free of a logf thread. It is silent until SetNote wires it, which cmd/wattun does at startup.
 var note = func(format string, args ...any) {}
+
+// SetNote routes the fake-SNI layer's one-time warnings to logf. Call it once, before NewDesync.
+func SetNote(logf func(format string, args ...any)) {
+	if logf != nil {
+		note = logf
+	}
+}
 
 // RawSendFails is how many fake-SNI fires could not be injected (raw socket open/bind/send failure).
 // A rising counter with healthy tunnels means the real SNI is going out unprotected: switch carrier.
@@ -166,7 +173,12 @@ func (p *filterProbe) connAlive(c *net.TCPConn) bool {
 func (p *filterProbe) sumProbe(c *net.TCPConn) bool {
 	la, ok1 := c.LocalAddr().(*net.TCPAddr)
 	ra, ok2 := c.RemoteAddr().(*net.TCPAddr)
-	if !ok1 || !ok2 || la.IP.To4() == nil || ra.IP.To4() == nil {
+	if !ok1 || !ok2 {
+		return true
+	}
+	s, sok := ipAddrOf(la.IP)
+	d, dok := ipAddrOf(ra.IP)
+	if !sok || !dok {
 		return true
 	}
 	snis := splitSNIs(p.cfg.SNI)
@@ -183,9 +195,6 @@ func (p *filterProbe) sumProbe(c *net.TCPConn) bool {
 	if !ok {
 		return true // unknown: cannot place the marker, treat sum as tolerated rather than guess
 	}
-	var s, d [4]byte
-	copy(s[:], la.IP.To4())
-	copy(d[:], ra.IP.To4())
 	k := desyncKey{s, d, uint16(la.Port), uint16(ra.Port)}
 	ttl := 64
 	if pt := p.d.PeerTTL(); pt > 0 { // the learned inbound TTL: the marker must mirror the production fire
@@ -202,8 +211,8 @@ func (p *filterProbe) sumProbe(c *net.TCPConn) bool {
 	return true
 }
 
-// sendRawProbe sends one crafted IPv4 packet through the same throwaway IPPROTO_RAW socket the injector
-// uses (IP_HDRINCL). Separate function so probe.go compiles on every OS with a stub elsewhere.
+// sendRawProbe sends one crafted IPv4 or IPv6 packet through the same throwaway IPPROTO_RAW socket the injector
+// uses (HDRINCL). Separate function so probe.go compiles on every OS with a stub elsewhere.
 func sendRawProbe(pkt []byte) { sendRawPacket(pkt) }
 
 // isnOf: the probe's one Linux socket dependency beyond NewDesync. On other OSes the probe never gets
