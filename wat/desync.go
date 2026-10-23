@@ -611,6 +611,7 @@ type desyncTracker struct {
 	mu        sync.Mutex
 	conns     map[desyncKey]*desyncConn
 	wait      map[desyncKey]chan struct{} // closed by fire, waited on by Wrap
+	recent    map[desyncKey]*desyncHS     // handshakes toward the peer seen before Wrap announced them (see announce)
 	peerTTLv  uint8
 	firedN    int
 	miss      int
@@ -628,6 +629,32 @@ type desyncConn struct {
 	at        time.Time
 }
 
+// desyncHS is what the sniffer saw of one handshake toward the peer before anyone announced it.
+type desyncHS struct {
+	isn      uint32 // our SYN's seq
+	srvSeq   uint32 // the SYN-ACK's seq
+	srvAck   uint32 // the SYN-ACK's ack field (our ISN+1 as the server sees it, so a NAT rewrite is followed)
+	haveSyn  bool
+	haveSA   bool
+	opts     []byte // kernel TCP options of our first non-SYN segment (timestamps)
+	at       time.Time
+}
+
+// hopTTL turns the TTL a packet arrived with into the TTL that makes our packet die one hop short of that peer:
+// the sender started from the smallest common initial TTL at or above what arrived (32, 64, 128 or 255), so the
+// path length is the difference. (Using the arrived TTL minus one, as 2.7.0-2.10.7 did, sends a packet that still
+// reaches the server.)
+func hopTTL(arrived uint8) int {
+	init := 255
+	for _, i := range []int{32, 64, 128} {
+		if int(arrived) <= i {
+			init = i
+			break
+		}
+	}
+	return max(init-int(arrived)-1, 1)
+}
+
 // newDesyncTracker prepares the state machine for one peer IP. Only SNIs that produce a hello are
 // kept; pickHello rebuilds the hello per fire from these.
 func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
@@ -643,7 +670,7 @@ func newDesyncTracker(cfg DesyncConfig, peerIP [4]byte) *desyncTracker {
 		}
 	}
 	return &desyncTracker{cfg: cfg, peerIP: peerIP, fakeIP: desyncFakeIP(cfg), hello: hello, snis: good,
-		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}}
+		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}, recent: map[desyncKey]*desyncHS{}}
 }
 
 // pickHello builds a FRESH FakeClientHello per fire (round-robining the SNIs when several are
@@ -683,8 +710,44 @@ func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struc
 		}
 	}
 	t.wait[k] = ch
-	t.conns[k] = &desyncConn{synSeq: isn, isnKnown: known, at: now}
+	c := &desyncConn{synSeq: isn, isnKnown: known, at: now}
+	t.conns[k] = c
+	// Wrap runs after the kernel handshake, and it blocks the first write until the fake is out, so the final ACK
+	// has already passed the sniffer and no further outbound packet will come to trigger the fire (it used to wait
+	// for Wrap's 2 s timeout, or for the stray ACK that leaving TCP_REPAIR happens to emit). Fire from what the
+	// sniffer remembered instead.
+	if m := t.recent[k]; known && m != nil && m.haveSA {
+		delete(t.recent, k)
+		c.synAckSeq, c.synAckAck, c.tcpOpts = m.srvSeq, m.srvAck, m.opts
+		if sumMirrorMode(t.cfg.Mode) {
+			c.sumSeq = m.srvAck
+		}
+		t.fireLocked(k, c, m.srvAck, m.srvSeq+1)
+	}
 	return ch
+}
+
+// noteHandshake remembers the packets of handshakes toward the peer that nobody announced (yet); mu held.
+func (t *desyncTracker) noteHandshake(out, in desyncKey, d, s [4]byte, th []byte, off int, seq, ackv uint32, syn, ackf bool, payload int, now time.Time) {
+	switch {
+	case d == t.peerIP && syn && !ackf && payload == 0:
+		if len(t.recent) > 64 {
+			for k, m := range t.recent {
+				if now.Sub(m.at) > 20*time.Second {
+					delete(t.recent, k)
+				}
+			}
+		}
+		t.recent[out] = &desyncHS{isn: seq, haveSyn: true, at: now}
+	case s == t.peerIP && syn && ackf && payload == 0:
+		if m := t.recent[in]; m != nil && m.haveSyn {
+			m.srvSeq, m.srvAck, m.haveSA = seq, ackv, true
+		}
+	case d == t.peerIP && !syn && off > 20:
+		if m := t.recent[out]; m != nil && len(m.opts) == 0 {
+			m.opts = append([]byte(nil), th[20:off]...)
+		}
+	}
 }
 
 // abandonLocked drops a connection (caller holds t.mu).
@@ -767,6 +830,9 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 	if syn && ackf && payload == 0 && !rst && s == t.peerIP && t.peerTTLv == 0 {
 		t.peerTTLv = ip[8]
 	}
+	if !rst && (t.conns[out] == nil && t.conns[in] == nil) {
+		t.noteHandshake(out, in, d, s, th, off, seq, ackv, syn, ackf, payload, now)
+	}
 	// our outgoing SYN on a tracked key: (re)learn the ISN from the wire
 	if c := t.conns[out]; c != nil && syn && !ackf && payload == 0 && !rst {
 		if !c.isnKnown || seq != c.synSeq {
@@ -784,6 +850,8 @@ func (t *desyncTracker) handleIPv4(ip []byte) {
 		return
 	}
 	if rst {
+		delete(t.recent, out)
+		delete(t.recent, in)
 		if t.conns[out] != nil {
 			t.abandonLocked(out)
 		}
@@ -830,8 +898,8 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 	if t.cfg.Mode == "ttl" {
 		ttl = t.cfg.TTL
 		if ttl <= 0 { // auto: one hop less than the distance the server's packets travel
-			if p := int(t.peerTTLv); p > 1 {
-				ttl = p - 1
+			if t.peerTTLv > 0 {
+				ttl = hopTTL(t.peerTTLv)
 			} else {
 				t.miss++
 				if !t.missNoted {

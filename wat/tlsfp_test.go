@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -795,4 +796,49 @@ func TestSmallClientHello(t *testing.T) {
 		t.Fatalf("handshake with the small hello: %v", err)
 	}
 	c.Close()
+}
+// -tls-small-ch must shrink the browser presets too: they offer X25519MLKEM768, which pushes the hello past 1 KB.
+func TestSmallClientHelloUnderFingerprint(t *testing.T) {
+	helloLen := func(fp string, noPQ bool) int {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		got := make(chan int, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				got <- -1
+				return
+			}
+			defer c.Close()
+			var h [5]byte
+			if _, err := io.ReadFull(c, h[:]); err != nil {
+				got <- -1
+				return
+			}
+			got <- 5 + int(binary.BigEndian.Uint16(h[3:]))
+		}()
+		e, err := newTLSEngine(TLSClientOptions{Fingerprint: fp, NoPQ: noPQ}, "http/1.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		e.handshakeUTLS(ctx, raw, "example.com", nil) // fails: the listener only reads the hello
+		raw.Close()
+		return <-got
+	}
+	for _, fp := range []string{"chrome", "firefox", "edge"} {
+		big, small := helloLen(fp, false), helloLen(fp, true)
+		t.Logf("%s: hello %d B, with NoPQ %d B", fp, big, small)
+		if small <= 0 || small > 700 || small > big {
+			t.Fatalf("%s: NoPQ hello is %d B (default %d B), want <= 700 and not larger", fp, small, big)
+		}
+	}
 }

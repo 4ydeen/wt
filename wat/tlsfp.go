@@ -339,6 +339,9 @@ func (e *tlsEngine) handshakeUTLS(ctx context.Context, conn net.Conn, sni string
 	if err != nil {
 		return nil, false, err
 	}
+	if e.o.NoPQ { // -tls-small-ch must hold under -fp too: the browser presets offer X25519MLKEM768, ~1.2 KB of key share
+		stripPQ(&spec)
+	}
 	if e.alpn != "" {
 		protos := []string{e.alpn}
 		if e.alpn == "h2" {
@@ -368,6 +371,35 @@ func (e *tlsEngine) handshakeUTLS(ctx context.Context, conn net.Conn, sni string
 		return nil, false, err
 	}
 	return uc, st.ECHAccepted, nil
+}
+
+// stripPQ removes the post-quantum hybrid groups (and their key shares) from a browser preset, so the hello stays
+// classical like the stdlib path of -tls-small-ch. The padding extension is left alone: it only fills a short hello up
+// to 512 bytes.
+func stripPQ(spec *utls.ClientHelloSpec) {
+	pq := func(c utls.CurveID) bool {
+		return c == utls.X25519MLKEM768 || c == utls.X25519Kyber768Draft00 || c == utls.X25519Kyber768Draft00Old
+	}
+	for _, x := range spec.Extensions {
+		switch ext := x.(type) {
+		case *utls.SupportedCurvesExtension:
+			keep := ext.Curves[:0:0]
+			for _, c := range ext.Curves {
+				if !pq(c) {
+					keep = append(keep, c)
+				}
+			}
+			ext.Curves = keep
+		case *utls.KeyShareExtension:
+			keep := ext.KeyShares[:0:0]
+			for _, ks := range ext.KeyShares {
+				if !pq(ks.Group) {
+					keep = append(keep, ks)
+				}
+			}
+			ext.KeyShares = keep
+		}
+	}
 }
 
 // ---------------------------------------------------------------- peers

@@ -459,8 +459,8 @@ func TestDesyncTTLCalibration(t *testing.T) {
 	if sent.n() != 1 {
 		t.Fatalf("want 1 fake, got %d", sent.n())
 	}
-	if got := sent.at(0)[8]; got != 51 {
-		t.Fatalf("calibrated ttl %d, want 51 (peer TTL 52 - 1)", got)
+	if got := sent.at(0)[8]; got != 11 {
+		t.Fatalf("calibrated ttl %d, want 11 (SYN-ACK arrived with 52: 64-52 = 12 hops, one short)", got)
 	}
 }
 
@@ -477,8 +477,8 @@ func TestDesyncTTLCalibratedBeforeHandshake(t *testing.T) {
 	if tr.fired() != 1 {
 		t.Fatal("fake did not fire with pre-calibrated TTL")
 	}
-	if got := sent.at(0)[8]; got != 59 {
-		t.Fatalf("ttl %d, want 59", got)
+	if got := sent.at(0)[8]; got != 3 {
+		t.Fatalf("ttl %d, want 3 (arrived with 60: 4 hops, one short)", got)
 	}
 }
 
@@ -1836,5 +1836,69 @@ func TestDesyncExistingModesFireUnchangedBytes(t *testing.T) {
 	damageChecksum(wantRST)
 	if !bytes.Equal(rstPkt, wantRST) {
 		t.Fatal("rst mode fire bytes changed")
+	}
+}
+
+func TestHopTTL(t *testing.T) {
+	for _, c := range []struct {
+		arrived uint8
+		want    int
+	}{{49, 14}, {52, 11}, {60, 3}, {64, 1}, {63, 1}, {30, 1}, {120, 7}, {118, 9}, {250, 4}, {1, 30}} {
+		if got := hopTTL(c.arrived); got != c.want {
+			t.Errorf("hopTTL(%d) = %d, want %d", c.arrived, got, c.want)
+		}
+	}
+}
+
+// Wrap announces a connection whose handshake is long over, and it holds the first write back until the fake is out:
+// the fake must fire from what the sniffer remembered, for every mode, with nothing more arriving on the wire.
+func TestDesyncAnnounceAfterHandshakeFires(t *testing.T) {
+	for _, mode := range []string{"seq", "ttl", "sum", "seqsum", "rst", "split", "hlen0", "synrst", "ff", "all"} {
+		t.Run(mode, func(t *testing.T) {
+			tr, sent := desyncTestTracker(mode, 0)
+			defer tr.close()
+			k := testClientKey()
+			const isn, srvSeq = uint32(1000), uint32(500000)
+			// the whole handshake passes the sniffer first; the final ACK carries a timestamp option
+			tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn, 0, testFlagSYN, nil, 64))
+			tr.handleIPv4(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq, isn+1, testFlagSYN|testFlagACK, nil, 52))
+			tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, isn+1, srvSeq+1, testFlagACK, nil, 64))
+			if tr.fired() != 0 || sent.n() != 0 {
+				t.Fatal("fired for a connection nobody announced")
+			}
+			ch := tr.announce(k, isn, true) // SND.NXT-1, as Wrap computes it
+			select {
+			case <-ch:
+			default:
+				t.Fatalf("%s: announce after the handshake did not release Wrap", mode)
+			}
+			if tr.fired() != 1 || sent.n() == 0 {
+				t.Fatalf("%s: fired %d, sent %d", mode, tr.fired(), sent.n())
+			}
+			pkt := sent.at(0)
+			if mode == "seq" && binary.BigEndian.Uint32(pkt[28:]) != srvSeq+1 {
+				t.Fatalf("fake ack %d, want %d", binary.BigEndian.Uint32(pkt[28:]), srvSeq+1)
+			}
+			if mode == "ttl" && pkt[8] != 11 {
+				t.Fatalf("ttl %d, want 11", pkt[8])
+			}
+		})
+	}
+}
+
+// A handshake the sniffer only half saw (no SYN-ACK) stays pending as before; Wrap's timeout releases it.
+func TestDesyncAnnounceWithoutSynAckWaits(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	tr.handleIPv4(desyncTestPkt(k.srcIP, k.dstIP, k.srcPt, k.dstPt, 1000, 0, testFlagSYN, nil, 64))
+	ch := tr.announce(k, 1000, true)
+	select {
+	case <-ch:
+		t.Fatal("fired without a SYN-ACK on record")
+	default:
+	}
+	if sent.n() != 0 {
+		t.Fatal("sent a fake without an ack to anchor it")
 	}
 }

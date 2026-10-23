@@ -26,8 +26,9 @@ import (
 // desync.go). A 2 s timeout releases a Wrap whose handshake was never observed: the tunnel still works, it is
 // just unclassified.
 
-// desyncWrapTimeout bounds how long Wrap waits for the fake before giving up on classification.
-const desyncWrapTimeout = 2 * time.Second
+// desyncWrapTimeout bounds how long Wrap waits for the fake before giving up on classification. The fake normally
+// fires inside announce (the sniffer remembered the handshake), so this only covers a handshake it never saw.
+const desyncWrapTimeout = 500 * time.Millisecond
 
 // tcpStreamBase returns the socket's send-queue sequence number (SND.NXT) as the stream-start anchor for the
 // tracker. TCP_REPAIR freezes the socket's queues without touching its buffers; TCP_REPAIR_QUEUE selects the

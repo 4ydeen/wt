@@ -31,7 +31,7 @@ type TLSClientOptions struct {
 	DialHook    func(net.Conn) (net.Conn, error) // dial hook on the raw TCP socket before TLS handshake (fake-SNI)
 	LocalAddr   net.Addr                         // client local address for multi-homing / dual-WAN bonding
 	Frag        int                              // split the ClientHello into this many bytes per TCP segment (0 = off)
-	NoPQ        bool                             // skip the post-quantum hybrid key share, keeping the ClientHello small (2.10.4)
+	NoPQ        bool                             // skip the post-quantum hybrid key share, keeping the ClientHello small (2.10.4; also under -fp chrome|edge, 2.10.8)
 	Logf        func(string, ...any) // optional: one-time notes (ECH lookups, fallbacks)
 }
 
