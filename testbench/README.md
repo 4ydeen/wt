@@ -166,7 +166,7 @@ with `systemd-run --unit=wat-bench-{server,client} --collect`, and reads `/stats
 `curl` to the client's loopback metrics address. It never commits, pushes, or builds on a host.
 
 ```sh
-export SSH_KEY=$HOME/.ssh/id_ed25519 IRAN=185.84.158.163 KHAREJ=31.57.185.20 PSK='...'
+export SSH_KEY=$HOME/.ssh/id_ed25519 IRAN=192.0.2.10 KHAREJ=198.51.100.20 PSK='...'
 testbench/deploy.sh build
 testbench/deploy.sh server
 testbench/deploy.sh client seq

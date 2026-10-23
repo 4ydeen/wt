@@ -106,7 +106,7 @@ behaviour derived below; the two genuinely missing pieces are the true F&F recor
 
 ### 1.3 What the live path actually measured (REPORT.md)
 
-The 2026-10-22 path (Iran 185.84.158.163 → Kharej 31.57.185.20, AS51396) is **not** an MCI/Irancell mobile path:
+The 2026-10-22 path (Iran 192.0.2.10 → Kharej 198.51.100.20, AS51396) is **not** an MCI/Irancell mobile path:
 a flow-aware filter that drops unknown *payload* after a classification timeout, caps HTTP GET bodies at 14,480 B
 per connection, blocks POST bodies outright, and lets 1474 B hellos vanish while 250–512 B hellos pass
 (`REPORT.md` §3, §7–7c). Consequences for this brief:
@@ -118,7 +118,7 @@ per connection, blocks POST bodies outright, and lets 1474 B hellos vanish while
   reports full TCP reassembly in Iran; [bbs #640](https://github.com/net4people/bbs/issues/640) says fragmented
   tlshello stopped passing).
 - The MCI/Irancell recipes in §2 are **mobile-ISP** recipes from a different vantage point; treat them as
-  hypotheses for the next field test, not as facts about the 31.57.185.20 path.
+  hypotheses for the next field test, not as facts about the 198.51.100.20 path.
 
 ### 1.4 Gaps this brief targets
 

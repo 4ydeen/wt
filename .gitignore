@@ -12,3 +12,7 @@ bugs.md
 .acl-recovery/
 wattun-release-signing.pem
 wattun-release-signing.pub.pem
+REPORT.md
+.goshort/
+.mimocode/
+*.pcap

@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.10.2-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.10.9-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -28,7 +28,7 @@ carriers too since 2.7.0, with automatic TTL calibration, NAT-sequence follow, a
 validate sequence numbers (2.7.1), and both markers at once (`seqsum`, 2.8.0); then five more in 2.10.5: `split` cuts the fake hello across segments, `hlen0` is the F&F-style empty TLS record, `fakeip` aims the fake at a whitelisted CDN address (`fake-ip`), `synrst` clears flow tables harder and `all` fires three markers), plus optional `pool-rotate` churn
 so no single connection shows a months-stable lifetime (2.8.0; optional byte budget `pool-rotate-bytes`, 2.8.1).
 The filter can be probed and the marker mode picked automatically (`fake-mode: auto`, 2.9.0); `wattun blackout
-NAME [SNI]` turns the kit on with one command when a censor starts blocking. `tls-small-ch` (2.10.5) keeps the ClientHello at ~250 B (no post-quantum key share) for DPIs that drop large hellos, `ech: ladder` (2.9.0) fetches the
+NAME [SNI]` turns the kit on with one command when a censor starts blocking. `tls-small-ch` (2.10.4) keeps the ClientHello at ~250 B (no post-quantum key share) for DPIs that drop large hellos, `ech: ladder` (2.9.0) fetches the
 ECH config through the tunnel itself when every public DNS-over-HTTPS server is blocked, and `-governor` (2.9.0)
 learns an ICMP path's volume ceiling from its reroute signature.
 
@@ -92,14 +92,15 @@ Under load, the tunnel adds +0.25 % to the bytes your users move on `tcp` (16 KB
 
 [Idle and bandwidth details](docs/TECHNICAL.md#resource-usage-idle-ram-cpu-and-bandwidth)
 
-## Latest release: 2.10.2
+## Latest release: 2.10.9
 
-**A matrix tester now measures every anti-censor method against the live filter, and connection quality
-became self-healing.** `wattun-manager ac-matrix` walks fake-SNI modes, fingerprints and edge counts
-against the real link and applies the best one (`wattun-manager auto-retest` keeps it fresh), while the
-governor watches the rate ceiling and the TCP pools drop stalled connections before they can stall a
-session. Update both ends for the matrix and the X25519 forward secrecy it rides on; old and new
-versions still work together.
+**The first release since 2.5.1: forward secrecy on every session, signed downloads, the anti-censorship kit, and
+two bug fixes in the transport.** Old and new versions work together (tested both ways against 2.5.1), so you can
+update one server at a time; forward secrecy switches on once both ends run 2.10.0 or newer. Everything in the
+anti-censorship kit is client-side, so only the Iran server needs it. This release also fixes a data race in the
+receive path and a buffer-reuse bug in bonded tunnels, adds IPv6 support to `fake-sni`, applies `tls-small-ch`
+under `fp: chrome|edge` too, and adds `wattun boost` (kernel network tuning) and `wattun matrix NAME` (tries every
+anti-censorship combination from the Iran server and applies the best one).
 [Full release history](docs/TECHNICAL.md#release-history).
 
 ## Setup

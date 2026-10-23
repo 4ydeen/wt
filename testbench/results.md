@@ -190,7 +190,7 @@ split,www.example.com,smallhello,0.000,0.000,0,1
   reasoning and the data path, **not** the AF_PACKET sniffer/raw sender in `wat/desync_linux.go`, and not the
   ordering/timing of the real injected packets.
 - **The live Iranian path was not measured here.** `testbench/deploy.sh` is the script for that pair (Iran
-  `185.84.158.163` → Kharej `31.57.185.20`); it was written and syntax-checked but not executed (no SSH, no VPS
+  `192.0.2.10` → Kharej `198.51.100.20`); it was written and syntax-checked but not executed (no SSH, no VPS
   work from this bench). Its rows use `dpi_rule=live`; no profile is involved because there the real censor decides.
 - **ICMP carrier not covered** (needs Linux raw sockets/CAP_NET_RAW as well); this bench uses the `tcp` pool carrier
   so the fake-SNI trigger path is the one being classified.

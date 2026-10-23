@@ -21,8 +21,8 @@
 #
 # Env (the first five are required):
 #   SSH_KEY=~/.ssh/id_ed25519        private key path (expand it: sh does not expand ~ inside quotes)
-#   IRAN=185.84.158.163              client / Iran host
-#   KHAREJ=31.57.185.20              server / Kharej host
+#   IRAN=192.0.2.10              client / Iran host
+#   KHAREJ=198.51.100.20              server / Kharej host
 #   PSK=...                          shared key, both ends must match
 #   SNI=www.example.com              allowlisted SNI the fake ClientHello carries (default)
 # Optional:
@@ -40,8 +40,8 @@ ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 OUT=${OUT:-$HERE/out}
 
 SSH_KEY=${SSH_KEY:-}
-IRAN=${IRAN:-185.84.158.163}
-KHAREJ=${KHAREJ:-31.57.185.20}
+IRAN=${IRAN:?set IRAN=<iran host>}
+KHAREJ=${KHAREJ:?set KHAREJ=<kharej host>}
 PSK=${PSK:-}
 SNI=${SNI:-www.example.com}
 REMOTE_DIR=${REMOTE_DIR:-/root/wat-bench}
