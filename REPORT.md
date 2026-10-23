@@ -227,3 +227,26 @@ All of the following ran on the real Tehran→NL pair with 2.10.5 (both ends), t
 | Every fake-SNI mode on the direct path (`seq`, `hlen0`, `split`, `all`, `fakeip`, `synrst`, baseline) | all `alive:true`, `srtt` 85–95 ms, `bytes_in` freezes within seconds, speedtest `session closed` |
 
 **What that adds up to:** the marker type is not the limiter on this route — the flow survives the handshake and then loses its data channel in every configuration, with a per-flow budget of a few hundred bytes to a few hundred kilobytes. Stock clients pass only because they finish inside that budget. The engine's own ceiling, measured on the bench DPI that accepts the injected SNI, is 29–31 MB/s; this route never lets a flow get there.
+
+## 7g. Round 7 — 2.10.7 on the same pair (2026-10-23, 06:09–06:22 UTC)
+
+Build: `dist/wattun-linux-amd64` 2.10.7 (`15135545…`, `build.sh`, commit `2376d3a`: `ff` fake mode, the receive-key race fix, the bond buffer-reuse fix), installed on both ends. Before this round Iran was running a different 2.10.7 build (`cda9d917…`) with a `tls` client pointed at kharej:443, which was serving `wss` — a carrier mismatch, so its "no reply from the server since start" for ~8 h says nothing about the path.
+
+Kharej ran one server per carrier at once (tcp :4443, tls :8443, wss :443 behind Cloudflare, ws :80, icmp). Iran ran each client for ~80 s with a 60 s cooldown: stats at 10/20 s, `/speedtest` down 8 MB + up 4 MB, an SSH banner read through the tunnel.
+
+| Client config | Server saw a session | `bytes_in` (client, stream payload) | Speedtest | SSH banner |
+|---|---|---|---|---|
+| Loopback `udp` on kharej (control, no censor, 1 core for both ends) | yes | — | **24.8 MB/s down, 24.6 MB/s up** (50 MB, 8 streams) | — |
+| `tcp` :4443, 4 conns | yes, idle-closed after 56 s | 611 → 783, then frozen | `session closed` | none |
+| `tls` + `tls-small-ch`, SNI `auth.vercel.com` | yes, idle-closed after 50 s | 368, frozen; `alive:false` by 20 s | `tunnel is not connected` | none |
+| same + `fake-mode: ff` | yes, idle-closed after 50 s | 358, frozen; `alive:false` by 20 s | `tunnel is not connected` | none |
+| same + `fake-mode: seq` | yes | 364 → 448, then frozen | `session closed` | none |
+| `ws` :80, 4 conns | yes, idle-closed after 50 s | 535, frozen; `alive:false` by 20 s | `tunnel is not connected` | none |
+| `wss` via Cloudflare (`test.xoamrz.ir`, 172.67.194.106, small CH) | **no session at the origin** | 0 | `tunnel is not connected` | none |
+| `icmp` + `governor` | yes, idle-closed after 46 s | 492 → 912, then frozen | `session closed` | none |
+
+**Reading:** every direct carrier still completes its handshake and the session key exchange (the server logs `new client session` for each), then the Iran→kharej direction dies: the server hears nothing more and closes the session as idle ~50 s later, while kharej→iran packets keep arriving for a while (`alive` stays true on tcp/icmp; it counts any packet in the last 10 s, `bytes_in` counts stream payload only). That is the round-2 signature (client→server payload blocked) unchanged. `ff` behaves exactly like the other markers here: the marker type is not the limiter on this route. The wss-through-Cloudflare pool blocker is unchanged too (no session at the origin).
+
+**Engine:** the 2.10.7 binary itself is healthy — the loopback control carried 50 MB each way at ~24.7 MB/s with both ends sharing kharej's single core, and every path session formed and keyed. No crash, no `-race`-class symptom in any log.
+
+**State left:** kharej runs the six `ft-*` servers above (transient systemd units, configs in `/etc/wattun/ft/`, the previous binary kept as `/usr/local/bin/wattun.prev-ft`); its old `kh443` wss process was stopped. Iran has 2.10.7 installed, `wattun-ir` stopped (its config was the mismatched one), raw results in `/root/ft-results.txt`.
