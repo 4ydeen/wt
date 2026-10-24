@@ -989,10 +989,10 @@ func TestDesyncMultiSNIRotation(t *testing.T) {
 	}
 }
 
-// TestFakeClientHelloECHGREASE verifies that FakeClientHello includes the RFC 9460 / RFC 8701
+// TestFakeClientHelloECHGREASE verifies that FakeClientHelloWithECH includes the RFC 9460 / RFC 8701
 // ECH GREASE extension (0xfe0d) with valid outer configuration.
 func TestFakeClientHelloECHGREASE(t *testing.T) {
-	rec := FakeClientHello("mci.ir")
+	rec := FakeClientHelloWithECH("mci.ir")
 	if len(rec) < 5 || rec[0] != 0x16 {
 		t.Fatalf("bad TLS record header: %v", rec[:5])
 	}
@@ -1758,8 +1758,13 @@ func TestDesyncFFFiresPlan(t *testing.T) {
 	if got := len(payloadOf(pkts[0])); got != ffFirstSeg {
 		t.Fatalf("first ff segment is %d bytes, want %d", got, ffFirstSeg)
 	}
-	if got := len(payloadOf(pkts[len(pkts)-1])); got != rLen-ffFirstSeg-(ffDefaultSegs-2) {
-		t.Fatalf("last ff segment is %d bytes, want the remainder %d", got, rLen-ffFirstSeg-(ffDefaultSegs-2))
+	rem := rLen - ffFirstSeg - (ffDefaultSegs - 2)
+	wantLast := rem
+	for wantLast > ffMaxPayload {
+		wantLast -= ffMaxPayload
+	}
+	if got := len(payloadOf(pkts[len(pkts)-1])); got != wantLast {
+		t.Fatalf("last ff segment is %d bytes, want the remainder %d", got, wantLast)
 	}
 }
 
@@ -2143,5 +2148,64 @@ func TestDefaultFakeIP6(t *testing.T) {
 	}
 	if want := testIP4("104.16.0.1"); defaultFakeIP != want {
 		t.Fatalf("defaultFakeIP = %x, want 104.16.0.1", defaultFakeIP)
+	}
+}
+
+// TestDesyncPatternihaDuplicateACKSync tests that after sending an out-of-window fake packet,
+// the tracker waits for the server's duplicate ACK (ack == SND.NXT) before closing ackChan.
+func TestDesyncPatternihaDuplicateACKSync(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+
+	// announce connection with known sequence numbers from TCP_REPAIR
+	ch := tr.announce(k, isn, true, srvSeq+1)
+	select {
+	case <-ch: // fake packet fired
+	default:
+		t.Fatal("fake packet did not fire on announce")
+	}
+	if sent.n() != 1 {
+		t.Fatalf("want 1 fake sent, got %d", sent.n())
+	}
+	ackCh := tr.ackChan(k)
+	if ackCh == nil {
+		t.Fatal("ackChan is nil")
+	}
+
+	// Before server ACK arrives, ackCh must remain open
+	select {
+	case <-ackCh:
+		t.Fatal("ackCh closed before server duplicate ACK arrived")
+	default:
+	}
+
+	// Simulate server sending duplicate ACK: ack == isn+1, payload == 0
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq+1, isn+1, testFlagACK, nil, 64))
+
+	// ackCh must now be closed
+	select {
+	case <-ackCh:
+	default:
+		t.Fatal("ackCh did not close after duplicate ACK arrived from server")
+	}
+}
+
+// TestFakeClientHelloPatternihaExact517 verifies that FakeClientHello builds a 517-byte Chrome ClientHello
+// with valid RFC 7685 padding for standard SNIs, matching patterniha/SNI-Spoofing.
+func TestFakeClientHelloPatternihaExact517(t *testing.T) {
+	for _, sni := range []string{"www.cloudflare.com", "mci.ir", "cf.xoamrz.ir", "auth.vercel.com"} {
+		rec := FakeClientHello(sni)
+		if len(rec) != 517 {
+			t.Fatalf("FakeClientHello(%q) len = %d, want exactly 517 bytes", sni, len(rec))
+		}
+		parsed, err := parseSNIOf(rec)
+		if err != nil {
+			t.Fatalf("parseSNIOf(%q) failed: %v", sni, err)
+		}
+		if parsed != sni {
+			t.Fatalf("parsed SNI = %q, want %q", parsed, sni)
+		}
 	}
 }

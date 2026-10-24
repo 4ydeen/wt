@@ -217,4 +217,4 @@ func sendRawProbe(pkt []byte) { sendRawPacket(pkt) }
 
 // isnOf: the probe's one Linux socket dependency beyond NewDesync. On other OSes the probe never gets
 // this far (NewDesync fails with the platform error), so the stub only exists for compilation.
-func isnOf(c *net.TCPConn) (uint32, bool) { return tcpStreamBase(c) }
+func isnOf(c *net.TCPConn) (uint32, bool) { nxt, _, ok := tcpStreamBase(c); return nxt, ok }

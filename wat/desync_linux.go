@@ -30,14 +30,14 @@ import (
 // fires inside announce (the sniffer remembered the handshake), so this only covers a handshake it never saw.
 const desyncWrapTimeout = 500 * time.Millisecond
 
-// tcpStreamBase returns the socket's send-queue sequence number (SND.NXT) as the stream-start anchor for the
-// tracker. TCP_REPAIR freezes the socket's queues without touching its buffers; TCP_REPAIR_QUEUE selects the
-// send queue and TCP_QUEUE_SEQ then reports its sequence number. ok false = probe unavailable (it needs
-// CAP_NET_ADMIN): the tracker falls back to the wire-learned ISN (our outgoing SYN) or its late path.
-func tcpStreamBase(tc *net.TCPConn) (nxt uint32, ok bool) {
+// tcpStreamBase returns the socket's send-queue sequence number (SND.NXT) and receive-queue sequence number
+// (RCV.NXT) as the stream-start anchor for the tracker. TCP_REPAIR freezes the socket's queues without touching its
+// buffers; TCP_REPAIR_QUEUE selects the send/recv queue and TCP_QUEUE_SEQ then reports its sequence number.
+// ok false = probe unavailable (it needs CAP_NET_ADMIN): the tracker falls back to the wire-learned ISN.
+func tcpStreamBase(tc *net.TCPConn) (nxt, rcv uint32, ok bool) {
 	raw, err := tc.SyscallConn()
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	var serr error
 	verr := raw.Control(func(fd uintptr) {
@@ -57,11 +57,22 @@ func tcpStreamBase(tc *net.TCPConn) (nxt uint32, ok bool) {
 			return
 		}
 		nxt = binary.LittleEndian.Uint32(b[:])
+
+		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR_QUEUE, 0 /* TCP_RECV_QUEUE */); serr != nil {
+			return
+		}
+		l = uint32(4)
+		if _, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, fd, uintptr(unix.IPPROTO_TCP), unix.TCP_QUEUE_SEQ,
+			uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&l)), 0); errno != 0 {
+			serr = errno
+			return
+		}
+		rcv = binary.LittleEndian.Uint32(b[:])
 	})
 	if verr != nil || serr != nil || nxt == 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	return nxt, true
+	return nxt, rcv, true
 }
 
 // Desync is the fake-SNI injector of one client process: created once with NewDesync, every pool connection
@@ -83,6 +94,9 @@ func NewDesync(cfg DesyncConfig, peer string) (*Desync, error) {
 	inj, err := newDesyncInjector(cfg, p)
 	if err != nil {
 		return nil, err
+	}
+	for _, ip := range desyncAllPeerIPs(peer) {
+		inj.tr.addPeerIP(ip)
 	}
 	return &Desync{inj: inj}, nil
 }
@@ -111,19 +125,34 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 		return c, nil
 	}
 	k := desyncKey{s, r, uint16(la.Port), uint16(ra.Port)}
-	// The probe reports SND.NXT = the next unsent sequence number. The tracker's announce stores the ISN (the
-	// stream start minus one): the early fire compares segment seq against synSeq+1, and the NAT follow rebuilds
-	// synSeq from a SYN-ACK's ack the same way. Handshake just finished => SND.NXT = ISN+1 => ISN = SND.NXT-1.
-	isn, known := tcpStreamBase(tc)
+	// The probe reports SND.NXT = the next unsent sequence number and RCV.NXT = the next expected byte from the peer.
+	// The tracker's announce stores the ISN (the stream start minus one): the early fire compares segment seq against synSeq+1,
+	// and the NAT follow rebuilds synSeq from a SYN-ACK's ack the same way. Handshake just finished => SND.NXT = ISN+1 => ISN = SND.NXT-1.
+	isn, rcvNxt, known := tcpStreamBase(tc)
 	if known {
 		isn--
 	}
-	ch := d.inj.tr.announce(k, isn, known)
+	d.inj.tr.addPeerIP(r)
+	ch := d.inj.tr.announce(k, isn, known, rcvNxt)
+	ackCh := d.inj.tr.ackChan(k)
 	if known {
 		select {
-		case <-ch: // fake fired on final ACK
+		case <-ch: // fake fired on final ACK / announce
 		case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
 			d.inj.tr.abandon(k)
+			return c, nil
+		}
+		// patterniha duplicate ACK synchronization:
+		// Wait for the server (Cloudflare) to send back a duplicate ACK for the out-of-window
+		// fake packet before sending real data. This ensures:
+		// 1) The fake packet traversed the middlebox DPI and reached Cloudflare.
+		// 2) The DPI parsed the fake SNI and whitelisted this TCP 5-tuple.
+		// 3) At least one RTT separates the fake packet and the real ClientHello.
+		if ackCh != nil && d.inj.tr.needsAck() {
+			select {
+			case <-ackCh: // duplicate ACK received from server!
+			case <-time.After(200 * time.Millisecond): // safety fallback
+			}
 		}
 	}
 	return c, nil

@@ -62,6 +62,14 @@ F&F recipe*, Xray's `finalMask` implementation, `fingerprint=unsafe`/`cipherSuit
 10. **Highest-value next commit, in order:** (a) record-reframed *fake* hello mode in `desync.go`; (b) real-hello
     record reframing behind an opt-in for CDN legs only; (c) `-fp unsafe`/`-tls-ciphers`/`-tls-min 1.2`; (d) IPv6
     injector; (e) command/manager preset for "clean Cloudflare IP + worker domain" (no engine work). Details in §8.
+11. **`patterniha/SNI-Spoofing` reference analysis & in-field remediation (2.10.11):** Source repository
+    [patterniha/SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing). Two critical requirements were missing in
+    earlier implementations: (a) *Duplicate ACK synchronization*: `fake_tcp.py` pauses the flow and waits for the
+    server's RFC 793 duplicate ACK (`ACK = syn_seq + 1`) before sending the real ClientHello. Sending real data with
+    zero RTT delay caused DPI flow tables to see both SNIs in the same burst and drop the flow. (b) *Clean 517-byte Chrome
+    template*: `ClientHelloMaker` builds a 517-byte template with RFC 7685 padding (`0x0015`) and NO ECH GREASE (`0xfe0d`),
+    which Iranian DPI middleboxes actively filter. (c) *Auto small ClientHello*: `-fake-sni` now implies `tls-small-ch`,
+    preventing 1.5 KB post-quantum ClientHello drops.
 
 ---
 

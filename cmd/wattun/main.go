@@ -376,7 +376,8 @@ func main() {
 				if derr != nil {
 					log.Fatalf("fake-sni: %v", derr)
 				}
-				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin, NoPQ: *tlsSmallCH,
+				smallCH := *tlsSmallCH || *fakeSNI != ""
+				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin, NoPQ: smallCH,
 					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf,
 					ECHLadder: ladderHook}
 				if srcNetIP != nil {
@@ -405,7 +406,7 @@ func main() {
 			} else {
 				co := wat.HTTPClientOptions{Path: *path, Host: *host, Secure: secure, Headers: map[string]string{}}
 				co.TLS.ServerName = *sni
-				co.TLS.NoPQ = *tlsSmallCH
+				co.TLS.NoPQ = *tlsSmallCH || *fakeSNI != ""
 				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				co.TLS.ECHCache = *echCache
 				co.TLS.ECHLadder = ladderHook

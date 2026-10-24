@@ -27,6 +27,6 @@ func (d *Desync) PeerTTL() int                      { return 0 }
 
 // Stubs for probe.go (never reached off Linux: ProbeFakeMode bails at NewDesync) so the package compiles.
 func sendRawPacket(pkt []byte)                     {}
-func tcpStreamBase(tc *net.TCPConn) (uint32, bool) { return 0, false }
+func tcpStreamBase(tc *net.TCPConn) (uint32, uint32, bool) { return 0, 0, false }
 
 var rawSendFails atomic.Uint64 // Linux has the real counter; nothing fails here

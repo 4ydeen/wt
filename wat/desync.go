@@ -147,11 +147,85 @@ func sumMirrorMode(mode string) bool {
 	return false
 }
 
-// FakeClientHello builds a realistic, RFC 8446-compliant TLS 1.3/1.2 ClientHello carrying sni.
-// It includes modern TLS 1.3 extensions (supported_versions, ALPN h2/http/1.1, key_share X25519,
-// supported_groups, signature_algorithms, and psk_key_exchange_modes) so heuristic middlebox
-// parsers classify the flow with 100% confidence as standard modern browser HTTPS web browsing.
+// FakeClientHello builds an authentic 517-byte Chrome ClientHello carrying sni, matching patterniha/SNI-Spoofing.
+// It includes realistic browser extensions (supported_versions TLS 1.3/1.2, ALPN h2/http/1.1, key_share X25519,
+// supported_groups, signature_algorithms, and RFC 7685 padding to 512 bytes payload / 517 bytes record)
+// without ECH GREASE (which triggers censor ECH-drop rules on Iranian middleboxes).
 func FakeClientHello(sni string) []byte {
+	if sni == "" {
+		return nil
+	}
+	sniB := []byte(sni)
+	if len(sniB) > 219 {
+		return FakeClientHelloWithECH(sni)
+	}
+
+	// 11 bytes static header: record header (16 03 01 02 00) + handshake header (01 00 01 fc) + version (03 03)
+	static1 := []byte{0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03}
+	var rnd [32]byte
+	_, _ = rand.Read(rnd[:])
+	static2 := []byte{0x20} // session ID len = 32
+	var sid [32]byte
+	_, _ = rand.Read(sid[:])
+
+	// static3 (44 bytes): cipher suites (18 suites, 36 B) + compression (1 B) + extensions total len (399 B) + server_name ext type (00 00)
+	static3 := []byte{
+		0x00, 0x24, 0x13, 0x02, 0x13, 0x03, 0x13, 0x01, 0xc0, 0x2c, 0xc0, 0x30, 0xc0, 0x2b, 0xc0, 0x2f,
+		0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x24, 0xc0, 0x28, 0xc0, 0x23, 0xc0, 0x27, 0x00, 0x9f, 0x00, 0x9e,
+		0x00, 0x6b, 0x00, 0x67, 0x00, 0xff, 0x01, 0x00, 0x01, 0x8f, 0x00, 0x00,
+	}
+
+	// server_name extension: len(sni)+5, len(sni)+3, host_name(0), len(sni), sni
+	sniExtLen := len(sniB) + 5
+	sniListLen := len(sniB) + 3
+	sniExt := []byte{
+		byte(sniExtLen >> 8), byte(sniExtLen),
+		byte(sniListLen >> 8), byte(sniListLen),
+		0x00,
+		byte(len(sniB) >> 8), byte(len(sniB)),
+	}
+	sniExt = append(sniExt, sniB...)
+
+	// static4 (135 bytes): ec_point_formats, supported_groups, session_ticket, alpn, encrypt_then_mac,
+	// extended_master_secret, signature_algorithms, supported_versions, psk_key_exchange_modes, key_share header
+	static4 := []byte{
+		0x00, 0x0b, 0x00, 0x04, 0x03, 0x00, 0x01, 0x02, 0x00, 0x0a, 0x00, 0x16, 0x00, 0x14, 0x00, 0x1d,
+		0x00, 0x17, 0x00, 0x1e, 0x00, 0x19, 0x00, 0x18, 0x01, 0x00, 0x01, 0x01, 0x01, 0x02, 0x01, 0x03,
+		0x01, 0x04, 0x00, 0x23, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08,
+		0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31, 0x00, 0x16, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00,
+		0x00, 0x0d, 0x00, 0x2a, 0x00, 0x28, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x07, 0x08, 0x08,
+		0x08, 0x09, 0x08, 0x0a, 0x08, 0x0b, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01, 0x05, 0x01,
+		0x06, 0x01, 0x03, 0x03, 0x03, 0x01, 0x03, 0x02, 0x04, 0x02, 0x05, 0x02, 0x06, 0x02, 0x00, 0x2b,
+		0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03, 0x00, 0x2d, 0x00, 0x02, 0x01, 0x01, 0x00, 0x33, 0x00,
+		0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20,
+	}
+
+	var keyShare [32]byte
+	_, _ = rand.Read(keyShare[:])
+
+	// padding extension (0x0015): 219 - len(sniB) zero bytes
+	padLen := 219 - len(sniB)
+	padExt := make([]byte, 4+padLen)
+	padExt[0] = 0x00
+	padExt[1] = 0x15
+	padExt[2] = byte(padLen >> 8)
+	padExt[3] = byte(padLen)
+
+	res := make([]byte, 0, 517)
+	res = append(res, static1...)
+	res = append(res, rnd[:]...)
+	res = append(res, static2...)
+	res = append(res, sid[:]...)
+	res = append(res, static3...)
+	res = append(res, sniExt...)
+	res = append(res, static4...)
+	res = append(res, keyShare[:]...)
+	res = append(res, padExt...)
+	return res
+}
+
+// FakeClientHelloWithECH builds a realistic TLS 1.3/1.2 ClientHello carrying sni and an ECH GREASE extension (0xfe0d).
+func FakeClientHelloWithECH(sni string) []byte {
 	if sni == "" {
 		return nil
 	}
@@ -183,9 +257,6 @@ func FakeClientHello(sni string) []byte {
 	ext = append(ext, 0, 0x2d, 0, 2, 1, 1)
 
 	// 8. encrypted_client_hello (ECH GREASE, RFC 9460 §6.1 / RFC 8701 / draft-ietf-tls-esni-22):
-	// Modern browsers (Chrome 117+, Firefox 118+) attach an outer ECH GREASE extension by default.
-	// Middleboxes cannot decrypt inner ClientHellos, forcing allowlist classifiers to evaluate the
-	// outer server_name, while JA4 heuristic analyzers validate authentic browser extension composition.
 	echData := make([]byte, 0, 138)
 	echData = append(echData, 0x00)                   // outer
 	echData = append(echData, 0x00, 0x01, 0x00, 0x01) // HKDF-SHA256, AES-128-GCM
@@ -491,6 +562,40 @@ func desyncPeerHostPort(peer string) (ip, port string) {
 	return "", p
 }
 
+// desyncAllPeerIPs resolves all IP addresses (v4 and v6) for a peer string, including comma-separated peers.
+func desyncAllPeerIPs(peer string) []ipAddr {
+	var ips []ipAddr
+	seen := map[ipAddr]bool{}
+	for _, p := range strings.Split(peer, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		h, _, err := net.SplitHostPort(p)
+		if err != nil {
+			h = p
+		}
+		if v := net.ParseIP(h); v != nil {
+			if a, ok := ipAddrOf(v); ok && !seen[a] {
+				seen[a] = true
+				ips = append(ips, a)
+			}
+			continue
+		}
+		if addrs, err := net.LookupHost(h); err == nil {
+			for _, a := range addrs {
+				if v := net.ParseIP(a); v != nil {
+					if a, ok := ipAddrOf(v); ok && !seen[a] {
+						seen[a] = true
+						ips = append(ips, a)
+					}
+				}
+			}
+		}
+	}
+	return ips
+}
+
 // ipAddr holds an IPv4 or IPv6 address: 16 bytes always, IPv4 stored v4-mapped (::ffff:a.b.c.d, matching
 // net.IP.To16), so desyncKey and the packet builders need no separate family-specific copies.
 type ipAddr [16]byte
@@ -697,6 +802,7 @@ func parseEthIP(frame []byte) []byte {
 type desyncTracker struct {
 	cfg       DesyncConfig
 	peerIP    ipAddr
+	peerIPs   map[ipAddr]bool
 	hello     []byte
 	snis      []string // SNIs with a non-empty hello; pickHello rebuilds fresh bytes per fire
 	helloIdx  atomic.Uint32
@@ -705,6 +811,7 @@ type desyncTracker struct {
 	mu        sync.Mutex
 	conns     map[desyncKey]*desyncConn
 	wait      map[desyncKey]chan struct{} // closed by fire, waited on by Wrap
+	ackWait   map[desyncKey]chan struct{} // closed by duplicate ACK from server, waited on by Wrap
 	recent    map[desyncKey]*desyncHS     // handshakes toward the peer seen before Wrap announced them (see announce)
 	peerTTLv  uint8
 	firedN    int
@@ -720,6 +827,8 @@ type desyncConn struct {
 	synAckAck uint32 // ack field of the server's SYN-ACK (== ISN+1)
 	sumSeq    uint32 // sum/seqsum: seq of the outbound data segment being mirrored (0 = none yet)
 	tcpOpts   []byte // kernel TCP options observed on outbound non-SYN segments (e.g. timestamps)
+	fakeSent  bool   // fake packet has been injected
+	waitAck   uint32 // duplicate ACK expected from server (isn+1 / SND.NXT)
 	at        time.Time
 }
 
@@ -763,8 +872,35 @@ func newDesyncTracker(cfg DesyncConfig, peerIP ipAddr) *desyncTracker {
 			}
 		}
 	}
-	return &desyncTracker{cfg: cfg, peerIP: peerIP, hello: hello, snis: good,
-		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}, recent: map[desyncKey]*desyncHS{}}
+	return &desyncTracker{cfg: cfg, peerIP: peerIP, peerIPs: map[ipAddr]bool{peerIP: true}, hello: hello, snis: good,
+		conns: map[desyncKey]*desyncConn{}, wait: map[desyncKey]chan struct{}{}, ackWait: map[desyncKey]chan struct{}{}, recent: map[desyncKey]*desyncHS{}}
+}
+
+func (t *desyncTracker) addPeerIP(ip ipAddr) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.peerIPs == nil {
+		t.peerIPs = map[ipAddr]bool{}
+	}
+	t.peerIPs[ip] = true
+}
+
+func (t *desyncTracker) isPeer(ip ipAddr) bool {
+	return ip == t.peerIP || (t.peerIPs != nil && t.peerIPs[ip])
+}
+
+func (t *desyncTracker) needsAck() bool {
+	switch t.cfg.Mode {
+	case "", "seq", "seqsum", "split", "synrst", "all", "ff":
+		return true
+	}
+	return false
+}
+
+func (t *desyncTracker) ackChan(k desyncKey) chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ackWait[k]
 }
 
 // pickHello builds a FRESH FakeClientHello per fire (round-robining the SNIs when several are
@@ -787,7 +923,9 @@ func (t *desyncTracker) pickHello() []byte {
 
 // announce registers a connection Wrap is waiting for and returns its channel. known says the ISN is exact
 // (from the socket probe); with known=false the tracker fires late, off the first data segment.
-func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struct{} {
+// Optional rcvNxt passes the server's sequence number (from TCP_RECV_QUEUE), allowing immediate injection
+// without relying on sniffer packet capture.
+func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool, rcvNxt ...uint32) chan struct{} {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	ch := make(chan struct{})
@@ -803,14 +941,30 @@ func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struc
 			}
 		}
 	}
+	if t.peerIPs == nil {
+		t.peerIPs = map[ipAddr]bool{}
+	}
+	t.peerIPs[k.dstIP] = true
 	t.wait[k] = ch
+	t.ackWait[k] = make(chan struct{})
 	c := &desyncConn{synSeq: isn, isnKnown: known, at: now}
 	t.conns[k] = c
-	// Wrap runs after the kernel handshake, and it blocks the first write until the fake is out, so the final ACK
-	// has already passed the sniffer and no further outbound packet will come to trigger the fire (it used to wait
-	// for Wrap's 2 s timeout, or for the stray ACK that leaving TCP_REPAIR happens to emit). Fire from what the
-	// sniffer remembered instead.
-	if m := t.recent[k]; known && m != nil && m.haveSA {
+	var rcv uint32
+	if len(rcvNxt) > 0 {
+		rcv = rcvNxt[0]
+	}
+	if known && rcv > 0 {
+		c.synAckAck = isn + 1
+		c.synAckSeq = rcv - 1
+		if m := t.recent[k]; m != nil {
+			delete(t.recent, k)
+			c.tcpOpts = m.opts
+		}
+		if sumMirrorMode(t.cfg.Mode) {
+			c.sumSeq = isn + 1
+		}
+		t.fireLocked(k, c, isn+1, rcv)
+	} else if m := t.recent[k]; known && m != nil && m.haveSA {
 		delete(t.recent, k)
 		c.synAckSeq, c.synAckAck, c.tcpOpts = m.srvSeq, m.srvAck, m.opts
 		if sumMirrorMode(t.cfg.Mode) {
@@ -823,8 +977,10 @@ func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool) chan struc
 
 // noteHandshake remembers the packets of handshakes toward the peer that nobody announced (yet); mu held.
 func (t *desyncTracker) noteHandshake(out, in desyncKey, d, s ipAddr, th []byte, off int, seq, ackv uint32, syn, ackf bool, payload int, now time.Time) {
+	isDstPeer := t.isPeer(d)
+	isSrcPeer := t.isPeer(s)
 	switch {
-	case d == t.peerIP && syn && !ackf && payload == 0:
+	case isDstPeer && syn && !ackf && payload == 0:
 		if len(t.recent) > 64 {
 			for k, m := range t.recent {
 				if now.Sub(m.at) > 20*time.Second {
@@ -833,11 +989,11 @@ func (t *desyncTracker) noteHandshake(out, in desyncKey, d, s ipAddr, th []byte,
 			}
 		}
 		t.recent[out] = &desyncHS{isn: seq, haveSyn: true, at: now}
-	case s == t.peerIP && syn && ackf && payload == 0:
+	case isSrcPeer && syn && ackf && payload == 0:
 		if m := t.recent[in]; m != nil && m.haveSyn {
 			m.srvSeq, m.srvAck, m.haveSA = seq, ackv, true
 		}
-	case d == t.peerIP && !syn && off > 20:
+	case isDstPeer && !syn && off > 20:
 		if m := t.recent[out]; m != nil && len(m.opts) == 0 {
 			m.opts = append([]byte(nil), th[20:off]...)
 		}
@@ -849,6 +1005,10 @@ func (t *desyncTracker) abandonLocked(k desyncKey) {
 	if ch := t.wait[k]; ch != nil {
 		delete(t.wait, k)
 		close(ch)
+	}
+	if ackCh := t.ackWait[k]; ackCh != nil {
+		delete(t.ackWait, k)
+		close(ackCh)
 	}
 	delete(t.conns, k)
 }
@@ -868,6 +1028,10 @@ func (t *desyncTracker) close() {
 		for k, ch := range t.wait {
 			close(ch)
 			delete(t.wait, k)
+		}
+		for k, ackCh := range t.ackWait {
+			close(ackCh)
+			delete(t.ackWait, k)
 		}
 		t.conns = map[desyncKey]*desyncConn{}
 	}
@@ -939,11 +1103,25 @@ func (t *desyncTracker) handleIP(ip []byte) {
 	}
 	now := time.Now()
 	// any SYN-ACK from the peer teaches the inbound TTL (ttl auto-calibration), tracked or not
-	if syn && ackf && payload == 0 && !rst && s == t.peerIP && t.peerTTLv == 0 {
+	if syn && ackf && payload == 0 && !rst && t.isPeer(s) && t.peerTTLv == 0 {
 		t.peerTTLv = ttl
 	}
 	if !rst && (t.conns[out] == nil && t.conns[in] == nil) {
 		t.noteHandshake(out, in, d, s, th, off, seq, ackv, syn, ackf, payload, now)
+	}
+	// duplicate ACK check from server in response to our injected fake packet (patterniha synchronization):
+	// when an out-of-window fake packet was sent (wrong_seq method), RFC 793/9293 mandates that
+	// the server reply with a pure ACK where ack == SND.NXT. Receiving it confirms the fake packet
+	// cleared the middlebox DPI and reached the server before real application data is sent.
+	if c := t.conns[in]; c != nil && c.fakeSent {
+		if !syn && ackf && !rst && payload == 0 && ackv == c.waitAck {
+			delete(t.conns, in)
+			if ackCh := t.ackWait[in]; ackCh != nil {
+				delete(t.ackWait, in)
+				close(ackCh)
+			}
+			return
+		}
 	}
 	// our outgoing SYN on a tracked key: (re)learn the ISN from the wire
 	if c := t.conns[out]; c != nil && syn && !ackf && payload == 0 && !rst {
@@ -977,8 +1155,8 @@ func (t *desyncTracker) handleIP(ip []byte) {
 		c.tcpOpts = append([]byte(nil), th[20:off]...)
 	}
 	c := t.conns[out]
-	if c == nil || c.synAckAck == 0 && !c.isnKnown {
-		return // nothing to anchor the fake's ack to yet
+	if c == nil || c.fakeSent || c.synAckAck == 0 && !c.isnKnown {
+		return // nothing to anchor the fake's ack to yet, or fake already fired
 	}
 	switch {
 	case c.isnKnown:
@@ -1036,12 +1214,26 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 	// seq = base - len(fake): the fake lands exactly below the stream start. The server holds snd_una at the
 	// stream start, so this is an old duplicate; a DPI without window checks reassembles it as the first flight.
 	t.firedN++
-	delete(t.conns, k)
 	if ch := t.wait[k]; ch != nil {
 		delete(t.wait, k)
 		close(ch)
 	}
+	if t.needsAck() {
+		c.fakeSent = true
+		c.waitAck = base
+	} else {
+		delete(t.conns, k)
+		if ackCh := t.ackWait[k]; ackCh != nil {
+			delete(t.ackWait, k)
+			close(ackCh)
+		}
+	}
 	if t.send == nil {
+		if ackCh := t.ackWait[k]; ackCh != nil {
+			delete(t.ackWait, k)
+			close(ackCh)
+		}
+		delete(t.conns, k)
 		return
 	}
 	if t.cfg.Mode == "rst" {

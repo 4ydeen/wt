@@ -478,6 +478,11 @@ it anchors the marker packet to the handshake's final ACK when it observed the S
 segment otherwise, and a NAT that rewrites sequence numbers uniformly no longer misfires (the marker follows the
 rewrite). Works on the `tcp`, `tls`, `wss`, `h2` and `grpc` carriers. `fake-ttl: 0` (the default) calibrates
 itself: the peer's inbound TTL is learned from its SYN-ACK, the marker goes out one hop short of the server.
+In 2.10.11, the injector aligns directly with `patterniha/SNI-Spoofing`: `tcpStreamBase` extracts both `SND.NXT` and
+`RCV.NXT` directly from the socket via `TCP_REPAIR`, and `Wrap` pauses the real flow until the server's RFC 793
+duplicate ACK (`ack == SND.NXT`) confirms that the fake packet has traversed the DPI before the real ClientHello
+is transmitted. `FakeClientHello` uses an authentic 517-byte Chrome template with RFC 7685 padding and no ECH GREASE.
+Specifying `fake-sni` also automatically enables `tls-small-ch` to avoid 1.5 KB post-quantum ClientHello drops.
 
 Client-side only, Linux only, needs CAP_NET_RAW (the icmp carrier's requirement); the server needs no change
 and no new version. Two caveats from field reports of the same trick in other tools: it died where the ISP's
