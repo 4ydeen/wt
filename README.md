@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.10.9-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.10.10-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -92,9 +92,12 @@ Under load, the tunnel adds +0.25 % to the bytes your users move on `tcp` (16 KB
 
 [Idle and bandwidth details](docs/TECHNICAL.md#resource-usage-idle-ram-cpu-and-bandwidth)
 
-## Latest release: 2.10.9
+## Latest release: 2.10.10
 
-**The first release since 2.5.1: forward secrecy on every session, signed downloads, the anti-censorship kit, and
+**A tunnel no longer stalls for up to 10 s after a short one-way blackout, and no longer hangs for good when the
+Kharej server restarts after one.** Client-side fix: update the Iran server; any 2.10.x Kharej server works with it.
+
+2.10.9 before it was **the first release since 2.5.1: forward secrecy on every session, signed downloads, the anti-censorship kit, and
 two bug fixes in the transport.** Old and new versions work together (tested both ways against 2.5.1), so you can
 update one server at a time; forward secrecy switches on once both ends run 2.10.0 or newer. Everything in the
 anti-censorship kit is client-side, so only the Iran server needs it. This release also fixes a data race in the
