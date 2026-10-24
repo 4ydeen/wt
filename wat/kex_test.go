@@ -248,3 +248,116 @@ func TestKexServerAeadExpiry(t *testing.T) {
 		t.Fatal("re-armed offer did not re-engage")
 	}
 }
+
+// dropIO drops everything one side sends while drop is set: a one-way blackout, as an ICMP reroute makes.
+type dropIO struct {
+	*memIO
+	drop *atomic.Bool
+}
+
+func (d dropIO) Send(p []byte, lane int) error {
+	if d.drop.Load() {
+		return nil
+	}
+	return d.memIO.Send(p, lane)
+}
+
+func kexCount(srv *Session, total *int64) {
+	for {
+		st, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			buf := make([]byte, 8192)
+			for {
+				n, err := st.Read(buf)
+				atomic.AddInt64(total, int64(n))
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+}
+
+// A server->client blackout longer than the probe delay with the server alive and past kexGrace (it no longer opens
+// the PSK key): the restart probe must keep the client's data on the fresh key (sealing it with the PSK blackholed it
+// for the whole probe window and gave it no forward secrecy), and must leave the client able to detect a REAL restart
+// afterwards (the false probe used to clear kexDone for good, so a later restart hung the session forever).
+func TestKexFalseProbeThenRestart(t *testing.T) {
+	a, b := newMemDir(), newMemDir()
+	cfg := Config{Key: []byte("bench-key"), SID: 0x1234567, InitBps: 400e6, MaxBps: 400e6}
+	sc := cfg
+	sc.Server = true
+	var drop atomic.Bool
+	cli, err := NewSession(cfg, &memIO{tx: a, rx: b, done: make(chan struct{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	srv, err := NewSession(sc, dropIO{&memIO{tx: b, rx: a, done: make(chan struct{})}, &drop})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []*Session{cli, srv} {
+		s.mu.Lock()
+		s.kexGrace, s.probeAfter, s.probeFor = 30*time.Millisecond, 200*time.Millisecond, 2*time.Second
+		s.mu.Unlock()
+	}
+	var total int64
+	go kexCount(srv, &total)
+	st, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Write(make([]byte, 100))
+	kexWait(t, "both switches and the old keys to expire", func() bool {
+		cli.mu.Lock(); c := cli.kexDone && cli.oldAead == nil; cli.mu.Unlock()
+		srv.mu.Lock(); s := srv.kexDone && srv.oldAead == nil; srv.mu.Unlock()
+		return c && s
+	})
+
+	drop.Store(true)
+	kexWait(t, "the client to start the restart probe", func() bool {
+		cli.mu.Lock(); defer cli.mu.Unlock()
+		return !cli.probeUntil.IsZero()
+	})
+	drop.Store(false)
+	before := atomic.LoadInt64(&total)
+	t0 := time.Now()
+	st.Write(make([]byte, 1000))
+	kexWait(t, "data written during the probe to reach the live server", func() bool { return atomic.LoadInt64(&total) >= before+1000 })
+	if d := time.Since(t0); d > time.Second { // the probe window is 2 s: data sealed with the PSK waits it out
+		t.Fatalf("data took %v to reach a live server during the probe: it was sealed with the PSK key", d)
+	}
+	kexWait(t, "the probe to end", func() bool {
+		cli.mu.Lock(); defer cli.mu.Unlock()
+		return cli.probeUntil.IsZero() && cli.kexDone
+	})
+
+	// now the server really restarts: a new session with no fresh key, reachable only through the PSK probe
+	srv.Close()
+	srv2, err := NewSession(sc, &memIO{tx: b, rx: a, done: make(chan struct{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv2.Close()
+	var total2 int64
+	go kexCount(srv2, &total2)
+	st2, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2.Write(make([]byte, 1000))
+	for i := 0; i < 500 && atomic.LoadInt64(&total2) < 1000; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := atomic.LoadInt64(&total2); n < 1000 {
+		t.Fatalf("restarted server got %d/1000 B in 10 s: the client never re-keyed with it", n)
+	}
+	kexWait(t, "the client to re-key with the restarted server", func() bool {
+		cli.mu.Lock(); defer cli.mu.Unlock()
+		return cli.kexDone && cli.probeUntil.IsZero()
+	})
+}

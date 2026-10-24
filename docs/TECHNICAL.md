@@ -1764,9 +1764,11 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
   every 10 s the client re-arms with fresh keys, so an exchange whose replies were lost completes once the path
   recovers. If a switched client hears nothing for 4 s while it keeps sending (the Kharej process
   restarted: its new process cannot open the fresh key, so it could never authenticate the client),
-  it seals and accepts PSK-key packets for 10 s and keeps offering, so the restarted server
-  re-authenticates the session, sends its boot frame, and a full re-exchange completes — streams
-  recover in a few seconds instead of hanging. `WAT_NO_KEX=1` turns the exchange off (A/B tests).
+  for the next 10 s it sends a lone PSK-sealed offer about once a second and accepts PSK-key packets,
+  so the restarted server re-authenticates the session, sends its boot frame, and a full re-exchange
+  completes — streams recover in a few seconds instead of hanging. The data itself stays on the fresh
+  key throughout (since 2.10.10), so a server that is alive and only cut off for a while keeps opening it,
+  and no user data ever goes out PSK-only after the switch. `WAT_NO_KEX=1` turns the exchange off (A/B tests).
 - **Authenticate first.** The server creates a session only if a packet authenticates. Garbage, scans and replays of
   another key are dropped without a response, and packet numbers are tracked, so a captured packet replayed later is
   dropped too.
@@ -1799,6 +1801,15 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.10.10: the Kharej-restart probe no longer stalls a live tunnel.** Client-side fix (the Iran server); no wire
+  change, works with every 2.10.x server. Since 2.10.1 a client that heard nothing for 4 s sealed **all** its
+  traffic with the PSK key for 10 s, in case the Kharej process had restarted. When the server was alive and only
+  cut off (a one-way blackout, an ICMP reroute) and its 30 s old-key grace was over, it dropped every one of those
+  packets: up to 10 s of extra stall after the path came back, and the data had no forward secrecy. Worse, the
+  probe cleared the key-exchange state for good, so after one false alarm a later real Kharej restart hung the
+  session until the Iran service was restarted. Now the probe is a lone PSK-sealed offer once a second, data stays
+  on the fresh key, and the state survives, so the next restart is still detected. Regression test
+  `TestKexFalseProbeThenRestart`.
 - **2.10.2: anti-censor matrix tester, ECH lock contention fix, and transport resilience.** Client-side
   reliability update, fully backward-compatible with 2.10.x servers.
   (1) **Autonomous anti-censor matrix tester**: `wattun-manager matrix NAME` tests every resilience combination

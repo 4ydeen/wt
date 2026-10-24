@@ -137,7 +137,7 @@ type Session struct {
 	// the server's reply switches it, the server answers offers until a packet sealed with the fresh key arrives.
 	oldAead      cipher.AEAD // the key before the switch: still opens in-flight packets for kexGrace, then dropped
 	pskAead      cipher.AEAD // the original PSK key: seals the restart probes (never dropped; a restarted peer's only way in)
-	probeUntil   time.Time   // client: while set, seal and accept PSK packets — the peer may have restarted and lost the fresh key
+	probeUntil   time.Time   // client: while set, send PSK-sealed kex offers and accept PSK packets — the peer may have restarted and lost the fresh key
 	kexPriv      []byte      // this side's ephemeral X25519 private key (nil: no exchange — WAT_NO_KEX, an old peer, or a bad peer key)
 	kexPub       []byte      // the matching public key, sent as the frKex frame
 	kexAead      cipher.AEAD // server: the fresh key, tried first on receive until the client proves it switched
@@ -151,6 +151,8 @@ type Session struct {
 	rxKeys       atomic.Pointer[[2]cipher.AEAD] // {aead, oldAead} while kexDone, else nil: handle's lock-free open (pubRxKeys)
 	kexGrace    time.Duration // old-key grace / stale-exchange expiry (a copy of the kexGrace default; a field so tests can shrink it per session without racing other sessions' pumps)
 	kexGiveUp    time.Duration // client: how long to keep offering before re-arming with fresh keys (same reasoning)
+	probeAfter   time.Duration // client: copies of kexProbeAfter/kexProbeFor (same reasoning)
+	probeFor     time.Duration
 	mu           sync.Mutex
 	now          time.Time
 
@@ -308,7 +310,7 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	}
 	s := &Session{
 		cfg: cfg, sid: cfg.SID, io: pio, aead: aead, pskAead: aead, stop: make(chan struct{}),
-		kexGrace: kexGrace, kexGiveUp: kexGiveUp,
+		kexGrace: kexGrace, kexGiveUp: kexGiveUp, probeAfter: kexProbeAfter, probeFor: kexProbeFor,
 		laneSeen: map[int]time.Time{}, streams: map[uint64]*Stream{}, tomb: map[uint64]time.Time{},
 		nextSID: 1, now: time.Now(), wake: make(chan struct{}, 1),
 		cc:       newCC(cfg.InitBps, cfg.MinBps, cfg.MaxBps, cfg.Slack),
@@ -431,7 +433,7 @@ func allZero(b []byte) bool {
 // sessions' pumps. kexGiveUp is how long a client keeps offering before re-arming with fresh keys.
 // kexProbeAfter/kexProbeFor bound the restart probe: a client that has switched keys but heard nothing for
 // kexProbeAfter while it keeps sending suspects the peer restarted (a restarted peer cannot open the fresh
-// key), and falls back to PSK sealing for kexProbeFor so the peer can authenticate it again.
+// key), and sends lone PSK-sealed kex offers for kexProbeFor so a restarted peer can authenticate it again.
 var kexGrace = 30 * time.Second
 
 var kexGiveUp = 10 * time.Second
@@ -446,12 +448,12 @@ var (
 // proves the client has switched. A peer key that yields the all-zero shared secret (a low-order point) ends the
 // exchange: the session stays on the PSK key, exactly like talking to an older peer.
 func (s *Session) onKex(pub []byte, now time.Time) {
-	if noKex || s.kexPriv == nil || s.kexDone || len(pub) != 32 {
+	if noKex || s.kexPriv == nil || (s.kexDone && s.probeUntil.IsZero()) || len(pub) != 32 {
 		return
 	}
 	if !s.cfg.Server {
 		if s.oldAead != nil {
-			return // an earlier reply already switched the key
+			return // an earlier reply already switched the key (nil again while probing, so a restarted peer's reply lands)
 		}
 		shared, err := curve25519.X25519(s.kexPriv, pub)
 		if err != nil || allZero(shared) {
@@ -464,6 +466,7 @@ func (s *Session) onKex(pub []byte, now time.Time) {
 			return
 		}
 		s.oldAead, s.aead, s.kexAt, s.kexDone = s.aead, fresh, now, true
+		s.probeUntil = time.Time{}
 		s.pubRxKeys()
 		return
 	}
@@ -843,6 +846,11 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	if len(s.probeQ) > 0 {
 		return s.buildProbe(now), true
 	}
+	if !s.probeUntil.IsZero() && s.kexPriv != nil && now.Sub(s.kexSentAt) >= time.Second {
+		if o, ok := s.buildKexProbe(now); ok {
+			return o, true
+		}
+	}
 	needAck := s.ackPend > 0 && (s.ackPend >= s.ackEvery || now.Sub(s.ackSince) >= 2*time.Millisecond)
 	canData := s.cc.tokens > 0 && s.inflight < s.cc.cwnd() && !s.held
 	needBoot := s.cfg.Server && s.cfg.Boot != 0 && now.Sub(s.bootAt) >= time.Second
@@ -1028,18 +1036,33 @@ func (s *Session) noteLimit() {
 	}
 }
 
-func (s *Session) seal(p []byte) ([]byte, uint64) {
+func (s *Session) seal(p []byte) ([]byte, uint64) { return s.sealWith(s.aead, p) }
+
+func (s *Session) sealWith(a cipher.AEAD, p []byte) ([]byte, uint64) {
 	pn := s.nextPN
 	s.nextPN++
 	out := s.getOut(hdrLen + len(p) + tagLen)
 	binary.BigEndian.PutUint64(out, s.sid)
 	binary.BigEndian.PutUint64(out[8:], pn)
 	copy(s.txNonce[4:], out[8:16])
-	a := s.aead
-	if !s.cfg.Server && !s.kexDone && s.probeUntil.After(s.now) {
-		a = s.pskAead // restart probe: a restarted peer can only open the PSK key (see timers)
-	}
 	return a.Seal(out, s.txNonce[:], p, out[:8]), pn
+}
+
+// buildKexProbe sends the restart probe (client, while probeUntil is set): a lone frKex offer sealed with the PSK
+// key, at most once a second. Only a restarted peer opens it; a live one drops it and keeps opening the data, which
+// stays on the fresh key. Untracked: a live peer never acks it, and that must not count as loss.
+func (s *Session) buildKexProbe(now time.Time) (outPkt, bool) {
+	lane := -1
+	if s.chooser == nil {
+		if lane = s.nextLane(); lane < 0 {
+			return outPkt{}, false
+		}
+	}
+	s.kexSentAt = now // not lastSend: fresh-key pings must keep eliciting a live peer's answer
+	out, _ := s.sealWith(s.pskAead, append(append(s.plainBuf[:0], frKex), s.kexPub...))
+	s.stats.PktsOut++
+	s.stats.BytesOut += uint64(len(out))
+	return outPkt{out, lane, -1}, true
 }
 
 // probePath asks for a tiny ack-eliciting packet on one path (how the bond finds a dead carrier alive again).
@@ -1275,14 +1298,20 @@ func (s *Session) timers(now time.Time) {
 		}
 		s.kexPriv, s.kexPub, s.kexStart = priv, pub, now
 	}
-	if !s.cfg.Server && s.kexDone && !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > kexProbeAfter {
+	if !s.probeUntil.IsZero() && now.After(s.probeUntil) {
+		s.probeUntil = time.Time{} // no restarted peer answered: back to the fresh key alone (re-probes if still silent)
+		s.pubRxKeys()
+	}
+	if !s.cfg.Server && s.kexDone && s.probeUntil.IsZero() && !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > s.probeAfter {
 		// we switched keys but the peer went silent while we keep sending: either the path died, or
 		// the peer RESTARTED and can no longer open the fresh key (2.10.0 regression the frBoot frame
 		// used to cover: a restarted server could never authenticate the switched client, so the boot
-		// id never reached it and every stream hung). Probe: seal and accept PSK packets for a while
-		// and offer a fresh exchange, so a restarted peer re-authenticates us and re-runs the kex.
-		s.probeUntil = now.Add(kexProbeFor)
-		s.kexDone = false
+		// id never reached it and every stream hung). Probe: send lone PSK-sealed offers (buildKexProbe)
+		// and accept PSK packets for a while, so a restarted peer re-authenticates us and re-runs the kex.
+		// Data stays on the fresh key: a peer that is alive, only cut off, keeps opening it (sealing the
+		// data with the PSK blackholed it at a live peer past kexGrace and gave it no forward secrecy),
+		// and kexDone stays set so a later real restart is still detected.
+		s.probeUntil = now.Add(s.probeFor)
 		s.oldAead = nil // the PSK key takes over as the receive fallback while probing
 		s.pubRxKeys()
 	}
@@ -1414,9 +1443,6 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 		if freshRx != nil {
 			first, fall = freshRx, s.aead
 		}
-		if !s.cfg.Server && s.probeUntil.After(time.Now()) {
-			fall = s.pskAead
-		}
 		s.mu.Unlock()
 	}
 	copy(s.rxNonce[4:], raw[8:16])
@@ -1482,7 +1508,11 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 // aead, oldAead or kexDone.
 func (s *Session) pubRxKeys() {
 	if s.kexDone {
-		s.rxKeys.Store(&[2]cipher.AEAD{s.aead, s.oldAead})
+		fall := s.oldAead
+		if !s.probeUntil.IsZero() {
+			fall = s.pskAead // restart probe: a restarted peer answers with the PSK key (oldAead is nil while probing)
+		}
+		s.rxKeys.Store(&[2]cipher.AEAD{s.aead, fall})
 	} else {
 		s.rxKeys.Store(nil)
 	}
