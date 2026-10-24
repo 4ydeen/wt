@@ -45,7 +45,10 @@ func tcpStreamBase(tc *net.TCPConn) (nxt, rcv uint32, ok bool) {
 			return
 		}
 		defer func() { _ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR, 0) }()
-		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR_QUEUE, 1 /* TCP_SEND_QUEUE */); serr != nil {
+		// Linux include/uapi/linux/tcp.h: TCP_NO_QUEUE=0, TCP_RECV_QUEUE=1, TCP_SEND_QUEUE=2
+		const tcpRecvQueue = 1
+		const tcpSendQueue = 2
+		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR_QUEUE, tcpSendQueue); serr != nil {
 			return
 		}
 		// x/sys/unix has no TCP_QUEUE_SEQ getsockopt wrapper; the raw getsockopt is 4 bytes, host order
@@ -58,7 +61,7 @@ func tcpStreamBase(tc *net.TCPConn) (nxt, rcv uint32, ok bool) {
 		}
 		nxt = binary.LittleEndian.Uint32(b[:])
 
-		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR_QUEUE, 0 /* TCP_RECV_QUEUE */); serr != nil {
+		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_REPAIR_QUEUE, tcpRecvQueue); serr != nil {
 			return
 		}
 		l = uint32(4)
@@ -135,24 +138,29 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 	d.inj.tr.addPeerIP(r)
 	ch := d.inj.tr.announce(k, isn, known, rcvNxt)
 	ackCh := d.inj.tr.ackChan(k)
-	if known {
+	if !known { // no socket probe: the fake fires late, off the first data segment, which only the caller's write produces
 		select {
-		case <-ch: // fake fired on final ACK / announce
-		case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
-			d.inj.tr.abandon(k)
+		case <-ch:
+		default:
 			return c, nil
 		}
-		// patterniha duplicate ACK synchronization:
-		// Wait for the server (Cloudflare) to send back a duplicate ACK for the out-of-window
-		// fake packet before sending real data. This ensures:
-		// 1) The fake packet traversed the middlebox DPI and reached Cloudflare.
-		// 2) The DPI parsed the fake SNI and whitelisted this TCP 5-tuple.
-		// 3) At least one RTT separates the fake packet and the real ClientHello.
-		if ackCh != nil && d.inj.tr.needsAck() {
-			select {
-			case <-ackCh: // duplicate ACK received from server!
-			case <-time.After(200 * time.Millisecond): // safety fallback
-			}
+	}
+	select {
+	case <-ch: // fake fired on announce or on the handshake's final ACK
+	case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
+		d.inj.tr.abandon(k)
+		return c, nil
+	}
+	// patterniha duplicate ACK synchronization:
+	// Wait for the server (Cloudflare) to send back a duplicate ACK for the out-of-window
+	// fake packet before sending real data. This ensures:
+	// 1) The fake packet traversed the middlebox DPI and reached Cloudflare.
+	// 2) The DPI parsed the fake SNI and whitelisted this TCP 5-tuple.
+	// 3) At least one RTT separates the fake packet and the real ClientHello.
+	if ackCh != nil && d.inj.tr.needsAck() {
+		select {
+		case <-ackCh: // duplicate ACK received from server!
+		case <-time.After(200 * time.Millisecond): // safety fallback
 		}
 	}
 	return c, nil

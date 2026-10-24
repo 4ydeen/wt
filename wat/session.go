@@ -1786,7 +1786,7 @@ func (s *Session) IO() PacketIO { return s.io }
 func (s *Session) Alive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.lastRecv.IsZero() && time.Since(s.lastRecv) < 10*time.Second
+	return !s.lastAuth.IsZero() && time.Since(s.lastAuth) < 10*time.Second
 }
 
 // LastRecv is when the last authenticated packet from the peer arrived (zero: none yet). Unlike Alive's clock it is

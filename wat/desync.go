@@ -964,8 +964,14 @@ func (t *desyncTracker) announce(k desyncKey, isn uint32, known bool, rcvNxt ...
 			c.sumSeq = isn + 1
 		}
 		t.fireLocked(k, c, isn+1, rcv)
-	} else if m := t.recent[k]; known && m != nil && m.haveSA {
+	} else if m := t.recent[k]; m != nil && m.haveSA {
 		delete(t.recent, k)
+		if m.srvAck > 0 {
+			c.synSeq = m.srvAck - 1
+		} else {
+			c.synSeq = m.isn
+		}
+		c.isnKnown = true
 		c.synAckSeq, c.synAckAck, c.tcpOpts = m.srvSeq, m.srvAck, m.opts
 		if sumMirrorMode(t.cfg.Mode) {
 			c.sumSeq = m.srvAck

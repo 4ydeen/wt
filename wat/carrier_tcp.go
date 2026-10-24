@@ -630,6 +630,7 @@ func (c *TCPPoolClient) dialer() func(ctx context.Context, slot int) (net.Conn, 
 // TCPClientOptions configures client dial parameters (source IP binding, dial hook).
 type TCPClientOptions struct {
 	LocalAddr net.Addr
+	DialHook  func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)
 }
 
 // NewTCPPoolClient dials conns (0 = DefaultPoolConns) TCP connections to host:port in the background; Send drops
@@ -649,13 +650,17 @@ func NewTCPPoolClientOptions(peer string, conns int, opt TCPClientOptions) (*TCP
 	d := net.Dialer{Timeout: 5 * time.Second, LocalAddr: opt.LocalAddr}
 	return newSlotClient(addrs, conns, func(ctx context.Context, addr string) (net.Conn, error) {
 		return d.DialContext(ctx, "tcp", addr)
-	})
+	}, opt.DialHook)
 }
 
 // newSlotClient is a pool client whose slots spread over addrs; dial opens one connection to one address. A slot
 // tries its home address first, then the others at once, and the pool's redial backoff only applies when all failed.
-func newSlotClient(addrs []string, conns int, dial func(ctx context.Context, addr string) (net.Conn, error)) (*TCPPoolClient, error) {
+func newSlotClient(addrs []string, conns int, dial func(ctx context.Context, addr string) (net.Conn, error), hook ...func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)) (*TCPPoolClient, error) {
 	ps := newPeerSet(addrs)
+	var h func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)
+	if len(hook) > 0 {
+		h = hook[0]
+	}
 	c, err := newSlotPoolClient(func(ctx context.Context, slot int) (net.Conn, error) {
 		var last error
 		for _, i := range ps.order(slot) {
@@ -673,7 +678,7 @@ func newSlotClient(addrs []string, conns int, dial func(ctx context.Context, add
 			last = ctx.Err()
 		}
 		return nil, last
-	}, conns)
+	}, conns, h)
 	if c != nil {
 		c.ps = ps
 	}
@@ -701,7 +706,7 @@ func (c *TCPPoolClient) Edges() []EdgeStat {
 	return c.ps.edges()
 }
 
-func newSlotPoolClient(dial func(ctx context.Context, slot int) (net.Conn, error), conns int) (*TCPPoolClient, error) {
+func newSlotPoolClient(dial func(ctx context.Context, slot int) (net.Conn, error), conns int, hook ...func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)) (*TCPPoolClient, error) {
 	if conns <= 0 {
 		conns = DefaultPoolConns
 	}
@@ -710,6 +715,9 @@ func newSlotPoolClient(dial func(ctx context.Context, slot int) (net.Conn, error
 	}
 	c := &TCPPoolClient{dial: dial, slots: make([]atomic.Pointer[poolConn], conns),
 		rx: make(chan []byte, poolRxQueue), done: make(chan struct{})}
+	if len(hook) > 0 && hook[0] != nil {
+		c.SetDialHook(hook[0])
+	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	if _, err := crand.Read(c.id[:]); err != nil {
 		return nil, err

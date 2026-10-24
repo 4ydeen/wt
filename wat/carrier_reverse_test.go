@@ -2,9 +2,11 @@ package wat
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -185,4 +187,52 @@ func TestReverseKillConnsMidTransfer(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func TestReverseDialHook(t *testing.T) {
+	key := []byte("rev-hook-key")
+	ir := revListen(t, "tcp", "127.0.0.1:0", key)
+	var hooked atomic.Int32
+	// the option, not SetDialHook: slots start dialing at once, a later hook misses the first redial
+	c, err := NewTCPPoolClientOptions(ir.io.Addr().String(), 4, TCPClientOptions{DialHook: func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error) {
+		conn, err := inner(ctx, slot)
+		if err == nil {
+			hooked.Add(1)
+		}
+		return conn, err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := NewReverseDialRaw(c)
+	srv := NewServer(Config{Key: key}, raw)
+	srv.IdleTimeout = 5 * time.Second
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case s := <-srv.New:
+				go func(s *Session) {
+					for {
+						st, err := s.Accept()
+						if err != nil {
+							return
+						}
+						go serveUDPStream(st)
+					}
+				}(s)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { close(stop); srv.Close(); raw.Close() })
+	deadline := time.Now().Add(5 * time.Second)
+	for hooked.Load() < 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("hooked %d conns, want at least 4", hooked.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	revBulk(t, ir.cli, 64<<10)
 }

@@ -4,11 +4,11 @@ import (
 	"testing"
 )
 
-// TestFilterProfileDefaults: before any probe runs, FilterProfileNow reports the seq default with Probed=false.
+// TestFilterProfileDefaults: before any probe runs, FilterProfileNow reports the zero value (no probe ran, Mode empty).
 func TestFilterProfileDefaults(t *testing.T) {
 	p := FilterProfileNow()
-	if p.Mode != "seq" || p.Probed {
-		t.Fatalf("default profile = %+v, want {seq probed=false}", p)
+	if p.Mode != "" || p.Probed {
+		t.Fatalf("default profile = %+v, want zero value", p)
 	}
 }
 

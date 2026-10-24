@@ -1899,11 +1899,12 @@ apply_preset() { # tunnel preset
   pr=$(preset_canonical "$raw_preset")
   local cr; cr=$(cfg "$tun" carrier)
   local r; r=$(role "$tun")
-  [ "$r" = Iran ] || { err "'$tun' is not an Iran tunnel (anti-censorship presets are client-only)."; return 1; }
-  [ "$(bin_ver_ok 2.7.0)" = 1 ] || { err "Anti-censorship features need wattun 2.7.0 or newer (run: $SELF update)."; return 1; }
-  if is_pool "$cr" && is_reverse "$tun"; then
-    err "'$tun' is a reverse pool tunnel (Kharej dials in to Iran). Anti-censorship desync is dialer-side only."; return 1
+  if is_reverse "$tun"; then
+    [ "$r" = Kharej ] || { err "'$tun' is a reverse Iran tunnel (the listener). Anti-censorship desync runs on the dialer (Kharej)."; return 1; }
+  else
+    [ "$r" = Iran ] || { err "'$tun' is not an Iran tunnel (anti-censorship presets run on the dialer)."; return 1; }
   fi
+  [ "$(bin_ver_ok 2.7.0)" = 1 ] || { err "Anti-censorship features need wattun 2.7.0 or newer (run: $SELF update)."; return 1; }
   if [ "$cr" != icmp ] && ! is_pool "$cr"; then
     err "Carrier '$cr' does not support anti-censorship features (only pool carriers and icmp are supported)."; return 1
   fi
@@ -3037,7 +3038,14 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
   # otherwise, so switching to icmp/udp/bond/reverse never leaves dead keys (or silently re-arms them
   # when the type is switched back later)
   local keepres=''
-  case "$T_CARRIER" in tcp|tls|ws|wss|h2|h2c|grpc) [ "$T_REV" != 1 ] && keepres=1 ;; esac
+  case "$T_CARRIER" in tcp|tls|ws|wss|h2|h2c|grpc)
+    if [ "$T_REV" = 1 ]; then
+      [ "$(role "$n")" = Kharej ] && keepres=1
+    else
+      [ "$(role "$n")" = Iran ] && keepres=1
+    fi
+    ;;
+  esac
   [ "$keepres" = 1 ] || sed -i -E '/^(fake-(sni|mode|ttl)|pool-rotate(-bytes)?):/d' "$f"
   set_value "$n" peer "$T_PEER"
   [ -n "$T_PATH" ] && set_value "$n" path "$T_PATH"

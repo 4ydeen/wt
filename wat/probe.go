@@ -42,7 +42,7 @@ type FilterProfile struct {
 
 var (
 	filterMu      sync.Mutex
-	filterProfile = FilterProfile{Mode: "seq"}
+	filterProfile = FilterProfile{}
 )
 
 // FilterProfileNow reports the startup probe's verdict (the zero value says no probe ran).
