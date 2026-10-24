@@ -861,10 +861,10 @@ v_preset() {
   [ -z "$1" ] && return 0
   local v=${1,,}
   case "$v" in
-    mci|irancell|mokhaberat|tci|blackout|emergency|strict|conservative|low-churn|off|clear|none) return 0 ;;
+    cloudflare|cf|cloudflare-tested|tested|worked|mci|irancell|mokhaberat|tci|blackout|emergency|strict|conservative|low-churn|off|clear|none) return 0 ;;
     "iran whitelist - mci"|"iran whitelist - irancell/mokhaberat"|"emergency blackout mode"|"conservative / low-churn"|"conservative/low-churn") return 0 ;;
   esac
-  err "Unknown preset '$1'. Available: mci, irancell, blackout, conservative"
+  err "Unknown preset '$1'. Available: cloudflare, mci, irancell, blackout, conservative"
   return 1
 }
 v_dns_listen() {
@@ -1518,9 +1518,16 @@ ni_kharej_ports() { # --ports "18999,2000,53/udp" -> MAPS (Kharej side: the serv
 # ======================================================================================
 #  Anti-Censorship Presets, Selection Helpers, and Numbered Pickers
 # ======================================================================================
+# Anti-censor runs on the side that DIALS the carrier: Iran normally, Kharej when the pool tunnel is reverse (2.10.12).
+ac_dialer() { # name
+  [ "$(uname -s)" = Linux ] || return 1
+  if is_pool "$(cfg "$1" carrier)" && is_reverse "$1"; then [ "$(role "$1")" = Kharej ]; else [ "$(role "$1")" = Iran ]; fi
+}
+
 preset_canonical() {
   local p="${1,,}"
   case "$p" in
+    cloudflare|cf|cloudflare-tested|tested|worked) echo cloudflare ;;
     mci|mci-whitelist|hamrah|hamrah-aval) echo mci ;;
     irancell|mokhaberat|tci|irancell-whitelist) echo irancell ;;
     blackout|emergency|strict) echo blackout ;;
@@ -1536,7 +1543,7 @@ preset_canonical() {
 
 is_builtin_preset() {
   case "$(preset_canonical "$1")" in
-    mci|irancell|blackout|conservative) return 0 ;;
+    cloudflare|mci|irancell|blackout|conservative) return 0 ;;
   esac
   return 1
 }
@@ -1544,6 +1551,19 @@ is_builtin_preset() {
 show_builtin_preset() {
   local p; p=$(preset_canonical "$1")
   case "$p" in
+    cloudflare)
+      cat <<'EOF'
+# WatTunnel built-in preset: Cloudflare (field-tested 2.10.12)
+# Fake hello naming www.cloudflare.com, out-of-window seq marker, no churn: the setup that came up on a real route
+FAKESNI=www.cloudflare.com
+FAKEMODE=seq
+FAKETTL=
+POOLROT=
+POOLBYTES=
+ECH=
+GOVERNOR=
+EOF
+      ;;
     mci)
       cat <<'EOF'
 # WatTunnel built-in preset: Iran Whitelist - MCI
@@ -1617,6 +1637,9 @@ detect_preset() {
   if [ -z "$fs" ] && [ -z "$rot" ] && [ "$(cfg "$n" governor)" != true ]; then
     echo "${GRY}none / disabled${RST}"; return
   fi
+  if [ "$fs" = "www.cloudflare.com" ] && [ "$fm" = "seq" ] && [ -z "$rot" ]; then
+    echo "${GRN}Cloudflare (field-tested)${RST}"; return
+  fi
   if [ "$fs" = "mci.ir" ] && [ "$fm" = "seqsum" ] && [ "$rot" = "30m" ]; then
     echo "${GRN}Iran Whitelist - MCI${RST}"; return
   fi
@@ -1639,20 +1662,23 @@ pick_preset() { # [default] -> REPLY_V
     return 0
   fi
   say "  ${BOLD}Select Built-in Anti-Censorship Preset${RST}:"
-  say "    ${CYN}1${RST}  Iran Whitelist - MCI          (mci.ir, seqsum mode, 30m / 500MB churn, ECH ladder)"
-  say "    ${CYN}2${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn, ECH ladder)"
-  say "    ${CYN}3${RST}  Emergency Blackout Mode       (mci.ir, auto probe, 90s / 100MB rapid churn, ECH ladder)"
-  say "    ${CYN}4${RST}  Conservative / Low-Churn      (mci.ir, seq mode, 4h / 4GB, ECH auto)"
-  say "    ${CYN}5${RST}  Disabled / Clear              (turn off all anti-censorship features)"
+  say "    ${CYN}1${RST}  Cloudflare (field-tested)     (www.cloudflare.com, seq mode, no churn; works with reverse)"
+  say "    ${CYN}2${RST}  Iran Whitelist - MCI          (mci.ir, seqsum mode, 30m / 500MB churn, ECH ladder)"
+  say "    ${CYN}3${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn, ECH ladder)"
+  say "    ${CYN}4${RST}  Emergency Blackout Mode       (mci.ir, auto probe, 90s / 100MB rapid churn, ECH ladder)"
+  say "    ${CYN}5${RST}  Conservative / Low-Churn      (mci.ir, seq mode, 4h / 4GB, ECH auto)"
+  say "    ${CYN}6${RST}  Disabled / Clear              (normal tunnel, full speed)"
   echo
-  printf '  %s?%s Press a number %s[1 = MCI]%s ' "$CYN" "$RST" "$GRY" "$RST"
+  printf '  %s?%s Press a number %s[1 = Cloudflare]%s ' "$CYN" "$RST" "$GRY" "$RST"
   key_read
   case "$KEY" in
-    1|enter) REPLY_V="mci" ;;
-    2) REPLY_V="irancell" ;;
-    3) REPLY_V="blackout" ;;
-    4) REPLY_V="conservative" ;;
-    5) REPLY_V="off" ;;
+    1) REPLY_V="cloudflare" ;;
+    2) REPLY_V="mci" ;;
+    3) REPLY_V="irancell" ;;
+    4) REPLY_V="blackout" ;;
+    5) REPLY_V="conservative" ;;
+    6) REPLY_V="off" ;;
+    enter) REPLY_V="$def" ;;
     esc|q) echo; return 1 ;;
     *) REPLY_V="$def" ;;
   esac
@@ -1899,7 +1925,7 @@ apply_preset() { # tunnel preset
   pr=$(preset_canonical "$raw_preset")
   local cr; cr=$(cfg "$tun" carrier)
   local r; r=$(role "$tun")
-  if is_reverse "$tun"; then
+  if is_pool "$cr" && is_reverse "$tun"; then
     [ "$r" = Kharej ] || { err "'$tun' is a reverse Iran tunnel (the listener). Anti-censorship desync runs on the dialer (Kharej)."; return 1; }
   else
     [ "$r" = Iran ] || { err "'$tun' is not an Iran tunnel (anti-censorship presets run on the dialer)."; return 1; }
@@ -1911,6 +1937,8 @@ apply_preset() { # tunnel preset
 
   local fs='' fm='' ft='' rot='' rbytes='' ech='' gov=''
   case "$pr" in
+    cloudflare)
+      fs="www.cloudflare.com"; fm="seq"; ft=""; rot=""; rbytes=""; ech=""; gov="" ;;
     mci)
       fs="mci.ir"; fm="seqsum"; ft=""; rot="30m"; rbytes="500MB"; ech="ladder"; gov="true" ;;
     irancell)
@@ -1921,7 +1949,7 @@ apply_preset() { # tunnel preset
       fs="mci.ir"; fm="seq"; ft=""; rot="4h"; rbytes="4GB"; ech="auto"; gov="true" ;;
     off|clear|none)
       fs=""; fm=""; ft=""; rot=""; rbytes=""; ech=""; gov="" ;;
-    *) err "Unknown preset '$raw_preset'. Available: mci, irancell, blackout, conservative"; return 1 ;;
+    *) err "Unknown preset '$raw_preset'. Available: cloudflare, mci, irancell, blackout, conservative"; return 1 ;;
   esac
 
   if [ "$cr" = icmp ]; then
@@ -4126,11 +4154,15 @@ tunnel_card() {
   fi
 
   sub=$(cdn_summary "$n"); [ -n "$sub" ] && box_row "  ${GRY}CDN: $sub${RST}"
-  if [ "$r" = Iran ] && [ "$(uname -s)" = Linux ]; then
+  if ac_dialer "$n"; then
     local fks=$(cfg "$n" fake-sni) gov=$(cfg "$n" governor) rot=$(cfg "$n" pool-rotate) dl=$(cfg "$n" dns-listen)
     if [ -n "$fks" ] || [ "$gov" = true ] || [ -n "$rot" ] || [ -n "$dl" ]; then
-      box_row "  Anti-Censor: $(detect_preset "$n")${fks:+ (fake-sni $fks)}${dl:+ (dns $dl)}"
+      box_row "  Anti-Censor: ${GRN}ON${RST} · $(detect_preset "$n")${fks:+ (fake-sni $fks)}${dl:+ (dns $dl)}"
+    else
+      box_row "  Anti-Censor: ${GRY}OFF (normal tunnel, full speed)${RST}"
     fi
+  elif [ "$(uname -s)" = Linux ] && is_pool "$(cfg "$n" carrier)" && is_reverse "$n"; then
+    box_row "  Anti-Censor: ${GRY}runs on the Kharej side (reverse)${RST}"
   fi
   local bmode=$(cfg "$n" bond-mode)
   [ -n "$bmode" ] && box_row "  Bond Mode: ${BOLD}$bmode${RST}"
@@ -4347,7 +4379,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
       if [ "$cr" = icmp ]; then summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej sends the pings)" || echo "normal (Iran sends the pings)")"
       else summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej connects to Iran)" || echo "normal (Iran connects to Kharej)")"; fi
     fi
-    if [ "$r" = Iran ] && [ "$(uname -s)" = Linux ]; then
+    if ac_dialer "$n"; then
       if is_pool "$cr"; then
         local fks=$(cfg "$n" fake-sni) fkm=$(cfg "$n" fake-mode)
         local fkl=${fks:-off}${fkm:+ ($fkm mode)}
@@ -4368,7 +4400,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
     [ "$r" = Iran ] && printf '%s  bind   ' "$(key_label a)"
     [ "$cr" = icmp ] && printf "%s  ICMP type   " "$(key_label i)"
     rev_capable "$cr" && printf "%s  direction   " "$(key_label d)"
-    [ "$r" = Iran ] && [ "$(uname -s)" = Linux ] && printf '%s  resilience   ' "$(key_label k)"
+    ac_dialer "$n" && printf '%s  resilience   ' "$(key_label k)"
     printf '%s  back\n' "$(key_label b)"
     key_read
     case "$KEY" in
@@ -4384,7 +4416,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
       u) echo; ask_ok "MTU 576-65535 (- or 0 or default = unset)" "$(cfg "$n" mtu)" v_mtu || continue
          case "$REPLY_V" in -|0|default) REPLY_V='' ;; esac
          if [ -z "$REPLY_V" ]; then unset_value "$n" mtu; else set_value "$n" mtu "$REPLY_V"; fi; changed=1 ;;
-      k) [ "$r" = Iran ] || continue; anticensor_menu "$n" ;;
+      k) ac_dialer "$n" || continue; anticensor_menu "$n" ;;
       f) echo; ask_ok "FEC: off or auto" "$(cfg "$n" fec | sed 's/^$/off/')" v_fec || continue
          if [ "$REPLY_V" = off ]; then unset_value "$n" fec; else set_value "$n" fec "$REPLY_V"; fi; changed=1 ;;
       a) [ "$r" = Iran ] || continue; echo; ask_ok "Bind address" "$(cfg "$n" bind | sed 's/^$/0.0.0.0/')" v_bind || continue
@@ -4414,7 +4446,7 @@ anticensor_test() {
   local n=$1 r cr peer s alive=false srtt pkts_in pkts_out fprof ech_st gov_st
   [ -f "$CONF/$n.yml" ] || { err "No tunnel named '$n'."; return 1; }
   r=$(role "$n"); cr=$(cfg "$n" carrier); peer=$(cfg "$n" peer)
-  [ "$r" = Iran ] || { err "'$n' is not an Iran tunnel (anti-censorship verification is client-only)."; return 1; }
+  ac_dialer "$n" || { err "'$n' does not dial the carrier (anti-censorship verification runs on the dialing end)."; return 1; }
   echo
   say "  ${BOLD}Anti-Censorship & Link Verification for '$n'${RST} ($r · $cr)"
   echo
@@ -4510,11 +4542,19 @@ anticensor_test() {
 # ======================================================================================
 #  Interactive Anti-Censorship Menu Hub
 # ======================================================================================
+AC_KEYS="fake-sni fake-mode fake-ttl fake-ip fake-split fp tls-small-ch ech ech-cache tls-frag pool-rotate pool-rotate-bytes governor dns-listen src-ip conns loss-ceiling"
 anticensor_menu() {
   local n=$1 cr r
   cr=$(cfg "$n" carrier); r=$(role "$n")
-  [ "$r" = Iran ] || return 0
-  local changed=0
+  [ "$(uname -s)" = Linux ] || return 0
+  if ! ac_dialer "$n"; then # the listening end has nothing to configure
+    page "Anti-Censorship & Resilience" "$n ($cr)"
+    say "  '$n' is a ${BOLD}$(is_reverse "$n" && echo reverse || echo normal)${RST} tunnel: the ${BOLD}$([ "$r" = Iran ] && echo Kharej || echo Iran)${RST} server dials the carrier,"
+    say "  so anti-censor is switched on and tuned there. Open this screen on that server."
+    hint "To change who dials: Advanced settings, then d (direction), on both servers."
+    pause; return 0
+  fi
+  local changed=0 k v
   while :; do
     page "Anti-Censorship & Resilience" "$n ($cr)"
     local fs fm ft pr pb ech gov dl sip
@@ -4530,7 +4570,12 @@ anticensor_menu() {
 
     say "  ${BOLD}Anti-Censorship Configuration for '$n'${RST}"
     echo
-    printf '    %s  Preset Profile         %s\n' "$(key_label 1)" "$(detect_preset "$n")"
+    if [ -n "$fs" ] || [ "$gov" = true ] || [ -n "$pr" ]; then
+      printf '    %s  Anti-Censor            %s ON  %s(press to turn off)%s  %s\n' "$(key_label 1)" "$GRN" "$GRY" "$RST" "$(detect_preset "$n")"
+    else
+      printf '    %s  Anti-Censor            %sOFF%s (normal tunnel, full speed)  press to turn on\n' "$(key_label 1)" "$GRY" "$RST"
+    fi
+    printf '    %s  Direction              %s\n' "$(key_label r)" "$(is_reverse "$n" && echo "reverse (Kharej dials Iran)" || echo "normal (Iran dials Kharej)")"
     if is_pool "$cr"; then
       printf '    %s  Fake SNI               %s\n' "$(key_label 2)" "${fs:-${GRY}off (disabled)${RST}}"
       printf '    %s  Fake Desync Mode       %s\n' "$(key_label 3)" "$([ -n "$fs" ] && echo "$fm" || echo "${GRY}n/a (fake-sni off)${RST}")"
@@ -4547,6 +4592,8 @@ anticensor_menu() {
     printf '    %s  DNS Forwarder          %s\n' "$(key_label 8)" "${dl:-${GRY}off (disabled)${RST}}"
     printf '    %s  Carrier Source IP      %s\n' "$(key_label 9)" "${sip:-${GRY}off (default route)${RST}}"
     echo
+    printf '    %s  Choose Another Preset\n' "$(key_label w)"
+    printf '    %s  Edit Any Key           (fake-ip, fp, tls-small-ch, conns ...)\n' "$(key_label e)"
     printf '    %s  Test Filter Bypass & Link Status\n' "$(key_label t)"
     printf '    %s  Anti-Censor Matrix      (test every combination, apply the best)\n' "$(key_label m)"
     printf '    %s  Save Current as Custom Profile\n' "$(key_label p)"
@@ -4554,11 +4601,35 @@ anticensor_menu() {
     echo
     key_read
     case "$KEY" in
-      1) # Presets
+      1) # Toggle: on -> plain tunnel, off -> preset (apply_preset restarts the tunnel itself)
          echo
-         if pick_preset "mci"; then
-           apply_preset "$n" "$REPLY_V" && changed=1
+         if [ -n "$fs" ] || [ "$gov" = true ] || [ -n "$pr" ]; then
+           confirm "Turn anti-censor OFF (plain tunnel, open connections drop)?" y && apply_preset "$n" off
+         elif pick_preset "cloudflare"; then
+           apply_preset "$n" "$REPLY_V"
          fi
+         sleep 1 ;;
+      w|W) echo
+         if pick_preset "cloudflare"; then
+           apply_preset "$n" "$REPLY_V"
+         fi
+         sleep 1 ;;
+      r|R) rev_capable "$cr" || continue; echo
+         if set_direction "$n"; then
+           step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
+           hint "Anti-censor now belongs to the dialing end: open this screen on the other server and press 1 there."
+           pause; return 0
+         fi
+         pause ;;
+      e|E) echo
+         hint "Keys: $AC_KEYS"
+         ask "Key to set" ""; k=$REPLY_V
+         [ -n "$k" ] || continue
+         case " $AC_KEYS " in *" $k "*) ;; *) err "Unknown key '$k'."; sleep 1; continue ;; esac
+         ask "Value for $k (- = remove)" "$(cfg "$n" "$k")"; v=$REPLY_V
+         if [ -z "$v" ] || [ "$v" = - ]; then unset_value "$n" "$k"; ok "$k removed."; changed=1
+         elif [[ "$v" =~ ^[A-Za-z0-9._:/@+-]+$ ]]; then set_value "$n" "$k" "$v"; ok "$k set to $v."; changed=1
+         else err "Value may only hold letters, digits and . _ : / @ + -"; fi
          sleep 1 ;;
       2) # Pick SNI (pool) or Toggle Governor (icmp)
          if [ "$cr" = icmp ]; then
@@ -4727,8 +4798,8 @@ blackout_cmd() { # name [sni_or_preset] : turn the resilience kit on when a cens
   local n=$1 sni=${2:-}
   [ "$(uname -s)" = Linux ] || { err "The resilience kit is a Linux feature (fake-SNI needs CAP_NET_RAW, like the icmp carrier)."; return 1; }
   [ -f "$CONF/$n.yml" ] || { err "No tunnel named '$n'."; return 1; }
-  [ "$(role "$n")" = Iran ] || {
-    err "'$n' is not an Iran tunnel; anti-censorship features are client-only."; return 1; }
+  ac_dialer "$n" || {
+    err "'$n' does not dial the carrier, so anti-censorship runs on its other end (Iran normally, Kharej when reverse)."; return 1; }
 
   if [ -z "$sni" ] && [ "$NONINTERACTIVE" != 1 ]; then
     echo
@@ -4885,11 +4956,11 @@ preset_cmd() { # name [preset]
   local n=$1 p=${2:-}
   [ "$(uname -s)" = Linux ] || { err "Anti-censorship presets are a Linux feature."; return 1; }
   [ -f "$CONF/$n.yml" ] || { err "No tunnel named '$n'."; return 1; }
-  [ "$(role "$n")" = Iran ] || { err "'$n' is not an Iran tunnel (presets are client-only)."; return 1; }
+  ac_dialer "$n" || { err "'$n' does not dial the carrier, so presets run on its other end (Iran normally, Kharej when reverse)."; return 1; }
   if [ -z "$p" ] && [ "$NONINTERACTIVE" != 1 ]; then
-    pick_preset "mci" || return 1; p=$REPLY_V
+    pick_preset "cloudflare" || return 1; p=$REPLY_V
   fi
-  [ -n "$p" ] || { err "A preset name is required (preset $n mci). Available: mci, irancell, blackout, conservative"; return 1; }
+  [ -n "$p" ] || { err "A preset name is required (preset $n mci). Available: cloudflare, mci, irancell, blackout, conservative"; return 1; }
   v_preset "$p" || return 1
   apply_preset "$n" "$p" || return 1
   if [ -t 0 ] && [ "$NONINTERACTIVE" != 1 ] && [ "${WAT_MANAGER_LIB:-0}" != 1 ]; then
@@ -5574,6 +5645,9 @@ tunnel_page() {
     printf '    %s Restart Tunnel Daemon               %s %sDelete Tunnel Permanently%s\n' "$(key_label r)" "$(key_label x)" "$RED" "$RST"
     printf '    %s %-32s  %s Advanced YAML Settings\n' "$(key_label s)" "$run_txt" "$(key_label o)"
     printf '    %s Toggle Autostart at Boot\n' "$(key_label e)"
+    if [ "$(uname -s)" = Linux ] && { is_pool "$(cfg "$n" carrier)" || [ "$(cfg "$n" carrier)" = icmp ]; }; then
+      printf '    %s Anti-Censor (on/off, presets, reverse)\n' "$(key_label z)"
+    fi
     echo
     hr
     printf '    %s Back to Dashboard                                        %s Help\n' "$(key_label 0)" "$(key_label '?')"
@@ -5595,6 +5669,7 @@ tunnel_page() {
          pause ;;
       k|K) if [ "$r" = Kharej ]; then page "New key" "$n"; run_flow change_key "$n"; pause; else anticensor_menu "$n"; fi ;;
       o|O) run_flow adv_menu "$n" ;;
+      z|Z) anticensor_menu "$n" ;;
       r|R) echo; if confirm "Restart '$n'? Open connections drop." n; then step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; sleep 1; fi ;;
       s|S) echo
          if [ "$run" = active ]; then systemctl stop "${WAT_PREFIX}@$n" 2>/dev/null; ok "Stopped (it still starts at boot if enabled)."; sleep 1

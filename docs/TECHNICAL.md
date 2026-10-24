@@ -1818,7 +1818,11 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   Kharej server), on tcp, tls, ws, wss, h2 and grpc; the manager's anti-censorship presets allow it. The `tcp` carrier
   gained `TCPClientOptions.DialHook` for this. (3) `Session.Alive` reads the honest authenticated-packet clock, so
   `/stats` `alive` and `/speedtest` no longer show a dead tunnel as alive for 10 s of every 30 s. (4) `filter_profile.mode`
-  is empty when no probe ran instead of `seq`.
+  is empty when no probe ran instead of `seq`. (5) Manager: anti-censor is a toggle, off by default so a tunnel stays the
+  plain full-speed one. Tunnel page, `z` (or Advanced, `k`): `1` turns it on with a preset or off again, `w` picks another
+  preset (new first choice `cloudflare`: fake `www.cloudflare.com`, `seq`, no churn, the combination field-tested in
+  2.10.12), `r` switches normal/reverse, `e` sets any single key (fake-ip, fp, tls-small-ch, conns ...). It runs on the
+  dialing end, which is Kharej once a pool tunnel is reverse. CLI: `wattun-manager preset NAME cloudflare|off`.
 
 - **2.10.10: the Kharej-restart probe no longer stalls a live tunnel.** Client-side fix (the Iran server); no wire
   change, works with every 2.10.x server. Since 2.10.1 a client that heard nothing for 4 s sealed **all** its

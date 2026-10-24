@@ -220,6 +220,30 @@ chk "pick_preset default" "$REPLY_V" "mci"
 NI_PRESET='irancell' pick_preset
 chk "pick_preset explicit" "$REPLY_V" "irancell"
 
+# anti-censor toggle: the Cloudflare preset on, off again, and who dials in a reverse tunnel
+chk "preset alias cf" "$(preset_canonical CF)" "cloudflare"
+chk "v_preset cloudflare" "$(v_preset cloudflare && echo ok)" "ok"
+apply_preset t1 cloudflare >/dev/null
+chk "cloudflare fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t1.yml")" "fake-sni: www.cloudflare.com"
+chk "cloudflare fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: seq"
+chk "cloudflare clears pool-rotate" "$(grep -c '^pool-rotate' "$WAT_CONF/t1.yml")" "0"
+apply_preset t1 off >/dev/null
+chk "off clears fake-sni" "$(grep -c '^fake-' "$WAT_CONF/t1.yml")" "0"
+chk "iran normal dials" "$(ac_dialer t1 && echo y || echo n)" "y"
+printf 'mode: server
+carrier: tcp
+reverse: true
+peer: "1.2.3.4:4443"
+' >"$WAT_CONF/t3.yml"
+role() { echo Kharej; }
+chk "kharej reverse dials" "$(ac_dialer t3 && echo y || echo n)" "y"
+chk "kharej normal listens" "$(ac_dialer t1 && echo y || echo n)" "n"
+apply_preset t3 cloudflare >/dev/null
+chk "kharej reverse preset" "$(grep '^fake-sni:' "$WAT_CONF/t3.yml")" "fake-sni: www.cloudflare.com"
+role() { echo Iran; }
+chk "iran reverse listens" "$(ac_dialer t3 && echo y || echo n)" "n"
+rm -f "$WAT_CONF/t3.yml"
+
 NI_FAKESNI='' pick_sni_preset
 chk "pick_sni_preset default" "$REPLY_V" "mci.ir"
 NI_FAKESNI='divar.ir' pick_sni_preset
