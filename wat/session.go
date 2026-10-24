@@ -439,7 +439,7 @@ var kexGrace = 30 * time.Second
 var kexGiveUp = 10 * time.Second
 
 var (
-	kexProbeAfter = 4 * time.Second // no received packet for this long (sends continue) starts the probe
+	kexProbeAfter = 4 * time.Second // a send this long after the last received packet starts the probe
 	kexProbeFor   = 10 * time.Second
 )
 
@@ -1302,12 +1302,14 @@ func (s *Session) timers(now time.Time) {
 		s.probeUntil = time.Time{} // no restarted peer answered: back to the fresh key alone (re-probes if still silent)
 		s.pubRxKeys()
 	}
-	if !s.cfg.Server && s.kexDone && s.probeUntil.IsZero() && !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > s.probeAfter {
+	if !s.cfg.Server && s.kexDone && s.probeUntil.IsZero() && !s.lastRecv.IsZero() && s.lastSend.Sub(s.lastRecv) > s.probeAfter {
 		// we switched keys but the peer went silent while we keep sending: either the path died, or
 		// the peer RESTARTED and can no longer open the fresh key (2.10.0 regression the frBoot frame
 		// used to cover: a restarted server could never authenticate the switched client, so the boot
 		// id never reached it and every stream hung). Probe: send lone PSK-sealed offers (buildKexProbe)
 		// and accept PSK packets for a while, so a restarted peer re-authenticates us and re-runs the kex.
+		// "Silent" means we sent probeAfter past the last packet we heard: an idle session whose keepalives
+		// are rarer than probeAfter (-ping-every) is not probed forever.
 		// Data stays on the fresh key: a peer that is alive, only cut off, keeps opening it (sealing the
 		// data with the PSK blackholed it at a live peer past kexGrace and gave it no forward secrecy),
 		// and kexDone stays set so a later real restart is still detected.

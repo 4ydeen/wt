@@ -1808,8 +1808,9 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   packets: up to 10 s of extra stall after the path came back, and the data had no forward secrecy. Worse, the
   probe cleared the key-exchange state for good, so after one false alarm a later real Kharej restart hung the
   session until the Iran service was restarted. Now the probe is a lone PSK-sealed offer once a second, data stays
-  on the fresh key, and the state survives, so the next restart is still detected. Regression test
-  `TestKexFalseProbeThenRestart`.
+  on the fresh key, and the state survives, so the next restart is still detected. The probe also starts only when
+  the client has sent something 4 s after the last packet it heard, so an idle tunnel with `ping-every` of 4 s or
+  more is not probed forever. Regression test `TestKexFalseProbeThenRestart`.
 - **2.10.2: anti-censor matrix tester, ECH lock contention fix, and transport resilience.** Client-side
   reliability update, fully backward-compatible with 2.10.x servers.
   (1) **Autonomous anti-censor matrix tester**: `wattun-manager matrix NAME` tests every resilience combination

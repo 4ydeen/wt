@@ -318,16 +318,17 @@ func TestKexFalseProbeThenRestart(t *testing.T) {
 		return c && s
 	})
 
+	before := atomic.LoadInt64(&total)
 	drop.Store(true)
+	st.Write(make([]byte, 100)) // unanswered sends (retransmits) are what start the probe
 	kexWait(t, "the client to start the restart probe", func() bool {
 		cli.mu.Lock(); defer cli.mu.Unlock()
 		return !cli.probeUntil.IsZero()
 	})
 	drop.Store(false)
-	before := atomic.LoadInt64(&total)
 	t0 := time.Now()
 	st.Write(make([]byte, 1000))
-	kexWait(t, "data written during the probe to reach the live server", func() bool { return atomic.LoadInt64(&total) >= before+1000 })
+	kexWait(t, "data written during the probe to reach the live server", func() bool { return atomic.LoadInt64(&total) >= before+1100 })
 	if d := time.Since(t0); d > time.Second { // the probe window is 2 s: data sealed with the PSK waits it out
 		t.Fatalf("data took %v to reach a live server during the probe: it was sealed with the PSK key", d)
 	}
@@ -336,6 +337,9 @@ func TestKexFalseProbeThenRestart(t *testing.T) {
 		return cli.probeUntil.IsZero() && cli.kexDone
 	})
 
+	cli.mu.Lock()
+	firstKey := cli.aead
+	cli.mu.Unlock()
 	// now the server really restarts: a new session with no fresh key, reachable only through the PSK probe
 	srv.Close()
 	srv2, err := NewSession(sc, &memIO{tx: b, rx: a, done: make(chan struct{})})
@@ -358,6 +362,6 @@ func TestKexFalseProbeThenRestart(t *testing.T) {
 	}
 	kexWait(t, "the client to re-key with the restarted server", func() bool {
 		cli.mu.Lock(); defer cli.mu.Unlock()
-		return cli.kexDone && cli.probeUntil.IsZero()
+		return cli.kexDone && cli.aead != firstKey
 	})
 }
