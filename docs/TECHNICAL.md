@@ -1856,7 +1856,8 @@ Update **both** servers for every release, unless an entry says otherwise. Versi
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
 - **2.10.12: fake-SNI fires on every connection, and it works from a reverse server.** Dialer-side fix, no wire
-  change. (1) The `TCP_REPAIR` probe read the wrong queues, so the fake used a wrong or missing stream start and fired on
+  change. This release also ships 2.10.11, which was never tagged (the duplicate-ACK wait and the 517-byte Chrome
+  fake hello). (1) The `TCP_REPAIR` probe read the wrong queues, so the fake used a wrong or missing stream start and fired on
   only one of two pool connections (field test of 2.10.11); fixed. A handshake the sniffer cached before `Wrap` now also
   fires the fake when the socket probe is unavailable. (2) `fake-sni` runs on the dialing end of a `-reverse` tunnel (the
   Kharej server), on tcp, tls, ws, wss, h2 and grpc; the manager's anti-censorship presets allow it. The `tcp` carrier

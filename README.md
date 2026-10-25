@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.10.11-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v2.10.12-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -105,9 +105,18 @@ Under load, the tunnel adds +0.25 % to the bytes your users move on `tcp` (16 KB
 
 [Idle and bandwidth details](docs/TECHNICAL.md#resource-usage-idle-ram-cpu-and-bandwidth)
 
-## Latest release: 2.10.10
+## Latest release: 2.10.12
 
-**A tunnel no longer stalls for up to 10 s after a short one-way blackout, and no longer hangs for good when the
+**`fake-sni` now carries a tunnel through a Cloudflare-only whitelist, and anti-censor is a one-key toggle in the manager.**
+On the owner's Iran route a `wss` tunnel through a Cloudflare edge connected with `fake-mode: rst` (9-17 MB/s down)
+while every other mode and no fake never did. The fake now fires on every pool connection (the old kernel-queue probe
+read the wrong queues), a reverse Kharej server can run `fake-sni` too, and `/stats` `alive` is honest. In the
+manager, tunnel page `z` turns anti-censor on or off, picks a preset (new first choice: Cloudflare), switches
+reverse and sets any single key; off is the plain full-speed tunnel. Only the dialing end needs the update; the
+wire is unchanged. This release also ships 2.10.11 (never tagged): the duplicate-ACK wait and a 517-byte Chrome
+fake hello. Numbers: [Behind a filter](#behind-a-filter-21012-field-test).
+
+2.10.10 before it: **a tunnel no longer stalls for up to 10 s after a short one-way blackout, and no longer hangs for good when the
 Kharej server restarts after one.** Client-side fix: update the Iran server; any 2.10.x Kharej server works with it.
 
 2.10.9 before it was **the first release since 2.5.1: forward secrecy on every session, signed downloads, the anti-censorship kit, and
