@@ -65,6 +65,11 @@ const (
 	padMax   = 100 // at most this many pad bytes (a one-byte length), so an idle exchange spreads over ~100 sizes
 )
 
+// padCapMask is the first byte of a padding frame from a peer that reads masked headers (older peers skip padding
+// whatever it holds). A client that took the plain form because nothing answered, for instance because the server
+// started later, then moves to the masked form instead of staying plain for the whole session.
+const padCapMask = 1
+
 var zeroPad [padMax]byte
 
 // pad appends a frPad frame of random length to a packet that carries no stream data. It stays inside maxPlain.
@@ -76,11 +81,15 @@ func (s *Session) pad(p []byte) []byte {
 	if room < 1 {
 		return p
 	}
-	n := rand.IntN(room + 1)
-	if n == 0 {
-		return p
+	n := 1 // NoShape: only the capability byte
+	if !s.cfg.NoShape {
+		n = 1 + rand.IntN(room)
 	}
 	p = append(p, frPad, byte(n))
+	if s.hk != nil {
+		p = append(p, padCapMask)
+		n--
+	}
 	return append(p, zeroPad[:n]...)
 }
 

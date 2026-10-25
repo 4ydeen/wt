@@ -162,3 +162,61 @@ func TestNoShapeKeepsSizeFixed(t *testing.T) {
 		t.Fatalf("NoShape idle packets vary over %d sizes", len(sizes))
 	}
 }
+
+// A client that starts before its server flips to the plain header after 3 s of silence. The server answers in the
+// form it was addressed in, so without the capability byte that plain form would stay for the whole session and the
+// session id would show on the wire again. Here the client must end up masked.
+func TestHdrMaskLateServer(t *testing.T) {
+	probe, err := NewUDPServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Close()
+	uc, err := NewUDPClient(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recClient{PacketIO: uc}
+	key := []byte("mask-key")
+	cli, err := NewSession(Config{Key: key, PingEvery: 50 * time.Millisecond}, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cli.Close)
+	time.Sleep(4 * time.Second) // one flip: the client now sends the plain header into the void
+	us, err := NewUDPServer(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(Config{Key: key}, us)
+	t.Cleanup(srv.Close)
+	go func() {
+		for s := range srv.New {
+			go func(s *Session) {
+				for {
+					st, err := s.Accept()
+					if err != nil {
+						return
+					}
+					go serveUDPStream(st)
+				}
+			}(s)
+		}
+	}()
+	udpEcho(t, cli, 20000, 7)
+	time.Sleep(time.Second)
+	n0 := len(rec.snapshot())
+	time.Sleep(time.Second)
+	sid := make([]byte, 8)
+	binary.BigEndian.PutUint64(sid, cli.sid)
+	tail := rec.snapshot()[n0:]
+	if len(tail) == 0 {
+		t.Fatal("client sent nothing after the exchange")
+	}
+	for i, p := range tail {
+		if bytes.Equal(p[:8], sid) {
+			t.Fatalf("packet %d of %d after the exchange still carries the session id in clear", i, len(tail))
+		}
+	}
+}

@@ -716,7 +716,9 @@ had the same sizes. None of that is encrypted content, so none of it needed to l
 header as plain (a session id it knows), then as masked, and answers in the form it was addressed in. A new client that
 hears nothing for 3 s switches between the two forms every 3 s until a packet authenticates (and again after 30 s of
 silence), so it joins an older server a few seconds late and then stays plain. `hdr-mask: false` skips the wait and
-sends the plain header; `shape: false` turns padding and jitter off. Both ends of a tunnel can be updated in any order.
+sends the plain header; `shape: false` turns padding and jitter off. A client that went plain only because its server
+was not up yet (it flips after 3 s of silence) moves back to the masked form as soon as the server's first padding
+frame arrives: that frame's first byte is `1` ("I read masked headers"), which older peers skip. Both ends of a tunnel can be updated in any order.
 A new `tcp` client whose hello gets no answer within 6 s falls back to the plain pool id on that connection (and retries
 the hello after 30 s); `tcp-mimic: false` sends the plain id at once. A new listener accepts both forms.
 

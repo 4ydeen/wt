@@ -205,6 +205,7 @@ type Session struct {
 	hk            []byte        // header-mask key (nil: NoMask)
 	masked        atomic.Bool   // seal outgoing packets with a masked header: the client's guess, the server's echo of what it received
 	maskFlip      time.Time     // client: when the masked/plain guess last changed while no packet had authenticated
+	peerMaskOK    atomic.Bool   // the peer's padding carried the "I read masked headers" byte (hdrmask.go): a client that guessed plain then switches to masked for good
 	stats         Stats
 	openBuf       []byte
 	noWinTune     bool     // tests: behave like a peer that never advertises more than the implicit window
@@ -1011,7 +1012,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 		s.freeSent(sp)
 		return outPkt{}, false
 	}
-	if !s.cfg.NoShape && len(sp.frames) == 0 && !sp.dgram {
+	if (!s.cfg.NoShape || s.hk != nil) && len(sp.frames) == 0 && !sp.dgram {
 		p = s.pad(p)
 	}
 	out, pn := s.seal(p)
@@ -1285,6 +1286,7 @@ func (s *Session) timers(now time.Time) {
 	if !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > 30*time.Second {
 		if s.hk != nil && !s.cfg.Server {
 			s.masked.Store(!s.masked.Load()) // a peer downgraded or upgraded while we were silent
+			s.peerMaskOK.Store(false)
 			s.maskFlip = now
 		}
 		s.resetAll(ErrSessionDead)
@@ -1495,7 +1497,7 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	if err != nil {
 		return // not ours: stay silent
 	}
-	if s.hk != nil && s.masked.Load() != peerMasked { // answer in the header form the peer spoke
+	if s.hk != nil && s.masked.Load() != peerMasked && (s.cfg.Server || !s.peerMaskOK.Load()) { // answer in the header form the peer spoke
 		s.masked.Store(peerMasked)
 	}
 	s.openBuf = plain[:0]
@@ -1655,7 +1657,10 @@ func (s *Session) parse(b []byte, now time.Time) (eliciting bool) {
 			eliciting = true
 			s.onKex(pub, now)
 		case frPad:
-			r.take(r.uv())
+			if b := r.take(r.uv()); len(b) > 0 && b[0] == padCapMask && s.hk != nil && !s.cfg.Server {
+				s.peerMaskOK.Store(true)
+				s.masked.Store(true) // the first exchange may have settled on plain only because the server was not up yet
+			}
 		default:
 			return
 		}
