@@ -18,19 +18,20 @@ Version: see `wat/version.go` (`wattun -version`).
    - [Managing tunnels](#managing-tunnels)
 4. [Carriers](#carriers)
 5. [Bonding](#bonding)
-6. [Reverse mode](#reverse-mode)
+6. [Traffic shape](#traffic-shape-what-a-dpi-sees-2110)
+7. [Reverse mode](#reverse-mode)
    - [Auto mode](#auto-mode)
    - [CDN tuning](#cdn-tuning)
-7. [UDP forwarding](#udp-forwarding)
-8. [Config file](#config-file)
-9. [Command-line flags](#command-line-flags)
-10. [Metrics](#metrics)
-11. [Handover, drain and rollback](#handover-drain-and-rollback)
-12. [Troubleshooting](#troubleshooting)
-13. [Security model](#security-model)
-14. [Build and test](#build-and-test)
-15. [Release history](#release-history)
-16. [License and attribution](#license-and-attribution)
+8. [UDP forwarding](#udp-forwarding)
+9. [Config file](#config-file)
+10. [Command-line flags](#command-line-flags)
+11. [Metrics](#metrics)
+12. [Handover, drain and rollback](#handover-drain-and-rollback)
+13. [Troubleshooting](#troubleshooting)
+14. [Security model](#security-model)
+15. [Build and test](#build-and-test)
+16. [Release history](#release-history)
+17. [License and attribution](#license-and-attribution)
 
 ## Why it exists
 
@@ -678,14 +679,78 @@ The fake costs no speed, and `raw_send_fails` stayed 0. A packet capture of an e
 `seq`) showed the fake at the listening end on both pool connections, 517 bytes below the stream start, with the
 duplicate ACK coming back.
 
+## Traffic shape: what a DPI sees (2.11.0)
+
+A tunnel that only forwards ports leaves marks that a flow classifier can learn, whatever carrier it uses. This release
+removes the ones that were in our own packets and adds the one structural protection other reverse tunnels rely on.
+
+**What a packet looked like before 2.11.0.** Every packet began with the 8-byte session id (the same in every packet of
+a session) and an 8-byte packet number (a counter, with the top bit set for the server's direction), both in clear;
+the rest was ciphertext. So on `udp` and `tcp` the first 16 bytes of each datagram or frame were a constant followed by
+a counter. An idle tunnel also sent one keepalive every 2 s at one fixed size, and the first exchange of every session
+had the same sizes. None of that is encrypted content, so none of it needed to leak.
+
+**What changed.**
+
+1. **Header masking (`hdr-mask`, default on).** The 16 header bytes are XORed with a ChaCha20 keystream, keyed from the
+   PSK and seeded by the first 12 bytes of the ciphertext (the idea of QUIC header protection). Every packet header
+   then looks random, and consecutive packets share nothing. The receiver cannot read the session id before it removes
+   the mask, so the key is per PSK, not per session. The session still authenticates the real header, so masking only
+   hides it. Cost: 122 ns per call, no allocation (Go benchmark, i7-11800H); a packet is masked once on send and unmasked
+   once on receive (twice on a server, which reads the id first).
+2. **Padding (`shape`, default on).** Packets with no stream data (acks, keepalives, the key exchange) get a `frPad`
+   frame (type `0x0c`, one length byte, that many zero bytes) of 0-100 random bytes when they are shorter than 192 bytes.
+   It is always the last frame, so an older peer stops parsing there and ignores it.
+3. **Keepalive jitter (`shape`).** The idle keepalive interval is re-rolled to 60-140 % of `ping-every` after every ping.
+4. **Raw tcp hello and masked lengths (`tcp-mimic`, default on).** Raw `tcp` used to open each connection with the plain
+   8-byte pool id and frame every packet with a 2-byte length. Now the first bytes are a 517-byte TLS 1.3 ClientHello
+   (Chrome cipher list, SNI from `fake-sni`, default `www.cloudflare.com`) whose `random` and `session id` fields carry
+   an HMAC of the key, a fresh nonce and the pool id, so no two connections open with the same bytes and the listener
+   verifies the hello before it accepts the connection (a wrong key is closed). The 2-byte lengths are XORed with a
+   ChaCha20 stream per direction, keyed from the same root. After the hello the stream is the usual encrypted packets;
+   it is not a real TLS session and does not pretend to be one (no ServerHello). It defeats "first bytes are not
+   TLS" and fixed-structure checks, not a classifier that waits for a real handshake; use `tls`/`wss` for that.
+5. **Reverse udp.** [Iran starts nothing](#reverse-udp-2110).
+
+**Compatibility.** Padding and jitter are invisible to older peers. A masked header is not. A receiver first reads the
+header as plain (a session id it knows), then as masked, and answers in the form it was addressed in. A new client that
+hears nothing for 3 s switches between the two forms every 3 s until a packet authenticates (and again after 30 s of
+silence), so it joins an older server a few seconds late and then stays plain. `hdr-mask: false` skips the wait and
+sends the plain header; `shape: false` turns padding and jitter off. Both ends of a tunnel can be updated in any order.
+A new `tcp` client whose hello gets no answer within 6 s falls back to the plain pool id on that connection (and retries
+the hello after 30 s); `tcp-mimic: false` sends the plain id at once. A new listener accepts both forms.
+
+**What is not hidden.**
+
+- With `tcp-mimic: false`, or against an older peer, raw `tcp` opens each connection with the plain 8-byte pool id and
+  plain 2-byte lengths. `tls`, `wss`, `h2` and `grpc` put both inside TLS.
+- Volume and timing under load, long-lived flows and the destination address. Padding only reshapes idle traffic.
+- The `icmp` carrier's echo structure.
+
+**Why this release is not "more obfuscation".** The Backhaul tunnel (Musixal/Backhaul), which an operator reported running
+without an Iran-only restriction, has no padding, shaping or evasion at all: its README documents none. In the usual
+deployment its Iran end is the listener and the foreign end dials in, so an Iran VPS never starts a flow towards a foreign address. That is the
+property `reverse` gives here, and 2.11.0 extends it to `udp`, the one carrier that could not do it. If a provider
+restricts a VPS after a tunnel starts, first check which address the tunnel leaves from (`src-ip`) and which direction
+it runs; a classifier cannot punish a flow that the VPS did not start. On a host with several public IPv4 addresses
+the tunnel leaves from the one the routing table picks, which may not be the address the customers use; pin it with
+`src-ip`. The manager shows it on the tunnel card ("leaves from") and offers the choice in the Iran wizard.
+
+**What other tunnels do (researched for 2.11.0).** Backhaul and rathole send plain TCP by default (rathole offers
+optional TLS or Noise); Backhaul's only protection is that the Iran end listens. GOST dials with a uTLS fingerprint and
+offers probe resistance and obfuscation layers. obfs4 pads its handshake to a random length and masks frame lengths.
+Iran's national filter is a protocol whitelist (DNS, HTTP/80, HTTPS/443 pass; the rest is dropped) and resets TLS to
+blocked SNIs after the ClientHello (FOCI 2020, arXiv 2507.14183). That is why `tcp-mimic` copies the ClientHello shape
+and the header mask removes the constant bytes. None of this is proven to be what restricted a given VPS.
+
 ## Reverse mode
 
 Normally the Kharej server listens and the Iran client dials out. Some networks only allow outbound connections from
 Kharej to Iran, or only inbound to Iran. `reverse: true` swaps who listens and who dials. Nothing else changes: Iran
 still opens the streams and listens on the public ports.
 
-Works with the pool carriers (`tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc`) and, since 2.0.0, with `icmp`.
-Not with `udp`. Put `reverse: true` on both ends.
+Works with the pool carriers (`tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc`), since 2.0.0 with `icmp`, and since
+2.11.0 with `udp` (see [Reverse udp](#reverse-udp-2110)). Put `reverse: true` on both ends.
 
 | Side | Without `reverse` | With `reverse` (pool carriers) | With `reverse` (`icmp`, 2.0.0) |
 |---|---|---|---|
@@ -811,12 +876,30 @@ instead.
 Since 2.1.0 the reverse dialers back off up to 30 s between attempts. They log the first failure, then at most one
 failure line every 5 minutes, and a `connected` line when a dial succeeds.
 
+### Reverse udp (2.11.0)
+
+With `carrier: udp` and `reverse: true` the Iran client binds `listen` and **never sends first**. The Kharej server sends
+it a small authenticated datagram (a "punch": 8 random bytes, a 12-byte HMAC of them under a key derived from the PSK,
+and 0-40 random pad bytes, so no byte is constant) from its own bound socket to `peer` (Iran's `IP:port`), about once a
+second. The client answers every datagram to the source address of the latest valid punch, so a NAT or a firewall sees
+a flow that Kharej started and Iran only answers, and the punches keep its state alive. Datagrams from any other
+address are dropped, and the session still authenticates everything.
+
+| Side | Config |
+|---|---|
+| Iran (client) | `reverse: true`, `listen: ":4443"` (open `4443/udp`), `peer` is not used |
+| Kharej (server) | `reverse: true`, `listen: ":4443"` (the source port of the punches and of every reply), `peer: "IRAN_IP:4443"` |
+
+Both ends need 2.11.0. An older peer cannot answer or send a punch, so the link stays down; set the same on both sides
+or leave both in the normal direction. The manager does this in the wizard and under Advanced settings, direction (`d`),
+with the right `udp` firewall rule.
+
 ### Carrier matrix
 
 | Carrier | Direct | Reverse | Minimum version (both ends) |
 |---|---|---|---|
 | `icmp` | yes | yes | direct: any; reverse: 2.0.0 |
-| `udp` | yes | no | not applicable (no reverse) |
+| `udp` | yes | yes | direct: any; reverse: 2.11.0 |
 | `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc` | yes | yes | direct: 1.3.0; reverse: 1.8.0 |
 
 The reverse pool carriers are in the first release of this repository's history (1.8.0). An earlier release may
@@ -1035,7 +1118,10 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `peer-NAME`, `listen-NAME` | = `peer`, `listen` | client / server | Bonded carriers only: per-carrier address (`peer-udp`, `listen-tcp`, ...). |
 | `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. Reverse pool carriers: Kharej sets Iran's `IP:port`. Reverse icmp: Kharej sets Iran's IP, Iran keeps Kharej's. |
 | `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. With `reverse` Iran listens here and Kharej's `peer` must point to it. |
-| `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. |
+| `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. With `udp` (2.11.0): Iran binds `listen` and only answers, Kharej punches to `peer`. |
+| `hdr-mask` | true | both | Mask the session id and packet number at the start of every packet (2.11.0). An older peer is detected and answered plain; `false` sends the plain header. |
+| `tcp-mimic` | true | both | tcp carrier: open each connection with a TLS ClientHello-shaped hello (SNI `fake-sni`) that carries the auth, and mask the 2-byte lengths (2.11.0). An older peer is detected after 6 s and answered with the plain pool id; `false` sends the plain id. |
+| `shape` | true | both | Pad small packets (acks, keepalives, key exchange) to random sizes and jitter the keepalive interval (2.11.0). Compatible with older peers. |
 | `ports` | | both | List of `N`, `N/udp`, `LISTEN:TARGET` and `LISTEN:TARGET/udp`. Client listens on LISTEN, server allows TARGET. Hot-reloaded. |
 | `bind` | `0.0.0.0` | client | Address of the public listeners. |
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
@@ -1197,6 +1283,9 @@ Every flag can also be a config key. Flags win over the file.
 | `-mtu N` | 0 | Datagram cap. |
 | `-max-mbps F` | 0 | Pace ceiling per direction and session; 0 = 16 with icmp, 1250 otherwise (2.4.18; 200 from 2.3.0). |
 | `-tcp-cc NAME` | `bbr` | Pool sockets' TCP congestion control, Linux (2.4.18). `system` keeps the kernel default. |
+| `-hdr-mask` | true | Mask the packet header (2.11.0). |
+| `-tcp-mimic` | true | tcp carrier: ClientHello-shaped hello and masked frame lengths (2.11.0). |
+| `-shape` | true | Pad small packets and jitter the keepalive (2.11.0). |
 | `-sessions N` | 1 | Client: N independent sessions, udp and the pool carriers only (2.3.0, server unchanged). |
 | `-icmp-type T` | `echo` | ICMP carrier: `echo`, `timestamp`, `info`, `mask` (both ends the same). |
 | `-loss-ceiling` | off | Pacer: also cut the rate when loss jumps far above its learned baseline (opt-in). |
@@ -1807,6 +1896,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 - **Per session keys.** Each client session picks a random 8-byte id. The packet key is SHA-256 over a fixed module
   prefix, the secret and that id. Packet = `session id | packet number | ChaCha20-Poly1305(frames)`. The nonce is
   the packet number and is never reused: server numbers start at a time-based value with a direction bit set.
+  Since 2.11.0 the first 16 bytes are masked on the wire (see "Traffic shape").
 - **Forward secrecy (2.10.0, both ends).** The client offers an ephemeral X25519 key in its packets (re-offering
   about once a second until the switch is done; the `frKex` frame is always the last frame of a packet: an older
   peer stops parsing there and never sees it). The server answers with its own key and both derive a fresh session
@@ -1831,8 +1921,9 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
   WebSocket or gRPC. They do not add secrecy; the session is already encrypted. With the default self-signed
   certificate the client does not verify the server. The PSK still stops an impostor, because it cannot read or forge
   the session. Set `tls-pin` to also reject a wrong certificate.
-- **What none of this hides.** The server's address, the volume and timing of packets, and the fact that ICMP or the
-  carrier is in use. WatTunnel is not an anonymity tool.
+- **What none of this hides.** The server's address, the volume and timing of packets under load, and the fact that
+  ICMP or the carrier is in use. Since 2.11.0 no byte of a packet's header is constant and idle packets vary in size
+  and timing, but a long-lived, high-volume flow to one foreign address is still visible as such. WatTunnel is not an anonymity tool.
 - **Protect the key file.** `chmod 600`, and do not put the key on the command line (`ps` shows it). The manager
   keeps `/etc/wattun` at mode `700` and key files at `600`. **The token contains the key**, so share it privately.
 - **Metrics.** Keep `metrics` on `127.0.0.1`. pprof is on the same address.
@@ -1855,6 +1946,17 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **2.11.0: no constant bytes in the packet header, random idle shape, and reverse `udp`.** Update both ends for
+  reverse `udp`; for the rest any order works. (1) The session id and packet number at the start of every packet are
+  masked (`hdr-mask`, default on): a flow classifier no longer sees 8 equal bytes plus a counter in each datagram. An
+  older peer is detected and answered in the plain header. (2) Packets without stream data are padded with 0-100
+  random bytes and the idle keepalive interval is jittered (`shape`, default on); `frPad` is a new ignorable frame.
+  (3) `carrier: udp` supports `reverse: true`: Iran binds and only answers, Kharej sends authenticated punch
+  datagrams, so Iran starts no flow towards a foreign address (the model of reverse tunnels such as Backhaul). The
+  manager offers it for `udp` in the wizard and under direction. (4) Raw `tcp` opens with a TLS ClientHello-shaped
+  hello that carries the authentication and masks the 2-byte frame lengths (`tcp-mimic`, default on; an older peer is
+  detected and answered with the plain pool id after 6 s). (5) The manager shows and lets you pick the source address
+  (`src-ip`). See "Traffic shape".
 - **2.10.12: fake-SNI fires on every connection, and it works from a reverse server.** Dialer-side fix, no wire
   change. This release also ships 2.10.11, which was never tagged (the duplicate-ACK wait and the 517-byte Chrome
   fake hello). (1) The `TCP_REPAIR` probe read the wrong queues, so the fake used a wrong or missing stream start and fired on

@@ -243,6 +243,16 @@ chk "kharej reverse preset" "$(grep '^fake-sni:' "$WAT_CONF/t3.yml")" "fake-sni:
 role() { echo Iran; }
 chk "iran reverse listens" "$(ac_dialer t3 && echo y || echo n)" "n"
 rm -f "$WAT_CONF/t3.yml"
+chk "udp can reverse" "$(rev_capable udp && echo y || echo n)" "y"
+chk "udp reverse port is udp" "$(rproto udp)" "udp"
+chk "tls reverse port is tcp" "$(rproto tls)" "tcp"
+chk "udp has no fake-sni dialer" "$(is_pool udp && echo y || echo n)" "n"
+ip() { case "$*" in *"route get"*) echo "198.51.100.7 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 0" ;; *"addr show"*) printf '2: eth0 inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0
+3: eth0 inet 203.0.113.9/24 scope global secondary eth0
+' ;; esac; }
+chk "out_ip reads the route's source" "$(out_ip 198.51.100.7)" "10.0.0.5"
+chk "local_ips lists every global address" "$(local_ips | paste -sd' ' -)" "10.0.0.5 203.0.113.9"
+unset -f ip
 
 NI_FAKESNI='' pick_sni_preset
 chk "pick_sni_preset default" "$REPLY_V" "mci.ir"

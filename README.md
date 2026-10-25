@@ -205,6 +205,11 @@ later key-file leak stays unreadable. That protects the **Iran ↔ Kharej leg on
 server the traffic is whatever the forwarded service itself provides, so run an end-to-end encrypted protocol
 (VLESS+Reality, TLS, WireGuard) inside the tunnel. Kharej dials only its own `127.0.0.1`, and only ports on the
 allowlist.
+From 2.11.0 no byte of a packet header is constant (the session id and packet number are masked), idle packets are
+padded to random sizes with a jittered keepalive, and `udp` has a [reverse mode](docs/TECHNICAL.md#reverse-udp-2110): the Iran
+server only listens and never starts a flow towards a foreign address. Raw `tcp` opens with a TLS ClientHello-shaped
+hello and masked frame lengths instead of a plain pool id (`tcp-mimic`)
+([traffic shape](docs/TECHNICAL.md#traffic-shape-what-a-dpi-sees-2110)).
 The installer verifies the download's signature against a public key baked into it, so a `WAT_PROXY` mirror (or
 any tampered copy) cannot slip in a changed binary. The connection token contains the key: treat it like a
 password and share it only over a private channel. Keep `metrics` on `127.0.0.1`. What stays visible to the

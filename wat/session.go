@@ -81,7 +81,12 @@ type Config struct {
 	// collapsed to 95% loss until a ~5 min cooldown). Both ends need it only if BOTH are idle-quiet;
 	// a single-sided raise already halves the rate.
 	PingEvery time.Duration
-	Logf      func(string, ...any)
+	// NoMask sends and expects the plain packet header (session id and packet number in clear). The default masks
+	// both (hdrmask.go) and falls back to the plain form against a peer older than 2.11.0.
+	NoMask bool
+	// NoShape turns off the random padding of small packets and the jitter on the idle keepalive (hdrmask.go).
+	NoShape bool
+	Logf    func(string, ...any)
 }
 
 type Stats struct {
@@ -196,6 +201,10 @@ type Session struct {
 	cc            cc
 	lastSend      time.Time
 	wantPing      bool
+	pingGap       time.Duration // idle time before the next keepalive: PingEvery, re-rolled after each ping (nextPingGap)
+	hk            []byte        // header-mask key (nil: NoMask)
+	masked        atomic.Bool   // seal outgoing packets with a masked header: the client's guess, the server's echo of what it received
+	maskFlip      time.Time     // client: when the masked/plain guess last changed while no packet had authenticated
 	stats         Stats
 	openBuf       []byte
 	noWinTune     bool     // tests: behave like a peer that never advertises more than the implicit window
@@ -316,6 +325,11 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		cc:       newCC(cfg.InitBps, cfg.MinBps, cfg.MaxBps, cfg.Slack),
 		maxPlain: cfg.MaxPayload - overhead,
 		winSlack: uint64(hi - overhead),
+	}
+	s.pingGap, s.maskFlip = cfg.PingEvery, time.Now()
+	if !cfg.NoMask {
+		s.hk = hdrMaskKey(cfg.Key)
+		s.masked.Store(!cfg.Server)
 	}
 	s.cc.reliable = prof.Reliable
 	s.cc.direct = prof.Reliable && cfg.Direct && !noDirect
@@ -709,6 +723,11 @@ func (s *Session) pump() {
 			next = time.Millisecond
 		}
 		s.mu.Unlock()
+		if s.masked.Load() {
+			for _, o := range batch {
+				maskHdr(s.hk, o.p)
+			}
+		}
 		if s.batcher != nil && len(batch) > 1 {
 			s.sendBatch(batch)
 		} else {
@@ -895,6 +914,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	if s.wantPing {
 		p = append(p, frPing)
 		s.wantPing = false
+		s.pingGap = s.nextPingGap()
 		sp.ctrl = append(sp.ctrl, pingFrame)
 	}
 	if canData {
@@ -990,6 +1010,9 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 	if len(p) == 0 {
 		s.freeSent(sp)
 		return outPkt{}, false
+	}
+	if !s.cfg.NoShape && len(sp.frames) == 0 && !sp.dgram {
+		p = s.pad(p)
 	}
 	out, pn := s.seal(p)
 	size := len(out) + ipIcmpHdr
@@ -1252,10 +1275,18 @@ func (s *Session) timers(now time.Time) {
 		}
 		s.compact()
 	}
-	if now.Sub(s.lastSend) > s.cfg.PingEvery {
+	if now.Sub(s.lastSend) > s.pingGap {
 		s.wantPing = true
 	}
+	if s.hk != nil && !s.cfg.Server && s.lastAuth.IsZero() && now.Sub(s.maskFlip) > 3*time.Second {
+		s.masked.Store(!s.masked.Load()) // nothing answered yet: the peer may speak only the other header form
+		s.maskFlip = now
+	}
 	if !s.lastRecv.IsZero() && now.Sub(s.lastRecv) > 30*time.Second {
+		if s.hk != nil && !s.cfg.Server {
+			s.masked.Store(!s.masked.Load()) // a peer downgraded or upgraded while we were silent
+			s.maskFlip = now
+		}
 		s.resetAll(ErrSessionDead)
 		// Re-arm with now, not zero: zeroing lastRecv disarmed the watchdog permanently (audit
 		// 2026-10-22), so a client session that never recovered kept streams opened after the
@@ -1420,8 +1451,16 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	if len(raw) < hdrLen+tagLen+1 {
 		return
 	}
+	peerMasked := false
 	if binary.BigEndian.Uint64(raw) != s.sid {
-		return
+		if s.hk == nil {
+			return
+		}
+		maskHdr(s.hk, raw)
+		if binary.BigEndian.Uint64(raw) != s.sid {
+			return
+		}
+		peerMasked = true
 	}
 	pn := binary.BigEndian.Uint64(raw[8:])
 	if (pn&dirServerBit != 0) == s.cfg.Server { // our own direction: reflected or foreign
@@ -1455,6 +1494,9 @@ func (s *Session) handle(raw []byte, lane int, src net.Addr) {
 	}
 	if err != nil {
 		return // not ours: stay silent
+	}
+	if s.hk != nil && s.masked.Load() != peerMasked { // answer in the header form the peer spoke
+		s.masked.Store(peerMasked)
 	}
 	s.openBuf = plain[:0]
 	now := time.Now()
@@ -1612,6 +1654,8 @@ func (s *Session) parse(b []byte, now time.Time) (eliciting bool) {
 			}
 			eliciting = true
 			s.onKex(pub, now)
+		case frPad:
+			r.take(r.uv())
 		default:
 			return
 		}

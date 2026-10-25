@@ -807,9 +807,19 @@ v_name() {
 v_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] && return 0; err "Enter an IP address or a domain name."; return 1; }
 v_ipv4() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter the server's IPv4 address, such as 198.51.100.20."; return 1; }
 is_pool() { case "$1" in tcp|tls|ws|wss|h2|h2c|grpc) return 0 ;; esac; return 1; }
-rev_capable() { [ "$1" = icmp ] || is_pool "$1"; }
+# Which address a connection to HOST leaves from, and the global IPv4 addresses this server holds (2.11.0). A server with
+# two addresses sends the tunnel from the one the route picks, which can be the address the users connect to.
+out_ip() { ip -4 route get "$1" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; }
+local_ips() { ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4}'; }
+# carriers whose reverse mode means: Iran listens on the carrier port and Kharej connects (tcp family) or punches (udp) to it
+is_rpool() { is_pool "$1" || [ "$1" = udp ]; }
+rproto() { [ "$1" = udp ] && echo udp || echo tcp; } # transport of the carrier port, for firewall and busy-port checks
+rev_capable() { [ "$1" = icmp ] || is_rpool "$1"; }
 reverse_hint() { # [carrier]
-  if is_pool "${1:-}"; then
+  if [ "${1:-}" = udp ]; then
+    hint "Reverse: Iran only listens and Kharej sends the first datagrams, so Iran never starts a flow towards Kharej."
+    hint "Use it when a filter punishes what an Iran server starts towards foreign IPs. Both sides must use it (wattun 2.11.0+)."
+  elif is_pool "${1:-}"; then
     hint "Reverse: Kharej connects out to Iran and Iran listens. Use it when Iran cannot reach Kharej's port but Kharej"
     hint "can reach Iran. Both sides must use it."
   else
@@ -1421,7 +1431,7 @@ wizard_kharej() {
         if listen_blocked "$([ "$cr" = udp ] && echo udp || echo tcp)" "$REPLY_V"; then err "Port $REPLY_V is already used by $(listen_conflict_desc "$([ "$cr" = udp ] && echo udp || echo tcp)" "$REPLY_V")."; else listen=$((10#$REPLY_V)); break; fi
         t=$((${t:-0}+1)); [ "$t" -ge 3 ] && { err "Too many tries, going back."; return 1; }
       done
-      if is_pool "$cr"; then
+      if is_rpool "$cr"; then
         echo; reverse_hint "$cr"
         if confirm "Reverse direction (this server connects out to Iran on port $listen)?" n; then
           ask_ok "Iran server IPv4 address" "" v_ipv4 || return 1; iranip=$REPLY_V; rev=1
@@ -1463,12 +1473,12 @@ wizard_kharej() {
       echo "mode: server"
       echo "key-file: $CONF/$name.key"
       echo "carrier: $cr"
-      [ -n "$listen" ] && [ "$rev" != 1 ] && echo "listen: \":$listen\""
+      [ -n "$listen" ] && { [ "$rev" != 1 ] || [ "$cr" = udp ]; } && echo "listen: \":$listen\"" # reverse udp binds it as the source port
       [ -n "$path" ] && echo "path: $path"
       [ -n "$itype" ] && [ "$itype" != echo ] && echo "icmp-type: $itype"
       if [ "$rev" = 1 ]; then
         echo "reverse: true"
-        if is_pool "$cr"; then
+        if is_rpool "$cr"; then
           echo "peer: $iranip:$listen"
           [ -n "$sni" ] && { echo "sni: $sni"; echo "host: $sni"; }
         else echo "peer: $iranip"; fi
@@ -1485,7 +1495,7 @@ wizard_kharej() {
   step "Writing key, config and token" write_server || return 1
   start_unit "$name" || return 1
   [ -n "$listen" ] && [ "$rev" != 1 ] && fw_open "$listen/$([ "$cr" = udp ] && echo udp || echo tcp)"
-  if [ "$rev" = 1 ] && is_pool "$cr"; then hint "Reverse: Iran listens on port $listen (the Iran wizard opens it). Kharej must be allowed to connect out to $iranip:$listen."
+  if [ "$rev" = 1 ] && is_rpool "$cr"; then hint "Reverse: Iran listens on port $listen/$(rproto "$cr") (the Iran wizard opens it). Kharej must be allowed to send to $iranip:$listen."
   elif [ "$rev" = 1 ]; then hint "Reverse ICMP: Iran must answer ping from this server. Do not block ICMP in either cloud firewall."
   elif [ "$cr" = icmp ]; then hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."; fi
   case "$cr" in tls|wss|grpc|h2) hint "TLS: the certificate is self-signed and unchecked by default. Pin it with tls-pin on the dialing side (docs/TECHNICAL.md, 'Certificates')." ;; esac
@@ -2028,7 +2038,7 @@ wizard_iran() {
       summary_line "Kharej" "$T_PEER"
       summary_line "Kharej allows" "${T_PORTS:-any port}"
       if [ "$T_REV" = 1 ]; then
-        if is_pool "$T_CARRIER"; then summary_line "Direction" "reverse (Kharej connects to this server on port ${T_PEER##*:})"
+        if is_rpool "$T_CARRIER"; then summary_line "Direction" "reverse (Kharej connects to this server on port ${T_PEER##*:})"
         else summary_line "Direction" "reverse: Kharej sends the pings, this server answers"; fi
       fi
       cdn_wizard_tune # CDN carrier + domain: automatic edge / TLS tuning (wattun >= 2.2.0), silent otherwise
@@ -2046,13 +2056,13 @@ wizard_iran() {
     if [ "$T_CARRIER" = icmp ]; then
       ask_ok "ICMP type (must match Kharej)" echo v_icmp || return 1; T_ICMP=$REPLY_V
       confirm "Reverse direction (only if Kharej is set to reverse too)?" n && T_REV=1
-    elif is_pool "$T_CARRIER"; then
+    elif is_rpool "$T_CARRIER"; then
       echo; reverse_hint "$T_CARRIER"
       confirm "Reverse direction (only if Kharej is set to reverse too)?" n && T_REV=1
     fi
   fi
   rport=''
-  if [ "$T_REV" = 1 ] && is_pool "$T_CARRIER"; then
+  if [ "$T_REV" = 1 ] && is_rpool "$T_CARRIER"; then
     rport=${T_PEER##*:}
     v_port "$rport" >/dev/null 2>&1 && [ "$rport" != "$T_PEER" ] || { err "The Kharej address has no valid carrier port, so reverse cannot be set up."; return 1; }
     rport=$((10#$rport))
@@ -2073,8 +2083,8 @@ wizard_iran() {
   fi
   port_editor || { warn "Cancelled."; return 1; }
   if [ -n "$rport" ]; then
-    if listen_blocked tcp "$rport"; then
-      err "Port $rport/tcp is already in use here by $(listen_conflict_desc tcp "$rport"). Reverse needs it free: pick another carrier port on Kharej and make a new token."
+    if listen_blocked "$(rproto "$T_CARRIER")" "$rport"; then
+      err "Port $rport/$(rproto "$T_CARRIER") is already in use here by $(listen_conflict_desc "$(rproto "$T_CARRIER")" "$rport"). Reverse needs it free: pick another carrier port on Kharej and make a new token."
       return 1
     fi
     for ((i=0; i<${#MAPS[@]}; i++)); do
@@ -2096,6 +2106,17 @@ wizard_iran() {
     if [ "$T_CARRIER" = icmp ]; then ask_ok "ICMP type (must match Kharej)" "${T_ICMP:-echo}" v_icmp || return 1; T_ICMP=$REPLY_V; fi
     case "$T_CARRIER" in wss|tls|grpc|h2) ask "Domain / SNI (empty = none)" "$T_SNI"; T_SNI=$REPLY_V ;; esac
     case "$T_CARRIER" in ws|wss|grpc|h2|h2c) ask_ok "URL path" "${T_PATH:-/wat}" v_path || return 1; T_PATH=$REPLY_V ;; esac
+  fi
+  # Which of this server's addresses the tunnel leaves from (2.11.0): the default is whatever the route picks, which on a
+  # server with two addresses may be the one users connect to; a provider that restricts that address then sees the tunnel.
+  if [ "$T_REV" != 1 ] && [ -z "$T_AUTO" ] && [ -z "$T_SRCIP" ] && [ "$NONINTERACTIVE" != 1 ] && [ "$(uname -s)" = Linux ]      && [ "$(local_ips | wc -l)" -gt 1 ]; then
+    local oip; oip=$(out_ip "${T_PEER%%[:,]*}")
+    echo
+    warn "This server has several IPv4 addresses: $(local_ips | paste -sd' ' -)"
+    hint "The tunnel leaves from ${oip:-the one the route picks}. If that is the address your users connect to, use the other one,"
+    hint "so a provider or filter that restricts the user-facing address never sees the tunnel."
+    ask_ok "IP the tunnel leaves from (Enter = ${oip:-the default route})" "" v_src_ip || return 1
+    case "${REPLY_V,,}" in ''|off|0) ;; *) T_SRCIP=$REPLY_V ;; esac
   fi
   # Resilience options (2.6.0-2.8.1): fake-sni (name, mode, ttl) and pool-rotate churn — the
   # blackout/whitelisting survival kit (docs/TECHNICAL.md). Strictly for censored routes, so NOT part
@@ -2281,7 +2302,7 @@ wizard_iran() {
   fi
   start_unit "$name" || return 1
   [ "$T_CARRIER" = icmp ] && [ "$T_REV" = 1 ] && kreply_offer
-  [ -n "$rport" ] && fw_open "$rport/tcp" # before the link check: Kharej cannot connect until it is open
+  [ -n "$rport" ] && fw_open "$rport/$(rproto "$T_CARRIER")" # before the link check: Kharej cannot connect until it is open
   for ((i=0; i<${#MAPS[@]}; i++)); do new_pub+=("$(spec_L "${MAPS[$i]}")/$(spec_P "${MAPS[$i]}")"); done
   echo
   if wait_link "$name" 25; then
@@ -3059,7 +3080,8 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
   local n=$1 f="$CONF/$1.yml" ol oldrev=0 oldpool=0 l k v rport=''
   ol=$(cfg "$n" listen); ol=${ol##*:}
   is_reverse "$n" && oldrev=1
-  [ "$oldrev" = 1 ] && is_pool "$(cfg "$n" carrier)" && oldpool=1
+  [ "$oldrev" = 1 ] && is_rpool "$(cfg "$n" carrier)" && oldpool=1
+  oldproto=$(rproto "$(cfg "$n" carrier)")
   sed -i -E '/^(carrier|peer|path|sni|host|reverse|listen|fp|ech|ech-cache|tls-frag|peer-[a-z0-9]+|listen-[a-z0-9]+):/d' "$f"
   set_value "$n" carrier "$T_CARRIER"
   # a working fake-SNI/pool-rotate combination survives a type switch only when the new type can still
@@ -3080,15 +3102,15 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
   [ -n "$T_PATH" ] && set_value "$n" path "$T_PATH"
   if [ -n "$T_SNI" ]; then set_value "$n" sni "$T_SNI"; set_value "$n" host "$T_SNI"; fi
   [ "$T_REV" = 1 ] && set_value "$n" reverse true
-  if [ "$T_REV" = 1 ] && is_pool "$T_CARRIER"; then rport=${T_PEER##*:}; set_value "$n" listen "\":$rport\""; fi
+  if [ "$T_REV" = 1 ] && is_rpool "$T_CARRIER"; then rport=${T_PEER##*:}; set_value "$n" listen "\":$rport\""; fi
   while IFS= read -r l; do
     [ -n "$l" ] || continue
     k=${l%%: *}; v=${l#*: }; set_value "$n" "$k" "$v"
   done <<<"$AT_EXTRA"
   l=$(ech_cache_line "$n"); if [ -n "$l" ]; then set_value "$n" ech-cache "${l#*: }"; fi
   step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
-  [ -n "$rport" ] && fw_open "$rport/tcp"
-  [ "$oldpool" = 1 ] && [ -n "$ol" ] && [ "$ol" != "$rport" ] && fw_close "$ol/tcp"
+  [ -n "$rport" ] && fw_open "$rport/$(rproto "$T_CARRIER")"
+  [ "$oldpool" = 1 ] && [ -n "$ol" ] && [ "$ol" != "$rport" ] && fw_close "$ol/$oldproto"
   if [ "$T_CARRIER" = icmp ] && [ "$T_REV" = 1 ]; then
     [ "$AT_QUIET" = 1 ] || kreply_offer
   else reverse_iran_left || kreply_restore; fi
@@ -3858,10 +3880,10 @@ test_tunnel() {
       spin_stop
       if [ "$e" -eq 0 ]; then ok "Ping to $host works"
       else err "Ping to $host fails: ICMP is blocked or Kharej drops ping (check its firewall / cloud panel)."; fi
-    elif is_pool "$cr" && is_reverse "$n"; then
+    elif is_rpool "$cr" && is_reverse "$n"; then
       port=$(cfg "$n" listen); port=${port##*:}
-      if [ -n "$port" ] && port_busy "$port" tcp; then ok "Port $port/tcp is listening here (Kharej connects to it)"
-      else err "Nothing listens on ${port:-the carrier port}/tcp here, so Kharej cannot connect."; fi
+      if [ -n "$port" ] && port_busy "$port" "$(rproto "$cr")"; then ok "Port $port/$(rproto "$cr") is listening here (Kharej connects to it)"
+      else err "Nothing listens on ${port:-the carrier port}/$(rproto "$cr") here, so Kharej cannot connect."; fi
       hint "Reverse: Kharej connects to this server. Run Diagnose on Kharej to test Kharej → Iran on port ${port:--}."
     elif [ "$cr" != udp ] && [ -n "$port" ]; then
       spin_start "Connecting to $host:$port"
@@ -3950,13 +3972,13 @@ test_tunnel() {
       hint "Iran's packets arrive here, but this server's answers may not be reaching Iran. Run Diagnose on the Iran side for the path check."
     else
       warn "Iran never reached this server in the last 6 hours."
-      if is_pool "$cr" && is_reverse "$n"; then
-        hint "Check on Iran: the same key and carrier, that Iran listens on ${peer##*:}/tcp and that its firewall allows it."
+      if is_rpool "$cr" && is_reverse "$n"; then
+        hint "Check on Iran: the same key and carrier, that Iran listens on ${peer##*:}/$(rproto "$cr") and that its firewall allows it."
       else
         hint "Check on Iran: the same key and carrier, and for icmp that ping to this server works. For other carriers the listen port must be open here."
       fi
     fi
-    if is_pool "$cr" && is_reverse "$n" && [ "$peer" != "${peer%:*}" ]; then
+    if is_pool "$cr" && is_reverse "$n" && [ "$peer" != "${peer%:*}" ]; then # tcp probe: no meaning for udp
       host=${peer%:*}; port=${peer##*:}
       echo
       spin_start "Connecting to $host:$port"
@@ -4150,12 +4172,19 @@ tunnel_card() {
     box_row "  ${GRY}$sub${RST}"
   elif [ "$cr" = icmp ] && is_reverse "$n"; then
     if [ "$r" = Iran ]; then box_row "  ${GRY}(reverse) ← pinged by ${peer:--}${RST}"; else box_row "  ${GRY}(reverse) → pings Iran ${peer:--}${RST}"; fi
-  elif is_pool "$cr" && is_reverse "$n"; then
+  elif is_rpool "$cr" && is_reverse "$n"; then
     if [ "$r" = Iran ]; then box_row "  ${GRY}(reverse) ← Kharej connects on ${lis:-:-}${RST}"; else box_row "  ${GRY}(reverse) → connects to Iran ${peer:--}${RST}"; fi
   elif [ "$r" = Iran ]; then
     box_row "  ${GRY}→ remote peer: ${peer:--}${RST}"
   else
     [ -n "$lis" ] && box_row "  ${GRY}listening on ${lis}${RST}"
+  fi
+  if [ "$r" = Iran ] && [ "$(uname -s)" = Linux ] && ! { is_rpool "$cr" && is_reverse "$n"; }; then
+    local oip nips; oip=$(cfg "$n" src-ip); nips=$(local_ips | wc -l)
+    if [ -n "$oip" ]; then box_row "  ${GRY}leaves from ${oip} (src-ip)${RST}"
+    elif [ -n "$(out_ip "${peer%%[:,]*}")" ]; then
+      box_row "  ${GRY}leaves from $(out_ip "${peer%%[:,]*}")$([ "$nips" -gt 1 ] && echo " - this server has $nips IPs: src-ip picks one")${RST}"
+    fi
   fi
 
   sub=$(cdn_summary "$n"); [ -n "$sub" ] && box_row "  ${GRY}CDN: $sub${RST}"
@@ -4249,11 +4278,11 @@ change_peer() {
     fi
     v_port "${v##*:}" >/dev/null 2>&1 || { err "The Kharej address needs a valid port, like host:443."; return 1; }
     np=$((10#${v##*:}))
-    if is_pool "$cr" && is_reverse "$n" && [ "$np" != "$op" ]; then
+    if is_rpool "$cr" && is_reverse "$n" && [ "$np" != "$op" ]; then
       # reverse: Iran listens on the carrier port, so it follows the peer port
-      if listen_blocked tcp "$np"; then err "Port $np/tcp is already in use here by $(listen_conflict_desc tcp "$np")."; return 1; fi
+      if listen_blocked "$(rproto "$cr")" "$np"; then err "Port $np/$(rproto "$cr") is already in use here by $(listen_conflict_desc "$(rproto "$cr")" "$np")."; return 1; fi
       set_value "$n" listen "\":$np\""
-      fw_open "$np/tcp"
+      fw_open "$np/$(rproto "$cr")"
     fi
     v="${v%:*}:$np"
   fi
@@ -4309,10 +4338,10 @@ delete_tunnel() {
 }
 # Toggle reverse ICMP on one side. Kharej keeps Iran's IP as its peer and puts the flag in the token.
 set_direction() { # name
-  local n=$1 r ip cr pp
-  r=$(role "$n"); cr=$(cfg "$n" carrier)
+  local n=$1 r ip cr pp pr
+  r=$(role "$n"); cr=$(cfg "$n" carrier); pr=$(rproto "$cr")
   reverse_hint "$cr"
-  if is_pool "$cr"; then
+  if is_rpool "$cr"; then
     if is_reverse "$n"; then
       confirm "Switch '$n' back to the normal direction (Iran connects to Kharej)?" n || return 1
       if [ "$r" = Kharej ]; then
@@ -4320,7 +4349,7 @@ set_direction() { # name
         v_port "$pp" >/dev/null 2>&1 || { err "Cannot read the carrier port from peer."; return 1; }
         set_value "$n" listen "\":$pp\""
         unset_value "$n" peer; unset_value "$n" sni; unset_value "$n" host
-        fw_open "$pp/tcp"
+        fw_open "$pp/$pr"
       else
         unset_value "$n" listen
       fi
@@ -4332,7 +4361,7 @@ set_direction() { # name
         v_port "$pp" >/dev/null 2>&1 || { err "Cannot read the carrier port from listen."; return 1; }
         ask_ok "Iran server IPv4 address" "" v_ipv4 || return 1; ip=$REPLY_V
         set_value "$n" peer "$ip:$pp"
-        unset_value "$n" listen
+        [ "$cr" = udp ] || unset_value "$n" listen # reverse udp keeps it: the source port of the punches
         if [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")" && [ -n "$T_SNI" ]; then
           set_value "$n" sni "$T_SNI"; set_value "$n" host "$T_SNI"
         fi
@@ -4340,9 +4369,9 @@ set_direction() { # name
         pp=$(cfg "$n" peer); pp=${pp##*:}
         v_port "$pp" >/dev/null 2>&1 && [ "$pp" != "$(cfg "$n" peer)" ] || { err "The peer has no carrier port, so reverse cannot be set up."; return 1; }
         pp=$((10#$pp))
-        if listen_blocked tcp "$pp"; then err "Port $pp/tcp is already in use here by $(listen_conflict_desc tcp "$pp")."; return 1; fi
+        if listen_blocked "$pr" "$pp"; then err "Port $pp/$pr is already in use here by $(listen_conflict_desc "$pr" "$pp")."; return 1; fi
         set_value "$n" listen "\":$pp\""
-        fw_open "$pp/tcp"
+        fw_open "$pp/$pr"
       fi
       set_value "$n" reverse true
     fi

@@ -18,6 +18,7 @@ const (
 	frFec       = 0x09 // XOR parity over the last few small data packets (fec.go); alone in its packet
 	frDgramFrag = 0x0a // flow, port, id, index, count, len, data: one piece of a datagram too big for one packet (2.5.0)
 	frKex       = 0x0b // 32-byte ephemeral X25519 public key: the forward-secrecy key exchange (2.10.0, both ends; see session.go onKex); always the LAST frame of a packet
+	frPad       = 0x0c // len (one byte, < 128), then len zero bytes: random padding (2.11.0, hdrmask.go); always the LAST frame of a packet, so an older peer stops at it
 )
 
 var errBadFrame = errors.New("wat: malformed frame")

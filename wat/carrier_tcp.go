@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/chacha20"
 )
 
 // The tcp pool carrier: N TCP connections between one client and the server, each datagram framed as
@@ -110,6 +112,8 @@ type poolConn struct {
 	lowWins int
 
 	rot atomic.Pointer[rotateBudget] // churn budget (client SetRotate); nil on the server side
+
+	txm, rxm *chacha20.Cipher // hello v2 (tcp_mimic.go): length masks of what this end writes and reads; nil = plain lengths
 }
 
 // A pool connection whose socket write has been blocked this long is stalled: through a CDN, one edge connection can
@@ -386,6 +390,9 @@ func (pc *poolConn) writeLoop() {
 		case p := <-pc.q:
 			for { // batch: flush only when the queue runs dry
 				binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+				if pc.txm != nil {
+					pc.txm.XORKeyStream(hdr[:], hdr[:])
+				}
 				if _, err := bw.Write(hdr[:]); err != nil {
 					pc.fail()
 					return
@@ -427,6 +434,11 @@ func (pc *poolConn) readLoop(push func([]byte) bool) {
 			}
 		}
 		n := int(binary.BigEndian.Uint16(buf[r:]))
+		if pc.rxm != nil {
+			h := [2]byte{buf[r], buf[r+1]}
+			pc.rxm.XORKeyStream(h[:], h[:])
+			n = int(binary.BigEndian.Uint16(h[:]))
+		}
 		if n == 0 || n > poolMaxFrame {
 			return
 		}
@@ -610,6 +622,55 @@ type TCPPoolClient struct {
 	lastLog    time.Time     // last failure line
 	failing    bool          // a failure was logged and no connection came up since
 	deaths     atomic.Uint64 // this pool's own connection deaths (ConnDeaths)
+
+	obfKey []byte       // SetObfs: PSK of the hello v2 (nil: the plain 8-byte pool id)
+	obfSNI string       // name in the hello's ClientHello
+	v2     atomic.Bool  // the next connections open with hello v2 (flipped by mimicWatch against an older listener)
+	lastRx atomic.Int64 // unix ns of the last packet received (mimicWatch)
+	upAt   atomic.Int64 // unix ns of the last connection that came up
+}
+
+// SetObfs makes every new connection open with the TLS-shaped hello v2 and mask its frame lengths (see tcp_mimic.go),
+// keyed by psk and naming sni (empty: www.cloudflare.com). Call it right after the pool is built, before traffic.
+func (c *TCPPoolClient) SetObfs(psk []byte, sni string) {
+	c.obfKey, c.obfSNI = psk, sni
+	c.v2.Store(true)
+	c.wg.Add(1)
+	go c.mimicWatch()
+}
+
+// mimicWatch falls back to the 8-byte pool id when connections come up but the listener never answers (an older
+// version reads the long hello as garbage and stays silent), and tries hello v2 again if the plain one is not answered
+// either, so a listener that is simply down or upgraded later is found again.
+func (c *TCPPoolClient) mimicWatch() {
+	defer c.wg.Done()
+	t := time.NewTicker(max(mimicFallback/4, 50*time.Millisecond))
+	defer t.Stop()
+	since := time.Now()
+	for {
+		select {
+		case <-c.done:
+			return
+		case now := <-t.C:
+			if c.upAt.Load() < since.UnixNano() {
+				continue // nothing connected in this mode yet: not the hello's fault
+			}
+			ref, limit := since, mimicFallback
+			if last := c.lastRx.Load(); last > since.UnixNano() {
+				ref, limit = time.Unix(0, last), mimicLater
+			}
+			if now.Sub(ref) <= limit {
+				continue
+			}
+			c.v2.Store(!c.v2.Load())
+			since = now
+			for i := range c.slots {
+				if pc := c.slots[i].Load(); pc != nil {
+					pc.fail() // the slot redials with the other hello
+				}
+			}
+		}
+	}
 }
 
 // SetDialHook wraps the pool's dial function (from the next redial on): the fake-SNI layer of the tcp and tls
@@ -843,6 +904,9 @@ func (c *TCPPoolClient) sleep(d time.Duration) bool {
 }
 
 func (c *TCPPoolClient) push(p []byte) bool {
+	if c.obfKey != nil {
+		c.lastRx.Store(time.Now().UnixNano())
+	}
 	select {
 	case c.rx <- p:
 		return true
@@ -861,9 +925,16 @@ func (c *TCPPoolClient) slotLoop(i int) {
 		default:
 		}
 		conn, err := c.dialer()(c.ctx, i)
+		var txm, rxm *chacha20.Cipher
 		if err == nil {
+			hello := c.id[:]
+			if c.obfKey != nil && c.v2.Load() {
+				if h, t, r, herr := buildMimicHello(c.obfKey, c.obfSNI, c.id); herr == nil {
+					hello, txm, rxm = h, t, r
+				}
+			}
 			conn.SetWriteDeadline(time.Now().Add(poolHelloWait))
-			_, err = conn.Write(c.id[:])
+			_, err = conn.Write(hello)
 			conn.SetWriteDeadline(time.Time{})
 			if err != nil {
 				conn.Close()
@@ -884,6 +955,8 @@ func (c *TCPPoolClient) slotLoop(i int) {
 			c.remIP.Store(addrIP(conn.RemoteAddr()))
 		}
 		pc := newPoolConn(conn)
+		pc.txm, pc.rxm = txm, rxm
+		c.upAt.Store(time.Now().UnixNano())
 		if rd := time.Duration(c.rotate.Load()); rd > 0 || c.rotBytes.Load() > 0 {
 			b := rollRotate(rd, c.rotBytes.Load())
 			pc.rot.Store(&b)
@@ -1175,7 +1248,12 @@ type TCPPoolServer struct {
 	all     map[net.Conn]struct{}  // every accepted conn, so Close also reaches ones still in their hello
 	merge   atomic.Bool            // reverse mode: every conn joins one pool whatever its hello id says
 	keep    atomic.Bool            // never close a connection for delivering below its share (SetKeepSlow)
+	obfKey  atomic.Pointer[[]byte] // SetObfs: PSK that lets the listener recognise hello v2 (nil: only the plain pool id)
 }
+
+// SetObfs lets the listener accept hello v2 (tcp_mimic.go) next to the plain 8-byte pool id, which it tells apart by the
+// first five bytes. A connection that starts like a hello v2 but does not verify is closed without an answer.
+func (s *TCPPoolServer) SetObfs(psk []byte) { s.obfKey.Store(&psk) }
 
 // SetKeepSlow turns off the slow-connection check (2.4.7) for a direct path (2.4.18). It exists for a CDN edge whose
 // far leg slows down; on a direct but lossy path every connection's delivery swings with its own TCP retransmits
@@ -1281,8 +1359,22 @@ func (s *TCPPoolServer) handle(c net.Conn) {
 		c.Close()
 		return
 	}
+	var txm, rxm *chacha20.Cipher
+	if k := s.obfKey.Load(); k != nil && isMimicPrefix(id[:]) {
+		hello := make([]byte, mimicHelloLen)
+		copy(hello, id[:])
+		var ok bool
+		if _, err := io.ReadFull(c, hello[len(id):]); err == nil {
+			id, txm, rxm, ok = parseMimicHello(*k, hello)
+		}
+		if !ok {
+			c.Close()
+			return
+		}
+	}
 	c.SetReadDeadline(time.Time{})
 	pc := newPoolConn(c)
+	pc.txm, pc.rxm = txm, rxm
 	key := string(id[:])
 	if s.merge.Load() {
 		key = reverseKey

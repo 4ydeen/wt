@@ -29,6 +29,7 @@ type rxPkt struct {
 type Server struct {
 	cfg      Config
 	raw      RawIO
+	hk       []byte // header-mask key (nil: NoMask)
 	mu       sync.Mutex
 	sessions map[uint64]*srvSess
 	New      chan *Session // freshly authenticated client sessions
@@ -131,6 +132,9 @@ func NewServer(cfg Config, raw RawIO) *Server {
 	}
 	srv := &Server{cfg: cfg, raw: raw, sessions: map[uint64]*srvSess{}, New: make(chan *Session, 64),
 		stop: make(chan struct{}), free: make(chan []byte, 1024), MaxSessions: 32, IdleTimeout: 45 * time.Second}
+	if !cfg.NoMask {
+		srv.hk = hdrMaskKey(cfg.Key)
+	}
 	go srv.run()
 	go srv.janitor()
 	return srv
@@ -394,21 +398,30 @@ func (srv *Server) run() {
 		if len(p) < hdrLen+tagLen+1 {
 			continue
 		}
-		if binary.BigEndian.Uint64(p[8:])&dirServerBit != 0 {
-			// Our own packet coming back: in reverse ICMP the client host's kernel answers every request with a copy.
-			// It carries a live session id, so counting it as traffic would keep a dead client's session from ever
-			// going idle. The session would drop it anyway (own direction).
-			continue
+		// The header is plain (an older peer) or masked (hdrmask.go): a known plain session id decides, else the masked
+		// reading is tried. The packet goes on as received; the session unmasks it itself.
+		hdr := [hdrLen]byte(p)
+		ss := srv.lookup(binary.BigEndian.Uint64(hdr[:]))
+		if ss == nil && srv.hk != nil {
+			mh := unmaskedHdr(srv.hk, p)
+			if m := srv.lookup(binary.BigEndian.Uint64(mh[:])); m != nil {
+				hdr, ss = mh, m
+			}
 		}
-		sid := binary.BigEndian.Uint64(p)
-		srv.mu.Lock()
-		ss := srv.sessions[sid]
-		srv.mu.Unlock()
-		if ss == nil {
+		if ss != nil {
+			if binary.BigEndian.Uint64(hdr[8:])&dirServerBit != 0 {
+				// Our own packet coming back: in reverse ICMP the client host's kernel answers every request with a copy.
+				// It carries a live session id, so counting it as traffic would keep a dead client's session from ever
+				// going idle. The session would drop it anyway (own direction).
+				continue
+			}
+		} else {
 			if srv.draining.Load() {
 				continue
 			}
-			ss = srv.admit(sid, p, src)
+			if ss = srv.admit(hdr, p, src); ss == nil && srv.hk != nil {
+				ss = srv.admit(unmaskedHdr(srv.hk, p), p, src)
+			}
 			if ss == nil {
 				continue
 			}
@@ -421,9 +434,16 @@ func (srv *Server) run() {
 	}
 }
 
+func (srv *Server) lookup(sid uint64) *srvSess {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.sessions[sid]
+}
+
 // admit creates a session for an unknown id, but only if this very packet authenticates under that id's key.
-func (srv *Server) admit(sid uint64, p []byte, src net.Addr) *srvSess {
-	pn := binary.BigEndian.Uint64(p[8:])
+func (srv *Server) admit(hdr [hdrLen]byte, p []byte, src net.Addr) *srvSess {
+	sid := binary.BigEndian.Uint64(hdr[:])
+	pn := binary.BigEndian.Uint64(hdr[8:])
 	if pn&dirServerBit != 0 {
 		return nil
 	}
@@ -432,8 +452,8 @@ func (srv *Server) admit(sid uint64, p []byte, src net.Addr) *srvSess {
 		return nil
 	}
 	var nonce [12]byte
-	copy(nonce[4:], p[8:16])
-	if _, err := aead.Open(nil, nonce[:], p[hdrLen:], p[:8]); err != nil {
+	copy(nonce[4:], hdr[8:])
+	if _, err := aead.Open(nil, nonce[:], p[hdrLen:], hdr[:8]); err != nil {
 		return nil
 	}
 	srv.mu.Lock()
