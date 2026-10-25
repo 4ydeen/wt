@@ -8,7 +8,7 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
-// Traffic shape (2.11.0). A session packet starts with its session id (constant for the whole session) and an explicit
+// Traffic shape (3.0.0). A session packet starts with its session id (constant for the whole session) and an explicit
 // packet number (a counter) in clear, so a flow classifier sees 8 equal bytes in every datagram plus an increasing
 // number behind them, whatever the carrier. maskHdr hides both: it XORs the 16 header bytes with a ChaCha20 keystream
 // keyed from the PSK and seeded by the first 12 ciphertext bytes (like QUIC header protection), so every packet

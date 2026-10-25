@@ -2,6 +2,7 @@ package wat
 
 import (
 	"net"
+	"sync/atomic"
 )
 
 // The udp carrier: one UDP datagram = one session packet. No crypto, framing or retransmit here; the session
@@ -18,7 +19,11 @@ type UDPClient struct {
 	c    *net.UDPConn
 	rbuf []byte
 	bx   *udpBatch // recvmmsg / sendmmsg (Linux), nil elsewhere
+	dns  bool      // DNS-shaped datagrams (dnsshape.go)
 }
+
+// SetDNS turns the DNS framing on or off; call it before the first Send. Both ends must agree.
+func (u *UDPClient) SetDNS(on bool) { u.dns = on }
 
 // NewUDPClient dials host:port. Dialing UDP sends nothing, so it succeeds before the server is reachable.
 func NewUDPClient(peer string) (*UDPClient, error) {
@@ -41,28 +46,47 @@ func NewUDPClientAddr(peer string, laddr *net.UDPAddr) (*UDPClient, error) {
 }
 
 func (u *UDPClient) Send(p []byte, path int) error {
+	if u.dns {
+		fs, done := dnsFrames([][]byte{p}, false)
+		defer done()
+		p = fs[0]
+	}
 	_, err := u.c.Write(p)
 	return err
 }
 
 func (u *UDPClient) Recv() ([]byte, int, net.Addr, error) {
-	if u.bx != nil {
-		p, _, err := u.bx.recv()
-		if err != nil {
-			return nil, 0, nil, err
+	for {
+		var p []byte
+		if u.bx != nil {
+			var err error
+			if p, _, err = u.bx.recv(); err != nil {
+				return nil, 0, nil, err
+			}
+		} else {
+			n, err := u.c.Read(u.rbuf)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			p = u.rbuf[:n]
+		}
+		if u.dns {
+			if p = dnsStrip(p); p == nil {
+				continue
+			}
 		}
 		return p, 0, u.c.RemoteAddr(), nil
 	}
-	n, err := u.c.Read(u.rbuf)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	return u.rbuf[:n], 0, u.c.RemoteAddr(), nil
 }
 
 func (u *UDPClient) CopiesOnSend() bool { return true }
 // SendBatch sends a burst in one system call where the platform has sendmmsg, else one write each.
 func (u *UDPClient) SendBatch(ps [][]byte, lanes []int) error {
+	if u.dns {
+		fs, done := dnsFrames(ps, false)
+		defer done()
+		ps = fs
+	}
 	if u.bx != nil {
 		return u.bx.send(ps, nil)
 	}
@@ -84,7 +108,11 @@ type UDPServer struct {
 	c    *net.UDPConn
 	rbuf []byte
 	bx   *udpBatch
+	dns  atomic.Bool // DNS-shaped datagrams (dnsshape.go); atomic because the reverse server's punch goroutine reads it
 }
+
+// SetDNS turns the DNS framing on or off; call it before the first Recv. Both ends must agree.
+func (u *UDPServer) SetDNS(on bool) { u.dns.Store(on) }
 
 // NewUDPServer listens on addr (":4443", "0.0.0.0:4443").
 func NewUDPServer(addr string) (*UDPServer, error) {
@@ -109,24 +137,39 @@ func (u *UDPServer) Profile() Profile { return udpProfile }
 func (u *UDPServer) Addr() net.Addr { return u.c.LocalAddr() }
 
 func (u *UDPServer) Recv() ([]byte, int, net.Addr, error) {
-	if u.bx != nil {
-		p, src, err := u.bx.recv()
-		if err != nil {
-			return nil, 0, nil, err
+	for {
+		var p []byte
+		var src net.Addr
+		if u.bx != nil {
+			var err error
+			if p, src, err = u.bx.recv(); err != nil {
+				return nil, 0, nil, err
+			}
+		} else {
+			n, a, err := u.c.ReadFromUDPAddrPort(u.rbuf)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			p, src = u.rbuf[:n], net.UDPAddrFromAddrPort(a)
+		}
+		if u.dns.Load() {
+			if p = dnsStrip(p); p == nil {
+				continue
+			}
 		}
 		return p, 0, src, nil
 	}
-	n, src, err := u.c.ReadFromUDPAddrPort(u.rbuf)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	return u.rbuf[:n], 0, net.UDPAddrFromAddrPort(src), nil
 }
 
 func (u *UDPServer) SendTo(p []byte, lane int, dst net.Addr) error {
 	ua, ok := dst.(*net.UDPAddr)
 	if !ok {
 		return net.ErrClosed
+	}
+	if u.dns.Load() {
+		fs, done := dnsFrames([][]byte{p}, true)
+		defer done()
+		p = fs[0]
 	}
 	_, err := u.c.WriteToUDP(p, ua)
 	return err
@@ -137,6 +180,11 @@ func (u *UDPServer) SendBatchTo(ps [][]byte, lanes []int, dst net.Addr) error {
 	ua, ok := dst.(*net.UDPAddr)
 	if !ok {
 		return net.ErrClosed
+	}
+	if u.dns.Load() {
+		fs, done := dnsFrames(ps, true)
+		defer done()
+		ps = fs
 	}
 	if u.bx != nil {
 		return u.bx.send(ps, ua)

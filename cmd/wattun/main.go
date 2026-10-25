@@ -71,9 +71,10 @@ func main() {
 	lossCeil := flag.Bool("loss-ceiling", false, "pacer: also cut the rate when loss jumps far above its learned baseline (opt-in; default: delay only)")
 	governor := flag.Bool("governor", false, "pacer, ICMP paths: learn the path's volume ceiling from the reroute signature (a sudden base-RTT jump after sustained bulk) and hold the rate under it (opt-in; replaces hand-tuned max-mbps on routes where ICMP above ~30 MB/s total triggers a reroute inside Iran; 2.9.0)")
 	tlsSmallCH := flag.Bool("tls-small-ch", false, "client, tls|wss|h2|grpc: keep the ClientHello small (skip the post-quantum hybrid key share; ~250 B instead of ~1.5 KB). Some DPIs drop large hellos outright (measured 2026-10-22 on a live Iranian path)")
-	hdrMask := flag.Bool("hdr-mask", true, "mask the session id and packet number at the start of every packet, so no byte of a packet is constant or counts up (2.11.0; an older peer is detected and answered in the plain form; false sends the plain header)")
-	tcpMimic := flag.Bool("tcp-mimic", true, "tcp carrier: open every connection with a TLS ClientHello-shaped hello (SNI -fake-sni, default www.cloudflare.com) that carries the authentication, and mask the 2-byte frame lengths, so the stream starts like TLS and has no plain structure (2.11.0; both ends; an older peer is detected and answered with the plain 8-byte pool id after a few seconds; false sends the plain id)")
-	shape := flag.Bool("shape", true, "randomize idle traffic: pad small packets (acks, keepalives, key exchange) to random sizes and jitter the keepalive interval around -ping-every (2.11.0; wire-compatible with older peers)")
+	hdrMask := flag.Bool("hdr-mask", true, "mask the session id and packet number at the start of every packet, so no byte of a packet is constant or counts up (3.0.0; an older peer is detected and answered in the plain form; false sends the plain header)")
+	tcpMimic := flag.Bool("tcp-mimic", true, "tcp carrier: open every connection with a TLS ClientHello-shaped hello (SNI -fake-sni, default www.cloudflare.com) that carries the authentication, and mask the 2-byte frame lengths, so the stream starts like TLS and has no plain structure (3.0.0; both ends; an older peer is detected and answered with the plain 8-byte pool id after a few seconds; false sends the plain id)")
+	udpDNS := flag.Bool("udp-dns", false, "udp carrier: start every datagram with a DNS message header and question, so a filter that lets only DNS-looking UDP through (measured: UDP to port 53 passes, everything else is cut after 3 datagrams) passes the tunnel; use with port 53 on the server. Both ends must set it; an older peer cannot read it (3.0.0)")
+	shape := flag.Bool("shape", true, "randomize idle traffic: pad small packets (acks, keepalives, key exchange) to random sizes and jitter the keepalive interval around -ping-every (3.0.0; wire-compatible with older peers)")
 	pingEvery := flag.Int("ping-every", 2, "idle keepalive interval, seconds (raise on paths whose filter rate-limits steady periodic packets into a penalty box: live 2026-10-22 saw 30 echo req/min collapse to 95% loss until a ~5 min cooldown; both ends use their own value)")
 	dnsUpstream := flag.String("dns-relay-upstream", "8.8.8.8:53", "Kharej recursive resolver used by the internal DNS relay (port 53, -ech ladder); empty = 8.8.8.8:53")
 	icmpType := flag.String("icmp-type", "echo", "icmp carrier: echo|timestamp|info|mask - the ICMP request type the client sends (the server answers with the matching reply: 8/0, 13/14, 15/16, 17/18); both ends must use the same")
@@ -101,7 +102,7 @@ func main() {
 	fakeTTL := flag.Int("fake-ttl", 0, "client, with -fake-sni -fake-mode ttl: hop count of the fake packet, 1 more than the distance to the censor's DPI box, 1 less than the distance to the server; 0 = calibrate from the server's replies (unused by the seq, sum and seqsum modes)")
 	host := flag.String("host", "", "client, ws|wss|h2|h2c|grpc carrier: Host header / authority (default: -peer)")
 	plain := flag.Bool("plain", false, "grpc carrier: cleartext h2c instead of TLS (behind a proxy that terminates TLS)")
-	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer; icmp carrier: the server sends the requests to -peer (the client's IP) and the client answers with replies (both ends need wattun >= 2.0.0 and -reverse); udp carrier: the client binds -listen and never sends first, the server punches datagrams to -peer (the client's address) and the client answers to the source of the latest one (2.11.0, both ends)")
+	reverse := flag.Bool("reverse", false, "tcp|tls|ws|wss|h2|h2c|grpc carriers: the client listens on -listen and the server dials -peer; icmp carrier: the server sends the requests to -peer (the client's IP) and the client answers with replies (both ends need wattun >= 2.0.0 and -reverse); udp carrier: the client binds -listen and never sends first, the server punches datagrams to -peer (the client's address) and the client answers to the source of the latest one (3.0.0, both ends)")
 	srcIP := flag.String("src-ip", "", "client: outbound source IP address for carriers (or per-carrier -src-ip-NAME)")
 	dnsListen := flag.String("dns-listen", "", "client: local address to listen for DNS queries (e.g. 127.0.0.1:53 or 127.0.0.1:5353) and forward them via the tunnel's DNS relay (2.9.0)")
 	pathProbeMax := flag.Duration("path-probe-max", 0, "client, bonded carriers: maximum probe backoff for dead paths (default 30s; blackout mode: 6s)")
@@ -322,7 +323,7 @@ func main() {
 			}
 			pio, raw = ic, ic
 		case "udp":
-			if *reverse && server { // 2.11.0: the server punches towards the client, which never sends first
+			if *reverse && server { // 3.0.0: the server punches towards the client, which never sends first
 				raw, err = wat.NewUDPReverseServer(listen, peer, k)
 			} else if *reverse {
 				pio, err = wat.NewUDPReverseListener(listen, k)
@@ -335,6 +336,13 @@ func main() {
 			}
 			if err != nil {
 				log.Fatalf("udp socket: %v", err)
+			}
+			if *udpDNS {
+				for _, x := range []any{pio, raw} {
+					if d, ok := x.(interface{ SetDNS(bool) }); ok {
+						d.SetDNS(true)
+					}
+				}
 			}
 		case "tcp":
 			if lis {
@@ -449,7 +457,7 @@ func main() {
 				pc.SetRotate(rotateD, rotateB)
 			}
 		}
-		if carrier == "tcp" && *tcpMimic { // 2.11.0: TLS-shaped hello and masked frame lengths on a raw tcp pool
+		if carrier == "tcp" && *tcpMimic { // 3.0.0: TLS-shaped hello and masked frame lengths on a raw tcp pool
 			if ps != nil {
 				ps.SetObfs(k)
 			}
@@ -542,7 +550,11 @@ func main() {
 			case *wat.TCPPoolClient: // same TLS engine and edge health, own connections; the next slots continue the edge rotation
 				p, err = c.Clone(k * max(*conns, 1))
 			case *wat.UDPClient:
-				p, err = wat.NewUDPClient(pick(peerBy, *peer, "udp"))
+				var uc *wat.UDPClient
+				if uc, err = wat.NewUDPClient(pick(peerBy, *peer, "udp")); err == nil {
+					uc.SetDNS(*udpDNS)
+					p = uc
+				}
 			default:
 				err = fmt.Errorf("-sessions > 1 is not supported on this carrier")
 			}

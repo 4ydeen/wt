@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Reverse udp (2.11.0): the Iran client binds a UDP port and never sends first; the Kharej server sends it small
+// Reverse udp (3.0.0): the Iran client binds a UDP port and never sends first; the Kharej server sends it small
 // "punch" datagrams from its own socket, and the client answers to whatever address the latest valid punch came from.
 // A flow from Iran's point of view is then started by the foreign host, like an inbound TCP connection (the model of
 // Backhaul-style reverse tunnels), so a filter that restricts what an Iran VPS may START towards foreign addresses
@@ -53,7 +53,11 @@ type UDPReverseListener struct {
 	peer atomic.Pointer[net.UDPAddr] // where the last valid punch came from (nil: none yet, so Send drops)
 	rbuf []byte
 	bx   *udpBatch
+	dns  bool // DNS-shaped datagrams (dnsshape.go)
 }
+
+// SetDNS turns the DNS framing on or off; call it before the first Recv. Both ends must agree.
+func (u *UDPReverseListener) SetDNS(on bool) { u.dns = on }
 
 // NewUDPReverseListener binds addr (":4443") and waits for the server's punches.
 func NewUDPReverseListener(addr string, psk []byte) (*UDPReverseListener, error) {
@@ -74,6 +78,11 @@ func (u *UDPReverseListener) Send(p []byte, path int) error {
 	dst := u.peer.Load()
 	if dst == nil {
 		return nil // nobody has punched yet: loss the session repairs once the server shows up
+	}
+	if u.dns {
+		fs, done := dnsFrames([][]byte{p}, false)
+		defer done()
+		p = fs[0]
 	}
 	_, err := u.c.WriteToUDP(p, dst)
 	return err
@@ -98,6 +107,11 @@ func (u *UDPReverseListener) Recv() ([]byte, int, net.Addr, error) {
 		ua, ok := src.(*net.UDPAddr)
 		if !ok {
 			continue
+		}
+		if u.dns {
+			if p = dnsStrip(p); p == nil {
+				continue
+			}
 		}
 		if isPunch(u.key, p) {
 			if cur := u.peer.Load(); cur == nil || !cur.IP.Equal(ua.IP) || cur.Port != ua.Port {
@@ -128,6 +142,10 @@ type UDPReverseServer struct {
 	once sync.Once
 }
 
+// SetDNS frames the punches too, so call it right after NewUDPReverseServer (a punch sent before it is unframed and
+// the listener ignores it; the next one, about a second later, is framed).
+func (r *UDPReverseServer) SetDNS(on bool) { r.UDPServer.SetDNS(on) }
+
 // NewUDPReverseServer binds listen (the source port of the punches and of every reply) and punches to peer.
 func NewUDPReverseServer(listen, peer string, psk []byte) (*UDPReverseServer, error) {
 	us, err := NewUDPServer(listen)
@@ -139,7 +157,11 @@ func NewUDPReverseServer(listen, peer string, psk []byte) (*UDPReverseServer, er
 	go func() {
 		for {
 			if ra, err := net.ResolveUDPAddr("udp", peer); err == nil {
-				us.c.WriteToUDP(makePunch(key), ra)
+				pk := makePunch(key)
+				if us.dns.Load() {
+					pk = dnsFrame(nil, pk, true)
+				}
+				us.c.WriteToUDP(pk, ra)
 			}
 			select {
 			case <-r.stop:

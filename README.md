@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v2.10.12-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v3.0.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -21,21 +21,81 @@
 
 WatTunnel connects an **Iran** server (where your users connect) to a **Kharej** server (where your service runs)
 and forwards any TCP or UDP port between them. One static binary, no dependencies, and a menu that sets everything
-up from one pasted token. It rides whatever your route lets through: `icmp` (ping), `udp`, `tcp`, `tls`, `ws`,
-`wss`, `h2`, `h2c`, `grpc`, Cloudflare with ECH, reverse mode, several of them bonded into one tunnel, or
-fake-SNI desync (`fake-sni`) when the route permit-lists flows by their TLS name (2.6.0; on the wss, h2 and grpc
-carriers too since 2.7.0, with automatic TTL calibration, NAT-sequence follow, a checksum mode for routes that
-validate sequence numbers (2.7.1), and both markers at once (`seqsum`, 2.8.0); then five more in 2.10.5: `split` cuts the fake hello across segments, `hlen0` is the F&F-style empty TLS record, `fakeip` aims the fake at a whitelisted CDN address (`fake-ip`), `synrst` clears flow tables harder and `all` fires three markers), plus optional `pool-rotate` churn
-so no single connection shows a months-stable lifetime (2.8.0; optional byte budget `pool-rotate-bytes`, 2.8.1).
-The filter can be probed and the marker mode picked automatically (`fake-mode: auto`, 2.9.0); `wattun blackout
-NAME [SNI]` turns the kit on with one command when a censor starts blocking. `tls-small-ch` (2.10.4) keeps the ClientHello at ~250 B (no post-quantum key share) for DPIs that drop large hellos, `ech: ladder` (2.9.0) fetches the
-ECH config through the tunnel itself when every public DNS-over-HTTPS server is blocked, and `-governor` (2.9.0)
-learns an ICMP path's volume ceiling from its reroute signature.
+up from one pasted token.
+
+**3.0.0 is the anti-censorship release.** When the route is filtered, the tunnel does not slow down: it changes shape.
+It rides whatever your route lets through (`icmp`, `udp`, `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc`, Cloudflare
+with ECH, reverse mode, or several of them bonded into one tunnel), and since 2.6.0 it has learned to get past
+permit-lists, flow cutters and traffic classifiers that kill every ordinary tunnel.
+
+## 🔥 Built for the worst days
+
+On a route that **cuts every direct Iran → Kharej flow within a second** (UDP after 3 datagrams, TCP after 3 KB, on every
+port, with every payload), a plain tunnel connects for a moment and dies. WatTunnel 3.0.0 was field-tested on exactly
+such a pair, and these are the results through that filter:
+
+| Setup on the filtered route | Download | Upload |
+|---|---|---|
+| **Direct `udp-dns`: every datagram looks like DNS on port 53** (400 MB run) | **36 MB/s** | **29 MB/s** |
+| Direct `udp-dns`, 4 sessions | **32 MB/s** | 24 MB/s |
+| **Direct `tcp` + fake-SNI `rst`**, pool-rotate | **28 MB/s** | **32 MB/s** |
+| Direct `tcp` + fake-SNI `rst`, 4 sessions | 21 MB/s | 29 MB/s |
+| **Reverse `tcp`** (Kharej dials Iran), pool-rotate | **28 MB/s** | **32 MB/s** |
+| Reverse `wss` / `tls` / `h2` | 22-25 MB/s | 27-30 MB/s |
+| Reverse `udp` (Iran never sends first) | 21 MB/s | 19 MB/s |
+
+One vCPU per server, 82 ms round trip, one run each, so read these as orders of magnitude (the pair also passes ICMP, at 7-10 MB/s). Every one of them is a tunnel
+that **plain tools cannot bring up at all** on this route. Old and new releases work together. Conditions, failures
+and the full list of 92 configurations: [docs/TECHNICAL.md](docs/TECHNICAL.md#field-numbers).
+
+## What changed since 2.6.0
+
+Everything below is shipped, tested and reachable from the menu (`wattun` → tunnel page → `z` for the anti-censor
+presets).
+
+**Looks like nothing a classifier knows (3.0.0)**
+
+- **No constant byte in any packet.** The session id and packet number are masked (`hdr-mask`), so there is no fixed
+  prefix and no counter to fingerprint. Idle packets are padded to random sizes and the keepalive interval is
+  jittered (`shape`).
+- **Reverse `udp`.** The Iran server only listens and never starts a flow towards a foreign address. Kharej sends
+  authenticated punches. Previously only the TCP-family carriers had a reverse mode.
+- **`udp-dns`.** Every UDP datagram starts like a DNS query (and every answer like a DNS answer) on port 53, with a
+  fresh id and name each time. It is the one shape the measured filter let through at full speed.
+- **TLS-shaped raw `tcp` (`tcp-mimic`).** The first bytes of a `tcp` tunnel are a Chrome-like 517-byte ClientHello
+  carrying the authentication, with masked frame lengths, not a plain pool id.
+- **Pick the source address** of the tunnel from the manager (`src-ip`), for servers with several IPs.
+
+**Gets past permit-lists and flow cutters (2.6.0 - 2.10.12)**
+
+- **Fake-SNI desync (`fake-sni`).** When a filter lets a flow live only if its TLS name is on a list, the tunnel sends
+  a decoy hello that the filter reads and the server ignores. Modes: `seq`, `ttl` (calibrated automatically), `sum`,
+  `seqsum`, `rst`, `synrst`, `split`, `hlen0`, `fakeip`, `all`, and `auto`, which probes the filter and picks one.
+  Works on `tcp`, `tls`, `ws`, `wss`, `h2`, `grpc`, over IPv4 and IPv6, also from a reverse server. Field result: a
+  `wss` tunnel through Cloudflare connected under a Cloudflare-only whitelist with `rst`, while every other mode did not.
+- **Churn (`pool-rotate`).** Connections are recycled at random times or byte budgets, so none shows a stable lifetime.
+- **ECH, even when DNS is hijacked** (`ech: ladder`): the ECH config is fetched through the tunnel itself.
+- **`tls-small-ch`** keeps the ClientHello at about 250 bytes for DPIs that drop large hellos.
+- **ICMP volume governor** learns a path's reroute ceiling, so the tunnel stays under it.
+- **`wattun blackout NAME`** turns the whole kit on with one command, **`wattun matrix NAME`** tries every
+  combination from the Iran server and applies the best one.
+
+**Safer and tougher**
+
+- **Forward secrecy** on every session (X25519 key exchange, 2.10.0): recorded traffic stays unreadable even if a key
+  file leaks later.
+- **Signed installer**: every download is checked against an RSA-signed checksum list, so a mirror cannot swap the binary.
+- **Reliability**: no stall after a short one-way blackout, no hang after a Kharej restart, honest `alive` in `/stats`,
+  a header mask that no longer stays off when the client starts before its server, fixed data races and buffer reuse.
+- **Manager**: anti-censor toggle with presets (Cloudflare first), reverse switch, resilience profiles, DNS-shaped
+  option in the Kharej wizard, auto-heal, update with rollback.
+
+[Full release history](docs/TECHNICAL.md#release-history).
 
 ## Speed
 
-Measured on real Iran ⇄ Europe servers (2 vCPU each), October 2026. Ping is the round trip through the tunnel while
-it is fully loaded; the route's own ping is about 40 ms.
+Measured on real Iran ⇄ Europe servers (2 vCPU each), October 2026, on an unfiltered path. Ping is the round trip
+through the tunnel while it is fully loaded; the route's own ping is about 40 ms.
 
 | Connection type | Download | Upload | Ping under load |
 |---|---|---|---|
@@ -47,7 +107,7 @@ Plain TCP with no tunnel at all reaches 243 MB/s down on the same route with 16 
 reaches **80 % of that**. Full tables, every version and how each was measured:
 [docs/TECHNICAL.md](docs/TECHNICAL.md#field-numbers).
 
-### Behind a filter (2.10.12 field test)
+### On the owner's filtered Iran route (2.10.12 field test)
 
 Same servers, 2026-10-25, on a route where Iran → Kharej directly is cut about a second into every flow, and Iran →
 Cloudflare passes only flows whose TLS name is `www.cloudflare.com`.
@@ -55,8 +115,7 @@ Cloudflare passes only flows whose TLS name is `www.cloudflare.com`.
 | Setup | Result |
 |---|---|
 | Reverse `tcp` (Kharej dials Iran), with or without `fake-sni` | 36-40 MB/s down, 30-36 MB/s up, 38-46 ms idle |
-| `wss` through a Cloudflare edge, real name filtered, `fake-mode: rst` | connected in 2 s (8 of 14 tries): 9-15 MB/s down, 2-5 MB/s up, ~125 ms; 100 MB test 13.8 MB/s down, 4.9 MB/s up |
-| the same with any other fake mode, or none | never connected (0 of 23 tries) |
+| `wss` through a Cloudflare edge, real name filtered, `fake-mode: rst` | connected in 2 s: 9-15 MB/s down, 2-5 MB/s up, ~125 ms; 100 MB test 13.8 MB/s down, 4.9 MB/s up |
 
 Details and the failures: [docs/TECHNICAL.md](docs/TECHNICAL.md#fake-sni-field-test-21012).
 
@@ -82,6 +141,7 @@ users.
 | ICMP carrier | ✅ | ✅ | ✅ | ✅ | ✅ |
 | UDP / TCP / TLS / WS / gRPC carriers | ✅ | ✅ | ❌ | ❌ | ❌ |
 | Cloudflare/CDN with ECH | ✅ | - | ❌ | ❌ | ❌ |
+| Fake-SNI desync, DNS-shaped UDP, masked headers | ✅ | ❌ | ❌ | ❌ | ❌ |
 | One token tests every connection type for you | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Loss does not slow it down (delay-based pacing) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | All ports in one process | ✅ | ✅ | ❌ | ✅ (tun) | ❌ |
@@ -104,29 +164,6 @@ Under load, the tunnel adds +0.25 % to the bytes your users move on `tcp` (16 KB
 `icmp` with `mtu: 1400`, headers included.
 
 [Idle and bandwidth details](docs/TECHNICAL.md#resource-usage-idle-ram-cpu-and-bandwidth)
-
-## Latest release: 2.10.12
-
-**`fake-sni` now carries a tunnel through a Cloudflare-only whitelist, and anti-censor is a one-key toggle in the manager.**
-On the owner's Iran route a `wss` tunnel through a Cloudflare edge connected with `fake-mode: rst` (9-17 MB/s down)
-while every other mode and no fake never did. The fake now fires on every pool connection (the old kernel-queue probe
-read the wrong queues), a reverse Kharej server can run `fake-sni` too, and `/stats` `alive` is honest. In the
-manager, tunnel page `z` turns anti-censor on or off, picks a preset (new first choice: Cloudflare), switches
-reverse and sets any single key; off is the plain full-speed tunnel. Only the dialing end needs the update; the
-wire is unchanged. This release also ships 2.10.11 (never tagged): the duplicate-ACK wait and a 517-byte Chrome
-fake hello. Numbers: [Behind a filter](#behind-a-filter-21012-field-test).
-
-2.10.10 before it: **a tunnel no longer stalls for up to 10 s after a short one-way blackout, and no longer hangs for good when the
-Kharej server restarts after one.** Client-side fix: update the Iran server; any 2.10.x Kharej server works with it.
-
-2.10.9 before it was **the first release since 2.5.1: forward secrecy on every session, signed downloads, the anti-censorship kit, and
-two bug fixes in the transport.** Old and new versions work together (tested both ways against 2.5.1), so you can
-update one server at a time; forward secrecy switches on once both ends run 2.10.0 or newer. Everything in the
-anti-censorship kit is client-side, so only the Iran server needs it. This release also fixes a data race in the
-receive path and a buffer-reuse bug in bonded tunnels, adds IPv6 support to `fake-sni`, applies `tls-small-ch`
-under `fp: chrome|edge` too, and adds `wattun boost` (kernel network tuning) and `wattun matrix NAME` (tries every
-anti-censorship combination from the Iran server and applies the best one).
-[Full release history](docs/TECHNICAL.md#release-history).
 
 ## Setup
 
@@ -187,6 +224,8 @@ wattun ports NAME      # edit port mappings (applied live)
 wattun update          # update the binary and the menu
 ```
 
+**Auto uses data.** The test on Iran moves up to about 400 MB in total (about 50-150 MB on a filtered route where few types connect). On a traffic-billed server, pick a type yourself. After Iran has picked, run `wattun-manager auto-narrow NAME` on Kharej (or `u` on the tunnel page) to close the carrier ports it does not use.
+
 If you already know what your route allows, you can pick a type yourself in step 2:
 
 | Your route | Use |
@@ -205,11 +244,12 @@ later key-file leak stays unreadable. That protects the **Iran ↔ Kharej leg on
 server the traffic is whatever the forwarded service itself provides, so run an end-to-end encrypted protocol
 (VLESS+Reality, TLS, WireGuard) inside the tunnel. Kharej dials only its own `127.0.0.1`, and only ports on the
 allowlist.
-From 2.11.0 no byte of a packet header is constant (the session id and packet number are masked), idle packets are
-padded to random sizes with a jittered keepalive, and `udp` has a [reverse mode](docs/TECHNICAL.md#reverse-udp-2110): the Iran
+From 3.0.0 no byte of a packet header is constant (the session id and packet number are masked), idle packets are
+padded to random sizes with a jittered keepalive, and `udp` has a [reverse mode](docs/TECHNICAL.md#reverse-udp-300): the Iran
 server only listens and never starts a flow towards a foreign address. Raw `tcp` opens with a TLS ClientHello-shaped
-hello and masked frame lengths instead of a plain pool id (`tcp-mimic`)
-([traffic shape](docs/TECHNICAL.md#traffic-shape-what-a-dpi-sees-2110)).
+hello and masked frame lengths instead of a plain pool id (`tcp-mimic`). On a route that cuts every UDP flow after a few
+packets but passes DNS, `udp-dns: true` starts each `udp` datagram like a DNS message on port 53
+([DNS shape](docs/TECHNICAL.md#dns-shaped-udp-udp-dns-300), [traffic shape](docs/TECHNICAL.md#traffic-shape-what-a-dpi-sees-300)).
 The installer verifies the download's signature against a public key baked into it, so a `WAT_PROXY` mirror (or
 any tampered copy) cannot slip in a changed binary. The connection token contains the key: treat it like a
 password and share it only over a private channel. Keep `metrics` on `127.0.0.1`. What stays visible to the

@@ -82,7 +82,7 @@ type Config struct {
 	// a single-sided raise already halves the rate.
 	PingEvery time.Duration
 	// NoMask sends and expects the plain packet header (session id and packet number in clear). The default masks
-	// both (hdrmask.go) and falls back to the plain form against a peer older than 2.11.0.
+	// both (hdrmask.go) and falls back to the plain form against a peer older than 3.0.0.
 	NoMask bool
 	// NoShape turns off the random padding of small packets and the jitter on the idle keepalive (hdrmask.go).
 	NoShape bool

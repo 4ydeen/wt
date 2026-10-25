@@ -18,7 +18,7 @@ Version: see `wat/version.go` (`wattun -version`).
    - [Managing tunnels](#managing-tunnels)
 4. [Carriers](#carriers)
 5. [Bonding](#bonding)
-6. [Traffic shape](#traffic-shape-what-a-dpi-sees-2110)
+6. [Traffic shape](#traffic-shape-what-a-dpi-sees-300)
 7. [Reverse mode](#reverse-mode)
    - [Auto mode](#auto-mode)
    - [CDN tuning](#cdn-tuning)
@@ -225,6 +225,43 @@ On a clean emulated link (20 ms each way, 0.2 % loss, 100 Mbit):
 - WatTunnel halves small-request latency (p50 43 ms vs 83 ms), because it sends interactive streams first.
 
 See [Loopback A/B against GOST](#loopback-ab-against-gost-emulated-link-2026-10-09).
+
+### 3.0.0 field test: a pair that cuts every direct flow
+
+2026-10-25, two fresh VPS (Ubuntu 24.04, 1 vCPU, 0.9 GB each), 82 ms round trip, driven over SSH. 92 tunnel
+configurations were run. Each one: tunnel up, `/speedtest` down and up (15-40 MB), a 24 MB file through a forwarded
+TCP port (sha256 checked), 30 UDP datagrams of 800 B echoed through a forwarded UDP port. One run per configuration
+on small VMs; identical runs differed by about 2x, so compare orders of magnitude.
+
+**What the pair does to plain traffic** (measured with raw sockets, no wattun): Iran to Kharej, every UDP flow is cut
+after its first 3 datagrams and every TCP flow after about 3 KB, on all ports and with every payload tried (random,
+TLS with any SNI, QUIC-shaped). The exceptions: UDP to port 53 when the payload starts like a DNS message, and UDP to
+port 123 when it looks like NTP. Kharej to Iran is completely open, and ICMP echo passes both ways.
+
+| Setup | Download | Upload |
+|---|---|---|
+| ICMP (all four types) | 7-10 MB/s | 7-10 MB/s |
+| Direct `udp`, `tcp`, `tls`, `ws`, ... (no switches) | cut within a second | |
+| **Direct `udp` + `udp-dns` on port 53** | 21-33 MB/s (`sessions: 4`: 32.6); 400 MB run: 36 | 19-24 MB/s; 400 MB run: 29 |
+| **Direct `tcp` + `fake-sni` `rst`** | 14 MB/s; `sessions: 4`: 21.5; `pool-rotate`: 27.8 | 16-32 MB/s |
+| Direct `tls` + `fake-sni` `rst`, Chrome fingerprint, small hello | 15 MB/s | 15 MB/s |
+| Reverse `tcp` | 22 MB/s; with `pool-rotate` 28 | 26 MB/s; 32 |
+| Reverse `wss`, `tls`, `h2`, `ws` | 19-25 MB/s | 27-30 MB/s |
+| Reverse `udp` | 21 MB/s | 19 MB/s |
+| Bonded `icmp`+`udp`+`tcp` (the direct members are cut) | stays up on the ICMP member | |
+
+Fake-SNI modes other than `rst` and `synrst` do not get through this filter on a direct tunnel; `sum` and `seqsum`
+fail here because of the virtual NIC's checksum offload (identically with 2.10.12). With `hdr-mask`, `shape` and
+`tcp-mimic` on or off, speeds were the same within noise. Interoperation with 2.10.12 on one end worked on `icmp`,
+reverse `tcp` and reverse `tls` in both directions.
+
+On the wire (tcpdump on the Iran box): with the defaults every datagram has a different first 8 bytes (359 of 359
+from Kharej, 41 of 41 from Iran), against one repeated session id with `hdr-mask: false`; idle packets use about 40
+sizes between 20 and 143 bytes against 20 sizes between 29 and 76; 16 raw-`tcp` connections opened with 16 different
+517-byte hellos. The test found one bug, fixed in 3.0.0: a client that started before its server stayed on the plain
+header for the whole session.
+
+Not tested on this pair: carriers through a CDN, `ech`, the manager's auto mode, and any real DPI.
 
 ## Resource usage: idle, RAM, CPU and bandwidth
 
@@ -679,12 +716,12 @@ The fake costs no speed, and `raw_send_fails` stayed 0. A packet capture of an e
 `seq`) showed the fake at the listening end on both pool connections, 517 bytes below the stream start, with the
 duplicate ACK coming back.
 
-## Traffic shape: what a DPI sees (2.11.0)
+## Traffic shape: what a DPI sees (3.0.0)
 
 A tunnel that only forwards ports leaves marks that a flow classifier can learn, whatever carrier it uses. This release
 removes the ones that were in our own packets and adds the one structural protection other reverse tunnels rely on.
 
-**What a packet looked like before 2.11.0.** Every packet began with the 8-byte session id (the same in every packet of
+**What a packet looked like before 3.0.0.** Every packet began with the 8-byte session id (the same in every packet of
 a session) and an 8-byte packet number (a counter, with the top bit set for the server's direction), both in clear;
 the rest was ciphertext. So on `udp` and `tcp` the first 16 bytes of each datagram or frame were a constant followed by
 a counter. An idle tunnel also sent one keepalive every 2 s at one fixed size, and the first exchange of every session
@@ -710,7 +747,7 @@ had the same sizes. None of that is encrypted content, so none of it needed to l
    ChaCha20 stream per direction, keyed from the same root. After the hello the stream is the usual encrypted packets;
    it is not a real TLS session and does not pretend to be one (no ServerHello). It defeats "first bytes are not
    TLS" and fixed-structure checks, not a classifier that waits for a real handshake; use `tls`/`wss` for that.
-5. **Reverse udp.** [Iran starts nothing](#reverse-udp-2110).
+5. **Reverse udp.** [Iran starts nothing](#reverse-udp-300).
 
 **Compatibility.** Padding and jitter are invisible to older peers. A masked header is not. A receiver first reads the
 header as plain (a session id it knows), then as masked, and answers in the form it was addressed in. A new client that
@@ -732,13 +769,13 @@ the hello after 30 s); `tcp-mimic: false` sends the plain id at once. A new list
 **Why this release is not "more obfuscation".** The Backhaul tunnel (Musixal/Backhaul), which an operator reported running
 without an Iran-only restriction, has no padding, shaping or evasion at all: its README documents none. In the usual
 deployment its Iran end is the listener and the foreign end dials in, so an Iran VPS never starts a flow towards a foreign address. That is the
-property `reverse` gives here, and 2.11.0 extends it to `udp`, the one carrier that could not do it. If a provider
+property `reverse` gives here, and 3.0.0 extends it to `udp`, the one carrier that could not do it. If a provider
 restricts a VPS after a tunnel starts, first check which address the tunnel leaves from (`src-ip`) and which direction
 it runs; a classifier cannot punish a flow that the VPS did not start. On a host with several public IPv4 addresses
 the tunnel leaves from the one the routing table picks, which may not be the address the customers use; pin it with
 `src-ip`. The manager shows it on the tunnel card ("leaves from") and offers the choice in the Iran wizard.
 
-**What other tunnels do (researched for 2.11.0).** Backhaul and rathole send plain TCP by default (rathole offers
+**What other tunnels do (researched for 3.0.0).** Backhaul and rathole send plain TCP by default (rathole offers
 optional TLS or Noise); Backhaul's only protection is that the Iran end listens. GOST dials with a uTLS fingerprint and
 offers probe resistance and obfuscation layers. obfs4 pads its handshake to a random length and masks frame lengths.
 Iran's national filter is a protocol whitelist (DNS, HTTP/80, HTTPS/443 pass; the rest is dropped) and resets TLS to
@@ -752,7 +789,7 @@ Kharej to Iran, or only inbound to Iran. `reverse: true` swaps who listens and w
 still opens the streams and listens on the public ports.
 
 Works with the pool carriers (`tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc`), since 2.0.0 with `icmp`, and since
-2.11.0 with `udp` (see [Reverse udp](#reverse-udp-2110)). Put `reverse: true` on both ends.
+3.0.0 with `udp` (see [Reverse udp](#reverse-udp-300)). Put `reverse: true` on both ends.
 
 | Side | Without `reverse` | With `reverse` (pool carriers) | With `reverse` (`icmp`, 2.0.0) |
 |---|---|---|---|
@@ -878,7 +915,7 @@ instead.
 Since 2.1.0 the reverse dialers back off up to 30 s between attempts. They log the first failure, then at most one
 failure line every 5 minutes, and a `connected` line when a dial succeeds.
 
-### Reverse udp (2.11.0)
+### Reverse udp (3.0.0)
 
 With `carrier: udp` and `reverse: true` the Iran client binds `listen` and **never sends first**. The Kharej server sends
 it a small authenticated datagram (a "punch": 8 random bytes, a 12-byte HMAC of them under a key derived from the PSK,
@@ -892,16 +929,45 @@ address are dropped, and the session still authenticates everything.
 | Iran (client) | `reverse: true`, `listen: ":4443"` (open `4443/udp`), `peer` is not used |
 | Kharej (server) | `reverse: true`, `listen: ":4443"` (the source port of the punches and of every reply), `peer: "IRAN_IP:4443"` |
 
-Both ends need 2.11.0. An older peer cannot answer or send a punch, so the link stays down; set the same on both sides
+Both ends need 3.0.0. An older peer cannot answer or send a punch, so the link stays down; set the same on both sides
 or leave both in the normal direction. The manager does this in the wizard and under Advanced settings, direction (`d`),
 with the right `udp` firewall rule.
+
+### DNS-shaped udp (`udp-dns`, 3.0.0)
+
+Some routes cut every UDP flow after its first datagrams, whatever the port and payload, and pass only traffic that
+looks like an allowed protocol. Measured on a fresh Iran/Kharej pair (2026-10-25): from Iran, the first 3 datagrams of any
+UDP flow pass and the rest are dropped, except UDP to **port 53** whose payload starts like a DNS message. That flow
+passes sustained, at full datagram size, in both directions. A tunnel on port 4443 with the same framing is cut; the
+filter looks at the port as well as the bytes.
+
+`udp-dns: true` (both ends, carrier `udp`) starts every datagram with a DNS header and one question, and the session
+packet follows as if it were the rest of the message. Client datagrams look like recursive queries (flags `0x0100`),
+server datagrams like empty NOERROR answers (`0x8180`). The id and the queried name (a random 5 to 14 character label
+plus `com`, `net`, `org`, `ir`, `info` or `io`, type A or AAAA) are fresh for every datagram; the cost is 26 to 37
+bytes. It composes with `hdr-mask` and `shape`, with `sessions`, `fec`, bonding and `reverse`.
+
+```yaml
+# Kharej                                   # Iran
+mode: server                               mode: client
+carrier: udp                               carrier: udp
+udp-dns: true                              udp-dns: true
+listen: "KHAREJ_IP:53"                     peer: "KHAREJ_IP:53"
+```
+
+Bind the server to its own address, not `:53`: `systemd-resolved` holds `127.0.0.53:53`, and a wildcard bind would
+fail. Nothing else on the server may listen on UDP 53. The manager offers it in the Kharej wizard for `udp` (the token
+carries `dns` in its path field; the Iran wizard then writes `udp-dns: true`). Unattended: `wattun-manager kharej --carrier udp --udp-dns --name NAME --yes`. Both ends must enable it: a plain peer
+cannot read the frame and a framed peer never connects to it. Measured on the pair above (one run, 1 vCPU each, 82 ms):
+21 MB/s down, 19 MB/s up; with `sessions: 4`, 32 and 24; a 400 MB transfer held 36 and 29 with no cut. This is
+what a DNS-only whitelist lets through; it does not hide that a very busy UDP 53 flow is not ordinary DNS.
 
 ### Carrier matrix
 
 | Carrier | Direct | Reverse | Minimum version (both ends) |
 |---|---|---|---|
 | `icmp` | yes | yes | direct: any; reverse: 2.0.0 |
-| `udp` | yes | yes | direct: any; reverse: 2.11.0 |
+| `udp` | yes | yes | direct: any; reverse: 3.0.0 |
 | `tcp`, `tls`, `ws`, `wss`, `h2`, `h2c`, `grpc` | yes | yes | direct: 1.3.0; reverse: 1.8.0 |
 
 The reverse pool carriers are in the first release of this repository's history (1.8.0). An earlier release may
@@ -953,6 +1019,22 @@ itself (off: `wattun` → `s` → `h`). The table is ranked by download plus upl
 **Auto-heal.** After two failed restart cycles on an auto tunnel, `wattun-manager heal` starts a re-test (1 MB, at most
 once per 30 minutes). It switches to another working variant only when the current one fails, and logs
 `wattun-heal: switched NAME from X to Y`.
+
+**Bandwidth of the test.** The Iran test moves real data. Each working variant is screened with 8 MB down and 8 MB up
+(16 MB), then the top 3 are measured again with 20 MB each way (120 MB in all). There are at most 17 variants (19 with a
+CDN domain): icmp, udp, tcp, tls, wss, h2, grpc, ws, h2c, icmp reverse and 7 reverse pool carriers. A variant that does
+not connect sends almost nothing. Worst case, when everything works, is about 400 MB in total (about 200 MB each way, on
+both servers); on a filtered route where few carriers connect, expect 50 to 150 MB. Re-tests by auto-heal or the off-peak
+optimizer use 1 MB each way per variant (about 35 MB when all variants work), and auto-heal runs one at most every 30
+minutes, only after the tunnel failed. If your server is billed by traffic, pick a fixed carrier instead of Auto.
+
+**After Iran has picked.** The Kharej auto tunnel is the real server for the carrier Iran chose, so it is not deleted. It
+keeps every carrier port open so that Iran's test and auto-heal can reach any of them. Once Iran runs on its pick, close
+the rest: tunnel page, `u`, or `wattun-manager auto-narrow NAME [--yes]`. It reads which carriers have a live Iran
+session (`/stats` `clients` on `NAME`, alive `carriers` on `NAME-r`), rewrites the carrier list, restarts the tunnel for a
+moment, closes the firewall ports no longer needed, and stops `NAME` or `NAME-r` when nothing of it is in use (the token
+and config stay). Auto-heal on Iran can then only switch between carriers that stay open. `wattun-manager auto-widen NAME`
+opens all of them again. The tunnel card shows "Iran uses ..." and how many carriers are still open.
 
 **Costs and limits.** Several ports are open on Kharej at once. The test takes about 2 to 3 minutes. Kharej must be
 2.1.0 or newer (the `clients` field and the reverse dial backoff). The wire format did not change, so 2.1.0 peers work
@@ -1120,10 +1202,11 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `peer-NAME`, `listen-NAME` | = `peer`, `listen` | client / server | Bonded carriers only: per-carrier address (`peer-udp`, `listen-tcp`, ...). |
 | `peer` | | client (server with `reverse`) | icmp, udp: server IP. Others: `host:port`. Reverse pool carriers: Kharej sets Iran's `IP:port`. Reverse icmp: Kharej sets Iran's IP, Iran keeps Kharej's. |
 | `listen` | `:4443` | server (client with `reverse`) | Address for non-ICMP carriers. With `reverse` Iran listens here and Kharej's `peer` must point to it. |
-| `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. With `udp` (2.11.0): Iran binds `listen` and only answers, Kharej punches to `peer`. |
-| `hdr-mask` | true | both | Mask the session id and packet number at the start of every packet (2.11.0). An older peer is detected and answered plain; `false` sends the plain header. |
-| `tcp-mimic` | true | both | tcp carrier: open each connection with a TLS ClientHello-shaped hello (SNI `fake-sni`) that carries the auth, and mask the 2-byte lengths (2.11.0). An older peer is detected after 6 s and answered with the plain pool id; `false` sends the plain id. |
-| `shape` | true | both | Pad small packets (acks, keepalives, key exchange) to random sizes and jitter the keepalive interval (2.11.0). Compatible with older peers. |
+| `reverse` | false | both | Swap who listens and who dials. With `icmp` (2.0.0): Kharej sends the requests, Iran replies. With `udp` (3.0.0): Iran binds `listen` and only answers, Kharej punches to `peer`. |
+| `hdr-mask` | true | both | Mask the session id and packet number at the start of every packet (3.0.0). An older peer is detected and answered plain; `false` sends the plain header. |
+| `tcp-mimic` | true | both | tcp carrier: open each connection with a TLS ClientHello-shaped hello (SNI `fake-sni`) that carries the auth, and mask the 2-byte lengths (3.0.0). An older peer is detected after 6 s and answered with the plain pool id; `false` sends the plain id. |
+| `udp-dns` | false | both | udp carrier: start every datagram with a DNS header and question (3.0.0), for routes that pass only DNS-looking UDP on port 53. Both ends must set it. See "DNS-shaped udp". |
+| `shape` | true | both | Pad small packets (acks, keepalives, key exchange) to random sizes and jitter the keepalive interval (3.0.0). Compatible with older peers. |
 | `ports` | | both | List of `N`, `N/udp`, `LISTEN:TARGET` and `LISTEN:TARGET/udp`. Client listens on LISTEN, server allows TARGET. Hot-reloaded. |
 | `bind` | `0.0.0.0` | client | Address of the public listeners. |
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
@@ -1285,9 +1368,10 @@ Every flag can also be a config key. Flags win over the file.
 | `-mtu N` | 0 | Datagram cap. |
 | `-max-mbps F` | 0 | Pace ceiling per direction and session; 0 = 16 with icmp, 1250 otherwise (2.4.18; 200 from 2.3.0). |
 | `-tcp-cc NAME` | `bbr` | Pool sockets' TCP congestion control, Linux (2.4.18). `system` keeps the kernel default. |
-| `-hdr-mask` | true | Mask the packet header (2.11.0). |
-| `-tcp-mimic` | true | tcp carrier: ClientHello-shaped hello and masked frame lengths (2.11.0). |
-| `-shape` | true | Pad small packets and jitter the keepalive (2.11.0). |
+| `-hdr-mask` | true | Mask the packet header (3.0.0). |
+| `-udp-dns` | false | udp carrier: DNS-shaped datagrams, for port 53 (3.0.0). |
+| `-tcp-mimic` | true | tcp carrier: ClientHello-shaped hello and masked frame lengths (3.0.0). |
+| `-shape` | true | Pad small packets and jitter the keepalive (3.0.0). |
 | `-sessions N` | 1 | Client: N independent sessions, udp and the pool carriers only (2.3.0, server unchanged). |
 | `-icmp-type T` | `echo` | ICMP carrier: `echo`, `timestamp`, `info`, `mask` (both ends the same). |
 | `-loss-ceiling` | off | Pacer: also cut the rate when loss jumps far above its learned baseline (opt-in). |
@@ -1898,7 +1982,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
 - **Per session keys.** Each client session picks a random 8-byte id. The packet key is SHA-256 over a fixed module
   prefix, the secret and that id. Packet = `session id | packet number | ChaCha20-Poly1305(frames)`. The nonce is
   the packet number and is never reused: server numbers start at a time-based value with a direction bit set.
-  Since 2.11.0 the first 16 bytes are masked on the wire (see "Traffic shape").
+  Since 3.0.0 the first 16 bytes are masked on the wire (see "Traffic shape").
 - **Forward secrecy (2.10.0, both ends).** The client offers an ephemeral X25519 key in its packets (re-offering
   about once a second until the switch is done; the `frKex` frame is always the last frame of a packet: an older
   peer stops parsing there and never sees it). The server answers with its own key and both derive a fresh session
@@ -1924,7 +2008,7 @@ A restart cuts every connection. WatTunnel avoids restarts on a live system.
   certificate the client does not verify the server. The PSK still stops an impostor, because it cannot read or forge
   the session. Set `tls-pin` to also reject a wrong certificate.
 - **What none of this hides.** The server's address, the volume and timing of packets under load, and the fact that
-  ICMP or the carrier is in use. Since 2.11.0 no byte of a packet's header is constant and idle packets vary in size
+  ICMP or the carrier is in use. Since 3.0.0 no byte of a packet's header is constant and idle packets vary in size
   and timing, but a long-lived, high-volume flow to one foreign address is still visible as such. WatTunnel is not an anonymity tool.
 - **Protect the key file.** `chmod 600`, and do not put the key on the command line (`ps` shows it). The manager
   keeps `/etc/wattun` at mode `700` and key files at `600`. **The token contains the key**, so share it privately.
@@ -1948,7 +2032,7 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
-- **2.11.0: no constant bytes in the packet header, random idle shape, and reverse `udp`.** Update both ends for
+- **3.0.0: no constant bytes in the packet header, random idle shape, reverse `udp`, DNS-shaped `udp`.** Update both ends for
   reverse `udp`; for the rest any order works. (1) The session id and packet number at the start of every packet are
   masked (`hdr-mask`, default on): a flow classifier no longer sees 8 equal bytes plus a counter in each datagram. An
   older peer is detected and answered in the plain header. (2) Packets without stream data are padded with 0-100
@@ -1958,7 +2042,8 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   manager offers it for `udp` in the wizard and under direction. (4) Raw `tcp` opens with a TLS ClientHello-shaped
   hello that carries the authentication and masks the 2-byte frame lengths (`tcp-mimic`, default on; an older peer is
   detected and answered with the plain pool id after 6 s). (5) The manager shows and lets you pick the source address
-  (`src-ip`). See "Traffic shape".
+  (`src-ip`). (6) `udp-dns`: DNS-shaped udp on port 53, which a route that cuts every other UDP flow lets through. (7) A
+  client that started before its server no longer stays on the plain header for the session. See "Traffic shape".
 - **2.10.12: fake-SNI fires on every connection, and it works from a reverse server.** Dialer-side fix, no wire
   change. This release also ships 2.10.11, which was never tagged (the duplicate-ACK wait and the 517-byte Chrome
   fake hello). (1) The `TCP_REPAIR` probe read the wrong queues, so the fake used a wrong or missing stream start and fired on

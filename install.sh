@@ -91,7 +91,7 @@ WATTUN_BANNER=(
   ' ▀██▀██▀  ██▀██  ██     ██   ▀███▀ ██ ▀██ ██ ▀██ '
 )
 META_GITHUB='https://github.com/JohnWatsoon'
-META_TELEGRAM='@Watdevs'
+META_TELEGRAM='@WatxDev'
 
 banner() { # [1 = animated line-by-line reveal]
   local i cols GFG
@@ -100,7 +100,7 @@ banner() { # [1 = animated line-by-line reveal]
     local side=(
       "┌─ WatTun Community ─────────┐"
       "│ GitHub:   github.com/JohnWatsoon"
-      "│ Telegram: @Watdevs"
+      "│ Telegram: @WatxDev"
       "└────────────────────────────┘"
     )
     for i in 0 1 2; do
@@ -111,7 +111,7 @@ banner() { # [1 = animated line-by-line reveal]
         case "$i" in
           0) right="${GRY}┌─ ${CYN}WatTun Community${GRY} ─────────┐${RST}" ;;
           1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   github.com/JohnWatsoon" ;;
-          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}" ;;
+          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@WatxDev${RST}" ;;
         esac
       fi
       printf '  %s%s%s  %s\n' "$GFG" "$left" "$RST" "$right"
@@ -122,7 +122,7 @@ banner() { # [1 = animated line-by-line reveal]
     local side=(
       "┌─ WatTun Community ──────┐"
       "│ GitHub:   JohnWatsoon   │"
-      "│ Telegram: @Watdevs      │"
+      "│ Telegram: @WatxDev      │"
       "└─────────────────────────┘"
     )
     for i in 0 1 2; do
@@ -133,7 +133,7 @@ banner() { # [1 = animated line-by-line reveal]
         case "$i" in
           0) right="${GRY}┌─ ${CYN}WatTun Community${GRY} ──────┐${RST}" ;;
           1) right="${GRY}│${RST} ${CYN}GitHub:${RST}   JohnWatsoon   ${GRY}│${RST}" ;;
-          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@Watdevs${RST}      ${GRY}│${RST}" ;;
+          2) right="${GRY}│${RST} ${CYN}Telegram:${RST} ${BOLD}@WatxDev${RST}      ${GRY}│${RST}" ;;
         esac
       fi
       printf ' %s%s%s %s\n' "$GFG" "$left" "$RST" "$right"

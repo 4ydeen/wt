@@ -10,7 +10,7 @@ import (
 	"golang.org/x/crypto/chacha20"
 )
 
-// Raw tcp pool, hello v2 (2.11.0). Until 2.11.0 a pool connection opened with the pool id in clear (8 bytes, equal on
+// Raw tcp pool, hello v2 (3.0.0). Until 3.0.0 a pool connection opened with the pool id in clear (8 bytes, equal on
 // every connection of a pool) and then framed each packet with a 2-byte length. A filter that lets only known protocols
 // through (Iran's whitelist passes DNS, HTTP and HTTPS and drops the rest, Bock et al., FOCI 2020, and a 2025
 // measurement of the same filter) saw neither. Now the first bytes of every connection are one TLS ClientHello record
@@ -21,7 +21,7 @@ import (
 //
 // root is HMAC(PSK, label), so only a holder of the key can build or check one. The 2-byte frame lengths that follow are
 // XORed with a ChaCha20 keystream per direction (keys from the PSK and the salt), so the stream carries no plain length
-// either. Both ends must run 2.11.0; the listener tells the two hellos apart by the first five bytes (an old pool id
+// either. Both ends must run 3.0.0; the listener tells the two hellos apart by the first five bytes (an old pool id
 // matches the TLS record header with probability 2^-40), and a dialer that hears nothing from a listener falls back to
 // the 8-byte id (mimicWatch), so an older peer on either side still works after a few seconds.
 
