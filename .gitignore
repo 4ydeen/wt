@@ -16,3 +16,6 @@ REPORT.md
 .goshort/
 .mimocode/
 *.pcap
+Field Test*.md
+*HANDOFF*.md
+FIELD*.md
