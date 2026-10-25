@@ -1020,6 +1020,14 @@ func (t *desyncTracker) abandonLocked(k desyncKey) {
 	delete(t.conns, k)
 }
 
+// keep records a marker for resend (mu held; only modes that wait for the duplicate ACK resend). Delayed markers
+// are recorded when they are scheduled, so a resend repeats the whole set in order.
+func (t *desyncTracker) keep(c *desyncConn, p []byte) {
+	if t.needsAck() && t.send != nil {
+		c.sent = append(c.sent, append([]byte(nil), p...))
+	}
+}
+
 // resend fires the markers of k once more (Wrap, when the duplicate ACK did not come back within an RTT: the
 // marker itself may have been lost). It reports whether anything was sent.
 func (t *desyncTracker) resend(k desyncKey) bool {
@@ -1251,10 +1259,10 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		}
 	}
 	send := t.send
-	if t.needsAck() && send != nil { // keep the immediate markers for the one retransmit Wrap may ask for (3.0.0)
+	if t.needsAck() && send != nil { // keep the markers for the one retransmit Wrap may ask for (3.0.0)
 		c.sent = c.sent[:0]
 		send = func(p []byte) {
-			c.sent = append(c.sent, append([]byte(nil), p...))
+			t.keep(c, p)
 			t.send(p)
 		}
 	}
@@ -1344,6 +1352,8 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		sumPkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 		damageChecksum(sumPkt)
 		hlenPkt := fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts)
+		t.keep(c, sumPkt)
+		t.keep(c, hlenPkt)
 		time.AfterFunc(time.Millisecond, func() { t.send(sumPkt) })
 		time.AfterFunc(2*time.Millisecond, func() { t.send(hlenPkt) })
 		_ = t.fireFFLocked(k, c, base, ack, ttl, hello, 3*time.Millisecond)
@@ -1358,6 +1368,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// the second marker goes out after the 1 ms gap WITHOUT sleeping under t.mu: fireLocked runs
 		// inside the sniffer's lock and a sleep here stalls every concurrent fire and Wrap announce
 		// (audit 2026-10-21). close() never nils t.send, so a fire racing shutdown is a dropped packet.
+		t.keep(c, pkt)
 		time.AfterFunc(time.Millisecond, func() { t.send(pkt) })
 	case "sum":
 		// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
@@ -1385,6 +1396,7 @@ func (t *desyncTracker) fireFFLocked(k desyncKey, c *desyncConn, base, ack uint3
 	for i, seg := range ffSegs(r, t.cfg.Split) {
 		pkt := fakePacketWithOptions(k, seq+uint32(off), ack, ttl, seg, c.tcpOpts)
 		off += len(seg)
+		t.keep(c, pkt)
 		if d := startDelay + time.Duration(i)*time.Millisecond; d <= 0 {
 			t.send(pkt)
 		} else {

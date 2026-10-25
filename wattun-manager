@@ -1800,7 +1800,7 @@ pick_fake_mode() { # [default] -> REPLY_V
     return 0
   fi
   say "  ${BOLD}Select Fake Desync Mode${RST}:"
-  say "    ${CYN}1${RST}  auto    Probes the route at startup and picks a mode; needs ~10 s at startup (3.0.0 probe)"
+  say "    ${CYN}1${RST}  auto    Probes the route at startup and picks a mode; needs up to ~18 s at startup (3.0.0 probe)"
   say "    ${CYN}2${RST}  seqsum  Dual marker: seq desync + bad checksum (2.8.0+, SNI-allowlist filters)"
   say "    ${CYN}3${RST}  sum     In-window segment, bad TCP checksum (2.7.1+, stateful NATs)"
   say "    ${CYN}4${RST}  seq     Out-of-window sequence marker (2.7.0+, standard default)"

@@ -2229,3 +2229,28 @@ func TestFakeClientHelloPatternihaExact517(t *testing.T) {
 		}
 	}
 }
+
+// TestDesyncResendKeepsDelayedMarkers: a mode with a delayed second marker (ff, F&F pieces 1 ms apart) resends
+// every piece, not only the first one (3.0.0 review).
+func TestDesyncResendKeepsDelayedMarkers(t *testing.T) {
+	tr, sent := desyncTestTracker("ff", 0)
+	defer tr.close()
+	k := testClientKey()
+	<-tr.announce(k, 1000, true, 500001)
+	time.Sleep(50 * time.Millisecond) // the delayed pieces
+	n := sent.n()
+	if n < 2 {
+		t.Fatalf("ff sent %d pieces, want several", n)
+	}
+	if !tr.resend(k) {
+		t.Fatal("no resend")
+	}
+	if sent.n() != 2*n {
+		t.Fatalf("resend sent %d, want all %d pieces", sent.n()-n, n)
+	}
+	for i := 0; i < n; i++ {
+		if !bytes.Equal(sent.at(i), sent.at(n+i)) {
+			t.Fatalf("resent piece %d differs", i)
+		}
+	}
+}

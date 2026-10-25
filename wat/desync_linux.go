@@ -195,6 +195,7 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 	case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
 		d.inj.tr.abandon(k)
 		if desyncFailClosed {
+			c.Close() // the caller only gets the error: the conn would leak
 			return nil, errDesyncUnconfirmed
 		}
 		return c, nil
@@ -211,6 +212,9 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 		rtt := handshakeRTT(tc)
 		total := ackWaitFor(rtt)
 		first := min(max(rtt+rtt/4, 50*time.Millisecond), total/2)
+		if rtt == 0 { // no TCP_INFO: no RTT to judge a lost marker by, resend halfway
+			first = total / 2
+		}
 		select {
 		case <-ackCh: // duplicate ACK received from server!
 			return c, nil
@@ -222,6 +226,7 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 		case <-time.After(total - first): // safety fallback
 			d.inj.tr.abandon(k)
 			if desyncFailClosed {
+				c.Close()
 				return nil, errDesyncUnconfirmed
 			}
 		}

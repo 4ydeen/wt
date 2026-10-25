@@ -569,6 +569,17 @@ func expressSkip(n int) int {
 // while the queues are full turns those drops into backpressure. Since 3.0.0 no conn at all holds as well (see
 // TCPPoolClient.Backlogged): the reverse listener and a server whose client is reconnecting no longer drop datagrams.
 func backlogged(conns []*poolConn) bool {
+	if k := expressSkip(len(conns)); k > 0 { // bulk cannot use the express lane, so its room does not count
+		if full, live := backlogOf(conns[k:]); live {
+			return full
+		}
+	}
+	full, _ := backlogOf(conns)
+	return full
+}
+
+// backlogOf: every live conn's queue is full (judged by the unstalled ones while any is), and whether any conn is live.
+func backlogOf(conns []*poolConn) (full, live bool) {
 	now := time.Now().UnixNano()
 	n, unstalled, free, freeAny := 0, 0, false, false
 	for _, pc := range conns {
@@ -590,12 +601,12 @@ func backlogged(conns []*poolConn) bool {
 		free = free || room
 	}
 	if n == 0 {
-		return true
+		return true, false
 	}
 	if unstalled == 0 { // every conn is stalled: judge by the shortest queue, as leastQueued does
-		return !freeAny
+		return !freeAny, true
 	}
-	return !free
+	return !free, true
 }
 
 // pickConn chooses the connection for one packet on the server side: a pinned (bulk) lane takes its stream's
@@ -1077,13 +1088,15 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 			}
 		}
 	}
-	if pc == nil { // leastQueued: rotate start, prefer unstalled, then shortest queue
+	// leastQueued: rotate start, prefer unstalled, then shortest queue. Bulk first looks outside the express lane,
+	// then at every conn, so it still has a way out while the other slots dial (as pickConn on the server).
+	for from := skip; pc == nil && from >= 0; from-- {
 		start := int(c.rr.Add(1))
 		var best, any *poolConn
 		bl, al := int64(1<<62), int64(1<<62)
 		for i := range c.slots {
 			k := (start + i) % len(c.slots)
-			if k < skip && len(c.slots) > skip {
+			if k < from {
 				continue
 			}
 			cand := c.slots[k].Load()
@@ -1221,9 +1234,20 @@ func (c *TCPPoolClient) SetRotate(d time.Duration, bytes int64) {
 // datagram of each new session on loopback; HTTP carriers in the field, whose connections churn). Holding is safe:
 // acks and pings still go out (and are dropped), stream data waits in the session where no loss timer runs.
 func (c *TCPPoolClient) Backlogged() bool {
+	if k := expressSkip(len(c.slots)); k > 0 { // as backlogged(): bulk's room is outside the express lane
+		if full, live := c.backlogFrom(k); live {
+			return full
+		}
+	}
+	full, _ := c.backlogFrom(0)
+	return full
+}
+
+// backlogFrom is backlogOf over c.slots[from:], inline: no per-tick allocation on the 1 kHz pump path (audit 2026-10-22).
+func (c *TCPPoolClient) backlogFrom(from int) (full, live bool) {
 	now := time.Now().UnixNano()
 	n, unstalled, free, freeAny := 0, 0, false, false
-	for i := range c.slots { // inline backlogged(): no per-tick allocation on the 1 kHz pump path (audit 2026-10-22)
+	for i := from; i < len(c.slots); i++ {
 		pc := c.slots[i].Load()
 		if pc == nil {
 			continue
@@ -1243,12 +1267,12 @@ func (c *TCPPoolClient) Backlogged() bool {
 		free = free || room
 	}
 	if n == 0 {
-		return true
+		return true, false
 	}
 	if unstalled == 0 {
-		return !freeAny
+		return !freeAny, true
 	}
-	return !free
+	return !free, true
 }
 
 // Clone returns a new pool client to the same peer(s) with the same dial function, and with it the same TLS engine

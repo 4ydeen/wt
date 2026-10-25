@@ -491,4 +491,27 @@ func TestPoolExpressLane(t *testing.T) {
 	if two := conns[:2]; expressSkip(len(two)) != 0 || pickConn(two, PinLaneBase, 0) == nil {
 		t.Fatal("a 2-connection pool must not reserve an express lane")
 	}
+	for _, pc := range conns[2:] { // every bulk connection full, the express lane empty: bulk must wait
+		pc.enqueue(make([]byte, poolBacklogBytes))
+	}
+	if !backlogged(conns) {
+		t.Fatal("bulk connections full but the pool is not backlogged (the express lane's room counted)")
+	}
+
+	// client: while only the express slot is up (the others still dialing), bulk falls back to it
+	c := &TCPPoolClient{slots: make([]atomic.Pointer[poolConn], 4), done: make(chan struct{})}
+	only := mk()
+	c.slots[0].Store(only)
+	if c.Backlogged() {
+		t.Fatal("client backlogged with an empty live connection")
+	}
+	c.Send(make([]byte, 100), PinLaneBase+1)
+	if only.qb.Load() != 100 {
+		t.Fatal("bulk packet dropped while only the express slot was live")
+	}
+	c.slots[1].Store(mk())
+	c.Send(make([]byte, 100), PinLaneBase+1)
+	if only.qb.Load() != 100 {
+		t.Fatal("bulk packet took the express slot while a bulk slot was live")
+	}
 }

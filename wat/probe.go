@@ -59,6 +59,9 @@ const (
 	probeWait    = 2 * time.Second         // how long the filler may take to be acknowledged
 	probeBytes   = 32 << 10
 	probeGap     = 300 * time.Millisecond // between candidates, so a filter's per-flow state is not shared
+	// probeBudget: no new candidate starts after this, so startup stays under ~18 s (one candidate is at most
+	// dial 1.5 s + Wrap 2 s + probeWait 2 s); the pool dials wait on the probe.
+	probeBudget = 12 * time.Second
 )
 
 var errNoTCPInfo = errors.New("wat: TCP_INFO unavailable")
@@ -81,8 +84,13 @@ func ProbeFakeMode(cfg DesyncConfig, peer, carrier, name string, logf func(strin
 	}
 	addr := net.JoinHostPort(ip, port)
 	verdict, mode := "route-cut", "rst"
+	t0 := time.Now()
 	for i, m := range probeCandidates {
 		if i > 0 {
+			if time.Since(t0) > probeBudget {
+				logf("fake-mode auto: probe time budget spent, %s and later not tried", m)
+				break
+			}
 			time.Sleep(probeGap)
 		}
 		ok, err := probeOnce(cfg, m, addr, peer, probeFiller(carrier, name))
@@ -95,6 +103,8 @@ func ProbeFakeMode(cfg DesyncConfig, peer, carrier, name string, logf func(strin
 			verdict, mode = m, m
 			break
 		}
+		// shortcut: "none" only proves the first 32 KB passed; a filter that cuts on volume or after minutes is
+		// not seen. Set fake-mode explicitly if an auto tunnel dies later.
 	}
 	filterMu.Lock()
 	filterProfile = FilterProfile{Mode: mode, Verdict: verdict, SeqOK: verdict == "seq", ConnAlive: verdict != "route-cut", Probed: true}

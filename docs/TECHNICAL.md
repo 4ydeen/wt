@@ -557,7 +557,9 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   not see; it picked `seqsum` on a route where only `rst`/`synrst` work. `none` means the route does not filter
   that name, and the tunnel then runs without fake-SNI. No survivor is `route-cut`: the tunnel runs `rst` and keeps
   retrying. `/stats` `filter_profile` has `mode` (what runs) and `verdict`. Costs up to four short connections and
-  ~10 s at startup, once; without a raw socket or `TCP_INFO` it runs `rst`. Only the dialing end needs 3.0.0.
+  up to ~18 s at startup, once (no candidate starts after 12 s); without a raw socket or `TCP_INFO` it runs `rst`.
+  `none` only proves that the first 32 KB passed: a filter that cuts on volume or after minutes is not seen, so set
+  `fake-mode` explicitly if an `auto` tunnel dies later. Only the dialing end needs 3.0.0.
 - `fake-mode: seq` (default): the marker's sequence number is `ISN+1-len(marker)`, below the stream start. The
   server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI. A NAT
   that rewrites sequence numbers uniformly shifts the marker with it (2.7.0), so only non-uniform normalization
@@ -846,6 +848,11 @@ the streams and which ports are published do not change.
   mask, so destination-unreachable and time-exceeded messages also go from 1 to 10 per second per destination.
   `net.ipv4.icmp_echo_ignore_all=1` also works (the tunnel still receives its packets), but then Iran answers no
   ping at all, which breaks monitoring that pings it.
+  **Since 3.0.0 the manager does the same on Kharej** for a normal (not reverse) ICMP tunnel with type `echo` or
+  `timestamp`, because there Kharej receives the requests and uploads every tunnel packet twice. This is a behaviour
+  change on Kharej: ordinary pings are still answered, but at most 10 per second per sender, and Kharej's
+  destination-unreachable and time-exceeded messages are limited the same way. The old values come back when the
+  last such tunnel is removed.
 - **Don't judge Iran by ping from Kharej under load.** The kernel limit is per sender, and in reverse mode every
   tunnel request comes from Kharej's IP, so a plain `ping` from Kharej competes with the tunnel for that budget and
   loses packets while traffic flows (measured 4/6 and 1/3 received during a speed test). Use `last_rx_age_ms` from
@@ -2070,8 +2077,9 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   carriers: byte-bounded queues, an express lane for interactive packets, bulk detection that decays, no lost
   datagrams while the first connection dials, and pool slots after the first dial with a 50-250 ms stagger. (10) New
   keys `batch` and `keep-slow`; `WAT_GSO=1` for udp; `WAT_GRPC_MSG` sets the grpc message size (default 32 KB).
-  (11) Manager: `rst-fast` preset, `rst` as the fake-mode default, `synrst` selectable, kernel echo copies turned
-  off on whichever side receives the tunnel's echo requests.
+  (11) Manager: `rst-fast` preset, `rst` as the fake-mode default, `synrst` selectable. Kernel echo copies are
+  now also rate-limited on **Kharej** for normal ICMP tunnels (before, only on Iran in reverse): Kharej then answers
+  at most 10 ordinary pings per second per sender (see Reverse ICMP).
 - **2.10.12: fake-SNI fires on every connection, and it works from a reverse server.** Dialer-side fix, no wire
   change. This release also ships 2.10.11, which was never tagged (the duplicate-ACK wait and the 517-byte Chrome
   fake hello). (1) The `TCP_REPAIR` probe read the wrong queues, so the fake used a wrong or missing stream start and fired on
