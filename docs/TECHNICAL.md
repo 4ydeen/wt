@@ -634,6 +634,50 @@ ports:
   - 443
 ```
 
+### Fake-SNI field test (2.10.12)
+
+Measured on 2026-10-25 between the owner's Iran server (185.84.158.216) and Kharej (185.71.219.227), binary 2.10.12,
+test units only (`MemoryMax=300M`, `CPUQuota=60%`), removed afterwards. Iran's ICMP ping: 80.6 ms to the Cloudflare
+edge 104.21.20.209, 100 % loss to Kharej; Kharej's ping to Iran: 40.7 ms. Speeds come from the built-in `/speedtest`
+(8 streams, 20-100 MB down, 5-30 MB up), ping is the tunnel's `srtt_ms`. About 1.5 GB of Iran's traffic cap was used.
+
+**The route.** Iran → Kharej direct (ports 47150 and 8443) is cut after the first exchange, about a second into every
+flow, with or without TLS and with or without a fake. Iran → a Cloudflare edge with real SNI `www.cloudflare.com` passes (HTTP 403); with SNI
+`cf.xoamrz.ir` (the real, proxied name) the TCP and TLS handshakes finish and then nothing comes back. So the filter
+here is an SNI allowlist for the Cloudflare route, which is the case `fake-sni` is built for.
+
+**Cloudflare edge, `wss`, Kharej origin on port 8443** (client: `peer` 104.21.20.209:8443, `sni`/`host` `cf.xoamrz.ir`,
+`path` /wat, `conns` 4, `fake-sni: www.cloudflare.com`):
+
+| `fake-mode` | Tries | Connected | Down / up (MB/s) | Tunnel ping |
+|---|---|---|---|---|
+| none (control) | 3 | 0 | - | - |
+| `seq`, `sum`, `seqsum`, `ttl`, `split`, `hlen0`, `fakeip`, `all`, `ff`, `auto` | 2 each | 0 | - | - |
+| **`rst`** | 10 | 6 | 9.3-14.8 / 1.8-4.9 | 122-143 ms |
+| **`synrst`** | 4 | 2 | 12.0-13.1 / 3.2 | 136-144 ms |
+
+`rst` (an in-window RST with a damaged checksum) and `synrst` are the only modes that connected, and every connection
+that came up connected within 2 s and ran at full speed. They failed together in one stretch of about 40 minutes (five
+attempts in a row, after roughly 350 MB of test traffic) and once more with `conns: 16`; why is not known. With 100 MB
+transfers: 4 connections 13.8 MB/s down, 4.9 MB/s up; 8 connections 16.6 MB/s down. A pause of 100 or 250 ms between
+the fake and the real hello (tried with a build that had one; all 8 such runs connected) was not needed, so there is
+no such option. `auto`
+picked `seqsum` and failed: its probe tests which marker kills a flow, not whether the real flow then survives;
+`wattun-manager` anti-censor matrix (tunnel page `z`, then `m`) tests `rst` and `synrst` explicitly.
+
+**Reverse `tcp`** (Iran listens on 47151, Kharej dials, 4 connections, 60 MB down / 20 MB up):
+
+| Kharej `fake-mode` | Down | Up | Ping idle / under load |
+|---|---|---|---|
+| none | 39.8 MB/s | 31.2 MB/s | 46 / 83 ms |
+| `seq` | 39.9 MB/s | 36.2 MB/s | 42 / 65 ms |
+| `rst` | 38.4 MB/s | 30.2 MB/s | 38 / 68 ms |
+| none, 8 connections | 35.9 MB/s | 30.9 MB/s | 39 / 97 ms |
+
+The fake costs no speed, and `raw_send_fails` stayed 0. A packet capture of an earlier reverse run (2 connections,
+`seq`) showed the fake at the listening end on both pool connections, 517 bytes below the stream start, with the
+duplicate ACK coming back.
+
 ## Reverse mode
 
 Normally the Kharej server listens and the Iran client dials out. Some networks only allow outbound connections from

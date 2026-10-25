@@ -225,7 +225,7 @@ chk "preset alias cf" "$(preset_canonical CF)" "cloudflare"
 chk "v_preset cloudflare" "$(v_preset cloudflare && echo ok)" "ok"
 apply_preset t1 cloudflare >/dev/null
 chk "cloudflare fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t1.yml")" "fake-sni: www.cloudflare.com"
-chk "cloudflare fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: seq"
+chk "cloudflare fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: rst"
 chk "cloudflare clears pool-rotate" "$(grep -c '^pool-rotate' "$WAT_CONF/t1.yml")" "0"
 apply_preset t1 off >/dev/null
 chk "off clears fake-sni" "$(grep -c '^fake-' "$WAT_CONF/t1.yml")" "0"
@@ -352,12 +352,12 @@ T_CARRIER=tcp; T_PEER=198.51.100.1:443; T_SNI=example.com; T_PATH=/wat; T_KEY=k;
 at_prep() { AT_DIR="$AUTO_RUN/t.$$"; mkdir -p "$AT_DIR"; printf 'k' >"$AT_DIR/key"; return 0; }
 at_probe() { AR_OK[$1]=1; AR_DOWN[$1]=5; AR_UP[$1]=5; AR_RTT[$1]=10; return 0; }
 ac_matrix t1
-chk "matrix: variant count" "${#AV_LABEL[@]}" "10" # 1 base + 5 modes + 3 SNIs + 1 auto-probe
+chk "matrix: variant count" "${#AV_LABEL[@]}" "13" # 1 base + 6 modes + 3 SNIs + 2 cloudflare + 1 auto-probe
 chk "matrix: baseline first" "${AV_LABEL[0]}" "base (no desync)"
 chk "matrix: seq present" "$(printf '%s\n' "${AV_FM[@]}" | grep -c '^seq$')" "1"
 chk "matrix: auto-probe present" "$(printf '%s\n' "${AV_FM[@]}" | grep -c '^auto$')" "1"
-chk "matrix: 9 desync rows carry fake-sni" "$(printf '%s\n' "${AV_FS[@]}" | grep -c .)" "9"
-chk "matrix: ranking fills" "${#AT_RANK[@]}" "10"
+chk "matrix: 12 desync rows carry fake-sni" "$(printf '%s\n' "${AV_FS[@]}" | grep -c .)" "12"
+chk "matrix: ranking fills" "${#AT_RANK[@]}" "13"
 
 # ac_matrix_apply writes the winner and strips desync keys for the baseline
 AT_SEL=("${AV_LABEL[*]}") # dummy to satisfy set -u shape; real selection below

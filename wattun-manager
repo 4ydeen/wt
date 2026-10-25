@@ -1554,9 +1554,10 @@ show_builtin_preset() {
     cloudflare)
       cat <<'EOF'
 # WatTunnel built-in preset: Cloudflare (field-tested 2.10.12)
-# Fake hello naming www.cloudflare.com, out-of-window seq marker, no churn: the setup that came up on a real route
+# Fake hello naming www.cloudflare.com plus a bad-checksum RST that clears the filter's flow state, no churn:
+# the combination that carried a wss tunnel through a Cloudflare edge when the real SNI was filtered
 FAKESNI=www.cloudflare.com
-FAKEMODE=seq
+FAKEMODE=rst
 FAKETTL=
 POOLROT=
 POOLBYTES=
@@ -1637,7 +1638,7 @@ detect_preset() {
   if [ -z "$fs" ] && [ -z "$rot" ] && [ "$(cfg "$n" governor)" != true ]; then
     echo "${GRY}none / disabled${RST}"; return
   fi
-  if [ "$fs" = "www.cloudflare.com" ] && [ "$fm" = "seq" ] && [ -z "$rot" ]; then
+  if [ "$fs" = "www.cloudflare.com" ] && [ "$fm" = "rst" ] && [ -z "$rot" ]; then
     echo "${GRN}Cloudflare (field-tested)${RST}"; return
   fi
   if [ "$fs" = "mci.ir" ] && [ "$fm" = "seqsum" ] && [ "$rot" = "30m" ]; then
@@ -1662,7 +1663,7 @@ pick_preset() { # [default] -> REPLY_V
     return 0
   fi
   say "  ${BOLD}Select Built-in Anti-Censorship Preset${RST}:"
-  say "    ${CYN}1${RST}  Cloudflare (field-tested)     (www.cloudflare.com, seq mode, no churn; works with reverse)"
+  say "    ${CYN}1${RST}  Cloudflare (field-tested)     (www.cloudflare.com, rst mode, no churn; passed a real CDN whitelist)"
   say "    ${CYN}2${RST}  Iran Whitelist - MCI          (mci.ir, seqsum mode, 30m / 500MB churn, ECH ladder)"
   say "    ${CYN}3${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn, ECH ladder)"
   say "    ${CYN}4${RST}  Emergency Blackout Mode       (mci.ir, auto probe, 90s / 100MB rapid churn, ECH ladder)"
@@ -1938,7 +1939,7 @@ apply_preset() { # tunnel preset
   local fs='' fm='' ft='' rot='' rbytes='' ech='' gov=''
   case "$pr" in
     cloudflare)
-      fs="www.cloudflare.com"; fm="seq"; ft=""; rot=""; rbytes=""; ech=""; gov="" ;;
+      fs="www.cloudflare.com"; fm="rst"; ft=""; rot=""; rbytes=""; ech=""; gov="" ;;
     mci)
       fs="mci.ir"; fm="seqsum"; ft=""; rot="30m"; rbytes="500MB"; ech="ladder"; gov="true" ;;
     irancell)
@@ -3207,7 +3208,7 @@ heal_retest() { # name : at most once per 30 min, in a transient unit so it outl
 #  Fills AV_*/AR_*/AT_RANK like auto_test; the winner is written with ac_matrix_apply.
 # ======================================================================================
 AC_SNIS='mci.ir,irancell.ir,tci.ir,divar.ir' # curated allowlisted SNIs, comma separated
-AC_MODES='seq seqsum sum ttl rst'
+AC_MODES='seq seqsum sum ttl rst synrst'
 ac_matrix() { # name : needs T_* loaded from the tunnel (ac_load); fills AV_*, AR_*, AT_RANK, AT_SECS
   local n=$1 i fs fm car=$T_CARRIER t0=$SECONDS w
   AV_LABEL=(); AV_CAR=(); AV_KIND=(); AV_PEER=(); AV_PORT=(); AV_SNI=(); AV_FP=(); AV_ECH=(); AV_FRAG=()
@@ -3225,6 +3226,10 @@ ac_matrix() { # name : needs T_* loaded from the tunnel (ac_load); fills AV_*, A
   for fs in ${rest//,/ }; do
     [ -n "$fs" ] || continue
     av_add "desync $fs → seqsum" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "$fs" seqsum
+  done
+  # 2b. the Cloudflare edge name with the two modes that passed a real CDN whitelist (2.10.12 field test)
+  for fm in rst synrst; do
+    av_add "desync www.cloudflare.com → $fm" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' www.cloudflare.com "$fm"
   done
   # 3. ECH ladder (TLS carriers only): hides the real SNI from the DPI, works when SNIs are filtered
   case "$car" in tls|wss|h2|grpc)

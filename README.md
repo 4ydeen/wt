@@ -47,6 +47,19 @@ Plain TCP with no tunnel at all reaches 243 MB/s down on the same route with 16 
 reaches **80 % of that**. Full tables, every version and how each was measured:
 [docs/TECHNICAL.md](docs/TECHNICAL.md#field-numbers).
 
+### Behind a filter (2.10.12 field test)
+
+Same servers, 2026-10-25, on a route where Iran → Kharej directly is cut about a second into every flow, and Iran →
+Cloudflare passes only flows whose TLS name is `www.cloudflare.com`.
+
+| Setup | Result |
+|---|---|
+| Reverse `tcp` (Kharej dials Iran), with or without `fake-sni` | 36-40 MB/s down, 30-36 MB/s up, 38-46 ms idle |
+| `wss` through a Cloudflare edge, real name filtered, `fake-mode: rst` | connected in 2 s (8 of 14 tries): 9-15 MB/s down, 2-5 MB/s up, ~125 ms; 100 MB test 13.8 MB/s down, 4.9 MB/s up |
+| the same with any other fake mode, or none | never connected (0 of 23 tries) |
+
+Details and the failures: [docs/TECHNICAL.md](docs/TECHNICAL.md#fake-sni-field-test-21012).
+
 ## Compared to other tunnels
 
 Same servers, same filtered route (only ICMP passes), real VLESS traffic through each tunnel:
