@@ -25,8 +25,7 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { return c, nil }
 func (d *Desync) Close() error                      { return nil }
 func (d *Desync) PeerTTL() int                      { return 0 }
 
-// Stubs for probe.go (never reached off Linux: ProbeFakeMode bails at NewDesync) so the package compiles.
-func sendRawPacket(pkt []byte)                     {}
-func tcpStreamBase(tc *net.TCPConn) (uint32, uint32, bool) { return 0, 0, false }
+// bytesAcked: the filter probe's TCP_INFO reading is Linux only; ProbeFakeMode degrades to rst elsewhere.
+func bytesAcked(tc *net.TCPConn) (uint64, bool) { return 0, false }
 
 var rawSendFails atomic.Uint64 // Linux has the real counter; nothing fails here

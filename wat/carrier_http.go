@@ -10,6 +10,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -504,6 +506,16 @@ func NewGRPCPoolServer(addr string, o HTTPServerOptions) (*TCPPoolServer, error)
 
 const grpcMaxMsg = 1 << 20
 
+// grpcWriteMsg is the largest gRPC message one Write emits. The pool hands the carrier up to 64 KB per flush, so 32 KB
+// means two messages (two HTTP/2 DATA writes) per flush. WAT_GRPC_MSG (bytes, 4 KB-1 MB, 3.0.0) overrides it for an
+// A/B against the weak grpc download; any peer accepts up to grpcMaxMsg.
+var grpcWriteMsg = func() int {
+	if n, err := strconv.Atoi(os.Getenv("WAT_GRPC_MSG")); err == nil && n >= 4<<10 && n <= grpcMaxMsg-16 {
+		return n
+	}
+	return 32 << 10
+}()
+
 // grpcConn wraps a net.Conn so Write emits gRPC messages (flag 0, uint32 length, protobuf field 1 = the bytes, as
 // Xray's gun Hunk) and Read unwraps them.
 type grpcConn struct {
@@ -522,7 +534,7 @@ func newGRPCConn(c net.Conn) *grpcConn {
 func (g *grpcConn) Write(p []byte) (int, error) {
 	total := len(p)
 	for len(p) > 0 {
-		n := min(len(p), 32<<10)
+		n := min(len(p), grpcWriteMsg)
 		var vb [binary.MaxVarintLen32]byte
 		vl := binary.PutUvarint(vb[:], uint64(n))
 		pb := 1 + vl + n

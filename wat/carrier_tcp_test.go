@@ -467,3 +467,28 @@ func TestEnqueueDeadConnDrainsAndReturnsBuffer(t *testing.T) {
 		t.Fatalf("pc.q contains %d stranded packets after enqueue on closed connection", len(pc.q))
 	}
 }
+
+// TestPoolExpressLane: with 3+ connections bulk (pinned) packets never take the first one, interactive packets take
+// the least-queued connection by bytes, and a byte-full connection counts as full (3.0.0).
+func TestPoolExpressLane(t *testing.T) {
+	mk := func() *poolConn { return &poolConn{q: make(chan []byte, poolQueue), done: make(chan struct{})} }
+	conns := []*poolConn{mk(), mk(), mk(), mk()}
+	for l := 0; l < 64; l++ {
+		if pickConn(conns, PinLaneBase+l, l) == conns[0] {
+			t.Fatalf("bulk lane %d took the express connection", l)
+		}
+	}
+	for _, pc := range conns[1:] { // every bulk connection holds a 16 KB payload
+		pc.enqueue(make([]byte, 16<<10))
+	}
+	if got := pickConn(conns, 0, 1); got != conns[0] {
+		t.Fatal("an interactive packet did not take the empty express connection")
+	}
+	conns[1].enqueue(make([]byte, poolBacklogBytes))
+	if !conns[1].full() || backlogged(conns) {
+		t.Fatalf("full=%v backlogged=%v, want true/false", conns[1].full(), backlogged(conns))
+	}
+	if two := conns[:2]; expressSkip(len(two)) != 0 || pickConn(two, PinLaneBase, 0) == nil {
+		t.Fatal("a 2-connection pool must not reserve an express lane")
+	}
+}

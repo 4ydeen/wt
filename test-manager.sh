@@ -107,10 +107,10 @@ done
 expect_fail v_preset "unknown"
 
 chk "profile show mci FAKESNI" "$(profile_cmd show mci | grep '^FAKESNI=')" "FAKESNI=mci.ir"
-chk "profile show mci FAKEMODE" "$(profile_cmd show mci | grep '^FAKEMODE=')" "FAKEMODE=seqsum"
+chk "profile show mci FAKEMODE" "$(profile_cmd show mci | grep '^FAKEMODE=')" "FAKEMODE=rst"
 chk "profile show mci POOLROT" "$(profile_cmd show mci | grep '^POOLROT=')" "POOLROT=30m"
 chk "profile show mci ECH" "$(profile_cmd show mci | grep '^ECH=')" "ECH=ladder"
-chk "profile show blackout FAKEMODE" "$(profile_cmd show blackout | grep '^FAKEMODE=')" "FAKEMODE=auto"
+chk "profile show blackout FAKEMODE" "$(profile_cmd show blackout | grep '^FAKEMODE=')" "FAKEMODE=rst"
 chk "profile show blackout POOLROT" "$(profile_cmd show blackout | grep '^POOLROT=')" "POOLROT=90s"
 chk "profile show conservative POOLROT" "$(profile_cmd show conservative | grep '^POOLROT=')" "POOLROT=4h"
 chk "profile show conservative ECH" "$(profile_cmd show conservative | grep '^ECH=')" "ECH=auto"
@@ -123,13 +123,13 @@ expect_fail profile_cmd save mci t1
 bin_ver_ok() { echo 1; }
 profile_cmd apply mci t1
 chk "apply mci fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t1.yml")" "fake-sni: mci.ir"
-chk "apply mci fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: seqsum"
+chk "apply mci fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: rst"
 chk "apply mci pool-rotate" "$(grep '^pool-rotate:' "$WAT_CONF/t1.yml")" "pool-rotate: 30m"
 chk "apply mci pool-rotate-bytes" "$(grep '^pool-rotate-bytes:' "$WAT_CONF/t1.yml")" "pool-rotate-bytes: 500MB"
 chk "apply mci ech" "$(grep '^ech:' "$WAT_CONF/t1.yml")" "ech: ladder"
 
 preset_cmd t1 blackout
-chk "preset blackout fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: auto"
+chk "preset blackout fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t1.yml")" "fake-mode: rst"
 chk "preset blackout pool-rotate" "$(grep '^pool-rotate:' "$WAT_CONF/t1.yml")" "pool-rotate: 90s"
 chk "preset blackout pool-rotate-bytes" "$(grep '^pool-rotate-bytes:' "$WAT_CONF/t1.yml")" "pool-rotate-bytes: 100MB"
 
@@ -199,14 +199,14 @@ printf 'mode: client\ncarrier: tcp\npeer: example.com:443\n' >"$WAT_CONF/t2.yml"
 bin_ver_ok() { echo 1; }
 WAT_PREFIX=wattest blackout_cmd t2 mci
 chk "blackout preset fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t2.yml")" "fake-sni: mci.ir"
-chk "blackout preset fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t2.yml")" "fake-mode: seqsum"
+chk "blackout preset fake-mode" "$(grep '^fake-mode:' "$WAT_CONF/t2.yml")" "fake-mode: rst"
 chk "blackout preset pool-rotate" "$(grep '^pool-rotate:' "$WAT_CONF/t2.yml")" "pool-rotate: 30m"
 
 sed -i -E '/^pool-rotate:/d' "$WAT_CONF/t2.yml"
 bin_ver_ok() { [ "$1" = 2.7.0 ] || { echo "FAIL bin_ver_ok got '$1'"; fail=1; }; echo 1; }
 WAT_PREFIX=wattest blackout_cmd t2 mci.ir
 chk "blackout wrote fake-sni" "$(grep '^fake-sni:' "$WAT_CONF/t2.yml")" "fake-sni: mci.ir"
-chk "blackout default mode seq" "$(grep '^fake-mode:' "$WAT_CONF/t2.yml")" "fake-mode: seq"
+chk "blackout default mode rst" "$(grep '^fake-mode:' "$WAT_CONF/t2.yml")" "fake-mode: rst"
 chk "blackout leaves fake-ttl unset" "$(grep -c '^fake-ttl:' "$WAT_CONF/t2.yml")" "0"
 chk "blackout domain leaves pool-rotate unset" "$(grep -c '^pool-rotate:' "$WAT_CONF/t2.yml")" "0"
 expect_fail blackout_cmd t2 'bad name!'
@@ -219,6 +219,13 @@ NI_PRESET='' pick_preset
 chk "pick_preset default" "$REPLY_V" "mci"
 NI_PRESET='irancell' pick_preset
 chk "pick_preset explicit" "$REPLY_V" "irancell"
+
+# reverse tunnels refuse the checksum-marker modes (3.0.0), plain ones keep them
+printf 'mode: server\ncarrier: tcp\nreverse: true\n' >"$WAT_CONF/trev.yml"
+chk "reverse refuses seqsum" "$(rev_sum_refused trev seqsum 2>/dev/null && echo refused)" "refused"
+chk "reverse keeps rst" "$(rev_sum_refused trev rst 2>/dev/null && echo refused)" ""
+chk "direct keeps sum" "$(rev_sum_refused t1 sum 2>/dev/null && echo refused)" ""
+rm -f "$WAT_CONF/trev.yml"
 
 # anti-censor toggle: the Cloudflare preset on, off again, and who dials in a reverse tunnel
 chk "preset alias cf" "$(preset_canonical CF)" "cloudflare"
@@ -262,7 +269,7 @@ NI_FAKESNI='off' pick_sni_preset
 chk "pick_sni_preset off" "$REPLY_V" "off"
 
 NI_FAKEMODE='' pick_fake_mode
-chk "pick_fake_mode default" "$REPLY_V" "seqsum"
+chk "pick_fake_mode default" "$REPLY_V" "rst"
 NI_FAKEMODE='auto' pick_fake_mode
 chk "pick_fake_mode explicit" "$REPLY_V" "auto"
 NI_FAKEMODE='rst' pick_fake_mode

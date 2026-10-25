@@ -520,7 +520,11 @@ In 2.10.11, the injector aligns directly with `patterniha/SNI-Spoofing`: `tcpStr
 `RCV.NXT` directly from the socket via `TCP_REPAIR`, and `Wrap` pauses the real flow until the server's RFC 793
 duplicate ACK (`ack == SND.NXT`) confirms that the fake packet has traversed the DPI before the real ClientHello
 is transmitted. `FakeClientHello` uses an authentic 517-byte Chrome template with RFC 7685 padding and no ECH GREASE.
-Specifying `fake-sni` also automatically enables `tls-small-ch` to avoid 1.5 KB post-quantum ClientHello drops.
+Specifying `fake-sni` also automatically enables `tls-small-ch` to avoid 1.5 KB post-quantum ClientHello drops; since
+3.0.0 an explicit `tls-small-ch: false` in the config wins. 3.0.0 also sizes the duplicate-ACK wait from the
+handshake RTT (two RTTs, 300 ms to 2 s, was a fixed 200 ms, less than one RTT on a 250 ms path) and resends the marker
+once if no duplicate ACK came within 1.25 RTT. `WAT_DESYNC_FAIL_CLOSED=1` makes a connection whose marker was never
+confirmed fail its dial, so the pool redials instead of running a flow the filter may cut (off by default).
 2.10.12 fixes the `TCP_REPAIR` probe, which selected the wrong queues (`TCP_REPAIR_QUEUE` is 1 = receive, 2 = send;
 the old code used 0 and 1), so `tcpStreamBase` failed or read the wrong sequence number and the fake fired on only one
 of two pool connections. It also lets the dialing side of a `-reverse` tunnel (the Kharej server) run `fake-sni`: the
@@ -544,13 +548,16 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
 
 - `fake-sni: mci.ir` on the client, `carrier: tls` (or `tcp`, `wss`, `h2`, `grpc` since 2.7.0). Linux +
   CAP_NET_RAW, like the icmp carrier.
-- `fake-mode: auto` (2.9.0): the client measures the filter once at startup and picks the mode itself. One
-  throwaway TCP connection to the peer carries two test markers — a below-window seq fake, then a bad-checksum
-  in-window fake — and the verdict comes from which marker the flow survived: flow survives both → `seq`;
-  dies with the sum marker in flight → `sum`; dies even with the seq marker alone → `seqsum`. The verdict is
-  logged once and reported as `filter_profile` in `/stats` (with `seq_ok`, `sum_ok`, `conn_alive`). Costs one
-  connection and ~3 s at startup, once; any failure degrades to `seq` without stopping the tunnel. Field
-  validation on a real filtering path is still outstanding — treat the verdict as a hint, check the log.
+- `fake-mode: auto`: the client measures the route once at startup and picks the mode itself. Since 3.0.0 it tries
+  `none`, `rst`, `synrst`, `seq` in that order, each on a fresh connection to the real peer port wrapped exactly like a
+  pool dial, writes 32 KB of filler shaped like the carrier's first bytes (a never-finished ClientHello carrying the
+  carrier's SNI for tls/wss/h2/grpc, an unfinished HTTP request for ws/h2c, a pool hello for tcp), and keeps the
+  first mode whose filler the kernel saw acknowledged within 2 s (`TCP_INFO` `bytes_acked`). The filters seen in the
+  field let the handshake and a few KB through and then drop the flow, which the 2.9.0 probe (two tiny writes) could
+  not see; it picked `seqsum` on a route where only `rst`/`synrst` work. `none` means the route does not filter
+  that name, and the tunnel then runs without fake-SNI. No survivor is `route-cut`: the tunnel runs `rst` and keeps
+  retrying. `/stats` `filter_profile` has `mode` (what runs) and `verdict`. Costs up to four short connections and
+  ~10 s at startup, once; without a raw socket or `TCP_INFO` it runs `rst`. Only the dialing end needs 3.0.0.
 - `fake-mode: seq` (default): the marker's sequence number is `ISN+1-len(marker)`, below the stream start. The
   server's kernel counts it as an old duplicate and answers with a dup-ACK; the DPI still read the SNI. A NAT
   that rewrites sequence numbers uniformly shifts the marker with it (2.7.0), so only non-uniform normalization
@@ -573,6 +580,8 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   fake). A filter must discard both correctly to miss the SNI: window-junk dropping alone does not stop the sum
   marker, checksum dropping alone does not stop the seq marker. Inherits sum's caveats (data segment needed,
   checksum-validating NATs) plus seq's (a uniform NAT rewrite is followed, a non-uniform one defeats marker 1).
+  Since 3.0.0 `sum` and `seqsum` are refused with `-reverse` (they rely on the server's kernel dropping the damaged
+  segment, which checksum offload on the peer may not do; `sum` failed on the field run's reverse tcp); the manager switches them to `rst`.
 - `fake-mode: rst` (2.9.0): the marker is an in-window RST|ACK with a damaged TCP checksum, sent instead of a
   ClientHello. A middlebox that tracks flow state clears the flow on the RST and stops inspecting it, while the
   server's kernel drops the corrupted packet before it reads the flags, so the real connection is untouched.
@@ -580,7 +589,7 @@ the session's own encrypted datagrams ride the flow, classified as TLS applicati
   inspecting a flow once they have classified it. Same caveat as `sum` on checksum-validating
   NATs, and the marker must stay in-window: a low-TTL RST can reach the server after a reroute shortens the path
   and tear the real connection down, which is exactly what this mode exists to avoid.
-  `fake-mode: auto` never picks it.
+  `fake-mode: auto` tries it right after `none` (3.0.0). `synrst` adds a marker before the handshake completes.
 - The server needs NO changes and no update: it never sees the marker packet. Only the client needs 2.6.0.
 - The manager sets none of this up by default: the Iran wizard asks one explicit question (Enter =
   skip), Advanced settings → resilience (`k`) on the tunnel page changes the values of an existing
@@ -922,7 +931,8 @@ it a small authenticated datagram (a "punch": 8 random bytes, a 12-byte HMAC of 
 and 0-40 random pad bytes, so no byte is constant) from its own bound socket to `peer` (Iran's `IP:port`), about once a
 second. The client answers every datagram to the source address of the latest valid punch, so a NAT or a firewall sees
 a flow that Kharej started and Iran only answers, and the punches keep its state alive. Datagrams from any other
-address are dropped, and the session still authenticates everything.
+address are dropped, and the session still authenticates everything. Since 3.0.0 Kharej skips the punch while it has
+heard the client within the last two punch intervals, so a busy tunnel sends no extra datagrams.
 
 | Side | Config |
 |---|---|
@@ -1368,6 +1378,8 @@ Every flag can also be a config key. Flags win over the file.
 | `-mtu N` | 0 | Datagram cap. |
 | `-max-mbps F` | 0 | Pace ceiling per direction and session; 0 = 16 with icmp, 1250 otherwise (2.4.18; 200 from 2.3.0). |
 | `-tcp-cc NAME` | `bbr` | Pool sockets' TCP congestion control, Linux (2.4.18). `system` keeps the kernel default. |
+| `-batch on\|off` | empty | sendmmsg batching for icmp and udp; empty keeps the default (on for icmp, off for udp). Same switch as `WAT_BATCH`, but kept in the config (3.0.0). |
+| `-keep-slow on\|off` | empty | Pool carriers: `on` never retires a connection for delivering below its share, `off` always checks; empty = on for reverse and direct tcp/tls, off for the HTTP carriers (3.0.0). |
 | `-hdr-mask` | true | Mask the packet header (3.0.0). |
 | `-udp-dns` | false | udp carrier: DNS-shaped datagrams, for port 53 (3.0.0). |
 | `-tcp-mimic` | true | tcp carrier: ClientHello-shaped hello and masked frame lengths (3.0.0). |
@@ -1773,7 +1785,13 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
   connection in loss recovery outlasted the old window and its delivered packets were dropped as replays.
 - **Pool backpressure.** A full pool queue used to drop the packet silently (the session resent it after its loss
   timer). The session now waits while every connection's queue holds 16 packets or more (`pool_full`;
-  `WAT_POOL_BACKLOG` sets the depth, `WAT_NO_BACKLOG=1` restores the old behaviour).
+  `WAT_POOL_BACKLOG` sets the depth, `WAT_NO_BACKLOG=1` restores the old behaviour). Since 3.0.0 the queue is also
+  bounded in bytes, 64 KB per connection (`WAT_POOL_BACKLOG_BYTES`): with 16 KB payloads the 16 packets were 256 KB,
+  ~85 ms of our own queue at 3 MB/s per connection in front of every interactive packet. Connections are ranked by
+  queued bytes, not packets. With 3 or more connections bulk keeps off the first one (the express lane), so a ping,
+  a datagram or an ACK always finds a short queue (`WAT_NO_EXPRESS=1` turns it off). The kernel's unsent queue per
+  socket (`TCP_NOTSENT_LOWAT`, 128 KB) is tunable with `WAT_POOL_LOWAT` for A/B tests. A session also waits while
+  the pool has no connection yet, so datagrams sent during the first dial are no longer lost (3.0.0).
 - **Window and timers.** A direct session's window is one second of delivery rather than 3 bandwidth-delay
   products, it skips the minRTT drain, and the pool keeps slow connections (TCP recovering is not a slow path).
   When a pool connection dies, its unacked packets are resent at once instead of after the loss timer.
@@ -1783,7 +1801,8 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
 - **Pinning.** Each stream rides one pool connection, assigned round-robin, as separate TCP connections would; a
   packet with interactive data takes the least queued connection, so ping under a full download stayed at the
   38-40 ms base. Resent data goes on any connection. `WAT_NO_PIN=1` sprays every packet instead (about the same
-  speed in the field).
+  speed in the field). A stream counts as bulk after 256 KB; since 3.0.0 that count decays with a 1 s half-life, so
+  an SSH session that once pasted a large file turns interactive again once it goes quiet.
 - **Loss cuts off.** A direct pool no longer cuts its rate on loss (TCP's loss is not ours; `WAT_REL_LOSSCUT=1`
   restores it), and its window also covers 2 x srtt (`WAT_CWND_MINRTT=1` turns that off). CDN tunnels keep the
   2.4.17 rules for both.
@@ -1929,7 +1948,9 @@ Measured 2026-10-10 on the real Iran <-> Kharej path (only ICMP passes):
   `ceiling_bps` stays 0. Watch `ceiling_bps` and `loss_pct` in `/stats`.
 - **Batching is on by default for the ICMP carrier on Linux** (sendmmsg / recvmmsg): one flow went from 15 to
   25 MB/s and CPU per MB from 0.043 to 0.026 on the real path. `WAT_BATCH=0` forces it off; other carriers keep
-  batching off unless `WAT_BATCH=1`.
+  batching off unless `WAT_BATCH=1`. Since 3.0.0 the `batch: on|off` key does the same from the config, and reverse
+  udp batches its sends too. `WAT_GSO=1` (udp, Linux, opt-in) sends runs of equal-size datagrams as one UDP GSO
+  write and turns GRO on for receive; a kernel or NIC that refuses it falls back to sendmmsg on that socket.
 - **`icmp-type`** picks the ICMP message type the tunnel hides in: `echo` (8 request / 0 reply, the default),
   `timestamp` (13/14), `info` (15/16) or `mask` (17/18). The client sends the request type, the server answers with
   the matching reply. The kernel BPF filter accepts only that pair (and the tunnel's identifier range), so other
@@ -2044,6 +2065,13 @@ toward one fix for CDN tunnels that got slower over time. If you are on any of t
   detected and answered with the plain pool id after 6 s). (5) The manager shows and lets you pick the source address
   (`src-ip`). (6) `udp-dns`: DNS-shaped udp on port 53, which a route that cuts every other UDP flow lets through. (7) A
   client that started before its server no longer stays on the plain header for the session. See "Traffic shape".
+  (8) `fake-mode: auto` probes by acknowledged bytes and can pick `none`, `rst`, `synrst` or `seq`; `sum`/`seqsum`
+  are refused with `-reverse`; the marker wait follows the RTT and the marker is resent once (see Fake-SNI). (9) Pool
+  carriers: byte-bounded queues, an express lane for interactive packets, bulk detection that decays, no lost
+  datagrams while the first connection dials, and pool slots after the first dial with a 50-250 ms stagger. (10) New
+  keys `batch` and `keep-slow`; `WAT_GSO=1` for udp; `WAT_GRPC_MSG` sets the grpc message size (default 32 KB).
+  (11) Manager: `rst-fast` preset, `rst` as the fake-mode default, `synrst` selectable, kernel echo copies turned
+  off on whichever side receives the tunnel's echo requests.
 - **2.10.12: fake-SNI fires on every connection, and it works from a reverse server.** Dialer-side fix, no wire
   change. This release also ships 2.10.11, which was never tagged (the duplicate-ACK wait and the 517-byte Chrome
   fake hello). (1) The `TCP_REPAIR` probe read the wrong queues, so the fake used a wrong or missing stream start and fired on

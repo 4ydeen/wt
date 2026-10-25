@@ -3,6 +3,7 @@ package wat
 import (
 	"net"
 	"sync/atomic"
+	"time"
 )
 
 // The udp carrier: one UDP datagram = one session packet. No crypto, framing or retransmit here; the session
@@ -109,6 +110,9 @@ type UDPServer struct {
 	rbuf []byte
 	bx   *udpBatch
 	dns  atomic.Bool // DNS-shaped datagrams (dnsshape.go); atomic because the reverse server's punch goroutine reads it
+
+	watch atomic.Pointer[net.UDPAddr] // reverse server: the punched client, whose datagrams (by IP) set rxAt
+	rxAt  atomic.Int64                // unix ns of the last datagram from watch
 }
 
 // SetDNS turns the DNS framing on or off; call it before the first Recv. Both ends must agree.
@@ -155,6 +159,11 @@ func (u *UDPServer) Recv() ([]byte, int, net.Addr, error) {
 		if u.dns.Load() {
 			if p = dnsStrip(p); p == nil {
 				continue
+			}
+		}
+		if w := u.watch.Load(); w != nil {
+			if ua, ok := src.(*net.UDPAddr); ok && ua.IP.Equal(w.IP) { // IP only: a NAT may move the port
+				u.rxAt.Store(time.Now().UnixNano())
 			}
 		}
 		return p, 0, src, nil

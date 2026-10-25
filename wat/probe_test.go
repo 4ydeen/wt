@@ -12,39 +12,6 @@ func TestFilterProfileDefaults(t *testing.T) {
 	}
 }
 
-// TestProbeVerdictTable pins the verdict mapping of filterProbe.run against synthetic observations
-// (the probe itself needs a real filter to be meaningful; the mapping is the testable part). The
-// verdict keys on which marker killed its flow, not on the final connAlive: sumOK already implies
-// the sum socket was alive after the probe, so gating on p.alive made "sum" unreachable.
-func TestProbeVerdictTable(t *testing.T) {
-	cases := []struct {
-		seqOK, sumOK, alive bool
-		want                string
-	}{
-		{true, true, true, "seq"},    // nothing kills the flow: default
-		{false, true, true, "sum"},   // seq marker killed its flow, sum survived: filter acts on below-window junk
-		{true, false, false, "seq"},  // sum marker killed its flow, seq survived: filter acts on bad checksums
-		{false, false, false, "seqsum"}, // both single markers killed their flows: try the dual marker
-		{true, true, false, "seq"},   // final connAlive flaked without a marker correlation: keep the default
-		{false, true, false, "sum"},  // verdict keys on the marker, not a flaky final recheck
-	}
-	for _, c := range cases {
-		p := filterProbe{seqOK: c.seqOK, sumOK: c.sumOK, alive: c.alive}
-		var got string
-		switch {
-		case !p.seqOK && p.sumOK:
-			got = "sum"
-		case !p.seqOK && !p.sumOK:
-			got = "seqsum"
-		default:
-			got = "seq"
-		}
-		if got != c.want {
-			t.Fatalf("seqOK=%v sumOK=%v alive=%v: got %q want %q", c.seqOK, c.sumOK, c.alive, got, c.want)
-		}
-	}
-}
-
 // TestSumProbeMultiSNI verifies that a filterProbe configured with comma-separated SNIs
 // parses cleanly into individual valid hostnames and does not embed commas in the SNI.
 func TestSumProbeMultiSNI(t *testing.T) {
@@ -60,5 +27,22 @@ func TestSumProbeMultiSNI(t *testing.T) {
 	}
 	if gotSNI != "mci.ir" {
 		t.Fatalf("got SNI %q, want mci.ir", gotSNI)
+	}
+}
+
+// TestProbeFillerShape: the filler is probeBytes or more and starts like the carrier's own first bytes.
+func TestProbeFillerShape(t *testing.T) {
+	tls := probeFiller("tls", "mci.ir")
+	if len(tls) < probeBytes || tls[0] != 0x16 || tls[5] != 1 {
+		t.Fatalf("tls filler starts % x", tls[:6])
+	}
+	if sni, err := parseSNIOf(tls[:5+int(tls[3])<<8|int(tls[4])]); err != nil || sni != "mci.ir" {
+		t.Fatalf("tls filler SNI %q, %v", sni, err)
+	}
+	if ws := string(probeFiller("ws", "a.example")[:33]); ws != "GET / HTTP/1.1\r\nHost: a.example\r\n" {
+		t.Fatalf("ws filler starts %q", ws)
+	}
+	if tcp := probeFiller("tcp", ""); tcp[0] != 0 || isMimicPrefix(tcp[:8]) {
+		t.Fatal("tcp filler id looks like a mimic hello")
 	}
 }

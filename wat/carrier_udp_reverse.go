@@ -88,6 +88,31 @@ func (u *UDPReverseListener) Send(p []byte, path int) error {
 	return err
 }
 
+// SendBatch sends a burst to the punching server in one system call where the platform has sendmmsg (WAT_BATCH=1 or
+// -batch on). Before 3.0.0 the upload of a reverse udp tunnel was one write per datagram whatever the setting, the one
+// udp direction that could not batch.
+func (u *UDPReverseListener) SendBatch(ps [][]byte, lanes []int) error {
+	dst := u.peer.Load()
+	if dst == nil {
+		return nil // nobody has punched yet, as in Send
+	}
+	if u.dns {
+		fs, done := dnsFrames(ps, false)
+		defer done()
+		ps = fs
+	}
+	if u.bx != nil {
+		return u.bx.send(ps, dst)
+	}
+	var first error
+	for _, p := range ps {
+		if _, err := u.c.WriteToUDP(p, dst); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
 func (u *UDPReverseListener) Recv() ([]byte, int, net.Addr, error) {
 	for {
 		var p []byte
@@ -156,7 +181,14 @@ func NewUDPReverseServer(listen, peer string, psk []byte) (*UDPReverseServer, er
 	key := punchKey(psk)
 	go func() {
 		for {
-			if ra, err := net.ResolveUDPAddr("udp", peer); err == nil {
+			ra, err := net.ResolveUDPAddr("udp", peer)
+			if err == nil {
+				us.watch.Store(ra)
+			}
+			// 3.0.0: no punch while the client is talking (it already knows us, and a datagram every second next
+			// to the traffic is a pattern); punching resumes 2 punch intervals after it goes quiet, so a restarted
+			// client, which waits for a punch before it sends anything, still finds us.
+			if quiet := time.Since(time.Unix(0, us.rxAt.Load())); err == nil && quiet > 2*punchEvery {
 				pk := makePunch(key)
 				if us.dns.Load() {
 					pk = dnsFrame(nil, pk, true)

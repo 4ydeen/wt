@@ -36,7 +36,7 @@ const (
 	// keepBuf is the largest drained send buffer a stream keeps for reuse (the receive side uses pooled chunks). Field 2026-10-12: at 1 MB, 220
 	// mostly idle streams pinned ~190 MB on the receiving end.
 	keepBuf      = 256 << 10
-	prioBytes    = 64 << 10 // streams that sent less than this go first (interactive traffic)
+	prioBytes    = 64 << 10 // streams that sent less than this recently go first (interactive traffic; Stream.bulky)
 	dirServerBit = uint64(1) << 63
 	replayWin    = 1024
 	// A pool of TCP connections reorders by a whole head-of-line stall (60-100 ms of packets, ~1900 at 640 B and
@@ -616,7 +616,7 @@ func (s *Session) activate(st *Stream) {
 }
 
 func (s *Session) enqueue(st *Stream) {
-	if st.sentTotal < prioBytes {
+	if !st.bulky(s.now) {
 		s.prio.push(st)
 	} else {
 		s.bulk.push(st)
@@ -630,7 +630,7 @@ func (s *Session) pick() *Stream {
 			st.inActive = false
 			continue
 		}
-		if st.sentTotal >= prioBytes {
+		if st.bulky(s.now) {
 			s.bulk.push(st)
 			continue
 		}
@@ -950,7 +950,7 @@ func (s *Session) build(now time.Time) (outPkt, bool) {
 			if st == nil {
 				break
 			}
-			isBulk := st.sentTotal >= prioBytes
+			isBulk := st.bulky(now)
 			if isBulk {
 				bulkSeen = true
 			} else {

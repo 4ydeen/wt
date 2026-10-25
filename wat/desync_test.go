@@ -2192,6 +2192,26 @@ func TestDesyncPatternihaDuplicateACKSync(t *testing.T) {
 	}
 }
 
+// TestDesyncResendBeforeAck: while the duplicate ACK is pending, resend fires the same marker once more (3.0.0);
+// after the ACK the connection is gone and resend sends nothing.
+func TestDesyncResendBeforeAck(t *testing.T) {
+	tr, sent := desyncTestTracker("seq", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	<-tr.announce(k, isn, true, srvSeq+1)
+	if !tr.resend(k) || sent.n() != 2 {
+		t.Fatalf("resend before the ACK: sent %d, want 2", sent.n())
+	}
+	if !bytes.Equal(sent.at(0), sent.at(1)) {
+		t.Fatal("the retransmitted marker differs from the first one")
+	}
+	tr.handleIP(desyncTestPkt(k.dstIP, k.srcIP, k.dstPt, k.srcPt, srvSeq+1, isn+1, testFlagACK, nil, 64))
+	if tr.resend(k) || sent.n() != 2 {
+		t.Fatalf("resend after the ACK: sent %d, want still 2", sent.n())
+	}
+}
+
 // TestFakeClientHelloPatternihaExact517 verifies that FakeClientHello builds a 517-byte Chrome ClientHello
 // with valid RFC 7685 padding for standard SNIs, matching patterniha/SNI-Spoofing.
 func TestFakeClientHelloPatternihaExact517(t *testing.T) {

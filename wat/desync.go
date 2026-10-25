@@ -829,6 +829,7 @@ type desyncConn struct {
 	tcpOpts   []byte // kernel TCP options observed on outbound non-SYN segments (e.g. timestamps)
 	fakeSent  bool   // fake packet has been injected
 	waitAck   uint32 // duplicate ACK expected from server (isn+1 / SND.NXT)
+	sent      [][]byte // needsAck modes: the markers sent at once on fire, kept for one retransmit (resend)
 	at        time.Time
 }
 
@@ -1017,6 +1018,21 @@ func (t *desyncTracker) abandonLocked(k desyncKey) {
 		close(ackCh)
 	}
 	delete(t.conns, k)
+}
+
+// resend fires the markers of k once more (Wrap, when the duplicate ACK did not come back within an RTT: the
+// marker itself may have been lost). It reports whether anything was sent.
+func (t *desyncTracker) resend(k desyncKey) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c := t.conns[k]
+	if c == nil || len(c.sent) == 0 || t.send == nil {
+		return false
+	}
+	for _, p := range c.sent {
+		t.send(p)
+	}
+	return true
 }
 
 // abandon drops a connection whose Wrap timed out (handshake never observed).
@@ -1234,6 +1250,14 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 			close(ackCh)
 		}
 	}
+	send := t.send
+	if t.needsAck() && send != nil { // keep the immediate markers for the one retransmit Wrap may ask for (3.0.0)
+		c.sent = c.sent[:0]
+		send = func(p []byte) {
+			c.sent = append(c.sent, append([]byte(nil), p...))
+			t.send(p)
+		}
+	}
 	if t.send == nil {
 		if ackCh := t.ackWait[k]; ackCh != nil {
 			delete(t.ackWait, k)
@@ -1247,7 +1271,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// while the server kernel drops corrupted checksum packets before parsing flags.
 		pkt := fakeRSTPacket(k, base, ack, ttl)
 		damageChecksum(pkt)
-		t.send(pkt)
+		send(pkt)
 		return
 	}
 	hello := t.pickHello()
@@ -1261,7 +1285,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		seq := base - uint32(len(hello))
 		off := 0
 		for _, seg := range splitHello(hello, t.cfg.Split) {
-			t.send(fakePacketWithOptions(k, seq+uint32(off), ack, ttl, seg, c.tcpOpts))
+			send(fakePacketWithOptions(k, seq+uint32(off), ack, ttl, seg, c.tcpOpts))
 			off += len(seg)
 		}
 	case "hlen0":
@@ -1270,7 +1294,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// with no SNI and stops parsing the flow; the bytes after the header still carry the allowlisted SNI for a
 		// per-packet sniffer, and the real first flight follows right behind the marker. Targets: the stateful
 		// TLS-SNI parsers of the MCI/Irancell filters.
-		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts))
+		send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts))
 	case "fakeip":
 		// fakeip mode: a well-formed SYN and ClientHello for a flow from this same client port to a whitelisted CDN
 		// address (cfg.FakeIP, default 104.16.0.1 = a Cloudflare edge), with sequence numbers below the real stream
@@ -1281,8 +1305,8 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		fk := k
 		fk.dstIP, fk.dstPt = desyncFakeIP(t.cfg, k.dstIP.is4()), 443
 		syn := base - uint32(len(hello)) - 1
-		t.send(fakeFlagPacket(fk, syn, 0, ttl, 0x02)) // SYN
-		t.send(fakePacketWithOptions(fk, syn+1, 0, ttl, hello, c.tcpOpts))
+		send(fakeFlagPacket(fk, syn, 0, ttl, 0x02)) // SYN
+		send(fakePacketWithOptions(fk, syn+1, 0, ttl, hello, c.tcpOpts))
 	case "synrst":
 		// synrst mode: an in-window SYN|RST with a damaged TCP checksum. SYN|RST is not a legal flag combination,
 		// so stateful middleboxes that keep a flow table treat it as a teardown-and-reset and purge the entry harder
@@ -1290,7 +1314,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// Targets: stateful flow tables that ignore a single in-window RST (the MCI/Irancell session trackers).
 		pkt := fakeFlagPacket(k, base, ack, ttl, 0x06) // SYN|RST
 		damageChecksum(pkt)
-		t.send(pkt)
+		send(pkt)
 	case "ff":
 		// ff mode: the real F&F record + segment plan (docs/SNI-SPOOFING-RESEARCH.md §3.3, the Irancell
 		// pattng-tlshello-0-len preset). The fake ClientHello is re-framed into an empty record + a 104-byte
@@ -1309,14 +1333,14 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 					t.logf("wat: fake-sni ff: the fake ClientHello is shorter than the F&F record plan (%d < %d bytes), sending the plain seq marker", len(hello), 5+ffChunk)
 				}
 			}
-			t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+			send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 		}
 	case "all":
 		// all mode (kitchen sink): the seq + sum + hlen0 markers ~1 ms apart, then the true F&F record/segment
 		// plan from 3 ms, so a filter has to mishandle every signal class (below-window junk, bad checksums,
 		// zero-length records, the F&F record/segment shape) to miss the SNI. The time.AfterFunc spacing is
 		// seqsum's: the sniffer lock is never held across a sleep (audit 2026-10-21).
-		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts)) // seq: below window, valid checksum
+		send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts)) // seq: below window, valid checksum
 		sumPkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 		damageChecksum(sumPkt)
 		hlenPkt := fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, fakeHelloZeroRecord(hello), c.tcpOpts)
@@ -1328,7 +1352,7 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// ~1 ms later (GoodbyeDPI sends wrong-seq + wrong-chksum as two fakes per connection). A filter
 		// must discard BOTH correctly to miss the SNI: window-junk dropping alone does not stop the sum
 		// marker, checksum dropping alone does not stop the seq marker. Both still die before the server.
-		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+		send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 		damageChecksum(pkt)
 		// the second marker goes out after the 1 ms gap WITHOUT sleeping under t.mu: fireLocked runs
@@ -1339,9 +1363,9 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		// sum mode mirrors the triggering data segment: in-window seq (base = c.sumSeq), damaged checksum
 		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 		damageChecksum(pkt)
-		t.send(pkt)
+		send(pkt)
 	default:
-		t.send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+		send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 	}
 }
 

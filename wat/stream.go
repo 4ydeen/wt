@@ -3,6 +3,7 @@ package wat
 import (
 	"errors"
 	"io"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -45,6 +46,8 @@ type Stream struct {
 	finAcked  bool
 	finOff    uint64
 	sentTotal uint64
+	heat      float64   // recent bytes sent, halving every prioHalfLife (bulky)
+	heatAt    time.Time // when heat was last decayed
 	inActive  bool
 	group     uint32 // fair-queue group (SetGroup): the public port the stream belongs to
 	fg        *fairGroup
@@ -469,6 +472,8 @@ func (st *Stream) emit(p []byte, sp *sentPkt, room int) (np []byte, sent, fit bo
 		sp.frames = append(sp.frames, frameRef{st.id, off, n, fin})
 		st.snext += uint64(n)
 		st.sentTotal += uint64(n)
+		st.cool(st.s.now)
+		st.heat += float64(n)
 		if fin {
 			st.finSent = true
 		}
@@ -663,3 +668,23 @@ func (q *rdQueue) reset() {
 	clear(q.ch)
 	*q = rdQueue{ch: q.ch[:0]}
 }
+
+// prioHalfLife is how fast a stream's recent volume decays when the scheduler sorts interactive from bulk (3.0.0).
+// Before, a stream was interactive until it had sent prioBytes in its whole life, so a long-lived forwarded connection
+// (a VPN inbound with mux, carrying one user's every flow) turned bulk within seconds and its game or ping packets
+// queued behind downloads for good. Now a stream is bulk while it sends more than ~prioBytes per 1.4 s, about 44 KB/s
+// steady, and turns interactive again a few seconds after it goes quiet. A fresh stream still turns bulk after its
+// first prioBytes, as before.
+const prioHalfLife = time.Second
+
+// cool decays heat to now and returns it.
+func (st *Stream) cool(now time.Time) float64 {
+	if dt := now.Sub(st.heatAt); dt > 0 {
+		st.heat *= math.Exp2(-dt.Seconds() / prioHalfLife.Seconds())
+		st.heatAt = now
+	}
+	return st.heat
+}
+
+// bulky: the stream sent prioBytes or more recently (it goes to the fair-queued bulk class, not the interactive one).
+func (st *Stream) bulky(now time.Time) bool { return st.cool(now) >= prioBytes }

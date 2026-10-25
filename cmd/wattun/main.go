@@ -57,6 +57,8 @@ func main() {
 	bind := flag.String("bind", "0.0.0.0", "client: listen address")
 	offset := flag.Int("port-offset", 0, "client: add this to every listen port (second slot)")
 	lanes := flag.Int("lanes", 4, "client: ICMP identifiers to stripe over")
+	keepSlow := flag.String("keep-slow", "", "pool carriers: on = never close a pool connection for delivering below its share, off = always run that check, empty = the default (on for reverse and direct tcp|tls, off for ws|wss|h2|h2c|grpc through a CDN); on suits a direct HTTP carrier on a route that cuts flows, where the check can retire the connection that was about to recover (3.0.0)")
+	batch := flag.String("batch", "", "icmp|udp: recvmmsg/sendmmsg batching, on|off (empty = the carrier default: on for icmp, off for udp); the same switch as WAT_BATCH, which this flag overrides (3.0.0)")
 	maxMB := flag.Float64("max-mbps", 0, "pace ceiling, MB/s per direction, per session (0 = the carrier default: 16 when icmp is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp|tcp|tls|ws|wss|h2|h2c|grpc; 2.4.18, before: 200; 2.3.0, before: 16 for all)")
 	slackMs := flag.Int("slack-ms", 8, "tolerated RTT growth before slowing down, ms")
 	metrics := flag.String("metrics", "", "serve JSON stats on this address (e.g. 127.0.0.1:19700)")
@@ -151,6 +153,20 @@ func main() {
 		}
 	}
 	debugOn = *debug
+	switch *keepSlow {
+	case "", "on", "true", "off", "false":
+	default:
+		log.Fatalf("-keep-slow must be on or off, got %q", *keepSlow)
+	}
+	switch *batch { // read by the carriers through WAT_BATCH when they are built below (3.0.0)
+	case "":
+	case "on", "true", "1":
+		os.Setenv("WAT_BATCH", "1")
+	case "off", "false", "0":
+		os.Setenv("WAT_BATCH", "0")
+	default:
+		log.Fatalf("-batch must be on or off, got %q", *batch)
+	}
 	if wat.PoolTCPCC = *tcpCC; *tcpCC == "system" || *tcpCC == "" {
 		wat.PoolTCPCC = ""
 	}
@@ -229,6 +245,15 @@ func main() {
 			os.Exit(2)
 		}
 	}
+	if *reverse && *fakeSNI != "" && (*fakeMode == "sum" || *fakeMode == "seqsum") { // 3.0.0
+		fmt.Fprintf(os.Stderr, "-fake-mode %s does not work with -reverse: checksum markers need a middlebox that drops the damaged segment; on an open reverse path the peer can take it and the tunnel dies. Use rst or synrst.\n", *fakeMode)
+		os.Exit(2)
+	}
+	// -fake-sni implies -tls-small-ch (2.10.11: large post-quantum hellos were dropped on a live path), unless the
+	// operator set -tls-small-ch explicitly, so -tls-small-ch=false now turns the full hello back on (3.0.0).
+	smallCHSet := false
+	flag.Visit(func(f *flag.Flag) { smallCHSet = smallCHSet || f.Name == "tls-small-ch" })
+	smallCH := *tlsSmallCH || *fakeSNI != "" && !smallCHSet
 	if *maxMB <= 0 { // carrier default: the ICMP path keeps its measured 16 MB/s, the others are not capped by it
 		*maxMB = 1250 // 10 Gbit: no practical cap (2.4.18, before: 200)
 		if seen["icmp"] {
@@ -259,19 +284,25 @@ func main() {
 	// getDesync returns or lazily creates the fake-SNI layer for a peer.
 	var desyncMu sync.Mutex
 	desyncByPeer := map[string]*wat.Desync{}
-	getDesync := func(peer string) (*wat.Desync, error) {
+	desyncNone := map[string]bool{} // peers the probe found unfiltered: no fake-SNI at all
+	getDesync := func(peer, carrier string) (*wat.Desync, error) {
 		if *fakeSNI == "" {
 			return nil, nil
 		}
 		wat.SetNote(log.Printf) // a failed raw send must be heard: the real SNI would go out unprotected
 		desyncMu.Lock()
 		defer desyncMu.Unlock()
-		if d := desyncByPeer[peer]; d != nil {
+		if d := desyncByPeer[peer]; d != nil || desyncNone[peer] {
 			return d, nil
 		}
 		mode := *fakeMode
-		if mode == "auto" { // 2.9.0: measure the filter once at startup, pick the mode from the verdict
-			mode = wat.ProbeFakeMode(wat.DesyncConfig{SNI: *fakeSNI, TTL: *fakeTTL}, peer, log.Printf)
+		if mode == "auto" { // measure the route once at startup, pick the mode from the verdict (3.0.0: by acked bytes)
+			mode = wat.ProbeFakeMode(wat.DesyncConfig{SNI: *fakeSNI, TTL: *fakeTTL}, peer, carrier,
+				wat.ProbeName(carrier, *sni, *host, peer), log.Printf)
+			if mode == "none" {
+				desyncNone[peer] = true
+				return nil, nil
+			}
 		}
 		d, err := wat.NewDesync(wat.DesyncConfig{SNI: *fakeSNI, Mode: mode, TTL: *fakeTTL, FakeIP: *fakeIP, Split: *fakeSplit}, peer)
 		if err != nil {
@@ -352,7 +383,7 @@ func main() {
 				if srcNetIP != nil {
 					opt.LocalAddr = &net.TCPAddr{IP: srcNetIP}
 				}
-				d, derr := getDesync(peer)
+				d, derr := getDesync(peer, carrier)
 				if derr != nil {
 					log.Fatalf("fake-sni: %v", derr)
 				}
@@ -380,11 +411,10 @@ func main() {
 						log.Fatalf("-tls-pin must be 64 hex chars (sha256)")
 					}
 				}
-				d, derr := getDesync(peer)
+				d, derr := getDesync(peer, carrier)
 				if derr != nil {
 					log.Fatalf("fake-sni: %v", derr)
 				}
-				smallCH := *tlsSmallCH || *fakeSNI != ""
 				tlsOpts := wat.TLSClientOptions{ServerName: *sni, PinSHA256: pin, NoPQ: smallCH,
 					Fingerprint: *tlsFP, ECH: *echMode, ECHCache: *echCache, Frag: *tlsFrag, Logf: log.Printf,
 					ECHLadder: ladderHook}
@@ -414,14 +444,14 @@ func main() {
 			} else {
 				co := wat.HTTPClientOptions{Path: *path, Host: *host, Secure: secure, Headers: map[string]string{}}
 				co.TLS.ServerName = *sni
-				co.TLS.NoPQ = *tlsSmallCH || *fakeSNI != ""
+				co.TLS.NoPQ = smallCH
 				co.TLS.Fingerprint, co.TLS.ECH, co.TLS.Frag, co.TLS.Logf = *tlsFP, *echMode, *tlsFrag, log.Printf
 				co.TLS.ECHCache = *echCache
 				co.TLS.ECHLadder = ladderHook
 				if srcNetIP != nil {
 					co.TLS.LocalAddr = &net.TCPAddr{IP: srcNetIP}
 				}
-				d, derr := getDesync(peer)
+				d, derr := getDesync(peer, carrier)
 				if derr != nil {
 					log.Fatalf("fake-sni: %v", derr)
 				}
@@ -465,7 +495,14 @@ func main() {
 				pc.SetObfs(k, *fakeSNI)
 			}
 		}
-		if len(names) == 1 && (*reverse || carrier == "tcp" || carrier == "tls") { // direct path (Config.Direct)
+		keep := len(names) == 1 && (*reverse || carrier == "tcp" || carrier == "tls") // direct path (Config.Direct)
+		switch *keepSlow {
+		case "on", "true":
+			keep = true
+		case "off", "false":
+			keep = false
+		}
+		if keep {
 			if pc != nil {
 				pc.SetKeepSlow(true)
 			}

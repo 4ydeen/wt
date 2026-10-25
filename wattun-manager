@@ -708,11 +708,12 @@ read_token() { # token -> T_CARRIER T_PEER T_KEY T_PATH T_SNI T_ICMP T_PORTS T_R
 }
 is_reverse() { [ "$(cfg "$1" reverse)" = true ]; }
 
-# Reverse ICMP on Iran: Linux answers every tunnel request with its own full-size copy, which doubles Iran's upload.
-# Rate-limiting the kernel's echo and timestamp replies (icmp_ratemask bits 0 and 14, 10 per second per sender) drops
-# those copies and keeps ordinary pings answered. The tunnel's replies are raw-socket sends and are not limited.
-# Measured on the real path: without it OutEchoReps = 2 x InEchos. The old values are kept and restored when the
-# last reverse Iran tunnel is gone.
+# The server that RECEIVES the tunnel's ICMP requests (Iran in reverse, Kharej in normal mode, echo/timestamp types):
+# Linux answers every one with its own full-size copy, which doubles that server's ICMP upload (and, on Kharej, the
+# ICMP volume the route sees, which has a ~30 MB/s reroute trigger). Rate-limiting the kernel's echo and timestamp
+# replies (icmp_ratemask bits 0 and 14, 10 per second per sender) drops those copies and keeps ordinary pings
+# answered. The tunnel's replies are raw-socket sends and are not limited. Measured on the real path: without it
+# OutEchoReps = 2 x InEchos. The old values are kept and restored when the last such tunnel is gone (Kharej: 3.0.0).
 KREPLY_CONF=/etc/sysctl.d/90-$WAT_PREFIX-reverse.conf
 kreply_on() { [ -f "$KREPLY_CONF" ]; }
 kreply_apply() {
@@ -720,8 +721,8 @@ kreply_apply() {
   mask=$(sysctl -n net.ipv4.icmp_ratemask 2>/dev/null) && lim=$(sysctl -n net.ipv4.icmp_ratelimit 2>/dev/null) || return 1
   [ -f "$CONF/.kreply.orig" ] || printf 'net.ipv4.icmp_ratemask = %s\nnet.ipv4.icmp_ratelimit = %s\n' "$mask" "$lim" >"$CONF/.kreply.orig"
   {
-    echo "# wattun-manager: reverse ICMP on this Iran server. The kernel's ping replies are rate-limited so it stops"
-    echo "# sending a copy of every tunnel packet. Removed when no reverse Iran tunnel is left."
+    echo "# wattun-manager: this server receives ICMP tunnel requests. The kernel's ping replies are rate-limited so it"
+    echo "# stops sending a copy of every tunnel packet. Removed when no such tunnel is left."
     echo "net.ipv4.icmp_ratemask = $((mask | 1 | 16384))"
     echo "net.ipv4.icmp_ratelimit = 100"
   } >"$KREPLY_CONF"
@@ -731,17 +732,22 @@ kreply_restore() {
   [ -f "$KREPLY_CONF" ] || return 0
   rm -f "$KREPLY_CONF"
   [ -f "$CONF/.kreply.orig" ] && sysctl -q -p "$CONF/.kreply.orig" >/dev/null && rm -f "$CONF/.kreply.orig"
-  ok "Restored the kernel's normal ping replies (no reverse Iran tunnel left)."
+  ok "Restored the kernel's normal ping replies (no ICMP tunnel that needs it is left)."
 }
-reverse_iran_left() {
+kreply_wanted() { # name : this tunnel receives ICMP requests that the kernel would answer too
+  [ "$(cfg "$1" carrier)" = icmp ] || return 1
+  case "$(cfg "$1" icmp-type)" in ''|echo|timestamp) ;; *) return 1 ;; esac # info/mask: Linux does not answer
+  if [ "$(role "$1")" = Iran ]; then is_reverse "$1"; else ! is_reverse "$1"; fi
+}
+kreply_users_left() {
   local n
-  for n in $(tunnels); do [ "$(role "$n")" = Iran ] && [ "$(cfg "$n" carrier)" = icmp ] && is_reverse "$n" && return 0; done
+  for n in $(tunnels); do kreply_wanted "$n" && return 0; done
   return 1
 }
 kreply_needed() { ! kreply_on && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" != 1 ]; }
 kreply_offer() {
   kreply_needed || return 0
-  hint "Reverse mode: Linux here also answers every tunnel packet with a full-size copy, doubling this server's upload."
+  hint "Linux here also answers every tunnel packet with a full-size copy, doubling this server's ICMP upload."
   [ "$SANDBOX" = 1 ] && warn "Sandbox: this changes GLOBAL kernel settings (net.ipv4.icmp_ratemask |= 16385, icmp_ratelimit = 100) via $KREPLY_CONF; original values saved in $CONF/.kreply.orig."
   step "Limiting the kernel's ping replies (normal pings keep working)" kreply_apply \
     && hint "Undo: remove $KREPLY_CONF and run: sysctl --system (it is also undone when the last reverse Iran tunnel is deleted)."
@@ -836,7 +842,14 @@ v_mtu() { [ -z "$1" ] && return 0; case "$1" in -|0|default) return 0 ;; esac; [
 v_num() { [[ "$1" =~ ^[0-9]+$ ]] && return 0; err "Enter a valid positive number."; return 1; }
 v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
 v_fec() { case "$1" in off|auto) return 0 ;; esac; err "Use off or auto."; return 1; }
-v_fake_mode() { case "$1" in seq|ttl|sum|seqsum|auto|rst) return 0 ;; esac; err "Use seq, ttl, sum, seqsum, auto or rst."; return 1; }
+v_fake_mode() { case "$1" in seq|ttl|sum|seqsum|auto|rst|synrst) return 0 ;; esac; err "Use seq, ttl, sum, seqsum, auto, rst or synrst."; return 1; }
+# Checksum markers need a middlebox that drops the damaged segment; on an open reverse path the peer may take it and
+# the tunnel dies (field 2.11.0, fr-tcp-sum). wattun 3.0.0 refuses them with -reverse; refuse them here as well.
+rev_sum_refused() { # name mode -> 0 (and an error) when the pair is refused
+  is_reverse "$1" || return 1
+  case "$2" in sum|seqsum) err "fake-mode $2 does not work on a reverse tunnel (checksum markers can kill the flow there); use rst or synrst."; return 0 ;; esac
+  return 1
+}
 v_fake_ttl() { [ -z "$1" ] && return 0; [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -le 255 ] && return 0; err "Enter a hop count 1-255 (or leave empty for auto)."; return 1; }
 v_pool_rotate() { [ -z "$1" ] && return 0; case "$1" in 0|off) return 0 ;; esac; [[ "$1" =~ ^[0-9]+(ms|s|m|h)$ ]] && return 0; err "Enter a lifetime such as 90s, 30m or 4h (or 0 to turn it off)."; return 1; }
 v_pool_bytes() { local s=${1,,}; [ -z "$s" ] && return 0; case "$s" in 0|0b|off) return 0 ;; esac; [[ "$s" =~ ^[0-9]+(\.[0-9]+)?(k|m|g|t)b?$ ]] && return 0; err "Enter a byte count such as 500MB, 4G or 300k (or 0 to turn it off)."; return 1; }
@@ -871,10 +884,10 @@ v_preset() {
   [ -z "$1" ] && return 0
   local v=${1,,}
   case "$v" in
-    cloudflare|cf|cloudflare-tested|tested|worked|mci|irancell|mokhaberat|tci|blackout|emergency|strict|conservative|low-churn|off|clear|none) return 0 ;;
+    cloudflare|cf|cloudflare-tested|tested|worked|rst-fast|fast|mci|irancell|mokhaberat|tci|blackout|emergency|strict|conservative|low-churn|off|clear|none) return 0 ;;
     "iran whitelist - mci"|"iran whitelist - irancell/mokhaberat"|"emergency blackout mode"|"conservative / low-churn"|"conservative/low-churn") return 0 ;;
   esac
-  err "Unknown preset '$1'. Available: cloudflare, mci, irancell, blackout, conservative"
+  err "Unknown preset '$1'. Available: cloudflare, rst-fast, mci, irancell, blackout, conservative"
   return 1
 }
 v_dns_listen() {
@@ -1513,6 +1526,7 @@ wizard_kharej() {
   if [ "$rev" = 1 ] && is_rpool "$cr"; then hint "Reverse: Iran listens on port $listen/$(rproto "$cr") (the Iran wizard opens it). Kharej must be allowed to send to $iranip:$listen."
   elif [ "$rev" = 1 ]; then hint "Reverse ICMP: Iran must answer ping from this server. Do not block ICMP in either cloud firewall."
   elif [ "$cr" = icmp ]; then hint "ICMP: this server must answer ping. Do not block ICMP in the cloud firewall."; fi
+  kreply_wanted "$name" && kreply_offer # normal ICMP: the kernel here would echo every request from Iran (3.0.0)
   case "$cr" in tls|wss|grpc|h2) hint "TLS: the certificate is self-signed and unchecked by default. Pin it with tls-pin on the dialing side (docs/TECHNICAL.md, 'Certificates')." ;; esac
 
   echo
@@ -1553,6 +1567,7 @@ preset_canonical() {
   local p="${1,,}"
   case "$p" in
     cloudflare|cf|cloudflare-tested|tested|worked) echo cloudflare ;;
+    rst-fast|fast) echo rst-fast ;;
     mci|mci-whitelist|hamrah|hamrah-aval) echo mci ;;
     irancell|mokhaberat|tci|irancell-whitelist) echo irancell ;;
     blackout|emergency|strict) echo blackout ;;
@@ -1568,7 +1583,7 @@ preset_canonical() {
 
 is_builtin_preset() {
   case "$(preset_canonical "$1")" in
-    cloudflare|mci|irancell|blackout|conservative) return 0 ;;
+    cloudflare|rst-fast|mci|irancell|blackout|conservative) return 0 ;;
   esac
   return 1
 }
@@ -1590,12 +1605,28 @@ ECH=
 GOVERNOR=
 EOF
       ;;
+    rst-fast)
+      cat <<'EOF'
+# WatTunnel built-in preset: rst-fast (3.0.0)
+# The fastest direct setup measured on a cut-after-first-bytes route (field 2.11.0): bad-checksum RST, 4 sessions
+# of 4 connections, 30 min pool rotation. On a reverse tunnel the sessions part is skipped (not supported there).
+FAKESNI=www.cloudflare.com
+FAKEMODE=rst
+FAKETTL=
+POOLROT=30m
+POOLBYTES=
+ECH=
+GOVERNOR=
+SESSIONS=4
+CONNS=4
+EOF
+      ;;
     mci)
       cat <<'EOF'
 # WatTunnel built-in preset: Iran Whitelist - MCI
-# Optimized for Hamrah Aval (MCI) whitelist restrictions
+# Optimized for Hamrah Aval (MCI) whitelist restrictions; rst since 3.0.0 (seqsum failed on a cut-after-first-bytes route)
 FAKESNI=mci.ir
-FAKEMODE=seqsum
+FAKEMODE=rst
 FAKETTL=
 POOLROT=30m
 POOLBYTES=500MB
@@ -1606,7 +1637,8 @@ EOF
     irancell)
       cat <<'EOF'
 # WatTunnel built-in preset: Iran Whitelist - Irancell/Mokhaberat
-# Optimized for MTN Irancell and TCI allowlist bypass
+# Optimized for MTN Irancell and TCI allowlist bypass. seq only helps an SNI-allowlist filter; on a route that cuts
+# every flow after the first bytes use rst-fast or mci (rst) instead
 FAKESNI=irancell.ir
 FAKEMODE=seq
 FAKETTL=
@@ -1619,9 +1651,9 @@ EOF
     blackout)
       cat <<'EOF'
 # WatTunnel built-in preset: Emergency Blackout Mode
-# Aggressive anti-censorship settings for strict national intranet / blackout regimes
+# Aggressive anti-censorship settings for strict national intranet / blackout regimes; rst since 3.0.0
 FAKESNI=mci.ir
-FAKEMODE=auto
+FAKEMODE=rst
 FAKETTL=
 POOLROT=90s
 POOLBYTES=100MB
@@ -1632,7 +1664,8 @@ EOF
     conservative)
       cat <<'EOF'
 # WatTunnel built-in preset: Conservative / Low-Churn
-# Low reconnect churn for stable connections under mild DPI filtering
+# Low reconnect churn for stable connections under mild DPI filtering (SNI-allowlist filters; seq does not survive a
+# cut-after-first-bytes route)
 FAKESNI=mci.ir
 FAKEMODE=seq
 FAKETTL=
@@ -1666,13 +1699,16 @@ detect_preset() {
   if [ "$fs" = "www.cloudflare.com" ] && [ "$fm" = "rst" ] && [ -z "$rot" ]; then
     echo "${GRN}Cloudflare (field-tested)${RST}"; return
   fi
-  if [ "$fs" = "mci.ir" ] && [ "$fm" = "seqsum" ] && [ "$rot" = "30m" ]; then
+  if [ "$fs" = "www.cloudflare.com" ] && [ "$fm" = "rst" ] && [ "$rot" = "30m" ]; then
+    echo "${GRN}rst-fast${RST}"; return
+  fi
+  if [ "$fs" = "mci.ir" ] && [ "$fm" = "rst" ] && [ "$rot" = "30m" ]; then
     echo "${GRN}Iran Whitelist - MCI${RST}"; return
   fi
   if [ "$fs" = "irancell.ir" ] && [ "$fm" = "seq" ] && [ "$rot" = "20m" ]; then
     echo "${GRN}Iran Whitelist - Irancell/Mokhaberat${RST}"; return
   fi
-  if [ "$fs" = "mci.ir" ] && [ "$fm" = "auto" ] && [ "$rot" = "90s" ]; then
+  if [ "$fs" = "mci.ir" ] && [ "$fm" = "rst" ] && [ "$rot" = "90s" ]; then
     echo "${RED}Emergency Blackout Mode${RST}"; return
   fi
   if [ "$fs" = "mci.ir" ] && [ "$fm" = "seq" ] && [ "$rot" = "4h" ]; then
@@ -1689,11 +1725,12 @@ pick_preset() { # [default] -> REPLY_V
   fi
   say "  ${BOLD}Select Built-in Anti-Censorship Preset${RST}:"
   say "    ${CYN}1${RST}  Cloudflare (field-tested)     (www.cloudflare.com, rst mode, no churn; passed a real CDN whitelist)"
-  say "    ${CYN}2${RST}  Iran Whitelist - MCI          (mci.ir, seqsum mode, 30m / 500MB churn, ECH ladder)"
-  say "    ${CYN}3${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn, ECH ladder)"
-  say "    ${CYN}4${RST}  Emergency Blackout Mode       (mci.ir, auto probe, 90s / 100MB rapid churn, ECH ladder)"
-  say "    ${CYN}5${RST}  Conservative / Low-Churn      (mci.ir, seq mode, 4h / 4GB, ECH auto)"
+  say "    ${CYN}2${RST}  Iran Whitelist - MCI          (mci.ir, rst mode, 30m / 500MB churn, ECH ladder)"
+  say "    ${CYN}3${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn; SNI-allowlist filters only)"
+  say "    ${CYN}4${RST}  Emergency Blackout Mode       (mci.ir, rst mode, 90s / 100MB rapid churn, ECH ladder)"
+  say "    ${CYN}5${RST}  Conservative / Low-Churn      (mci.ir, seq mode, 4h / 4GB, ECH auto; SNI-allowlist filters only)"
   say "    ${CYN}6${RST}  Disabled / Clear              (normal tunnel, full speed)"
+  say "    ${CYN}7${RST}  rst-fast                      (www.cloudflare.com, rst, 4 sessions x 4 conns, 30m churn; fastest)"
   echo
   printf '  %s?%s Press a number %s[1 = Cloudflare]%s ' "$CYN" "$RST" "$GRY" "$RST"
   key_read
@@ -1704,6 +1741,7 @@ pick_preset() { # [default] -> REPLY_V
     4) REPLY_V="blackout" ;;
     5) REPLY_V="conservative" ;;
     6) REPLY_V="off" ;;
+    7) REPLY_V="rst-fast" ;;
     enter) REPLY_V="$def" ;;
     esc|q) echo; return 1 ;;
     *) REPLY_V="$def" ;;
@@ -1756,20 +1794,21 @@ pick_sni_preset() { # [default] -> REPLY_V
 }
 
 pick_fake_mode() { # [default] -> REPLY_V
-  local def=${1:-seqsum}
+  local def=${1:-rst}
   if [ "$NONINTERACTIVE" = 1 ]; then
     REPLY_V=${NI_FAKEMODE:-$def}
     return 0
   fi
   say "  ${BOLD}Select Fake Desync Mode${RST}:"
-  say "    ${CYN}1${RST}  auto    Probe link on startup, auto-select optimal mode (2.9.0+, recommended)"
-  say "    ${CYN}2${RST}  seqsum  Dual marker: seq desync + bad checksum (2.8.0+, best all-round bypass)"
+  say "    ${CYN}1${RST}  auto    Probes the route at startup and picks a mode; needs ~10 s at startup (3.0.0 probe)"
+  say "    ${CYN}2${RST}  seqsum  Dual marker: seq desync + bad checksum (2.8.0+, SNI-allowlist filters)"
   say "    ${CYN}3${RST}  sum     In-window segment, bad TCP checksum (2.7.1+, stateful NATs)"
   say "    ${CYN}4${RST}  seq     Out-of-window sequence marker (2.7.0+, standard default)"
   say "    ${CYN}5${RST}  ttl     Hop-count distance calibration (2.7.0+)"
-  say "    ${CYN}6${RST}  rst     Corrupted-checksum RST packet (2.9.0+, middlebox state confusion)"
+  say "    ${CYN}6${RST}  rst     Corrupted-checksum RST packet (2.9.0+, clears the filter's flow state; recommended)"
+  say "    ${CYN}7${RST}  synrst  Corrupted-checksum SYN|RST (2.10.5+, fallback when rst is filtered)"
   echo
-  printf '  %s?%s Press a number %s[1 = auto]%s ' "$CYN" "$RST" "$GRY" "$RST"
+  printf '  %s?%s Press a number %s[Enter = %s]%s ' "$CYN" "$RST" "$GRY" "$def" "$RST"
   key_read
   case "$KEY" in
     1) REPLY_V="auto" ;;
@@ -1778,6 +1817,7 @@ pick_fake_mode() { # [default] -> REPLY_V
     4) REPLY_V="seq" ;;
     5) REPLY_V="ttl" ;;
     6) REPLY_V="rst" ;;
+    7) REPLY_V="synrst" ;;
     enter) REPLY_V="$def" ;;
     esc|q) echo; return 1 ;;
     *) REPLY_V="$def" ;;
@@ -1961,21 +2001,23 @@ apply_preset() { # tunnel preset
     err "Carrier '$cr' does not support anti-censorship features (only pool carriers and icmp are supported)."; return 1
   fi
 
-  local fs='' fm='' ft='' rot='' rbytes='' ech='' gov=''
+  local fs='' fm='' ft='' rot='' rbytes='' ech='' gov='' sess='' conns=''
   case "$pr" in
     cloudflare)
       fs="www.cloudflare.com"; fm="rst"; ft=""; rot=""; rbytes=""; ech=""; gov="" ;;
+    rst-fast)
+      fs="www.cloudflare.com"; fm="rst"; ft=""; rot="30m"; rbytes=""; ech=""; gov=""; sess=4; conns=4 ;;
     mci)
-      fs="mci.ir"; fm="seqsum"; ft=""; rot="30m"; rbytes="500MB"; ech="ladder"; gov="true" ;;
+      fs="mci.ir"; fm="rst"; ft=""; rot="30m"; rbytes="500MB"; ech="ladder"; gov="true" ;;
     irancell)
       fs="irancell.ir"; fm="seq"; ft=""; rot="20m"; rbytes="300MB"; ech="ladder"; gov="true" ;;
     blackout)
-      fs="mci.ir"; fm="auto"; ft=""; rot="90s"; rbytes="100MB"; ech="ladder"; gov="true" ;;
+      fs="mci.ir"; fm="rst"; ft=""; rot="90s"; rbytes="100MB"; ech="ladder"; gov="true" ;;
     conservative)
       fs="mci.ir"; fm="seq"; ft=""; rot="4h"; rbytes="4GB"; ech="auto"; gov="true" ;;
     off|clear|none)
       fs=""; fm=""; ft=""; rot=""; rbytes=""; ech=""; gov="" ;;
-    *) err "Unknown preset '$raw_preset'. Available: cloudflare, mci, irancell, blackout, conservative"; return 1 ;;
+    *) err "Unknown preset '$raw_preset'. Available: cloudflare, rst-fast, mci, irancell, blackout, conservative"; return 1 ;;
   esac
 
   if [ "$cr" = icmp ]; then
@@ -2000,6 +2042,10 @@ apply_preset() { # tunnel preset
 
     if [ -n "$rbytes" ]; then set_value "$tun" pool-rotate-bytes "$rbytes"; changed=1
     elif [ -n "$(cfg "$tun" pool-rotate-bytes)" ]; then unset_value "$tun" pool-rotate-bytes; changed=1; fi
+
+    if [ -n "$conns" ]; then set_value "$tun" conns "$conns"; changed=1; fi
+    # sessions > 1 is refused with -reverse (the server dials one pool), so rst-fast skips it there
+    if [ -n "$sess" ] && ! is_reverse "$tun"; then set_value "$tun" sessions "$sess"; changed=1; fi
 
     case "$cr" in
       tls|wss|h2|grpc)
@@ -2144,9 +2190,10 @@ wizard_iran() {
     # Unattended preset or flags
     if [ -n "$NI_PRESET" ]; then
       case "$NI_PRESET" in
-        mci) T_FAKESNI="mci.ir"; T_FAKEMODE="seqsum"; T_POOLROT="30m"; T_POOLBYTES="500MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
+        rst-fast) T_FAKESNI="www.cloudflare.com"; T_FAKEMODE="rst"; T_POOLROT="30m"; NI_SESSIONS=${NI_SESSIONS:-4}; NI_CONNS=${NI_CONNS:-4} ;;
+        mci) T_FAKESNI="mci.ir"; T_FAKEMODE="rst"; T_POOLROT="30m"; T_POOLBYTES="500MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
         irancell) T_FAKESNI="irancell.ir"; T_FAKEMODE="seq"; T_POOLROT="20m"; T_POOLBYTES="300MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
-        blackout) T_FAKESNI="mci.ir"; T_FAKEMODE="auto"; T_POOLROT="90s"; T_POOLBYTES="100MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
+        blackout) T_FAKESNI="mci.ir"; T_FAKEMODE="rst"; T_POOLROT="90s"; T_POOLBYTES="100MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
         conservative) T_FAKESNI="mci.ir"; T_FAKEMODE="seq"; T_POOLROT="4h"; T_POOLBYTES="4GB"; T_ECH="auto"; T_GOVERNOR="true" ;;
       esac
     fi
@@ -2164,25 +2211,25 @@ wizard_iran() {
     if [ "$askres" = y ] && [ -z "$NI_FAKESNI$NI_PRESET" ] && [ -z "$T_FAKESNI" ]; then
       echo
       say "  ${BOLD}Anti-Censorship Profile${RST}:"
-      say "    ${CYN}1${RST}  Iran Whitelist - MCI          (mci.ir, seqsum mode, 30m / 500MB churn, ECH ladder)"
-      say "    ${CYN}2${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn, ECH ladder)"
-      say "    ${CYN}3${RST}  Emergency Blackout Mode       (mci.ir, auto probe, 90s / 100MB rapid churn, ECH ladder)"
-      say "    ${CYN}4${RST}  Conservative / Low-Churn      (mci.ir, seq mode, 4h / 4GB, ECH auto)"
+      say "    ${CYN}1${RST}  Iran Whitelist - MCI          (mci.ir, rst mode, 30m / 500MB churn, ECH ladder)"
+      say "    ${CYN}2${RST}  Iran Whitelist - Irancell     (irancell.ir, seq mode, 20m / 300MB churn; SNI-allowlist filters only)"
+      say "    ${CYN}3${RST}  Emergency Blackout Mode       (mci.ir, rst mode, 90s / 100MB rapid churn, ECH ladder)"
+      say "    ${CYN}4${RST}  Conservative / Low-Churn      (mci.ir, seq mode, 4h / 4GB, ECH auto; SNI-allowlist filters only)"
       say "    ${CYN}5${RST}  Custom Configuration          (select SNI, mode, and rotation step-by-step)"
       say "    ${CYN}6${RST}  Skip                          (keep anti-censorship disabled)"
       printf '  %s?%s Choose profile %s[1 = MCI]%s ' "$CYN" "$RST" "$GRY" "$RST"
       key_read
       case "$KEY" in
-        1|enter) T_FAKESNI="mci.ir"; T_FAKEMODE="seqsum"; T_POOLROT="30m"; T_POOLBYTES="500MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
+        1|enter) T_FAKESNI="mci.ir"; T_FAKEMODE="rst"; T_POOLROT="30m"; T_POOLBYTES="500MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
         2) T_FAKESNI="irancell.ir"; T_FAKEMODE="seq"; T_POOLROT="20m"; T_POOLBYTES="300MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
-        3) T_FAKESNI="mci.ir"; T_FAKEMODE="auto"; T_POOLROT="90s"; T_POOLBYTES="100MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
+        3) T_FAKESNI="mci.ir"; T_FAKEMODE="rst"; T_POOLROT="90s"; T_POOLBYTES="100MB"; T_ECH="ladder"; T_GOVERNOR="true" ;;
         4) T_FAKESNI="mci.ir"; T_FAKEMODE="seq"; T_POOLROT="4h"; T_POOLBYTES="4GB"; T_ECH="auto"; T_GOVERNOR="true" ;;
         5) # Custom step-by-step
            if is_pool "$T_CARRIER"; then
              pick_sni_preset "${T_FAKESNI:-mci.ir}" || return 1; T_FAKESNI=$REPLY_V
              if [ "$T_FAKESNI" = off ] || [ "$T_FAKESNI" = 0 ]; then T_FAKESNI=''; fi
              if [ -n "$T_FAKESNI" ]; then
-               pick_fake_mode "${T_FAKEMODE:-seqsum}" || return 1; T_FAKEMODE=$REPLY_V
+               pick_fake_mode "${T_FAKEMODE:-rst}" || return 1; T_FAKEMODE=$REPLY_V
                if [ "$T_FAKEMODE" = ttl ]; then
                  ask "Fake TTL (hop count, empty = auto-calibrate)" "${T_FAKETTL:-}"; T_FAKETTL=$REPLY_V
                  v_fake_ttl "$T_FAKETTL" || return 1
@@ -2215,7 +2262,7 @@ wizard_iran() {
       v_sni_name "$T_FAKESNI" || return 1
       [ "$(bin_ver_ok 2.7.0)" = 1 ] || err "fake-sni needs wattun 2.7.0 or newer on this server (run: $SELF update)."
       [ -n "${NI_FAKEMODE:-}" ] && T_FAKEMODE=$NI_FAKEMODE
-      [ -n "$T_FAKEMODE" ] || T_FAKEMODE=seqsum
+      [ -n "$T_FAKEMODE" ] || T_FAKEMODE=rst
       v_fake_mode "$T_FAKEMODE" || return 1
       T_FAKETTL=${NI_FAKETTL:-${T_FAKETTL:-}}
       if [ "$T_FAKEMODE" = ttl ] && [ -n "$T_FAKETTL" ]; then v_fake_ttl "$T_FAKETTL" || return 1; fi
@@ -3243,7 +3290,7 @@ auto_apply() { # name : write the chosen variant (T_*, AT_EXTRA) into NAME.yml, 
   [ "$oldpool" = 1 ] && [ -n "$ol" ] && [ "$ol" != "$rport" ] && fw_close "$ol/$oldproto"
   if [ "$T_CARRIER" = icmp ] && [ "$T_REV" = 1 ]; then
     [ "$AT_QUIET" = 1 ] || kreply_offer
-  else reverse_iran_left || kreply_restore; fi
+  else kreply_users_left || kreply_restore; fi
   [ "$AT_QUIET" = 1 ] && return 0
   if wait_link "$n" 25; then ok "CONNECTED (RTT ${LINK_RTT} ms)"; else warn "Not connected yet."; [ "$NONINTERACTIVE" = 1 ] && return 1; fi
   return 0
@@ -3371,13 +3418,14 @@ ac_matrix() { # name : needs T_* loaded from the tunnel (ac_load); fills AV_*, A
   av_add "base (no desync)" "$car" d "$T_PEER" '' "$T_SNI"
   # 1. every fake-mode for the first curated SNI
   for fm in $AC_MODES; do
+    is_reverse "$n" && case "$fm" in sum|seqsum) continue ;; esac # refused on reverse (3.0.0)
     av_add "desync ${AC_SNIS%%,*} → $fm" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "${AC_SNIS%%,*}" "$fm"
   done
-  # 2. the strongest mode (seqsum) against every other curated SNI
+  # 2. the mode that passed the cut-after-first-bytes route (rst, field 2.11.0) against every other curated SNI
   local fs rest=${AC_SNIS#*,}
   for fs in ${rest//,/ }; do
     [ -n "$fs" ] || continue
-    av_add "desync $fs → seqsum" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "$fs" seqsum
+    av_add "desync $fs → rst" "$car" d "$T_PEER" '' "$T_SNI" '' '' '' "$fs" rst
   done
   # 2b. the Cloudflare edge name with the two modes that passed a real CDN whitelist (2.10.12 field test)
   for fm in rst synrst; do
@@ -4147,9 +4195,9 @@ test_tunnel() {
       fi
     fi
   fi
-  if [ "$r" = Iran ] && [ "$cr" = icmp ] && is_reverse "$n" && kreply_needed; then
+  if kreply_wanted "$n" && kreply_needed; then
     echo; warn "The kernel here answers every tunnel packet with a copy (wasted upload)."
-    if [ -t 0 ]; then kreply_offer; else hint "Fix: $SELF → this tunnel → o → d (or see docs: Reverse ICMP)."; fi
+    if [ -t 0 ]; then kreply_offer; else hint "Fix: run $SELF on this server and open this tunnel (or see docs: Kernel copies)."; fi
   fi
   while IFS= read -r it; do
     [ -n "$it" ] || continue
@@ -4468,7 +4516,7 @@ delete_tunnel() {
   systemctl disable --now "${WAT_PREFIX}@$n" >/dev/null 2>&1
   rm -f "$CONF/$n".yml "$CONF/$n".ech "$CONF/$n".key "$CONF/$n".token "$CONF/$n".auto "$RUN/$n.down" "$RUN/$n.cycles" "$RUN/$n.retest"
   ok "Tunnel '$n' deleted."
-  reverse_iran_left || kreply_restore
+  kreply_users_left || kreply_restore
   return 0
 }
 # Toggle reverse ICMP on one side. Kharej keeps Iran's IP as its peer and puts the flag in the token.
@@ -4509,6 +4557,10 @@ set_direction() { # name
         fw_open "$pp/$pr"
       fi
       set_value "$n" reverse true
+      local ofm; ofm=$(cfg "$n" fake-mode)
+      case "$ofm" in sum|seqsum)
+        set_value "$n" fake-mode rst; warn "fake-mode $ofm changed to rst: checksum markers are refused on a reverse tunnel." ;;
+      esac
     fi
   elif is_reverse "$n"; then
     confirm "Switch '$n' back to the normal direction (Iran sends the pings)?" n || return 1
@@ -4522,8 +4574,8 @@ set_direction() { # name
     fi
     set_value "$n" reverse true
   fi
-  if [ "$r" = Iran ] && [ "$cr" = icmp ]; then
-    if is_reverse "$n"; then kreply_offer; else reverse_iran_left || kreply_restore; fi
+  if [ "$cr" = icmp ]; then
+    if kreply_wanted "$n"; then kreply_offer; else kreply_users_left || kreply_restore; fi
   fi
   if [ "$r" = Kharej ] && [ -f "$CONF/$n.token" ] && read_token "$(cat "$CONF/$n.token")"; then
     T_REV=''; is_reverse "$n" && T_REV=1
@@ -4544,6 +4596,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
     summary_line "fec" "$(cfg "$n" fec | sed 's/^$/off (default)/')"
     [ "$r" = Iran ] && summary_line "bind" "$(cfg "$n" bind | sed 's/^$/0.0.0.0 (default)/')"
     [ "$cr" = icmp ] && summary_line "icmp-type" "$(cfg "$n" icmp-type | sed 's/^$/echo (default)/')"
+    case "$cr" in icmp|udp) summary_line "batch" "$(cfg "$n" batch | sed "s/^$/$([ "$cr" = icmp ] && echo on || echo off) (default)/")" ;; esac
     if rev_capable "$cr"; then
       if [ "$cr" = icmp ]; then summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej sends the pings)" || echo "normal (Iran sends the pings)")"
       else summary_line "direction" "$(is_reverse "$n" && echo "reverse (Kharej connects to Iran)" || echo "normal (Iran connects to Kharej)")"; fi
@@ -4568,6 +4621,7 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
     printf '  %s  speed   %s  sessions   %s  conns   %s  MTU   %s  FEC   ' "$(key_label m)" "$(key_label s)" "$(key_label c)" "$(key_label u)" "$(key_label f)"
     [ "$r" = Iran ] && printf '%s  bind   ' "$(key_label a)"
     [ "$cr" = icmp ] && printf "%s  ICMP type   " "$(key_label i)"
+    case "$cr" in icmp|udp) printf '%s  batching   ' "$(key_label y)" ;; esac
     rev_capable "$cr" && printf "%s  direction   " "$(key_label d)"
     ac_dialer "$n" && printf '%s  resilience   ' "$(key_label k)"
     printf '%s  back\n' "$(key_label b)"
@@ -4592,6 +4646,15 @@ adv_menu() { # name : max-mbps, fec, bind, icmp-type, direction
          if [ "$REPLY_V" = 0.0.0.0 ]; then unset_value "$n" bind; else set_value "$n" bind "$REPLY_V"; fi; changed=1 ;;
       i) [ "$cr" = icmp ] || continue; echo; hint "Must match the other side."; ask_ok "ICMP type" "$(cfg "$n" icmp-type | sed 's/^$/echo/')" v_icmp || continue
          if [ "$REPLY_V" = echo ]; then unset_value "$n" icmp-type; else set_value "$n" icmp-type "$REPLY_V"; fi; changed=1 ;;
+      y) case "$cr" in icmp|udp) ;; *) continue ;; esac
+         echo; hint "Batching sends and reads many packets per system call (less CPU per MB). Needs wattun 3.0.0."
+         ask "Batching: on, off or default" "$(cfg "$n" batch | sed 's/^$/default/')"
+         case "$REPLY_V" in
+           on|off) [ "$(bin_ver_ok 3.0.0)" = 1 ] || { err "batch needs wattun 3.0.0 or newer (run: $SELF update)."; sleep 1; continue; }
+              set_value "$n" batch "$REPLY_V"; changed=1 ;;
+           default|-|'') unset_value "$n" batch; changed=1 ;;
+           *) err "Use on, off or default."; sleep 1 ;;
+         esac ;;
       d) rev_capable "$cr" || continue; echo
          # applied at once, so the direction never sits in the file without running
          set_direction "$n" && step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"
@@ -4695,7 +4758,7 @@ anticensor_test() {
     if [ -n "$fks" ]; then
       warn "The current allowlisted SNI ($fks) or fake-mode ($fkm) may be blocked by this provider."
       hint "1. Try Emergency Blackout Mode: $SELF blackout $n blackout"
-      hint "2. Or switch mode to 'seqsum' or 'auto' (menu: tunnel page -> o -> k -> 3)."
+      hint "2. Or switch mode to 'rst' or 'synrst' (menu: tunnel page -> o -> k -> 3)."
       hint "3. Or try another allowlisted SNI: 'irancell.ir', 'tci.ir', 'divar.ir'."
     else
       warn "No Fake-SNI is active. If your provider enforces an SNI allowlist, connections will be dropped."
@@ -4711,7 +4774,7 @@ anticensor_test() {
 # ======================================================================================
 #  Interactive Anti-Censorship Menu Hub
 # ======================================================================================
-AC_KEYS="fake-sni fake-mode fake-ttl fake-ip fake-split fp tls-small-ch ech ech-cache tls-frag pool-rotate pool-rotate-bytes governor dns-listen src-ip conns loss-ceiling"
+AC_KEYS="fake-sni fake-mode fake-ttl fake-ip fake-split fp tls-small-ch ech ech-cache tls-frag pool-rotate pool-rotate-bytes governor dns-listen src-ip conns loss-ceiling keep-slow"
 anticensor_menu() {
   local n=$1 cr r
   cr=$(cfg "$n" carrier); r=$(role "$n")
@@ -4818,7 +4881,7 @@ anticensor_menu() {
              ok "Fake-SNI turned OFF."; changed=1
            else
              set_value "$n" fake-sni "$REPLY_V"
-             [ -n "$(cfg "$n" fake-mode)" ] || set_value "$n" fake-mode seqsum
+             [ -n "$(cfg "$n" fake-mode)" ] || set_value "$n" fake-mode rst
              ok "Fake-SNI set to $REPLY_V"; changed=1
            fi
          fi
@@ -4827,7 +4890,7 @@ anticensor_menu() {
          is_pool "$cr" || continue
          [ -n "$(cfg "$n" fake-sni)" ] || { warn "Turn on Fake-SNI first (option 2)."; sleep 1; continue; }
          echo
-         if pick_fake_mode "$fm"; then
+         if pick_fake_mode "$fm" && ! rev_sum_refused "$n" "$REPLY_V"; then
            set_value "$n" fake-mode "$REPLY_V"
            [ "$REPLY_V" != ttl ] && unset_value "$n" fake-ttl
            ok "Fake mode set to $REPLY_V"; changed=1
@@ -4993,9 +5056,9 @@ blackout_cmd() { # name [sni_or_preset] : turn the resilience kit on when a cens
   v_sni_name "$sni" || return 1
   [ "$(bin_ver_ok 2.7.0)" = 1 ] || { err "fake-sni needs wattun 2.7.0 or newer on this server (run: $SELF update)."; return 1; }
   set_value "$n" fake-sni "$sni"
-  set_value "$n" fake-mode seq
+  set_value "$n" fake-mode rst
   unset_value "$n" fake-ttl
-  ok "Resilience kit on: fake-sni $sni (seq mode, auto ttl). pool-rotate stays off; tune later: tunnel page -> o -> k."
+  ok "Resilience kit on: fake-sni $sni (rst mode). pool-rotate stays off; tune later: tunnel page -> o -> k."
   if step "Restarting ${WAT_PREFIX}@$n" systemctl restart "${WAT_PREFIX}@$n"; then
     ok "Restart applied. Watch whether the link comes back: $SELF test $n"
     if [ -t 0 ] && [ "$NONINTERACTIVE" != 1 ] && [ "${WAT_MANAGER_LIB:-0}" != 1 ]; then
@@ -5071,8 +5134,8 @@ audit_blackout_cmd() { # name
       ok "Sysctl: net.ipv4.icmp_echo_ignore_all == 0 (ICMP replies enabled)"
       pass_cnt=$((pass_cnt+1))
     else
-      warn "Sysctl: net.ipv4.icmp_echo_ignore_all != 0 (ICMP carrier will fail)"
-      fail_cnt=$((fail_cnt+1))
+      ok "Sysctl: net.ipv4.icmp_echo_ignore_all == 1 (plain ping is off; the ICMP tunnel still receives its packets)"
+      pass_cnt=$((pass_cnt+1))
     fi
     local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)
     if [ "$cc" = bbr ]; then
@@ -5129,7 +5192,7 @@ preset_cmd() { # name [preset]
   if [ -z "$p" ] && [ "$NONINTERACTIVE" != 1 ]; then
     pick_preset "cloudflare" || return 1; p=$REPLY_V
   fi
-  [ -n "$p" ] || { err "A preset name is required (preset $n mci). Available: cloudflare, mci, irancell, blackout, conservative"; return 1; }
+  [ -n "$p" ] || { err "A preset name is required (preset $n mci). Available: cloudflare, rst-fast, mci, irancell, blackout, conservative"; return 1; }
   v_preset "$p" || return 1
   apply_preset "$n" "$p" || return 1
   if [ -t 0 ] && [ "$NONINTERACTIVE" != 1 ] && [ "${WAT_MANAGER_LIB:-0}" != 1 ]; then
@@ -5157,7 +5220,7 @@ profile_cmd() { # profile save|list|show|del|apply NAME [tunnel]
       if { echo "# WatTunnel resilience profile: $name"
            echo "# From tunnel $tun, saved $(date -u '+%Y-%m-%d %H:%M UTC'). Apply: $SELF profile apply $name TUNNEL"
            echo "# FAKESNI   allowlisted server name (e.g. mci.ir); empty = fake-SNI off"
-           echo "# FAKEMODE  seq | ttl | sum | seqsum | auto | rst"
+           echo "# FAKEMODE  seq | ttl | sum | seqsum | auto | rst | synrst"
            echo "# FAKETTL   hop count for fake-mode ttl; empty = auto-calibrate"
            echo "# POOLROT   recycle each healthy pool connection after this long (90s, 30m, 4h); empty = off"
            echo "# POOLBYTES recycle after this much traffic (500MB, 4G); empty = off"
@@ -5179,9 +5242,10 @@ profile_cmd() { # profile save|list|show|del|apply NAME [tunnel]
       fi ;;
     list)
       say "  ${BOLD}Built-in Presets:${RST}"
-      echo "  mci          Iran Whitelist - MCI (mci.ir, seqsum, 30m, 500MB, ECH ladder)"
+      echo "  rst-fast     Fastest direct setup (www.cloudflare.com, rst, 4 sessions x 4 conns, 30m)"
+      echo "  mci          Iran Whitelist - MCI (mci.ir, rst, 30m, 500MB, ECH ladder)"
       echo "  irancell     Iran Whitelist - Irancell/Mokhaberat (irancell.ir, seq, 20m, 300MB, ECH ladder)"
-      echo "  blackout     Emergency Blackout Mode (mci.ir, auto, 90s, 100MB, ECH ladder)"
+      echo "  blackout     Emergency Blackout Mode (mci.ir, rst, 90s, 100MB, ECH ladder)"
       echo "  conservative Conservative / Low-Churn (mci.ir, seq, 4h, 4GB, ECH auto)"
       echo
       say "  ${BOLD}Saved Custom Profiles:${RST}"
@@ -5253,8 +5317,10 @@ prof_apply() { # profile tunnel : write the tunnel's resilience keys from a save
     unset_value "$tun" fake-sni; unset_value "$tun" fake-mode; unset_value "$tun" fake-ttl; changed=1
   fi
   if [ -n "$fs" ] && [ -n "$fm" ]; then
+    rev_sum_refused "$tun" "$fm" && return 1
     case "$fm" in
       auto|rst) [ "$(bin_ver_ok 2.9.0)" = 1 ] || { err "fake-mode $fm needs wattun 2.9.0 or newer (run: $SELF update)."; return 1; } ;;
+      synrst) [ "$(bin_ver_ok 2.10.5)" = 1 ] || { err "fake-mode synrst needs wattun 2.10.5 or newer (run: $SELF update)."; return 1; } ;;
       seqsum) [ "$(bin_ver_ok 2.8.0)" = 1 ] || { err "fake-mode seqsum needs wattun 2.8.0 or newer (run: $SELF update)."; return 1; } ;;
       sum) [ "$(bin_ver_ok 2.7.1)" = 1 ] || { err "fake-mode sum needs wattun 2.7.1 or newer (run: $SELF update)."; return 1; } ;;
     esac
@@ -6180,7 +6246,7 @@ ni_parse() {
       --ports) [ -n "$v" ] || { err "--ports needs a list such as 18999,2000,53/udp"; return 1; }; NI_PORTS=$v ;;
       --max-mbps) v_mbps "$v" || return 1; NI_MBPS=$v ;;
       --fake-sni) v_sni_name "$v" || return 1; NI_FAKESNI=$v ;;
-      --fake-mode) case "$v" in seq|ttl|sum|seqsum|auto|rst) NI_FAKEMODE=$v ;; *) err "--fake-mode: use seq, ttl, sum, seqsum, auto or rst (got '$v')"; return 1 ;; esac ;;
+      --fake-mode) case "$v" in seq|ttl|sum|seqsum|auto|rst|synrst) NI_FAKEMODE=$v ;; *) err "--fake-mode: use seq, ttl, sum, seqsum, auto, rst or synrst (got '$v')"; return 1 ;; esac ;;
       --fake-ttl) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -le 255 ] || { err "--fake-ttl: use a hop count 0-255 (0 = auto, got '$v')"; return 1; }; NI_FAKETTL=$v ;;
       --pool-rotate) v_pool_rotate "$v" || return 1; NI_POOLROT=$v ;;
       --pool-rotate-bytes) v_pool_bytes "$v" || return 1; NI_POOLBYTES=$v ;;
@@ -6223,11 +6289,11 @@ Usage: $SELF [command]
   speedtest NAME [MB]   speed test only (default 10 MB each way)
   logs NAME             follow the log
   token NAME            print the Kharej token again
-  preset NAME [PRESET]  apply built-in anti-censorship preset (mci, irancell, blackout, conservative)
+  preset NAME [PRESET]  apply built-in anti-censorship preset (rst-fast, mci, irancell, blackout, conservative)
   test-bypass NAME      automated connectivity & filter bypass test for anti-censorship profile
   profile save|list|show|del|apply   resilience profiles: save one tunnel's fake-sni/pool-rotate combination
                         under a name and re-apply it later (profile save NAME [tunnel])
-  blackout NAME [SNI|PRESET] turn on resilience: accepts operator preset (mci, irancell, blackout, conservative)
+  blackout NAME [SNI|PRESET] turn on resilience: accepts operator preset (rst-fast, mci, irancell, blackout, conservative)
                         or custom allowlisted SNI (e.g. mci.ir), restarts, tests filter bypass.
                         Fine-tuning (mode, ttl, pool-rotate, ech): tunnel page -> o -> k. Linux only.
   arm-blackout NAME     arm Kharej in Fortress mode (multi-carrier listeners, sysctls, firewall)
@@ -6263,10 +6329,10 @@ or NONINTERACTIVE=1). Plain output, errors on stderr, exit code 0 = done, 1 = fa
          creates and starts the Iran tunnel. Auto token: runs the test, --pick chooses a row (default best, bond = all
          working direct carriers, 1,3 = join those rows). CDN token: automatic CDN tuning. Ends with LINK=up|down and TUNNEL=NAME; exit 1 if down.
          --sessions N writes "sessions: N" (only with wattun 2.3.0 or newer; otherwise it is ignored with a warning)
-         --preset mci|irancell|blackout|conservative applies an operator-tailored anti-censorship preset
-         --fake-sni NAME [--fake-mode seq|ttl|sum|seqsum|auto|rst] [--fake-ttl 0-255] enables the fake-SNI desync on a
+         --preset rst-fast|mci|irancell|blackout|conservative applies an operator-tailored anti-censorship preset
+         --fake-sni NAME [--fake-mode seq|ttl|sum|seqsum|auto|rst|synrst] [--fake-ttl 0-255] enables the fake-SNI desync on a
          fixed-type token (wattun 2.7.0 or newer; Linux only, needs CAP_NET_RAW; --fake-ttl only with --fake-mode ttl;
-         seqsum needs 2.8.0, sum needs 2.7.1, auto/rst need 2.9.0)
+         seqsum needs 2.8.0, sum needs 2.7.1, auto/rst need 2.9.0, synrst needs 2.10.5)
          [--pool-rotate 90s|30m|4h] [--pool-rotate-bytes 500MB|4G] recycle each healthy pool connection after this
          long / this much traffic (pool-rotate needs wattun 2.8.0, --pool-rotate-bytes 2.8.1; Linux only)
          [--ech off|auto|ladder] Encrypted Client Hello mode (ladder relays DoH via tunnel port 53; 2.9.0+)

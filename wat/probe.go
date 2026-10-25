@@ -1,42 +1,44 @@
 package wat
 
-// Filter probe (-fake-mode auto, 2.9.0): before the first pool dial the client measures WHICH marker class
-// the path's filter tolerates, and the result picks the fake-SNI mode. Client only; the server never sees
-// any of it. RESEARCH.md's queue item: a probe, then an auto-picked mode, instead of five questions.
+// Filter probe (-fake-mode auto). Before the first pool dial the client measures which fake-SNI mode keeps a
+// flow alive on this route, and the result picks the mode. Client only; the server sees a few short connections
+// it rejects like any stray client.
 //
-// Method, on ONE throwaway TCP connection to the peer (not a pool slot):
+// 3.0.0 method (the 2.9.0 one judged a flow by whether two tiny writes returned no error, which a cut flow passes:
+// the kernel accepts writes long after a filter starts dropping). Each candidate runs on its own throwaway TCP
+// connection to the real peer port:
 //
-//	1. Complete a normal handshake. The sniffer reports whether the seq marker fired (ISN probe + wire).
-//	2. Fire a sum-style marker manually next to that connection (same seq/ack as a real data segment we
-//	   then write; the filter sees an in-window duplicate with a bad checksum).
-//	3. Write one byte of stream data and try to read the echo (the wattun server's target-port 0 answers,
-//	   but ANY listening TCP service answers TCP at least with RST/ACK or data). If the connection still
-//	   carries data a moment later, the filter did not reset the flow for the marker.
+//  1. dial, wrap with that mode's Desync (nothing for "none"), exactly like a pool dial;
+//  2. write probeBytes of filler shaped like the carrier's own first bytes (see probeFiller);
+//  3. the flow survives if the kernel saw all of it acknowledged (TCP_INFO bytes_acked) within probeWait.
 //
-// Verdict table (which marker correlated with a flow death; the signal is the marker, not the final
-// connAlive, whose failure only mirrors the last probe that ran on that socket):
+// The SNI allowlist filters seen in the field let the handshake and a few KB through and then drop the flow
+// (field 2.10.12), so 32 KB acked is the signal, not the handshake. Candidates in order, first survivor wins:
 //
-//	seq marker survived, sum marker survived  -> filter ignores both markers: seq (the default)
-//	seq marker killed its flow, sum survived  -> filter acts on below-window junk but ignores checksum junk: sum
-//	both single markers killed their flows    -> filter acts on both: seqsum (the dual marker, last resort)
-//	sum marker killed its flow, seq survived  -> filter acts on bad checksums but drops below-window junk: seq
-//	probe socket never became writable        -> the path is fully blocked, no mode helps: seq anyway
+//	none    the route does not filter this name: run without fake-SNI (no marker, no startup wait)
+//	rst     the field's working mode on the CF-whitelist routes (2.10.12)
+//	synrst  rst plus a marker before the handshake completes
+//	seq     the 2.7.0 default, for SNI-allowlist filters only
 //
-// The probe runs once per process, logs its verdict, and exposes it through /stats (FilterProfile()).
-// A failure anywhere degrades to seq (the 2.7.0 default) without stopping the tunnel.
+// No survivor ("route-cut") means no mode helps from this source; the tunnel runs rst and keeps retrying.
+// The verdict is logged and exposed through /stats (filter_profile).
 
 import (
+	"crypto/rand"
+	"errors"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
 // FilterProfile is the startup probe's verdict, for /stats and the manager.
 type FilterProfile struct {
-	Mode      string `json:"mode"`       // the fake-mode the probe picked: seq|sum|seqsum
-	SeqOK     bool   `json:"seq_ok"`     // the below-window seq marker did not kill the flow
-	SumOK     bool   `json:"sum_ok"`     // the bad-checksum in-window marker did not kill the flow
-	ConnAlive bool   `json:"conn_alive"` // the probe connection still carried data afterwards
+	Mode      string `json:"mode"`       // the fake-mode the tunnel runs: none|rst|synrst|seq
+	Verdict   string `json:"verdict"`    // the probe's result: the surviving mode, or route-cut (3.0.0)
+	SeqOK     bool   `json:"seq_ok"`     // the seq candidate survived (kept for 2.x readers)
+	SumOK     bool   `json:"sum_ok"`     // always false since 3.0.0: sum modes are no longer probed
+	ConnAlive bool   `json:"conn_alive"` // some candidate survived
 	Probed    bool   `json:"probed"`     // a probe ran at all (false = disabled, off-platform, or it failed)
 }
 
@@ -52,39 +54,157 @@ func FilterProfileNow() FilterProfile {
 	return filterProfile
 }
 
-// probeTimeout bounds each step; the whole probe adds at most ~3 s to startup, once.
-const probeTimeout = 1500 * time.Millisecond
+const (
+	probeTimeout = 1500 * time.Millisecond // dial bound per candidate
+	probeWait    = 2 * time.Second         // how long the filler may take to be acknowledged
+	probeBytes   = 32 << 10
+	probeGap     = 300 * time.Millisecond // between candidates, so a filter's per-flow state is not shared
+)
 
-// ProbeFakeMode runs the marker probe against peer (host:port) with the allowlisted name and returns the
-// mode to run fake-SNI with. called by cmd/wattun when -fake-mode auto. Needs the desync sniffer already
-// running (it watches the probe handshake like any pool dial); on platforms without it the answer is seq.
-func ProbeFakeMode(cfg DesyncConfig, peer string, logf func(string, ...any)) string {
-	mode := "seq"
-	ipStr, port := desyncPeerHostPort(peer)
-	if net.ParseIP(ipStr) == nil || port == "" {
-		note("probe: need an IP host:port peer, keeping fake-mode seq")
-		return mode
+var errNoTCPInfo = errors.New("wat: TCP_INFO unavailable")
+
+// probeCandidates in the order tried; tests may shorten it.
+var probeCandidates = []string{"none", "rst", "synrst", "seq"}
+
+// ProbeFakeMode tries the candidate modes against peer and returns the one to run: "none" means run without
+// fake-SNI. carrier and name (the TLS SNI or the HTTP Host) shape the filler like the real carrier's first bytes,
+// so the filter judges what it would see. Called by cmd/wattun when -fake-mode auto. Any failure to run the probe
+// (no raw socket, no TCP_INFO, a non-IP peer) degrades to rst without stopping the tunnel.
+func ProbeFakeMode(cfg DesyncConfig, peer, carrier, name string, logf func(string, ...any)) string {
+	if logf == nil {
+		logf = func(string, ...any) {}
 	}
-	var d *Desync
-	var err error
-	if d, err = NewDesync(DesyncConfig{SNI: cfg.SNI, Mode: "seq", TTL: cfg.TTL}, peer); err != nil {
-		note("probe: no raw socket (%v), keeping fake-mode seq", err)
-		return mode
+	ip, port := desyncPeerHostPort(peer)
+	if net.ParseIP(ip) == nil || port == "" {
+		logf("fake-mode auto: need an IP host:port peer, running rst")
+		return "rst"
 	}
-	defer d.Close()
-	p := filterProbe{cfg: cfg, peer: peer, d: d, logf: logf}
-	mode = p.run()
+	addr := net.JoinHostPort(ip, port)
+	verdict, mode := "route-cut", "rst"
+	for i, m := range probeCandidates {
+		if i > 0 {
+			time.Sleep(probeGap)
+		}
+		ok, err := probeOnce(cfg, m, addr, peer, probeFiller(carrier, name))
+		if err != nil {
+			logf("fake-mode auto: probe unavailable (%v), running rst", err)
+			return "rst"
+		}
+		logf("fake-mode auto: %s %s", m, map[bool]string{true: "survived", false: "cut"}[ok])
+		if ok {
+			verdict, mode = m, m
+			break
+		}
+	}
 	filterMu.Lock()
-	filterProfile = FilterProfile{Mode: mode, SeqOK: p.seqOK, SumOK: p.sumOK, ConnAlive: p.alive, Probed: true}
+	filterProfile = FilterProfile{Mode: mode, Verdict: verdict, SeqOK: verdict == "seq", ConnAlive: verdict != "route-cut", Probed: true}
 	filterMu.Unlock()
-	if logf != nil {
-		logf("fake-mode auto: probe says %q (seq_ok=%v sum_ok=%v conn_alive=%v)", mode, p.seqOK, p.sumOK, p.alive)
-	}
+	logf("fake-mode auto: verdict %s, running %s", verdict, mode)
 	return mode
 }
 
-// note is the package-level log line of the fake-SNI layer (raw-send failures, the probe's fallbacks); it keeps
-// probe.go free of a logf thread. It is silent until SetNote wires it, which cmd/wattun does at startup.
+// probeOnce: one candidate on one fresh connection. err means the probe itself cannot run here.
+func probeOnce(cfg DesyncConfig, mode, addr, peer string, filler []byte) (bool, error) {
+	var d *Desync
+	if mode != "none" {
+		var err error
+		if d, err = NewDesync(DesyncConfig{SNI: cfg.SNI, Mode: mode, TTL: cfg.TTL}, peer); err != nil {
+			return false, err
+		}
+		defer d.Close()
+	}
+	nc, err := net.DialTimeout("tcp4", addr, probeTimeout)
+	if err != nil {
+		return false, nil // a dial that fails is a cut too (or the peer is down: every mode fails alike)
+	}
+	defer nc.Close()
+	if d != nil {
+		if nc, err = d.Wrap(nc); err != nil {
+			return false, nil
+		}
+	}
+	tc, _ := nc.(*net.TCPConn)
+	if tc == nil {
+		return false, nil
+	}
+	if _, ok := bytesAcked(tc); !ok {
+		return false, errNoTCPInfo
+	}
+	deadline := time.Now().Add(probeWait)
+	_ = tc.SetWriteDeadline(deadline)
+	for off := 0; off < len(filler); off += 4 << 10 {
+		if _, err := tc.Write(filler[off:min(off+4<<10, len(filler))]); err != nil {
+			return false, nil
+		}
+	}
+	for time.Now().Before(deadline) {
+		if n, _ := bytesAcked(tc); n >= uint64(len(filler)) {
+			return true, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false, nil
+}
+
+// probeFiller is probeBytes shaped like the carrier's first bytes, so the filter classifies the probe like a pool
+// connection and the server keeps reading instead of closing early (a close would stop the acks):
+//
+//	tls carriers  one ClientHello carrying name, its handshake length raised so it never completes
+//	ws, h2c       an HTTP/1 request whose header never ends
+//	tcp           a pool hello id that is not a mimic prefix, then frames the server drops at AEAD
+func probeFiller(carrier, name string) []byte {
+	b := make([]byte, probeBytes)
+	_, _ = rand.Read(b)
+	switch carrier {
+	case "tls", "wss", "h2", "grpc":
+		hello := FakeClientHello(name)
+		if hello == nil {
+			hello = FakeClientHello("www.cloudflare.com")
+		}
+		// records of <=16 KB; the first carries the hello, the handshake length claims more than we send
+		out := make([]byte, 0, probeBytes+64)
+		body := hello[5:]
+		body[1], body[2], body[3] = 0x00, 0xfd, 0xe8 // handshake length 65000
+		for rest := append(body, b[:probeBytes-len(body)]...); len(rest) > 0; {
+			n := min(len(rest), 16<<10)
+			out = append(out, 0x16, 0x03, 0x01, byte(n>>8), byte(n))
+			out = append(out, rest[:n]...)
+			rest = rest[n:]
+		}
+		return out
+	case "ws", "h2c":
+		h := "GET / HTTP/1.1\r\nHost: " + name + "\r\nX-Pad: "
+		const pad = "abcdefghijklmnopqrstuvwxyz0123456789"
+		for i := range b {
+			b[i] = pad[int(b[i])%len(pad)]
+		}
+		return append([]byte(h), b[len(h):]...)
+	default: // tcp
+		b[0] = 0
+		for off := 8; off+2 < len(b); off += 1002 {
+			n := min(1000, len(b)-off-2)
+			b[off], b[off+1] = byte(n>>8), byte(n)
+		}
+		return b
+	}
+}
+
+// ProbeName is the name the probe's filler carries for a carrier: the TLS SNI, or the HTTP Host.
+func ProbeName(carrier, sni, host, peer string) string {
+	if carrier == "ws" || carrier == "h2c" {
+		if host != "" {
+			return host
+		}
+	}
+	if sni != "" {
+		return sni
+	}
+	h, _, _ := strings.Cut(peer, ":")
+	return h
+}
+
+// note is the package-level log line of the fake-SNI layer (raw-send failures); it keeps the injector free of a
+// logf thread. It is silent until SetNote wires it, which cmd/wattun does at startup.
 var note = func(format string, args ...any) {}
 
 // SetNote routes the fake-SNI layer's one-time warnings to logf. Call it once, before NewDesync.
@@ -97,124 +217,3 @@ func SetNote(logf func(format string, args ...any)) {
 // RawSendFails is how many fake-SNI fires could not be injected (raw socket open/bind/send failure).
 // A rising counter with healthy tunnels means the real SNI is going out unprotected: switch carrier.
 func RawSendFails() uint64 { return rawSendFails.Load() }
-
-type filterProbe struct {
-	cfg  DesyncConfig
-	peer string
-	d    *Desync
-	logf func(string, ...any)
-
-	seqOK, sumOK, alive bool
-}
-
-func (p *filterProbe) run() string {
-	var nc net.Conn
-	var err error
-	nc, err = net.DialTimeout("tcp4", p.peer, probeTimeout)
-	if err != nil {
-		return "seq" // peer unreachable: every mode is moot, the tunnel would fail regardless
-	}
-	defer nc.Close()
-	tc := nc.(*net.TCPConn)
-	_ = tc.SetDeadline(time.Now().Add(probeTimeout))
-
-	// step 1: the handshake plus the seq marker fire through the sniffer (Wrap waits for the fire)
-	if _, err := p.d.Wrap(tc); err != nil {
-		return "seq"
-	}
-	p.seqOK = p.connAlive(tc)
-
-	// step 2: if tc was killed by the seq marker, open a fresh connection to test sum independently!
-	targetConn := tc
-	if !p.seqOK {
-		_ = tc.Close()
-		nc2, err := net.DialTimeout("tcp4", p.peer, probeTimeout)
-		if err != nil {
-			return "seq"
-		}
-		defer nc2.Close()
-		targetConn = nc2.(*net.TCPConn)
-		_ = targetConn.SetDeadline(time.Now().Add(probeTimeout))
-	}
-
-	p.sumOK = p.sumProbe(targetConn)
-
-	// step 3: is the flow still alive after both? (kept for the log below; the verdict keys on which
-	// marker killed its flow, because sumOK already implies its socket was alive after the sum probe)
-	p.alive = p.connAlive(targetConn)
-	switch {
-	case !p.seqOK && p.sumOK:
-		return "sum" // the seq marker killed its flow, the sum marker survived: the filter acts on below-window junk
-	case !p.seqOK && !p.sumOK:
-		return "seqsum" // both single markers correlate with a death: try the dual marker
-	default:
-		return "seq" // sum killed while seq survived (checksum validation), or nothing acted: keep seq
-	}
-}
-
-// connAlive: after the probe writes, can we still push data and read anything back within the deadline?
-// A censor reset lands within a packet RTT or two; a surviving flow accepts writes without error.
-func (p *filterProbe) connAlive(c *net.TCPConn) bool {
-	_ = c.SetDeadline(time.Now().Add(probeTimeout))
-	if _, err := c.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x01, 0x00}); err != nil { // a tiny TLS-ish record
-		return false // write error: the flow was reset (or the peer closed) after the marker
-	}
-	buf := make([]byte, 64)
-	_, _ = c.Read(buf) // any answer (even RST->EOF) within the deadline: the kernel accepted more writes
-	// a second write AFTER a possible RST is the real test: a reset flow now fails
-	if _, err := c.Write([]byte{0x00}); err != nil {
-		return false
-	}
-	return true
-}
-
-// sumProbe fires one bad-checksum in-window marker via the tracker's own packet builder, then watches the
-// flow: seq/ack mirror the small real write that follows, like sum mode does with the first data segment.
-func (p *filterProbe) sumProbe(c *net.TCPConn) bool {
-	la, ok1 := c.LocalAddr().(*net.TCPAddr)
-	ra, ok2 := c.RemoteAddr().(*net.TCPAddr)
-	if !ok1 || !ok2 {
-		return true
-	}
-	s, sok := ipAddrOf(la.IP)
-	d, dok := ipAddrOf(ra.IP)
-	if !sok || !dok {
-		return true
-	}
-	snis := splitSNIs(p.cfg.SNI)
-	if len(snis) == 0 {
-		return true
-	}
-	hello := FakeClientHello(snis[0])
-	if hello == nil {
-		return true
-	}
-	// read the socket's SND.NXT for the mirror base, exactly like Wrap's early path (needs CAP_NET_ADMIN;
-	// without it the sum marker cannot be placed, and the verdict degrades to seq)
-	isn, ok := isnOf(c)
-	if !ok {
-		return true // unknown: cannot place the marker, treat sum as tolerated rather than guess
-	}
-	k := desyncKey{s, d, uint16(la.Port), uint16(ra.Port)}
-	ttl := 64
-	if pt := p.d.PeerTTL(); pt > 0 { // the learned inbound TTL: the marker must mirror the production fire
-		ttl = pt
-	}
-	pkt := fakePacket(k, isn, 0, ttl, hello)
-	damageChecksum(pkt)
-	sendRawProbe(pkt)
-	// the flow surviving the marker is the signal; the marker's ack=0 is wrong on purpose — the filter's
-	// reassembler does not check it, and the server kernel never accepts the packet (bad checksum).
-	if !p.connAlive(c) {
-		return false
-	}
-	return true
-}
-
-// sendRawProbe sends one crafted IPv4 or IPv6 packet through the same throwaway IPPROTO_RAW socket the injector
-// uses (HDRINCL). Separate function so probe.go compiles on every OS with a stub elsewhere.
-func sendRawProbe(pkt []byte) { sendRawPacket(pkt) }
-
-// isnOf: the probe's one Linux socket dependency beyond NewDesync. On other OSes the probe never gets
-// this far (NewDesync fails with the platform error), so the stub only exists for compilation.
-func isnOf(c *net.TCPConn) (uint32, bool) { nxt, _, ok := tcpStreamBase(c); return nxt, ok }

@@ -194,3 +194,25 @@ func TestBufferOwnership(t *testing.T) {
 		t.Fatal("a carrier without Copier must keep fresh buffers and single sends")
 	}
 }
+
+// TestStreamBulkyDecays: a stream turns bulk after prioBytes and interactive again once it has been quiet (3.0.0).
+func TestStreamBulkyDecays(t *testing.T) {
+	t0 := time.Now()
+	st := &Stream{}
+	st.cool(t0)
+	st.heat += prioBytes - 1
+	if st.bulky(t0) {
+		t.Fatal("bulk below prioBytes")
+	}
+	st.heat += 2
+	if !st.bulky(t0) {
+		t.Fatal("not bulk after prioBytes")
+	}
+	st.heat = 4 * prioBytes
+	if !st.bulky(t0.Add(prioHalfLife)) { // 2x prioBytes left
+		t.Fatal("cooled too fast")
+	}
+	if st.bulky(t0.Add(3 * prioHalfLife)) { // 0.5x prioBytes left
+		t.Fatal("still bulk after going quiet")
+	}
+}

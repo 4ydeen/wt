@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"os"
 	"slices"
@@ -100,6 +101,7 @@ func putPkt(b []byte) {
 type poolConn struct {
 	c      net.Conn
 	q      chan []byte
+	qb     atomic.Int64 // bytes in q (3.0.0: the backlog and the least-queued choice count bytes)
 	done   chan struct{}
 	once   sync.Once
 	wbusy  atomic.Int64  // unix ns when the writer entered a socket write that has not returned yet, 0 when idle
@@ -141,8 +143,16 @@ func PoolTCPCCInUse() string {
 const (
 	poolStall     = 300 * time.Millisecond
 	poolStallKill = 5 * time.Second
-	poolLowat     = 128 << 10
 )
+
+// poolLowat caps the unsent data the kernel queues per pool socket (TCP_NOTSENT_LOWAT). WAT_POOL_LOWAT (bytes, 3.0.0)
+// overrides the 128 KB default for an A/B: less is less queueing delay under load, if BBR still keeps the pipe full.
+var poolLowat = func() int {
+	if n, err := strconv.Atoi(os.Getenv("WAT_POOL_LOWAT")); err == nil && n >= 16<<10 {
+		return n
+	}
+	return 128 << 10
+}()
 
 func newPoolConn(c net.Conn) *poolConn {
 	if tc := rawTCP(c); tc != nil {
@@ -339,11 +349,13 @@ func (pc *poolConn) enqueue(p []byte) bool {
 		putPkt(p)
 		return false
 	case pc.q <- p:
+		pc.qb.Add(int64(len(p)))
 		select {
 		case <-pc.done:
 			for {
 				select {
 				case dropped := <-pc.q:
+					pc.qb.Add(-int64(len(dropped)))
 					putPkt(dropped)
 				default:
 					return false
@@ -377,6 +389,7 @@ func (pc *poolConn) writeLoop() {
 		for {
 			select {
 			case p := <-pc.q:
+				pc.qb.Add(-int64(len(p)))
 				putPkt(p)
 			default:
 				return
@@ -389,6 +402,7 @@ func (pc *poolConn) writeLoop() {
 			return
 		case p := <-pc.q:
 			for { // batch: flush only when the queue runs dry
+				pc.qb.Add(-int64(len(p)))
 				binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
 				if pc.txm != nil {
 					pc.txm.XORKeyStream(hdr[:], hdr[:])
@@ -491,7 +505,7 @@ func pinnedConn(conns []*poolConn, lane int) *poolConn {
 		return nil
 	}
 	pc := conns[(lane-PinLaneBase)%len(conns)]
-	if pc == nil || len(pc.q) >= poolBacklog || pc.stalledFor(time.Now().UnixNano()) > poolStall {
+	if pc == nil || pc.full() || pc.stalledFor(time.Now().UnixNano()) > poolStall {
 		return nil
 	}
 	select {
@@ -516,15 +530,47 @@ var poolBacklog = func() int {
 	return 16
 }()
 
+// poolBacklogBytes (3.0.0) bounds the same queue in bytes. Since direct and reverse pools carry 16 KB payloads, the
+// 16 packets above meant 256 KB per connection, 4x the 64 KB they were sized as; at ~3 MB/s per connection that is
+// ~85 ms of our own queue in front of every packet, interactive ones included. 64 KB keeps the old depth at the
+// 4 KB MTU and caps the big-payload queue at the intended size. WAT_POOL_BACKLOG_BYTES overrides it; setting only
+// WAT_POOL_BACKLOG keeps the pre-3.0.0 packet-only rule (for an A/B).
+var poolBacklogBytes = func() int64 {
+	if n, err := strconv.ParseInt(os.Getenv("WAT_POOL_BACKLOG_BYTES"), 10, 64); err == nil && n > 0 {
+		return n
+	}
+	if os.Getenv("WAT_POOL_BACKLOG") != "" {
+		return 1 << 62
+	}
+	return 64 << 10
+}()
+
+// full: the connection's queue holds poolBacklog packets or poolBacklogBytes bytes.
+func (pc *poolConn) full() bool { return len(pc.q) >= poolBacklog || pc.qb.Load() >= poolBacklogBytes }
+
+// Express lane (3.0.0). With 3 or more connections, bulk packets (pinned to a stream's connection) stay off the
+// pool's first connection, so interactive packets, datagrams and ack-only packets, which take the least-queued
+// connection, always find one with a short queue: under a bulk transfer every connection used to hold a full
+// queue, and a ping or a game packet waited behind it. WAT_NO_EXPRESS=1 turns it off (A/B).
+var poolExpress = os.Getenv("WAT_NO_EXPRESS") == ""
+
+// expressSkip is how many leading connections bulk must avoid: 1 with the express lane on and 3+ connections.
+func expressSkip(n int) int {
+	if poolExpress && n >= 3 {
+		return 1
+	}
+	return 0
+}
+
 // backlogged reports whether even the least-queued usable conn already holds poolBacklog packets. Over a lossy path
 // the pool's TCP connections stall in their own retransmits, their sockets stop taking data, and the queues fill;
 // before 2.4.18 the session kept sending, Send dropped the overflow, and each drop came back as a "loss" ~400 ms later
 // (field 2026-10-16, Kharej -> Iran: 61k such losses in 4x200 MB, ~20 MB/s where bare TCP did 78). Holding new data
-// while the queues are full turns those drops into backpressure. No conn at all is not a backlog: the session keeps
-// its old behaviour while the pool (re)connects.
+// while the queues are full turns those drops into backpressure. Since 3.0.0 no conn at all holds as well (see
+// TCPPoolClient.Backlogged): the reverse listener and a server whose client is reconnecting no longer drop datagrams.
 func backlogged(conns []*poolConn) bool {
 	now := time.Now().UnixNano()
-	best, anyQ, n := 1<<30, 1<<30, 0
+	n, unstalled, free, freeAny := 0, 0, false, false
 	for _, pc := range conns {
 		if pc == nil {
 			continue
@@ -535,27 +581,43 @@ func backlogged(conns []*poolConn) bool {
 		default:
 		}
 		n++
-		l := len(pc.q)
-		anyQ = min(anyQ, l)
+		room := !pc.full()
+		freeAny = freeAny || room
 		if pc.stalledFor(now) > poolStall {
 			continue
 		}
-		best = min(best, l)
+		unstalled++
+		free = free || room
 	}
 	if n == 0 {
-		return false
+		return true
 	}
-	if best == 1<<30 { // every conn is stalled: judge by the shortest queue, as leastQueued does
-		best = anyQ
+	if unstalled == 0 { // every conn is stalled: judge by the shortest queue, as leastQueued does
+		return !freeAny
 	}
-	return best >= poolBacklog
+	return !free
+}
+
+// pickConn chooses the connection for one packet on the server side: a pinned (bulk) lane takes its stream's
+// connection, or the least-queued one, both outside the express lane; everything else the least-queued of all.
+func pickConn(conns []*poolConn, lane, start int) *poolConn {
+	if lane >= PinLaneBase && len(conns) > 0 { // a stable order, so a stream keeps its connection
+		bulk := conns[expressSkip(len(conns)):] // bulk keeps off the express lane (3.0.0)
+		if pc := pinnedConn(bulk, lane); pc != nil {
+			return pc
+		}
+		if pc := leastQueued(bulk, start); pc != nil {
+			return pc
+		}
+	}
+	return leastQueued(conns, start)
 }
 
 // leastQueued picks the live conn with the shortest queue; start rotates so ties spread.
 func leastQueued(conns []*poolConn, start int) *poolConn {
 	now := time.Now().UnixNano()
 	var best, any *poolConn
-	bl, al := 1<<30, 1<<30
+	bl, al := int64(1<<62), int64(1<<62)
 	var stuck []*poolConn
 	for i := range conns {
 		pc := conns[(start+i)%len(conns)]
@@ -567,7 +629,7 @@ func leastQueued(conns []*poolConn, start int) *poolConn {
 			continue
 		default:
 		}
-		l := len(pc.q)
+		l := pc.qb.Load() // bytes, not packets: an ack and a 16 KB payload do not weigh the same (3.0.0)
 		if l < al {
 			any, al = pc, l
 		}
@@ -918,6 +980,11 @@ func (c *TCPPoolClient) push(p []byte) bool {
 func (c *TCPPoolClient) slotLoop(i int) {
 	defer c.wg.Done()
 	backoff := 100 * time.Millisecond
+	// 3.0.0: the first dial of every slot but slot 0 waits 50-250 ms, so a pool does not open N connections in the
+	// same millisecond (a burst of identical handshakes is easy to fingerprint); slot 0 keeps startup fast.
+	if i > 0 && !c.sleep(time.Duration(50+mrand.IntN(201))*time.Millisecond) {
+		return
+	}
 	for {
 		select {
 		case <-c.done:
@@ -996,9 +1063,13 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 	// selection is written out against c.slots directly.
 	now := time.Now().UnixNano()
 	var pc *poolConn
-	if path >= PinLaneBase && len(c.slots) > 0 { // pinned first, exactly like pinnedConn
-		if cand := c.slots[(path-PinLaneBase)%len(c.slots)].Load(); cand != nil &&
-			len(cand.q) < poolBacklog && cand.stalledFor(now) <= poolStall {
+	skip := 0
+	if path >= PinLaneBase {
+		skip = expressSkip(len(c.slots)) // bulk keeps off the express lane
+	}
+	if path >= PinLaneBase && len(c.slots) > skip { // pinned first, exactly like pinnedConn
+		if cand := c.slots[skip+(path-PinLaneBase)%(len(c.slots)-skip)].Load(); cand != nil &&
+			!cand.full() && cand.stalledFor(now) <= poolStall {
 			select {
 			case <-cand.done:
 			default:
@@ -1009,9 +1080,13 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 	if pc == nil { // leastQueued: rotate start, prefer unstalled, then shortest queue
 		start := int(c.rr.Add(1))
 		var best, any *poolConn
-		bl, al := 1<<30, 1<<30
+		bl, al := int64(1<<62), int64(1<<62)
 		for i := range c.slots {
-			cand := c.slots[(start+i)%len(c.slots)].Load()
+			k := (start + i) % len(c.slots)
+			if k < skip && len(c.slots) > skip {
+				continue
+			}
+			cand := c.slots[k].Load()
 			if cand == nil {
 				continue
 			}
@@ -1020,7 +1095,7 @@ func (c *TCPPoolClient) Send(p []byte, path int) error {
 				continue
 			default:
 			}
-			l := len(cand.q)
+			l := cand.qb.Load()
 			if cand.stalledFor(now) <= poolStall && l < bl {
 				best, bl = cand, l
 			}
@@ -1099,7 +1174,7 @@ func (c *TCPPoolClient) SetKeepSlow(v bool) { c.keepSlow.Store(v) }
 func (c *TCPPoolClient) rotatePick(now time.Time) *poolConn {
 	usable := 0
 	for i := range c.slots {
-		if pc := c.slots[i].Load(); pc != nil && len(pc.q) < poolBacklog && pc.stalledFor(now.UnixNano()) <= poolStall {
+		if pc := c.slots[i].Load(); pc != nil && !pc.full() && pc.stalledFor(now.UnixNano()) <= poolStall {
 			select {
 			case <-pc.done:
 			default:
@@ -1141,9 +1216,13 @@ func (c *TCPPoolClient) SetRotate(d time.Duration, bytes int64) {
 }
 
 // Backlogged reports whether the pool's send queues are full (Backlogger).
+// Since 3.0.0 a client pool with no live connection counts as backlogged too: Send would drop the packet, and a
+// datagram (UDP forwarding) is never repaired, so every datagram sent while the pool (re)connected was lost (the first
+// datagram of each new session on loopback; HTTP carriers in the field, whose connections churn). Holding is safe:
+// acks and pings still go out (and are dropped), stream data waits in the session where no loss timer runs.
 func (c *TCPPoolClient) Backlogged() bool {
 	now := time.Now().UnixNano()
-	best, anyQ, n := 1<<30, 1<<30, 0
+	n, unstalled, free, freeAny := 0, 0, false, false
 	for i := range c.slots { // inline backlogged(): no per-tick allocation on the 1 kHz pump path (audit 2026-10-22)
 		pc := c.slots[i].Load()
 		if pc == nil {
@@ -1155,20 +1234,21 @@ func (c *TCPPoolClient) Backlogged() bool {
 		default:
 		}
 		n++
-		l := len(pc.q)
-		anyQ = min(anyQ, l)
+		room := !pc.full()
+		freeAny = freeAny || room
 		if pc.stalledFor(now) > poolStall {
 			continue
 		}
-		best = min(best, l)
+		unstalled++
+		free = free || room
 	}
 	if n == 0 {
-		return false
+		return true
 	}
-	if best == 1<<30 {
-		best = anyQ
+	if unstalled == 0 {
+		return !freeAny
 	}
-	return best >= poolBacklog
+	return !free
 }
 
 // Clone returns a new pool client to the same peer(s) with the same dial function, and with it the same TLS engine
@@ -1458,13 +1538,7 @@ func (s *TCPPoolServer) SendTo(p []byte, lane int, dst net.Addr) error {
 	s.mu.RLock()
 	conns := s.ordered[a.key] // born-ordered copy kept by add/remove: read-locked without writer contention
 	s.mu.RUnlock()
-	var pc *poolConn
-	if lane >= PinLaneBase && len(conns) > 0 { // a stable order, so a stream keeps its connection
-		pc = pinnedConn(conns, lane)
-	}
-	if pc == nil {
-		pc = leastQueued(conns, int(s.rr.Add(1)))
-	}
+	pc := pickConn(conns, lane, int(s.rr.Add(1)))
 	if pc != nil {
 		pc.enqueue(append(getPkt(len(p))[:0], p...))
 	}

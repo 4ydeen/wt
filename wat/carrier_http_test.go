@@ -62,6 +62,16 @@ func newHTTPRig(t *testing.T, flavor string) *httpRig {
 			case <-stop:
 				return
 			}
+			go func(s *Session) { // datagram echo (TestHTTPCarriersDatagrams)
+				for {
+					select {
+					case d := <-s.Datagrams():
+						s.SendDatagram(d.Flow, d.Port, d.Data)
+					case <-s.Done():
+						return
+					}
+				}
+			}(s)
 			go func(s *Session) {
 				for {
 					st, err := s.Accept()
@@ -234,5 +244,42 @@ func TestHTTPClientHostFallback(t *testing.T) {
 	o3 := HTTPClientOptions{}
 	if got := o3.host("1.2.3.4:443"); got != "1.2.3.4:443" {
 		t.Fatalf("want 1.2.3.4:443, got %s", got)
+	}
+}
+
+// TestHTTPCarriersDatagrams: 30 datagrams of 800 B, echoed by the server, with no bulk traffic. The field (2.11.0)
+// saw 13/30 on h2, 16/30 on grpc and 28/30 on h2c; on loopback every one must come back.
+func TestHTTPCarriersDatagrams(t *testing.T) {
+	for _, f := range []string{"ws", "wss", "h2", "h2c", "grpc"} {
+		t.Run(f, func(t *testing.T) {
+			r := newHTTPRig(t, f)
+			cli, err := NewSession(Config{Key: r.key}, r.pio(t)) // the pool itself, as in production (the tap hides Backlogger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(cli.Close)
+			seen, n := collect(cli)
+			for i := 0; i < 30; i++ {
+				if !cli.SendDatagram(1, 9000, dg(uint64(i), 800)) {
+					t.Fatalf("datagram %d refused", i)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for n.Load() < 30 && time.Now().Before(deadline) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if got := n.Load(); got != 30 || dupes(seen) != 0 {
+				var miss []int
+				for i := 0; i < 30; i++ {
+					if _, ok := seen.Load(uint64(i)); !ok {
+						miss = append(miss, i)
+					}
+				}
+				st := cli.Stats()
+				t.Logf("missing %v", miss)
+				t.Fatalf("%s: %d/30 echoed (dupes %d); client dropped=%d dgram_dropq=%d", f, got, dupes(seen), st.Dropped, st.DgramDropQueue)
+			}
+		})
 	}
 }

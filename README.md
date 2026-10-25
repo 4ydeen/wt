@@ -48,7 +48,7 @@ One vCPU per server, 82 ms round trip, one run each, so read these as orders of 
 that **plain tools cannot bring up at all** on this route. Old and new releases work together. Conditions, failures
 and the full list of 92 configurations: [docs/TECHNICAL.md](docs/TECHNICAL.md#field-numbers).
 
-## What changed since 2.6.0
+## What changed since 2.5.0
 
 Everything below is shipped, tested and reachable from the menu (`wattun` → tunnel page → `z` for the anti-censor
 presets).
@@ -65,12 +65,14 @@ presets).
 - **TLS-shaped raw `tcp` (`tcp-mimic`).** The first bytes of a `tcp` tunnel are a Chrome-like 517-byte ClientHello
   carrying the authentication, with masked frame lengths, not a plain pool id.
 - **Pick the source address** of the tunnel from the manager (`src-ip`), for servers with several IPs.
+- **Lower ping under a download.** Pool queues are capped in bytes and interactive packets get a connection of their
+  own, so a ping or a game packet no longer waits behind a bulk transfer.
 
 **Gets past permit-lists and flow cutters (2.6.0 - 2.10.12)**
 
 - **Fake-SNI desync (`fake-sni`).** When a filter lets a flow live only if its TLS name is on a list, the tunnel sends
   a decoy hello that the filter reads and the server ignores. Modes: `seq`, `ttl` (calibrated automatically), `sum`,
-  `seqsum`, `rst`, `synrst`, `split`, `hlen0`, `fakeip`, `all`, and `auto`, which probes the filter and picks one.
+  `seqsum`, `rst`, `synrst`, `split`, `hlen0`, `fakeip`, `all`, and `auto`, which tests which mode keeps a real flow alive on your route and picks it (3.0.0).
   Works on `tcp`, `tls`, `ws`, `wss`, `h2`, `grpc`, over IPv4 and IPv6, also from a reverse server. Field result: a
   `wss` tunnel through Cloudflare connected under a Cloudflare-only whitelist with `rst`, while every other mode did not.
 - **Churn (`pool-rotate`).** Connections are recycled at random times or byte budgets, so none shows a stable lifetime.
@@ -87,7 +89,7 @@ presets).
 - **Signed installer**: every download is checked against an RSA-signed checksum list, so a mirror cannot swap the binary.
 - **Reliability**: no stall after a short one-way blackout, no hang after a Kharej restart, honest `alive` in `/stats`,
   a header mask that no longer stays off when the client starts before its server, fixed data races and buffer reuse.
-- **Manager**: anti-censor toggle with presets (Cloudflare first), reverse switch, resilience profiles, DNS-shaped
+- **Manager**: anti-censor toggle with presets (Cloudflare first, `rst-fast`), reverse switch, resilience profiles, DNS-shaped
   option in the Kharej wizard, auto-heal, update with rollback.
 
 [Full release history](docs/TECHNICAL.md#release-history).

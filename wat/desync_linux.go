@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,12 +24,56 @@ import (
 // not carry one), so the fake normally fires on the handshake's final ACK — before any real data — even when the
 // sniffer missed the SYN/SYN-ACK. When the probe fails (needs CAP_NET_ADMIN), Wrap announces the key with
 // isnKnown=false and the tracker fires anchored to the first outbound data segment instead (the late path of
-// desync.go). A 2 s timeout releases a Wrap whose handshake was never observed: the tunnel still works, it is
-// just unclassified.
+// desync.go). A 500 ms timeout releases a Wrap whose handshake was never observed: the tunnel still works, it is
+// just unclassified (or, with WAT_DESYNC_FAIL_CLOSED=1, the dial fails and the pool redials).
 
 // desyncWrapTimeout bounds how long Wrap waits for the fake before giving up on classification. The fake normally
 // fires inside announce (the sniffer remembered the handshake), so this only covers a handshake it never saw.
 const desyncWrapTimeout = 500 * time.Millisecond
+
+// desyncFailClosed (WAT_DESYNC_FAIL_CLOSED=1, 3.0.0): a connection whose marker was never seen to land (fake not
+// fired, or no duplicate ACK after the retransmit) fails its dial, so the pool redials instead of running a flow the
+// filter may cut. Off by default: direct rst needs no duplicate ACK, and an unclassified flow still works on most
+// routes.
+var desyncFailClosed = os.Getenv("WAT_DESYNC_FAIL_CLOSED") == "1"
+
+var errDesyncUnconfirmed = errors.New("wat: fake-sni marker not confirmed (WAT_DESYNC_FAIL_CLOSED)")
+
+// ackWaitFor is how long Wrap waits for the duplicate ACK of the marker: two handshake RTTs (one for the marker, one
+// spare for its retransmit), at least 300 ms, at most 2 s. Before 3.0.0 it was a fixed 200 ms, less than one RTT on
+// a 250 ms path, so the real hello often left before the filter had seen the fake.
+func ackWaitFor(rtt time.Duration) time.Duration {
+	return min(max(2*rtt, 300*time.Millisecond), 2*time.Second)
+}
+
+// handshakeRTT reads the kernel's smoothed RTT for the socket (TCP_INFO); right after connect it is the handshake RTT.
+func handshakeRTT(tc *net.TCPConn) time.Duration {
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var rtt time.Duration
+	_ = raw.Control(func(fd uintptr) {
+		if ti, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO); err == nil {
+			rtt = time.Duration(ti.Rtt) * time.Microsecond
+		}
+	})
+	return rtt
+}
+
+// bytesAcked is the socket's acknowledged byte count (TCP_INFO bytes_acked, Linux 4.6+); the filter probe's signal.
+func bytesAcked(tc *net.TCPConn) (n uint64, ok bool) {
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	_ = raw.Control(func(fd uintptr) {
+		if ti, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO); err == nil {
+			n, ok = ti.Bytes_acked, true
+		}
+	})
+	return n, ok
+}
 
 // tcpStreamBase returns the socket's send-queue sequence number (SND.NXT) and receive-queue sequence number
 // (RCV.NXT) as the stream-start anchor for the tracker. TCP_REPAIR freezes the socket's queues without touching its
@@ -149,6 +194,9 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 	case <-ch: // fake fired on announce or on the handshake's final ACK
 	case <-time.After(desyncWrapTimeout): // never observed: connect anyway, the tunnel still works
 		d.inj.tr.abandon(k)
+		if desyncFailClosed {
+			return nil, errDesyncUnconfirmed
+		}
 		return c, nil
 	}
 	// patterniha duplicate ACK synchronization:
@@ -157,10 +205,25 @@ func (d *Desync) Wrap(c net.Conn) (net.Conn, error) { // the tls/wss/h2 carriers
 	// 1) The fake packet traversed the middlebox DPI and reached Cloudflare.
 	// 2) The DPI parsed the fake SNI and whitelisted this TCP 5-tuple.
 	// 3) At least one RTT separates the fake packet and the real ClientHello.
+	// 3.0.0: the wait follows the path RTT, and the marker is sent once more after one RTT without the ACK (a lost
+	// marker otherwise left the flow unclassified).
 	if ackCh != nil && d.inj.tr.needsAck() {
+		rtt := handshakeRTT(tc)
+		total := ackWaitFor(rtt)
+		first := min(max(rtt+rtt/4, 50*time.Millisecond), total/2)
 		select {
 		case <-ackCh: // duplicate ACK received from server!
-		case <-time.After(200 * time.Millisecond): // safety fallback
+			return c, nil
+		case <-time.After(first):
+		}
+		d.inj.tr.resend(k)
+		select {
+		case <-ackCh:
+		case <-time.After(total - first): // safety fallback
+			d.inj.tr.abandon(k)
+			if desyncFailClosed {
+				return nil, errDesyncUnconfirmed
+			}
 		}
 	}
 	return c, nil
