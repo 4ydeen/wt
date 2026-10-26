@@ -41,7 +41,7 @@ func TestProbeFillerServersKeepReading(t *testing.T) {
 			}
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(probeWait + 500*time.Millisecond))
-			if _, err := c.Write(probeFiller(carrier, "example.com")); err != nil {
+			if _, err := c.Write(probeFiller(carrier, "example.com", "")); err != nil {
 				t.Fatalf("write: %v", err)
 			}
 			buf := make([]byte, 4096)

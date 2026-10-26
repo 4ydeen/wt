@@ -69,11 +69,11 @@ var errNoTCPInfo = errors.New("wat: TCP_INFO unavailable")
 // probeCandidates in the order tried; tests may shorten it.
 var probeCandidates = []string{"none", "rst", "synrst", "paws", "seq"}
 
-// ProbeFakeMode tries the candidate modes against peer and returns the one to run: "none" means run without
+// ProbeFakeMode tries the candidate modes against peer (path: the tunnel's URL path, for the ws and h2c filler) and returns the one to run: "none" means run without
 // fake-SNI. carrier and name (the TLS SNI or the HTTP Host) shape the filler like the real carrier's first bytes,
 // so the filter judges what it would see. Called by cmd/wattun when -fake-mode auto. Any failure to run the probe
 // (no raw socket, no TCP_INFO, a non-IP peer) degrades to rst without stopping the tunnel.
-func ProbeFakeMode(cfg DesyncConfig, peer, carrier, name string, logf func(string, ...any)) string {
+func ProbeFakeMode(cfg DesyncConfig, peer, carrier, name, path string, logf func(string, ...any)) string {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -93,7 +93,7 @@ func ProbeFakeMode(cfg DesyncConfig, peer, carrier, name string, logf func(strin
 			}
 			time.Sleep(probeGap)
 		}
-		ok, err := probeOnce(cfg, m, addr, peer, probeFiller(carrier, name))
+		ok, err := probeOnce(cfg, m, addr, peer, probeFiller(carrier, name, path))
 		if err != nil {
 			logf("fake-mode auto: probe unavailable (%v), running rst", err)
 			return "rst"
@@ -160,9 +160,9 @@ func probeOnce(cfg DesyncConfig, mode, addr, peer string, filler []byte) (bool, 
 // connection and the server keeps reading instead of closing early (a close would stop the acks):
 //
 //	tls carriers  one ClientHello carrying name, its handshake length raised so it never completes
-//	ws, h2c       an HTTP/1 request whose header never ends
+//	ws, h2c       an HTTP/1 request for the tunnel path (path, "/" when empty) whose header never ends
 //	tcp           a pool hello id that is not a mimic prefix, then frames the server drops at AEAD
-func probeFiller(carrier, name string) []byte {
+func probeFiller(carrier, name, path string) []byte {
 	b := make([]byte, probeBytes)
 	_, _ = rand.Read(b)
 	switch carrier {
@@ -183,7 +183,12 @@ func probeFiller(carrier, name string) []byte {
 		}
 		return out
 	case "ws", "h2c":
-		h := "GET / HTTP/1.1\r\nHost: " + name + "\r\nX-Pad: "
+		if path == "" {
+			path = "/"
+		} else if path[0] != '/' {
+			path = "/" + path
+		}
+		h := "GET " + path + " HTTP/1.1\r\nHost: " + name + "\r\nX-Pad: "
 		const pad = "abcdefghijklmnopqrstuvwxyz0123456789"
 		for i := range b {
 			b[i] = pad[int(b[i])%len(pad)]

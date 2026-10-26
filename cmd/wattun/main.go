@@ -298,7 +298,7 @@ func main() {
 		mode := *fakeMode
 		if mode == "auto" { // measure the route once at startup, pick the mode from the verdict (3.0.0: by acked bytes)
 			mode = wat.ProbeFakeMode(wat.DesyncConfig{SNI: *fakeSNI, TTL: *fakeTTL}, peer, carrier,
-				wat.ProbeName(carrier, *sni, *host, peer), log.Printf)
+				wat.ProbeName(carrier, *sni, *host, peer), *path, log.Printf)
 			if mode == "none" {
 				desyncNone[peer] = true
 				return nil, nil

@@ -48,12 +48,12 @@ func TestProbeOnceAckSignal(t *testing.T) {
 		}
 	}()
 	for _, carrier := range []string{"tcp", "tls", "ws"} {
-		f := probeFiller(carrier, "example.com")
+		f := probeFiller(carrier, "example.com", "")
 		if ok, err := probeOnce(DesyncConfig{}, "none", reading.Addr().String(), "", f); err != nil || !ok {
 			t.Fatalf("%s: reading peer: ok=%v err=%v, want alive", carrier, ok, err)
 		}
 	}
-	if ok, err := probeOnce(DesyncConfig{}, "none", stalled.Addr().String(), "", probeFiller("tcp", "")); err != nil || ok {
+	if ok, err := probeOnce(DesyncConfig{}, "none", stalled.Addr().String(), "", probeFiller("tcp", "", "")); err != nil || ok {
 		t.Fatalf("stalled peer: ok=%v err=%v, want cut", ok, err)
 	}
 }
