@@ -624,7 +624,11 @@ func main() {
 		}
 		return tun.stats()
 	}
-	alive := func() bool { return srv != nil && srv.Sessions() > 0 || tun != nil && tun.alive() }
+	// A server counts as alive only while a client was heard in the last 10 s, like a client does: a session that is
+	// still in the table but silent (every pool conn blackholed) is not alive (3.0.1).
+	alive := func() bool {
+		return srv != nil && srv.Sessions() > 0 && time.Since(srv.LastRecv()) < 10*time.Second || tun != nil && tun.alive()
+	}
 	// rxAge: ms since the last authenticated packet from the peer (server: from any client), -1 if none yet.
 	rxAge := func() int64 {
 		var t time.Time

@@ -757,7 +757,7 @@ had the same sizes. None of that is encrypted content, so none of it needed to l
    verifies the hello before it accepts the connection (a wrong key is closed). The 2-byte lengths are XORed with a
    ChaCha20 stream per direction, keyed from the same root. After the hello the stream is the usual encrypted packets;
    it is not a real TLS session and does not pretend to be one (no ServerHello). It defeats "first bytes are not
-   TLS" and fixed-structure checks, not a classifier that waits for a real handshake; use `tls`/`wss` for that.
+   TLS" and fixed-structure checks, not a classifier that waits for a real handshake; use `tls`/`wss` for that. Since 3.0.1 the hello is built with utls (Chrome 106 shuffle profile): extension order and GREASE vary per connection, so there is no single JA3/JA4 to match; it parses on 3.0.0 peers too, and falls back to the fixed Chrome template when the SNI is too long for 517 bytes.
 5. **Reverse udp.** [Iran starts nothing](#reverse-udp-300).
 
 **Compatibility.** Padding and jitter are invisible to older peers. A masked header is not. A receiver first reads the
@@ -1476,7 +1476,7 @@ metrics port, even if the port is in the allowlist.
 | `version` | The wattun version string (for example `2.0.2`). |
 | `carriers` | Only with bonded carriers (`carrier: a+b`): one entry per carrier with `name`, `alive`, `srtt_ms`, `share` (fraction of traffic), `sent`, `acked`, `lost`. |
 | `ports` | Per-port counters (same data as `/ports`). |
-| `alive` | Server: at least one client session (a session closes 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive); with `sessions` > 1, on any session. |
+| `alive` | Server: at least one client session and an authenticated packet from a client in the last 10 s (3.0.1; before, a session whose connections were all dead still counted until it closed, 45 s after its last packet). Client: an authenticated packet from the server arrived in the last 10 s (each side pings at least every 2 s, so an idle link stays alive); with `sessions` > 1, on any session. |
 | `last_rx_age_ms` | Since 2.0.1. Milliseconds since the last authenticated packet from the peer (server: from any client, including sessions that have closed). `-1` = none since the process started. Monitors should use this rather than ping: it only moves on real tunnel packets. |
 | `clients` | Since 2.1.0, servers only. One entry per live client session: `[{"ip":"203.0.113.5","carrier":"tcp","age_ms":1234}]`. Behind a CDN carrier (`ws`, `wss`, `h2`, `h2c`, `grpc`) `ip` is the proxy's address. Auto mode uses it to learn Iran's IP. |
 | `tls_fp` | Since 2.2.0, pool carriers. The TLS fingerprint in use (`go`, `chrome`, ...). |
@@ -1803,6 +1803,11 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
   products, it skips the minRTT drain, and the pool keeps slow connections (TCP recovering is not a slow path).
   When a pool connection dies, its unacked packets are resent at once instead of after the loss timer.
   `WAT_NO_DIRECT=1` turns direct mode off.
+- **All connections stalled (3.0.1).** A pool whose connections all stop at once (a middlebox cutting every flow, or a
+  path that blackholes) used to wait for the kernel's retransmit limit, about 15 minutes, before redialling. Now
+  every connection stuck longer than 5 s is closed by the health loop even when no healthy one exists, and the
+  pool sockets carry `TCP_USER_TIMEOUT` (30 s, `WAT_POOL_USER_TIMEOUT` in seconds, 0 turns it off), so the slots
+  redial within seconds. Rate control also holds on a path that delivers nothing, instead of ramping to the maximum.
 - **Startup.** A direct session paces at 2.5x its delivery estimate until the estimate stops growing (a fresh
   tunnel's first 200 MB ran at 42-45 MB/s, the next at 53-71).
 - **Pinning.** Each stream rides one pool connection, assigned round-robin, as separate TCP connections would; a

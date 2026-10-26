@@ -4,6 +4,7 @@ package wat
 
 import (
 	"net"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,4 +34,13 @@ func setCongestion(tc *net.TCPConn, name string) string {
 		got, _ = unix.GetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION)
 	})
 	return got
+}
+
+// setUserTimeout closes the connection once sent data stays unacknowledged for d (TCP_USER_TIMEOUT).
+func setUserTimeout(tc *net.TCPConn, d time.Duration) {
+	rc, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	rc.Control(func(fd uintptr) { unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, int(d.Milliseconds())) })
 }

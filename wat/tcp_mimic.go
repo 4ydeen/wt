@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"net"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/chacha20"
 )
 
@@ -63,10 +65,6 @@ func buildMimicHello(psk []byte, sni string, id [8]byte) (hello []byte, tx, rx *
 	if len(sni) > 200 {
 		return nil, nil, nil, errMimic
 	}
-	hello = FakeClientHello(sni)
-	if len(hello) != mimicHelloLen {
-		return nil, nil, nil, errMimic
-	}
 	root := hmacSum(psk, []byte("wattun tcp hello v2"))
 	var a [64]byte
 	if _, err = rand.Read(a[:]); err != nil {
@@ -79,8 +77,14 @@ func buildMimicHello(psk []byte, sni string, id [8]byte) (hello []byte, tx, rx *
 	}
 	copy(a[16:24], enc)
 	copy(a[24:40], hmacSum(root, []byte("tag"), salt, enc)[:16])
-	copy(hello[11:43], a[:32]) // ClientHello.random
-	copy(hello[44:76], a[32:]) // legacy_session_id (its length byte, hello[43], is 32)
+	if hello = mimicBrowserHello(sni, a[:32], a[32:]); hello == nil { // utls refused: the fixed hello of the fake-SNI layer
+		hello = FakeClientHello(sni)
+		if len(hello) != mimicHelloLen {
+			return nil, nil, nil, errMimic
+		}
+		copy(hello[11:43], a[:32]) // ClientHello.random
+		copy(hello[44:76], a[32:]) // legacy_session_id (its length byte, hello[43], is 32)
+	}
 	tx, rx, err = mimicCiphers(root, salt)
 	return hello, tx, rx, err
 }
@@ -113,4 +117,35 @@ func parseMimicHello(psk, hello []byte) (id [8]byte, tx, rx *chacha20.Cipher, ok
 		return id, nil, nil, false
 	}
 	return id, l2d, d2l, true
+}
+
+// mimicBrowserHello builds the hello from a real browser profile (utls Chrome 106, the last Chrome hello of exactly 517
+// bytes, extension order shuffled per connection like Chrome does), with rnd in ClientHello.random and sid in the
+// session id. The fixed hello of FakeClientHello has one JA3 on every tunnel and a cipher list no browser sends. nil
+// means "use that one": utls failed, or the SNI is so long the hello is not 517 bytes any more (3.0.1).
+func mimicBrowserHello(sni string, rnd, sid []byte) []byte {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_106_Shuffle)
+	if err != nil {
+		return nil
+	}
+	c1, c2 := net.Pipe() // nothing is read or written: only the hello is built
+	defer c1.Close()
+	defer c2.Close()
+	uc := utls.UClient(c1, &utls.Config{ServerName: sni}, utls.HelloCustom)
+	if uc.ApplyPreset(&spec) != nil || uc.BuildHandshakeState() != nil || uc.SetClientRandom(rnd) != nil {
+		return nil
+	}
+	uc.HandshakeState.Hello.SessionId = append([]byte(nil), sid...)
+	if uc.MarshalClientHello() != nil {
+		return nil
+	}
+	raw := uc.HandshakeState.Hello.Raw
+	if len(raw)+5 != mimicHelloLen || len(sid) != 32 {
+		return nil
+	}
+	hello := append([]byte{0x16, 0x03, 0x01, 0x02, 0x00}, raw...)
+	if !isMimicPrefix(hello) || hello[43] != 32 {
+		return nil
+	}
+	return hello
 }

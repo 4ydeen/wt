@@ -79,6 +79,7 @@ type cc struct {
 	bwLen     int
 	bwBusy    bool    // the current measurement interval had at least one busy tick
 	maxBW     float64 // windowed-max delivery rate (bytes/s); 0 until the first sample
+	bwSeen    bool    // a delivery rate was ever measured: a later 0 means a dead path, not "no estimate yet"
 	grown     bool    // direct startup over: the estimate stopped growing (BBR's full-pipe check)
 	growBW    float64 // estimate at the last 25 % step
 	growAt    time.Time
@@ -186,6 +187,7 @@ func (c *cc) updateBW(now time.Time, busy bool) {
 	if !busyInterval { // app-limited: let a high sample raise the estimate, never let a low one lower it
 		if bw > c.maxBW {
 			c.maxBW = bw
+			c.bwSeen = true
 		}
 		return
 	}
@@ -199,6 +201,9 @@ func (c *cc) updateBW(now time.Time, busy bool) {
 		if c.bwRing[i] > c.maxBW {
 			c.maxBW = c.bwRing[i]
 		}
+	}
+	if c.maxBW > 0 {
+		c.bwSeen = true
 	}
 }
 
@@ -536,6 +541,9 @@ func (c *cc) tickReliable(now time.Time, cut, busy bool) {
 	c.updateBW(now, busy)
 	c.probeRTT(now)
 	if c.maxBW <= 0 {
+		if c.bwSeen { // the estimate fell to zero over busy windows: nothing is delivered. Hold; ramping to the maximum on a dead path (3.0.1)
+			return
+		}
 		if c.limited && !cut { // no estimate yet: ramp like slow start
 			c.rate = min(c.rate*1.10, c.maxRate)
 			if c.ceiling > 0 && c.rate > c.ceiling { // the ramp honours the same ceilings as the probe above

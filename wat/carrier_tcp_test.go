@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -514,4 +515,146 @@ func TestPoolExpressLane(t *testing.T) {
 	if only.qb.Load() != 100 {
 		t.Fatal("bulk packet took the express slot while a bulk slot was live")
 	}
+}
+
+// Every conn stuck past poolStallKill is closed even though no healthy one exists (3.0.1; before, "the whole path is
+// slow" kept them for the ~15 min the kernel retries), and none is handed out; a conn that is only stalled is kept.
+func TestLeastQueuedClosesAllStuck(t *testing.T) {
+	mk := func(stuckFor time.Duration) *poolConn {
+		a, b := net.Pipe()
+		t.Cleanup(func() { a.Close(); b.Close() })
+		pc := newPoolConn(a)
+		pc.wbusy.Store(time.Now().UnixNano() - int64(stuckFor))
+		return pc
+	}
+	conns := []*poolConn{mk(10 * time.Second), mk(20 * time.Second), mk(6 * time.Second)}
+	if pc := leastQueued(conns, 0); pc != nil {
+		t.Fatal("handed out a stuck conn")
+	}
+	for i, pc := range conns {
+		select {
+		case <-pc.done:
+		case <-time.After(time.Second):
+			t.Fatalf("conn %d, stuck past poolStallKill, was not closed", i)
+		}
+	}
+	slow, stuck := mk(time.Second), mk(10*time.Second)
+	if pc := leastQueued([]*poolConn{slow, stuck}, 0); pc != slow {
+		t.Fatal("a stalled but recoverable conn must still be used")
+	}
+	select {
+	case <-stuck.done:
+	case <-time.After(time.Second):
+		t.Fatal("the stuck conn was not closed")
+	}
+}
+
+// blackholeProxy relays loopback tcp to dst; hole() makes every connection that exists at that moment stop moving data
+// (nothing is read, nothing closed: the sockets stall like a path that drops established flows), while new ones pass.
+type blackholeProxy struct {
+	ln  net.Listener
+	gen atomic.Int64
+}
+
+func newBlackholeProxy(t *testing.T, dst string) *blackholeProxy {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &blackholeProxy{ln: ln}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			g := p.gen.Load()
+			if tc, ok := c.(*net.TCPConn); ok {
+				tc.SetReadBuffer(8 << 10) // a small window: once held, the sender's socket fills and its writer blocks
+			}
+			d, err := net.Dial("tcp", dst)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			t.Cleanup(func() { c.Close(); d.Close() })
+			for _, pair := range [][2]net.Conn{{c, d}, {d, c}} {
+				go func(from, to net.Conn) {
+					buf := make([]byte, 32<<10)
+					for {
+						if p.gen.Load() != g {
+							time.Sleep(50 * time.Millisecond) // held: the proxy stops reading, the senders' buffers fill
+							continue
+						}
+						from.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+						n, err := from.Read(buf)
+						if n > 0 {
+							to.Write(buf[:n])
+						}
+						if err != nil && !os.IsTimeout(err) {
+							return
+						}
+					}
+				}(pair[0], pair[1])
+			}
+		}
+	}()
+	return p
+}
+
+func (p *blackholeProxy) hole() { p.gen.Add(1) }
+
+// All pool conns stall at once while the session keeps sending (prod outage 2026-10-26): the client closes them and
+// redials, and traffic flows again within seconds, not after the kernel's retry timeout.
+func TestTCPPoolRedialsWhenAllConnsStall(t *testing.T) {
+	r := newPoolRig(t, 0, false)
+	px := newBlackholeProxy(t, r.addr)
+	pio, err := NewTCPPoolClient(px.ln.Addr().String(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := NewSession(Config{Key: r.key}, pio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cli.Close)
+	poolBulk(t, r, cli, 1<<20) // the pool works
+	deaths := pio.ConnDeaths()
+	px.hole()
+	stop := make(chan struct{})
+	defer close(stop)
+	for i := 0; i < 8; i++ { // keep the session sending: bulk streams into the hole
+		go func() {
+			st, err := cli.OpenStream()
+			if err != nil {
+				return
+			}
+			b := make([]byte, 64<<10)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := st.Write(append([]byte{'U'}, b...)); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	deadline := time.Now().Add(25 * time.Second)
+	for pio.ConnDeaths() < deaths+4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stalled conns were not closed: %d deaths since the blackhole", pio.ConnDeaths()-deaths)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for pio.Conns() < 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("pool did not redial: %d conns", pio.Conns())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	poolBulk(t, r, cli, 1<<20) // and it carries data again
 }

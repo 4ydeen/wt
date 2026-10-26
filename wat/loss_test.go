@@ -553,3 +553,41 @@ func TestDirectStartup(t *testing.T) {
 		t.Fatalf("flat busy estimate kept startup: grown %v rate %.1f MB/s maxBW %.1f", c.grown, c.rate/1e6, c.maxBW/1e6)
 	}
 }
+
+// TestReliableHoldsOnDeadPath: once a delivery rate was measured, a window of busy ticks that deliver nothing (a dead
+// path) holds the rate; before 3.0.1 the estimate fell back to "none yet" and the slow-start ramp ran to the maximum.
+func TestReliableHoldsOnDeadPath(t *testing.T) {
+	c := newCC(10e6, 0.1e6, 80e6, 8*time.Millisecond)
+	c.reliable = true
+	now := time.Now()
+	c.tickReliable(now, false, true)
+	for i := 0; i < 5; i++ { // 20 MB/s delivered
+		now = now.Add(100 * time.Millisecond)
+		c.onDelivered(2_000_000)
+		c.tickReliable(now, false, true)
+	}
+	if !c.bwSeen || c.maxBW <= 0 {
+		t.Fatalf("no estimate after delivery: seen %v maxBW %.1f", c.bwSeen, c.maxBW/1e6)
+	}
+	dead := func() { // nothing delivered, sender busy and rate-limited
+		now = now.Add(100 * time.Millisecond)
+		c.limited = true
+		c.tickReliable(now, false, true)
+	}
+	for i := 0; c.maxBW > 0; i++ {
+		if i > 10*bwWin {
+			t.Fatal("estimate never fell to zero")
+		}
+		dead()
+	}
+	r := c.rate
+	if r >= c.maxRate {
+		t.Fatalf("rate already at the maximum (%.1f MB/s): the test would prove nothing", r/1e6)
+	}
+	for i := 0; i < 50; i++ {
+		dead()
+	}
+	if c.rate != r {
+		t.Fatalf("rate moved on a dead path: %.1f -> %.1f MB/s", r/1e6, c.rate/1e6)
+	}
+}

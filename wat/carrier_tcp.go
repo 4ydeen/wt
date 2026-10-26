@@ -147,6 +147,16 @@ const (
 
 // poolLowat caps the unsent data the kernel queues per pool socket (TCP_NOTSENT_LOWAT). WAT_POOL_LOWAT (bytes, 3.0.0)
 // overrides the 128 KB default for an A/B: less is less queueing delay under load, if BBR still keeps the pipe full.
+// poolUserTimeout is TCP_USER_TIMEOUT on every pool socket: data unacknowledged this long closes the connection, so a
+// path that cuts established flows (an Iran ISP resetting nothing, just dropping) fails the pool over in ~30 s whatever
+// the traffic. WAT_POOL_USER_TIMEOUT (seconds, 3.0.1; 0 turns it off).
+var poolUserTimeout = func() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv("WAT_POOL_USER_TIMEOUT")); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 30 * time.Second
+}()
+
 var poolLowat = func() int {
 	if n, err := strconv.Atoi(os.Getenv("WAT_POOL_LOWAT")); err == nil && n >= 16<<10 {
 		return n
@@ -158,6 +168,9 @@ func newPoolConn(c net.Conn) *poolConn {
 	if tc := rawTCP(c); tc != nil {
 		tc.SetNoDelay(true)
 		setNotsentLowat(tc, poolLowat) // a stalled conn must block its writer, not swallow megabytes
+		if poolUserTimeout > 0 {
+			setUserTimeout(tc, poolUserTimeout) // a blackholed conn dies in seconds, not after ~15 min of kernel retries
+		}
 		if cc := setCongestion(tc, PoolTCPCC); cc != "" {
 			poolTCPCCInUse.Store(&cc)
 		}
@@ -655,7 +668,16 @@ func leastQueued(conns []*poolConn, start int) *poolConn {
 		}
 	}
 	if best == nil { // every conn is stalled: the whole path is slow, not one edge
-		return any
+		// ...unless every one has made no progress for poolStallKill: then the sockets are dead, and the kernel would
+		// keep retransmitting on them for ~15 min (tcp_retries2) while the session sits in a blackout (prod 2026-10-26).
+		// Close the stuck ones so the client slots redial; a stalled conn below that age may still recover.
+		for _, pc := range stuck {
+			go pc.fail()
+		}
+		if any != nil && !slices.Contains(stuck, any) {
+			return any
+		}
+		return nil
 	}
 	for _, pc := range stuck { // a healthy conn exists: drop the stuck ones so the client redials them
 		go pc.fail()
@@ -877,6 +899,14 @@ func (c *TCPPoolClient) healthLoop() {
 		case <-c.done:
 			return
 		case now := <-t.C:
+			// A socket whose write has made no progress for poolStallKill is dead for our purposes. leastQueued closes
+			// such a conn only when a packet is sent, and a backlogged session sends nothing: when every conn stalls
+			// at once (prod 2026-10-26) this sweep is what frees the slots to redial (3.0.1).
+			for i := range c.slots {
+				if pc := c.slots[i].Load(); pc != nil && pc.stalledFor(now.UnixNano()) > poolStallKill {
+					pc.fail()
+				}
+			}
 			// churn (2.8.0): recycle the connections that hit their budget. At most one per tick, oldest first,
 			// so a recycle never lands in the same tick as a slow-connection kill (two closures in one tick halve
 			// the judged traffic at once and read as one coordinated event) and the per-connection share the
