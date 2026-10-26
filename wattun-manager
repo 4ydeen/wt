@@ -489,6 +489,7 @@ public_ip() { # prints a valid IPv4 or nothing. A public address on an interface
   return 0
 }
 new_key() { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40; }
+rand_path() { echo "/api/$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; } # a fresh URL path per tunnel: every install used /wat, a fixed string a filter can match (3.0.1)
 uptime_of() { local t; t=$(systemctl show "${WAT_PREFIX}@$1" -p ActiveEnterTimestamp --value 2>/dev/null); [ -n "$t" ] && echo "since $t" || echo "-"; }
 
 free_metrics_port() { # first free port from WAT_METRICS_BASE (default 19750, sandbox 19850); never 19700-19709 or 18990-18999
@@ -1392,7 +1393,7 @@ wizard_kharej() {
   cr=$CARRIER
   if [ "$cr" = auto ]; then wizard_kharej_auto "$name"; return; fi
   [ "$cr" != icmp ] && listen=$(default_listen "$cr")
-  case "$cr" in ws|wss|grpc|h2|h2c) path=/wat; [ -n "$NI_PATH" ] && path=$NI_PATH ;; esac
+  case "$cr" in ws|wss|grpc|h2|h2c) path=$(rand_path); [ -n "$NI_PATH" ] && path=$NI_PATH ;; esac
   [ "$cr" != icmp ] && [ -n "$NI_LISTEN" ] && listen=$NI_LISTEN
   sni=$NI_SNI; mbps=$NI_MBPS
   if [ "$cr" = udp ] && { [ "$NI_UDPDNS" = 1 ] || { [ "$NONINTERACTIVE" != 1 ] && [ -z "$NI_LISTEN" ]; }; }; then # DNS-shaped udp (3.0.0)
@@ -2571,7 +2572,7 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
   confirm "Create this tunnel?" y || { warn "Nothing was created."; return 1; }
   echo
 
-  key=$(new_key); m=$(free_metrics_port)
+  key=$(new_key); m=$(free_metrics_port); apath=$(rand_path)
   for c in ${AUTO_D//,/ }; do cars="$cars+${c%%:*}"; done
   write_auto_server() {
     local old; old=$(umask); umask 077
@@ -2582,11 +2583,11 @@ wizard_kharej_auto() { # suggested-name : called from wizard_kharej when the car
       echo "key-file: $CONF/$name.key"
       echo "carrier: icmp$cars"
       for c in ${AUTO_D//,/ }; do echo "listen-${c%%:*}: \":${c##*:}\""; done
-      echo "path: /wat"
+      echo "path: $apath"
       echo "metrics: 127.0.0.1:$m"
       maps_yaml_block
     } >"$CONF/$name.yml"
-    make_token auto "$AUTO_ADDR" "$key" /wat "$cdn" "" "$allow" "" "$plan" >"$CONF/$name.token"
+    make_token auto "$AUTO_ADDR" "$key" "$apath" "$cdn" "" "$allow" "" "$plan" >"$CONF/$name.token"
     umask "$old"
   }
   mkdir -p "$CONF"; chmod 700 "$CONF"
@@ -2808,7 +2809,7 @@ auto_variants() { # T_* from the auto token -> AV_*
   local d r c p
   AV_LABEL=(); AV_CAR=(); AV_KIND=(); AV_PEER=(); AV_PORT=(); AV_SNI=(); AV_FP=(); AV_ECH=(); AV_FRAG=()
   AV_FS=(); AV_FM=()
-  AT_ADDR=$T_PEER
+  AT_ADDR=$T_PEER; AT_PATH=${T_PATH:-/wat}
   d=$(plan_part "$T_AUTO" d); r=$(plan_part "$T_AUTO" r)
   av_add icmp icmp d "$AT_ADDR" '' ''
   for c in udp tcp tls wss h2 grpc ws h2c; do
@@ -3114,13 +3115,13 @@ at_to_t() { # AT_SEL (one index, or several = bond) -> T_CARRIER T_PEER T_PATH T
     done
     AT_EXTRA=${AT_EXTRA%$'\n'}
     if [ -n "$cdn" ]; then while IFS= read -r l; do [ -n "$l" ] && AT_EXTRA+=$'\n'"$l"; done < <(at_cdn_lines "$cdn"); fi
-    T_CARRIER=$cars; T_PEER=$AT_ADDR; T_PATH=/wat
+    T_CARRIER=$cars; T_PEER=$AT_ADDR; T_PATH=$AT_PATH
     AT_SEL_LABEL="bond $cars"; AT_SEL_KEY=bond
     return 0
   fi
   i=${AT_SEL[0]}; c=${AV_CAR[$i]}
   T_CARRIER=$c; T_PEER=${AV_PEER[$i]}
-  case "$c" in ws|wss|h2|h2c|grpc) T_PATH=/wat ;; esac
+  case "$c" in ws|wss|h2|h2c|grpc) T_PATH=$AT_PATH ;; esac
   if [ "${AV_KIND[$i]}" = c ]; then T_SNI=${AV_SNI[$i]}; AT_EXTRA=$(at_cdn_lines "$i"); fi
   [ "${AV_KIND[$i]}" = r ] && T_REV=1
   AT_SEL_LABEL=${AV_LABEL[$i]}; AT_SEL_KEY=$(av_key "$i")

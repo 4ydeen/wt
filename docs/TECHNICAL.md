@@ -1248,7 +1248,7 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `tls-cert`, `tls-key` | in-memory self-signed | server (client with `reverse`) | Certificate files for tls, wss, h2 and grpc, on whichever side listens. |
 | `sni` | | client (server with `reverse`) | Server name in the TLS ClientHello, set on whichever side dials. |
 | `tls-pin` | | client (server with `reverse`) | Hex sha256 of the listener's certificate. Also makes the dialing side check it. Without it the dialer does not verify the certificate. |
-| `path` | `/wat` | both | URL path for ws, wss, h2, h2c, grpc (grpc: service name). Same on both ends, also with `reverse`. |
+| `path` | `/wat` | both | URL path for ws, wss, h2, h2c, grpc (grpc: service name). Same on both ends, also with `reverse`. The manager picks a random `/api/...` path for each new tunnel (3.0.1); the program default stays `/wat`. |
 | `host` | = `peer` | client (server with `reverse`) | Host header / authority, set on whichever side dials. |
 | `plain` | false | both (dialer with `reverse`) | grpc without TLS. |
 | `header` | | client (server with `reverse`) | Extra request header `Name: value`. Repeatable. |
@@ -2060,6 +2060,7 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **3.0.1: no fixed strings in `ws`/`wss`/`h2`/`grpc` tunnels.** Any order of updating works; an existing tunnel keeps its path until you change it on both ends. (1) The manager gives every new `ws`, `wss`, `h2`, `h2c` or `grpc` tunnel (the auto tunnel too) its own URL path, `/api/` plus 12 random hex digits, instead of the `/wat` every install used: a filter could match `GET /wat` with `Upgrade: websocket` on a plain `ws` tunnel as the signature of this tool. The path travels in the token, so Iran follows by itself. To change a running tunnel set the same `path:` on both ends and restart. (2) The `ws` upgrade request now has a browser's header set in a browser's order (`User-Agent`, `Origin`, `Pragma`, `Cache-Control`, `Accept-Encoding`, `Accept-Language`); before it had no `User-Agent` at all. A header you give with `header:` replaces the default of the same name. Both only matter where the request is visible in plain text (`ws`), or where the path is read after the TLS layer (never by a passive filter). For `tls`, `wss`, `h2` and `grpc` the ClientHello is still the Go library's unless you set `fp: chrome` (or `firefox`, `random`): do that on any route that blocks the server's IP after some minutes.
 - **3.0.0: no constant bytes in the packet header, random idle shape, reverse `udp`, DNS-shaped `udp`.** Update both ends for
   reverse `udp`; for the rest any order works. (1) The session id and packet number at the start of every packet are
   masked (`hdr-mask`, default on): a flow classifier no longer sees 8 equal bytes plus a counter in each datagram. An

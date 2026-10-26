@@ -213,6 +213,8 @@ func wsAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(h[:])
 }
 
+const wsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
 // wsClientHandshake upgrades an established connection. host is the Host header, headers are extra request headers.
 func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, headers map[string]string) (*wsConn, error) {
 	if dl, ok := ctx.Deadline(); ok {
@@ -222,13 +224,39 @@ func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, heade
 	var kb [16]byte
 	crand.Read(kb[:])
 	key := base64.StdEncoding.EncodeToString(kb[:])
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n", path, host, key)
 	for k, v := range headers {
 		if strings.ContainsAny(k+v, "\r\n") {
 			return nil, errors.New("ws: bad header")
 		}
+	}
+	// The request of a browser (Chrome's header set and order), so a plain-text ws tunnel does not stand out by a bare
+	// header set with no User-Agent (3.0.1). A header the caller gives (-header) replaces the default of the same name.
+	var sb strings.Builder
+	used := map[string]bool{}
+	hdr := func(k, v string) {
+		for ck, cv := range headers {
+			if strings.EqualFold(ck, k) {
+				v, used[ck] = cv, true
+			}
+		}
 		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
+	}
+	fmt.Fprintf(&sb, "GET %s HTTP/1.1\r\n", path)
+	hdr("Host", host)
+	hdr("Connection", "Upgrade")
+	hdr("Pragma", "no-cache")
+	hdr("Cache-Control", "no-cache")
+	hdr("User-Agent", wsUserAgent)
+	hdr("Upgrade", "websocket")
+	hdr("Origin", "https://"+host)
+	hdr("Sec-WebSocket-Version", "13")
+	hdr("Accept-Encoding", "gzip, deflate, br")
+	hdr("Accept-Language", "en-US,en;q=0.9")
+	hdr("Sec-WebSocket-Key", key)
+	for k, v := range headers {
+		if !used[k] {
+			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
+		}
 	}
 	sb.WriteString("\r\n")
 	if _, err := io.WriteString(c, sb.String()); err != nil {
