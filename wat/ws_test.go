@@ -34,7 +34,7 @@ func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	wsClientHandshake(ctx, cli, "cdn.example.com", "/api/1", map[string]string{"user-agent": "Custom/1", "X-Extra": "1"}) // the pipe closes: only the request matters
+	wsClientHandshake(ctx, cli, "cdn.example.com", "/api/1", true, map[string]string{"user-agent": "Custom/1", "X-Extra": "1"}) // the pipe closes: only the request matters
 	lines := <-got
 	if lines[0] != "GET /api/1 HTTP/1.1" || lines[1] != "Host: cdn.example.com" {
 		t.Fatalf("request line / Host first, got %q", lines[:2])

@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"log"
 	"net"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -78,6 +80,7 @@ func buildMimicHello(psk []byte, sni string, id [8]byte) (hello []byte, tx, rx *
 	copy(a[16:24], enc)
 	copy(a[24:40], hmacSum(root, []byte("tag"), salt, enc)[:16])
 	if hello = mimicBrowserHello(sni, a[:32], a[32:]); hello == nil { // utls refused: the fixed hello of the fake-SNI layer
+		mimicHelloFallbackLog.Do(func() { log.Printf("wat: tcp-mimic: browser hello unavailable for sni %q, using the fixed hello (one JA3 on every tunnel)", sni) })
 		hello = FakeClientHello(sni)
 		if len(hello) != mimicHelloLen {
 			return nil, nil, nil, errMimic
@@ -149,3 +152,5 @@ func mimicBrowserHello(sni string, rnd, sid []byte) []byte {
 	}
 	return hello
 }
+
+var mimicHelloFallbackLog sync.Once

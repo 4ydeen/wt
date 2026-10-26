@@ -109,7 +109,7 @@ func NewWSPoolClient(peer string, conns int, o HTTPClientOptions) (*TCPPoolClien
 		if err != nil {
 			return nil, err
 		}
-		w, err := wsClientHandshake(ctx, c, o.host(addr), path, o.Headers)
+		w, err := wsClientHandshake(ctx, c, o.host(addr), path, o.Secure, o.Headers)
 		if err != nil {
 			c.Close()
 			return nil, err

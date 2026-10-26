@@ -216,7 +216,7 @@ func wsAccept(key string) string {
 const wsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 // wsClientHandshake upgrades an established connection. host is the Host header, headers are extra request headers.
-func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, headers map[string]string) (*wsConn, error) {
+func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, secure bool, headers map[string]string) (*wsConn, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		c.SetDeadline(dl)
 		defer c.SetDeadline(time.Time{})
@@ -248,7 +248,11 @@ func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, heade
 	hdr("Cache-Control", "no-cache")
 	hdr("User-Agent", wsUserAgent)
 	hdr("Upgrade", "websocket")
-	hdr("Origin", "https://"+host)
+	scheme := "http" // a browser page opens ws:// from an http:// page, wss:// from https://
+	if secure {
+		scheme = "https"
+	}
+	hdr("Origin", scheme+"://"+host)
 	hdr("Sec-WebSocket-Version", "13")
 	hdr("Accept-Encoding", "gzip, deflate, br")
 	hdr("Accept-Language", "en-US,en;q=0.9")
