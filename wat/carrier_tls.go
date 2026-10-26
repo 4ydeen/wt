@@ -92,8 +92,27 @@ func NewTLSPoolServer(addr, certFile, keyFile string) (*TCPPoolServer, error) {
 	return newPoolServer(tls.NewListener(ln, &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}})), nil
 }
 
-// SelfSignedCert makes a throwaway ECDSA P-256 certificate.
+// SelfSignedCert makes an ECDSA P-256 certificate with realistic 90-day validity.
 func SelfSignedCert() (tls.Certificate, error) {
+	return SelfSignedCertDomain("")
+}
+
+// randomHost is a throwaway hostname like "kdmqzvtoa.com": a certificate that names a real site's domain or
+// organization would claim an identity it cannot prove, and a fixed name is itself a fingerprint.
+func randomHost() string {
+	var b [16]byte
+	crand.Read(b[:])
+	n := 7 + int(b[0])%5
+	name := make([]byte, n)
+	for i := range name {
+		name[i] = 'a' + b[1+i]%26
+	}
+	return string(name) + [...]string{".com", ".net", ".org", ".io"}[b[15]%4]
+}
+
+// SelfSignedCertDomain builds a throwaway certificate for domain (a random hostname when empty), valid 90 days, no
+// localhost name and no organization.
+func SelfSignedCertDomain(domain string) (tls.Certificate, error) {
 	k, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -102,9 +121,13 @@ func SelfSignedCert() (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	if domain == "" {
+		domain = randomHost()
+	}
 	tpl := &x509.Certificate{
-		SerialNumber: serial, Subject: pkix.Name{CommonName: "localhost"}, DNSNames: []string{"localhost"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(10 * 365 * 24 * time.Hour),
+		SerialNumber: serial, Subject: pkix.Name{CommonName: domain},
+		DNSNames: []string{domain},
+		NotBefore: time.Now().Add(-24 * time.Hour), NotAfter: time.Now().Add(90 * 24 * time.Hour),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}

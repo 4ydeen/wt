@@ -1,6 +1,7 @@
 package wat
 
 import (
+	"crypto/x509"
 	"net/http"
 	"runtime"
 	"sync"
@@ -180,8 +181,12 @@ func TestWSNon404(t *testing.T) {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != 404 {
-			t.Fatalf("GET %s = %d, want 404", p, resp.StatusCode)
+		want := 404 // anything but the front page, like an nginx with its default site (3.0.2)
+		if p == "/" {
+			want = 200
+		}
+		if resp.StatusCode != want {
+			t.Fatalf("GET %s = %d, want %d", p, resp.StatusCode, want)
 		}
 	}
 	// the right path without upgrade headers looks the same, and so does an upgrade on the wrong path
@@ -281,5 +286,53 @@ func TestHTTPCarriersDatagrams(t *testing.T) {
 				t.Fatalf("%s: %d/30 echoed (dupes %d); client dropped=%d dgram_dropq=%d", f, got, dupes(seen), st.Dropped, st.DgramDropQueue)
 			}
 		})
+	}
+}
+
+// TestHTTPCamouflageNginx verifies that probing an HTTP carrier server at / or an unknown path
+// returns an authentic Nginx response with Server: nginx header and Nginx HTML.
+func TestHTTPCamouflageNginx(t *testing.T) {
+	ps, err := NewWSPoolServer("127.0.0.1:0", HTTPServerOptions{Path: "/tunnel-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+
+	addr := ps.Addr().String()
+	res, err := http.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 || res.Header.Get("Server") != "nginx" {
+		t.Fatalf("/ should return 200 with Server: nginx, got status %d header %q", res.StatusCode, res.Header.Get("Server"))
+	}
+
+	res404, err := http.Get("http://" + addr + "/unknown-scanner-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res404.Body.Close()
+	if res404.StatusCode != 404 || res404.Header.Get("Server") != "nginx" {
+		t.Fatalf("scanner path should return 404 with Server: nginx, got status %d", res404.StatusCode)
+	}
+}
+
+// TestRealisticSelfSignedCert verifies that throwaway certificates no longer leak CN=localhost or 10-year validity.
+func TestRealisticSelfSignedCert(t *testing.T) {
+	cert, err := SelfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x509Cert.Subject.CommonName == "localhost" {
+		t.Fatal("self-signed cert must not use CN=localhost (active scanner fingerprint)")
+	}
+	days := int(x509Cert.NotAfter.Sub(x509Cert.NotBefore).Hours() / 24)
+	if days > 100 {
+		t.Fatalf("validity %d days is too long (scanner fingerprint), want standard ~90 days", days)
 	}
 }

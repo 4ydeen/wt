@@ -601,9 +601,35 @@ func TestDesyncAbandonAndClose(t *testing.T) {
 	}
 }
 
-// TestDesyncPAWS: paws mode fires an in-window fake packet with a mathematically valid TCP checksum
-// and a stale TCP timestamp (TSval = 1) triggering RFC 7323 PAWS discard at the destination kernel.
-func TestDesyncPAWS(t *testing.T) {
+// TestStaleTimestampOpts: the paws timestamp is older than the real one for every TSval (the kernel offsets TSval
+// randomly per connection, so a fixed value would be "older" only half the time), the other options survive, and a
+// connection without a timestamp option gets none made up (3.0.2).
+func TestStaleTimestampOpts(t *testing.T) {
+	for _, tsval := range []uint32{0, 1, 5, 1 << 30, 1<<31 - 1, 1 << 31, 1<<31 + 7, 0xfffffff0, 0x12345678} {
+		in := []byte{2, 4, 5, 0xb4, 1, 1, 8, 10, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 1, 3, 3, 7}
+		binary.BigEndian.PutUint32(in[8:], tsval)
+		out, ok := staleTimestampOpts(in)
+		if !ok || len(out) != len(in) {
+			t.Fatalf("tsval %d: ok=%v len %d", tsval, ok, len(out))
+		}
+		stale := binary.BigEndian.Uint32(out[8:])
+		if int32(stale-tsval) >= 0 || int32(stale-tsval) < -(1<<30) {
+			t.Fatalf("tsval %d: stale %d is not 2^30 behind", tsval, stale)
+		}
+		if !bytes.Equal(out[:8], in[:8]) || !bytes.Equal(out[12:], in[12:]) {
+			t.Fatalf("tsval %d: options other than TSval changed: %x", tsval, out)
+		}
+	}
+	for _, opts := range [][]byte{nil, {2, 4, 5, 0xb4, 1, 3, 3, 7}, {1, 1, 8, 5}, {1, 1, 8, 10, 0, 0}} {
+		if out, ok := staleTimestampOpts(opts); ok || !bytes.Equal(out, opts) {
+			t.Fatalf("opts %x: want untouched and not ok, got %x ok=%v", opts, out, ok)
+		}
+	}
+}
+
+// TestDesyncPAWSFallback: without a timestamp option in the handshake, paws falls back to the plain below-window seq
+// marker; an in-window fake there would be accepted by the server as the real stream (3.0.2).
+func TestDesyncPAWSFallback(t *testing.T) {
 	tr, sent := desyncTestTracker("paws", 0)
 	defer tr.close()
 	k := testClientKey()
@@ -619,51 +645,11 @@ func TestDesyncPAWS(t *testing.T) {
 		t.Fatalf("want 1 fake, got %d", sent.n())
 	}
 	pkt := sent.at(0)
-	// Must be in-window: seq == isn + 1
-	seq := binary.BigEndian.Uint32(pkt[24:28])
-	if seq != isn+1 {
-		t.Fatalf("paws seq %d, want in-window %d", seq, isn+1)
+	if seq, want := binary.BigEndian.Uint32(pkt[24:28]), isn+1-uint32(len(tr.hello)); seq != want {
+		t.Fatalf("fallback seq %d, want below-window %d", seq, want)
 	}
-	// TCP header with options: data offset should be > 5 (20 bytes)
-	doff := int(pkt[32]>>4) * 4
-	if doff <= 20 {
-		t.Fatalf("paws packet missing TCP options: data offset %d", doff)
-	}
-	// Check TCP checksum is valid
-	stored := binary.BigEndian.Uint16(pkt[36:38])
-	th := make([]byte, len(pkt)-20)
-	copy(th, pkt[20:])
-	binary.BigEndian.PutUint16(th[16:18], 0)
-	if c := tcpChecksum(th, k.srcIP.bytes(), k.dstIP.bytes()); c != stored {
-		t.Fatalf("paws checksum invalid: recomputed %04x, stored %04x", c, stored)
-	}
-	// Check that TCP Timestamp option (Kind 8) has TSval == 1
-	opts := pkt[40 : 20+doff]
-	foundTS := false
-	for i := 0; i < len(opts); {
-		if opts[i] == 0 {
-			break
-		}
-		if opts[i] == 1 {
-			i++
-			continue
-		}
-		if i+1 >= len(opts) {
-			break
-		}
-		l := int(opts[i+1])
-		if opts[i] == 8 && l == 10 {
-			tsval := binary.BigEndian.Uint32(opts[i+2 : i+6])
-			if tsval != 1 {
-				t.Fatalf("paws TSval %d, want 1", tsval)
-			}
-			foundTS = true
-			break
-		}
-		i += l
-	}
-	if !foundTS {
-		t.Fatal("paws packet missing timestamp option")
+	if !tcpChecksumOK(pkt) {
+		t.Fatal("fallback marker must keep a valid checksum")
 	}
 }
 
@@ -2323,9 +2309,17 @@ func TestDesyncResendKeepsDelayedMarkers(t *testing.T) {
 	if sent.n() != 2*n {
 		t.Fatalf("resend sent %d, want all %d pieces", sent.n()-n, n)
 	}
+	// The delayed pieces leave from independent 1 ms timers, so the order they reach the log is not fixed: compare the
+	// pieces as a set.
+	first, again := make([]string, n), make([]string, n)
 	for i := 0; i < n; i++ {
-		if !bytes.Equal(sent.at(i), sent.at(n+i)) {
-			t.Fatalf("resent piece %d differs", i)
+		first[i], again[i] = string(sent.at(i)), string(sent.at(n+i))
+	}
+	sort.Strings(first)
+	sort.Strings(again)
+	for i := range first {
+		if first[i] != again[i] {
+			t.Fatalf("resent pieces differ from the first run (piece %d of the sorted set)", i)
 		}
 	}
 }

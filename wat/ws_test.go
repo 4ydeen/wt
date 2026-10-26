@@ -53,3 +53,41 @@ func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
 		}
 	}
 }
+
+// TestWSHandshakeRefusesNegotiatedExtension: the request offers permessage-deflate, and a peer that accepts it is
+// refused at the handshake rather than sending frames the reader cannot decode (3.0.2).
+func TestWSHandshakeRefusesNegotiatedExtension(t *testing.T) {
+	for _, ext := range []string{"", "permessage-deflate"} {
+		cli, srv := net.Pipe()
+		go func() {
+			defer srv.Close()
+			br := bufio.NewReader(srv)
+			var key string
+			for {
+				l, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				l = strings.TrimRight(l, "\r\n")
+				if l == "" {
+					break
+				}
+				if k, v, ok := strings.Cut(l, ": "); ok && strings.EqualFold(k, "Sec-WebSocket-Key") {
+					key = v
+				}
+			}
+			resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAccept(key) + "\r\n"
+			if ext != "" {
+				resp += "Sec-WebSocket-Extensions: " + ext + "\r\n"
+			}
+			srv.Write([]byte(resp + "\r\n"))
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := wsClientHandshake(ctx, cli, "cdn.example.com", "/api/1", true, nil)
+		cancel()
+		cli.Close()
+		if (ext == "") != (err == nil) {
+			t.Fatalf("extension %q: err=%v", ext, err)
+		}
+	}
+}

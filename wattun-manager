@@ -1131,6 +1131,167 @@ fw_close() { # "443/tcp 53/udp" ... : mirror of fw_open, never asks
   [ "$fw" = firewalld ] && firewall-cmd -q --reload
   return 0
 }
+
+# ======================================================================================
+#  Iran-only client ports
+# ======================================================================================
+IRAN_IPSET="wattun_iran"
+IRAN_IP_URL="https://www.ipdeny.com/ipblocks/data/countries/ir.zone"
+IRAN_CACHE_FILE="$CONF/.iran_cidrs.zone"
+
+iran_fw_ports() { # returns space-separated list of all local client ports on this Iran server
+  local f l p
+  local -A seen=()
+  for f in "$CONF"/*.yml; do
+    [ -f "$f" ] || continue
+    [ "$(grep '^mode:' "$f" | awk '{print $2}')" = client ] || [ "$(grep '^mode:' "$f")" = "" ] || continue
+    while IFS= read -r l; do
+      p=$(echo "$l" | awk '{print $2}' | tr -d '"'"'" | cut -d: -f1 | cut -d- -f1 | cut -d/ -f1)
+      if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+        seen["$p"]=1
+      fi
+    done < <(grep -E '^[[:space:]]*-[[:space:]]+[0-9]+' "$f" 2>/dev/null)
+  done
+  echo "${!seen[@]}"
+}
+
+iran_fw_fetch() {
+  mkdir -p "$CONF"
+  spin_start "Downloading official Iran IPv4 ranges (ipdeny.com)"
+  curl -fsSL --max-time 15 "$IRAN_IP_URL" -o "$CONF/.iran_cidrs.zone.tmp" 2>/dev/null
+  local rc=$?
+  spin_stop
+  if [ $rc -eq 0 ] && [ -s "$CONF/.iran_cidrs.zone.tmp" ]; then
+    mv -f "$CONF/.iran_cidrs.zone.tmp" "$IRAN_CACHE_FILE"
+    ok "Downloaded $(wc -l < "$IRAN_CACHE_FILE") Iranian CIDR blocks."
+    return 0
+  fi
+  rm -f "$CONF/.iran_cidrs.zone.tmp"
+  if [ -s "$IRAN_CACHE_FILE" ]; then
+    warn "Download failed; using previously cached Iran CIDR list ($(wc -l < "$IRAN_CACHE_FILE") ranges)."
+    return 0
+  fi
+  err "Download failed and there is no cached list, so nothing was changed. Check this server's internet access and try again."
+  return 1
+}
+
+iran_fw_apply() { # ports...
+  local ports="$*"
+  [ -n "$ports" ] || ports=$(iran_fw_ports)
+  [ -n "$ports" ] || { err "No client ports found or specified. Usage: $SELF iran-firewall on [port,port...]"; return 1; }
+
+  if ! command -v ipset >/dev/null 2>&1; then
+    step "Installing ipset" apt-get update -qq && apt-get install -y -qq ipset || { err "Failed to install ipset."; return 1; }
+  fi
+  iran_fw_fetch || return 1
+
+  step "Creating ipset $IRAN_IPSET" ipset create "$IRAN_IPSET" hash:net maxelem 65536 -exist
+  step "Populating Iranian IP blocks into ipset" bash -c "
+    while IFS= read -r net; do
+      [[ \"\$net\" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]] && ipset add -exist '$IRAN_IPSET' \"\$net\"
+    done < '$IRAN_CACHE_FILE'
+  "
+  local cnt
+  cnt=$(ipset list "$IRAN_IPSET" 2>/dev/null | grep -c '^[0-9]')
+  if [ "${cnt:-0}" -lt 50 ]; then # a real list has hundreds of ranges; a short one is a bad download and would lock everyone out
+    ipset destroy "$IRAN_IPSET" 2>/dev/null
+    err "The Iran range list has only ${cnt:-0} entries (expected hundreds). Nothing was changed."; return 1
+  fi
+
+  local p pt
+  for p in $ports; do
+    p=${p//,/ }
+    for pt in $p; do
+      [[ "$pt" =~ ^[0-9]+$ ]] || continue
+      iptables -D INPUT -p tcp --dport "$pt" -m set --match-set "$IRAN_IPSET" src -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -p tcp --dport "$pt" -j DROP 2>/dev/null || true
+      iptables -D INPUT -p udp --dport "$pt" -m set --match-set "$IRAN_IPSET" src -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -p udp --dport "$pt" -j DROP 2>/dev/null || true
+
+      iptables -I INPUT -p tcp --dport "$pt" -j DROP
+      iptables -I INPUT -p tcp --dport "$pt" -m set --match-set "$IRAN_IPSET" src -j ACCEPT
+      iptables -I INPUT -p udp --dport "$pt" -j DROP
+      iptables -I INPUT -p udp --dport "$pt" -m set --match-set "$IRAN_IPSET" src -j ACCEPT
+      ok "Port $pt: protected (Iran-only allowed, foreign IPs dropped)"
+    done
+  done
+
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 # the ipset itself is not saved by this: see the note below
+  elif [ -d /etc/iptables ]; then
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  fi
+  ok "Iran-only protection is ON: client ports accept connections from Iranian addresses only."
+  warn "The rules and the address set are not kept across a reboot: run  $SELF iran-firewall on  again after one (or install iptables-persistent and ipset-persistent)."
+}
+
+iran_fw_remove() { # [ports...]
+  local ports="$*"
+  [ -n "$ports" ] || ports=$(iran_fw_ports)
+  local p pt
+  for p in $ports; do
+    p=${p//,/ }
+    for pt in $p; do
+      [[ "$pt" =~ ^[0-9]+$ ]] || continue
+      iptables -D INPUT -p tcp --dport "$pt" -m set --match-set "$IRAN_IPSET" src -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -p tcp --dport "$pt" -j DROP 2>/dev/null || true
+      iptables -D INPUT -p udp --dport "$pt" -m set --match-set "$IRAN_IPSET" src -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -p udp --dport "$pt" -j DROP 2>/dev/null || true
+      ok "Port $pt: protection removed (open to all IPs)"
+    done
+  done
+  ok "Iran-only protection is OFF."
+}
+
+iran_fw_status() {
+  page "Iran-only client ports"
+  if ipset list "$IRAN_IPSET" >/dev/null 2>&1; then
+    local cnt
+    cnt=$(ipset list "$IRAN_IPSET" 2>/dev/null | grep -c '^[0-9]' || echo 0)
+    say "  ${BOLD}Iran IPSet:${RST} ${GRN}Active${RST} ($cnt CIDR ranges loaded)"
+  else
+    say "  ${BOLD}Iran IPSet:${RST} ${GRY}Inactive${RST}"
+  fi
+  echo
+  say "  ${BOLD}Active Port Protection Rules in iptables:${RST}"
+  local rules
+  rules=$(iptables -S INPUT 2>/dev/null | grep "$IRAN_IPSET" || true)
+  if [ -n "$rules" ]; then
+    printf '%s\n' "$rules" | sed "s/^/    $GRN/; s/\$/$RST/"
+  else
+    say "    ${GRY}No active port restrictions found.${RST}"
+  fi
+  echo
+  say "  ${BOLD}Detected Local Client Ports:${RST} $(iran_fw_ports)"
+}
+
+iran_firewall_cmd() {
+  case "${1:-}" in
+    on|enable) shift; iran_fw_apply "$@" ;;
+    off|disable) shift; iran_fw_remove "$@" ;;
+    status) iran_fw_status ;;
+    update) iran_fw_fetch && ok "Updated cached Iran CIDRs." ;;
+    *)
+      page "Iran-only client ports"
+      say "  Limits your client ports to connections from Iranian addresses."
+      say "  Incoming client connections on your proxy ports will only be accepted from Iranian IPs."
+      say "  Connections from other countries (scanners, probes, and your own users abroad) are dropped."
+      echo
+      say "  Commands:"
+      say "    ${CYN}wattun iran-firewall on${RST}      [ports] - activate Iran-only protection"
+      say "    ${CYN}wattun iran-firewall off${RST}     [ports] - disable protection"
+      say "    ${CYN}wattun iran-firewall status${RST}  - view status and active rules"
+      say "    ${CYN}wattun iran-firewall update${RST}  - refresh Iranian IP range list"
+      echo
+      confirm "Toggle protection now?" y || return 0
+      if iptables -S INPUT 2>/dev/null | grep -q "$IRAN_IPSET"; then
+        iran_fw_remove
+      else
+        iran_fw_apply
+      fi
+      ;;
+  esac
+}
 unit_up() { # name : enable + start, wait up to 10 s for "active"
   local i
   ensure_template || return 1
@@ -6306,6 +6467,7 @@ Usage: $SELF [command]
                         from this Iran server with throw-away clients, apply the best that connects.
                         Kharej is never contacted except through the tunnel itself. Linux only.
   boost [--status|--undo|--yes]  kernel speed boost (BBR, 64MB buffers, FQ)
+  iran-firewall [on|off|status]  accept connections on the client ports only from Iranian addresses
   backup [dest.tar.gz]  backup all tunnel configs and keys to archive
   restore <archive.tar.gz> restore tunnel configs and keys from archive
   start-all | stop-all  bulk start or stop all tunnels
@@ -6412,6 +6574,7 @@ main() {
     auto-watch) need_tunnel "${2:?name}" && auto_watch "$2" ;;
     auto-retest) need_tunnel "${2:?name}" && auto_retest "$2" ;;
     cdn-tune) need_tunnel "${NI_POS[0]:?name}" && ni_run cdn_tune_cmd "${NI_POS[0]}" "${NI_POS[1]:-}" ;;
+    iran-firewall|anti-access) shift; iran_firewall_cmd "$@" ;;
     update) shift; update "$@" ;;
     rollback) rollback ;;
     *) usage; exit 1 ;;

@@ -275,6 +275,11 @@ func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, secur
 	if resp.StatusCode != 101 || resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
 		return nil, fmt.Errorf("ws: handshake refused (%s)", resp.Status)
 	}
+	// The request offers permessage-deflate like Chrome does, but frames are never compressed here: a peer that agreed
+	// to it would send frames this reader cannot decode, so fail the dial instead of corrupting the stream (3.0.2).
+	if resp.Header.Get("Sec-WebSocket-Extensions") != "" {
+		return nil, errors.New("ws: peer negotiated a websocket extension, which is not supported")
+	}
 	return newWSConn(c, br, true), nil
 }
 

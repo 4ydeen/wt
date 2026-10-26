@@ -182,14 +182,55 @@ func (l *httpListener) Close() error {
 	return nil
 }
 
+const (
+	nginxWelcomeHTML = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`
+	nginx404HTML = `<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>`
+)
+
 // pathMux answers path with h (which returns false when the request is not ours) and everything else, and anything
-// h refuses, with a bare 404 like an ordinary web server.
+// h refuses, with the default pages of an nginx with server_tokens off (the same 200 at / and 404 elsewhere), so a prober that asks for a web page finds a web server.
 func pathMux(path string, h func(http.ResponseWriter, *http.Request) bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == path && h(w, r) {
 			return
 		}
-		http.NotFound(w, r)
+		w.Header().Set("Server", "nginx")
+		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, nginxWelcomeHTML)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, nginx404HTML)
 	})
 }
 

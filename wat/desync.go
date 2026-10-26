@@ -1376,12 +1376,18 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		damageChecksum(pkt)
 		send(pkt)
 	case "paws":
-		// paws mode: an in-window fake ClientHello with a VALID TCP checksum and a stale TCP timestamp (TSval = 1).
-		// DPI middleboxes that inspect in-window sequence numbers and calculate TCP checksums accept it and classify
-		// the flow; the server's Linux kernel drops the segment via RFC 7323 PAWS (TSval < TS.recent) and emits a dup-ACK.
-		opts := staleTimestampOpts(c.tcpOpts)
-		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, opts)
-		send(pkt)
+		// paws mode: an in-window fake ClientHello with a VALID TCP checksum and a stale TCP timestamp. The server's
+		// Linux kernel drops it via RFC 7323 PAWS (TSval older than TS.recent) and answers with a dup-ACK, while a DPI
+		// that checks window and checksum accepts it and classifies the flow. The kernel adds a random per-connection
+		// offset to TSval, so a fixed value would be "older" only half the time: the stale value is derived from the
+		// real one (3.0.2). Without a timestamp option nothing makes the kernel drop an in-window segment (it would
+		// be taken as the real stream), so the plain below-window seq marker goes out instead.
+		opts, ok := staleTimestampOpts(c.tcpOpts)
+		if !ok {
+			send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
+			break
+		}
+		send(fakePacketWithOptions(k, base, ack, ttl, hello, opts))
 	default:
 		send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 	}
@@ -1428,35 +1434,31 @@ func damageChecksum(pkt []byte) {
 	binary.BigEndian.PutUint16(pkt[at:], d)
 }
 
-// staleTimestampOpts takes observed TCP options and sets the TCP timestamp (RFC 7323 Kind 8)
-// to TSval = 1 (in the distant past) while keeping TSecr intact. If no timestamp option was observed,
-// it synthesizes one. When sent in a data segment, this causes the destination Linux kernel to drop the segment
-// via PAWS (Protection Against Wrapped Sequence Numbers) per RFC 7323 Section 5.2 and send a dup-ACK,
-// while DPI middleboxes that validate TCP checksums and in-window sequence numbers accept it and whitelists the flow.
-func staleTimestampOpts(opts []byte) []byte {
-	out := append([]byte(nil), opts...)
+// staleTimestampOpts returns the observed TCP options with the timestamp (RFC 7323, kind 8) moved 2^30 into the past:
+// older than the server's TS.recent, so Linux discards a data segment carrying it (PAWS) and sends a dup-ACK. ok is
+// false when the connection has no timestamp option, where no such option can be made up.
+func staleTimestampOpts(opts []byte) (out []byte, ok bool) {
+	out = append([]byte(nil), opts...)
 	for i := 0; i < len(out); {
-		kind := out[i]
-		if kind == 0 { // EOL
-			break
-		}
-		if kind == 1 { // NOP
+		switch out[i] {
+		case 0: // EOL
+			return opts, false
+		case 1: // NOP
 			i++
 			continue
 		}
 		if i+1 >= len(out) {
 			break
 		}
-		length := int(out[i+1])
-		if length < 2 || i+length > len(out) {
+		l := int(out[i+1])
+		if l < 2 || i+l > len(out) {
 			break
 		}
-		if kind == 8 && length == 10 { // TCP Timestamp option
-			binary.BigEndian.PutUint32(out[i+2:i+6], 1)
-			return out
+		if out[i] == 8 && l == 10 {
+			binary.BigEndian.PutUint32(out[i+2:i+6], binary.BigEndian.Uint32(out[i+2:i+6])-1<<30)
+			return out, true
 		}
-		i += length
+		i += l
 	}
-	return append(out, 1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0)
+	return opts, false
 }
-
