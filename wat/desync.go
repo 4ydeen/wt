@@ -892,7 +892,7 @@ func (t *desyncTracker) isPeer(ip ipAddr) bool {
 
 func (t *desyncTracker) needsAck() bool {
 	switch t.cfg.Mode {
-	case "", "seq", "seqsum", "split", "synrst", "all", "ff":
+	case "", "seq", "seqsum", "split", "synrst", "all", "ff", "paws":
 		return true
 	}
 	return false
@@ -1375,6 +1375,13 @@ func (t *desyncTracker) fireLocked(k desyncKey, c *desyncConn, base, ack uint32)
 		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, c.tcpOpts)
 		damageChecksum(pkt)
 		send(pkt)
+	case "paws":
+		// paws mode: an in-window fake ClientHello with a VALID TCP checksum and a stale TCP timestamp (TSval = 1).
+		// DPI middleboxes that inspect in-window sequence numbers and calculate TCP checksums accept it and classify
+		// the flow; the server's Linux kernel drops the segment via RFC 7323 PAWS (TSval < TS.recent) and emits a dup-ACK.
+		opts := staleTimestampOpts(c.tcpOpts)
+		pkt := fakePacketWithOptions(k, base, ack, ttl, hello, opts)
+		send(pkt)
 	default:
 		send(fakePacketWithOptions(k, base-uint32(len(hello)), ack, ttl, hello, c.tcpOpts))
 	}
@@ -1420,3 +1427,36 @@ func damageChecksum(pkt []byte) {
 	}
 	binary.BigEndian.PutUint16(pkt[at:], d)
 }
+
+// staleTimestampOpts takes observed TCP options and sets the TCP timestamp (RFC 7323 Kind 8)
+// to TSval = 1 (in the distant past) while keeping TSecr intact. If no timestamp option was observed,
+// it synthesizes one. When sent in a data segment, this causes the destination Linux kernel to drop the segment
+// via PAWS (Protection Against Wrapped Sequence Numbers) per RFC 7323 Section 5.2 and send a dup-ACK,
+// while DPI middleboxes that validate TCP checksums and in-window sequence numbers accept it and whitelists the flow.
+func staleTimestampOpts(opts []byte) []byte {
+	out := append([]byte(nil), opts...)
+	for i := 0; i < len(out); {
+		kind := out[i]
+		if kind == 0 { // EOL
+			break
+		}
+		if kind == 1 { // NOP
+			i++
+			continue
+		}
+		if i+1 >= len(out) {
+			break
+		}
+		length := int(out[i+1])
+		if length < 2 || i+length > len(out) {
+			break
+		}
+		if kind == 8 && length == 10 { // TCP Timestamp option
+			binary.BigEndian.PutUint32(out[i+2:i+6], 1)
+			return out
+		}
+		i += length
+	}
+	return append(out, 1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0)
+}
+

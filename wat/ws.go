@@ -254,6 +254,7 @@ func wsClientHandshake(ctx context.Context, c net.Conn, host, path string, secur
 	}
 	hdr("Origin", scheme+"://"+host)
 	hdr("Sec-WebSocket-Version", "13")
+	hdr("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits")
 	hdr("Accept-Encoding", "gzip, deflate, br")
 	hdr("Accept-Language", "en-US,en;q=0.9")
 	hdr("Sec-WebSocket-Key", key)

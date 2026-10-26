@@ -47,7 +47,7 @@ func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
 			t.Fatalf("the caller's User-Agent must win, got %q", v)
 		}
 	}
-	for _, k := range []string{"user-agent", "origin", "accept-language", "sec-websocket-key", "upgrade", "x-extra"} {
+	for _, k := range []string{"user-agent", "origin", "accept-language", "sec-websocket-key", "upgrade", "sec-websocket-extensions", "x-extra"} {
 		if seen[k] != 1 {
 			t.Fatalf("header %s sent %d times, want 1 (%q)", k, seen[k], lines)
 		}

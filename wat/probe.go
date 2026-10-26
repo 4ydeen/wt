@@ -67,7 +67,7 @@ const (
 var errNoTCPInfo = errors.New("wat: TCP_INFO unavailable")
 
 // probeCandidates in the order tried; tests may shorten it.
-var probeCandidates = []string{"none", "rst", "synrst", "seq"}
+var probeCandidates = []string{"none", "rst", "synrst", "paws", "seq"}
 
 // ProbeFakeMode tries the candidate modes against peer and returns the one to run: "none" means run without
 // fake-SNI. carrier and name (the TLS SNI or the HTTP Host) shape the filler like the real carrier's first bytes,

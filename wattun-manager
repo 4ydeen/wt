@@ -843,7 +843,7 @@ v_mtu() { [ -z "$1" ] && return 0; case "$1" in -|0|default) return 0 ;; esac; [
 v_num() { [[ "$1" =~ ^[0-9]+$ ]] && return 0; err "Enter a valid positive number."; return 1; }
 v_bind() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0; err "Enter an IPv4 address such as 0.0.0.0 or 10.0.0.5."; return 1; }
 v_fec() { case "$1" in off|auto) return 0 ;; esac; err "Use off or auto."; return 1; }
-v_fake_mode() { case "$1" in seq|ttl|sum|seqsum|auto|rst|synrst) return 0 ;; esac; err "Use seq, ttl, sum, seqsum, auto, rst or synrst."; return 1; }
+v_fake_mode() { case "$1" in seq|ttl|sum|seqsum|auto|rst|synrst|paws) return 0 ;; esac; err "Use seq, ttl, sum, seqsum, auto, rst, synrst or paws."; return 1; }
 # Checksum markers need a middlebox that drops the damaged segment; on an open reverse path the peer may take it and
 # the tunnel dies (field 2.11.0, fr-tcp-sum). wattun 3.0.0 refuses them with -reverse; refuse them here as well.
 rev_sum_refused() { # name mode -> 0 (and an error) when the pair is refused
@@ -1808,6 +1808,7 @@ pick_fake_mode() { # [default] -> REPLY_V
   say "    ${CYN}5${RST}  ttl     Hop-count distance calibration (2.7.0+)"
   say "    ${CYN}6${RST}  rst     Corrupted-checksum RST packet (2.9.0+, clears the filter's flow state; recommended)"
   say "    ${CYN}7${RST}  synrst  Corrupted-checksum SYN|RST (2.10.5+, fallback when rst is filtered)"
+  say "    ${CYN}8${RST}  paws    In-window + valid checksum + stale timestamp (RFC 7323 PAWS discard; checksum-enforcing DPIs)"
   echo
   printf '  %s?%s Press a number %s[Enter = %s]%s ' "$CYN" "$RST" "$GRY" "$def" "$RST"
   key_read
@@ -1819,6 +1820,7 @@ pick_fake_mode() { # [default] -> REPLY_V
     5) REPLY_V="ttl" ;;
     6) REPLY_V="rst" ;;
     7) REPLY_V="synrst" ;;
+    8) REPLY_V="paws" ;;
     enter) REPLY_V="$def" ;;
     esc|q) echo; return 1 ;;
     *) REPLY_V="$def" ;;

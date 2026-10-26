@@ -275,6 +275,8 @@ func desyncTestTracker(mode string, ttl int) (*desyncTracker, *sentLog) {
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "fakeip"}
 	case "synrst":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "synrst"}
+	case "paws":
+		cfg = DesyncConfig{SNI: "mci.ir", Mode: "paws"}
 	case "ff":
 		cfg = DesyncConfig{SNI: "mci.ir", Mode: "ff"}
 	case "all":
@@ -596,6 +598,72 @@ func TestDesyncAbandonAndClose(t *testing.T) {
 	tr.announce(k, 123, true) // after close: announced channels close at once, nothing fires
 	if tr.fired() != 0 || sent.n() != 0 {
 		t.Fatal("fired after close")
+	}
+}
+
+// TestDesyncPAWS: paws mode fires an in-window fake packet with a mathematically valid TCP checksum
+// and a stale TCP timestamp (TSval = 1) triggering RFC 7323 PAWS discard at the destination kernel.
+func TestDesyncPAWS(t *testing.T) {
+	tr, sent := desyncTestTracker("paws", 0)
+	defer tr.close()
+	k := testClientKey()
+	const isn, srvSeq = uint32(1000), uint32(500000)
+	ch := tr.announce(k, isn+1, true)
+	feedFullHandshake(tr, k, isn, srvSeq)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake never fired")
+	}
+	if sent.n() != 1 {
+		t.Fatalf("want 1 fake, got %d", sent.n())
+	}
+	pkt := sent.at(0)
+	// Must be in-window: seq == isn + 1
+	seq := binary.BigEndian.Uint32(pkt[24:28])
+	if seq != isn+1 {
+		t.Fatalf("paws seq %d, want in-window %d", seq, isn+1)
+	}
+	// TCP header with options: data offset should be > 5 (20 bytes)
+	doff := int(pkt[32]>>4) * 4
+	if doff <= 20 {
+		t.Fatalf("paws packet missing TCP options: data offset %d", doff)
+	}
+	// Check TCP checksum is valid
+	stored := binary.BigEndian.Uint16(pkt[36:38])
+	th := make([]byte, len(pkt)-20)
+	copy(th, pkt[20:])
+	binary.BigEndian.PutUint16(th[16:18], 0)
+	if c := tcpChecksum(th, k.srcIP.bytes(), k.dstIP.bytes()); c != stored {
+		t.Fatalf("paws checksum invalid: recomputed %04x, stored %04x", c, stored)
+	}
+	// Check that TCP Timestamp option (Kind 8) has TSval == 1
+	opts := pkt[40 : 20+doff]
+	foundTS := false
+	for i := 0; i < len(opts); {
+		if opts[i] == 0 {
+			break
+		}
+		if opts[i] == 1 {
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			break
+		}
+		l := int(opts[i+1])
+		if opts[i] == 8 && l == 10 {
+			tsval := binary.BigEndian.Uint32(opts[i+2 : i+6])
+			if tsval != 1 {
+				t.Fatalf("paws TSval %d, want 1", tsval)
+			}
+			foundTS = true
+			break
+		}
+		i += l
+	}
+	if !foundTS {
+		t.Fatal("paws packet missing timestamp option")
 	}
 }
 
@@ -2237,8 +2305,15 @@ func TestDesyncResendKeepsDelayedMarkers(t *testing.T) {
 	defer tr.close()
 	k := testClientKey()
 	<-tr.announce(k, 1000, true, 500001)
-	time.Sleep(50 * time.Millisecond) // the delayed pieces
 	n := sent.n()
+	for stable := 0; stable < 5; { // the delayed pieces: wait until the count stops moving, a slow runner needs more than a fixed pause
+		time.Sleep(20 * time.Millisecond)
+		if m := sent.n(); m != n {
+			n, stable = m, 0
+		} else {
+			stable++
+		}
+	}
 	if n < 2 {
 		t.Fatalf("ff sent %d pieces, want several", n)
 	}

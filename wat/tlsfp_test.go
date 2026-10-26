@@ -58,6 +58,29 @@ func TestWriteFragments(t *testing.T) {
 	}
 }
 
+// TestWriteFragmentsSNISplit: n = -1 splits directly through the TLS SNI domain name.
+func TestWriteFragmentsSNISplit(t *testing.T) {
+	hello := FakeClientHello("mci.ir")
+	var w recWriter
+	n, err := writeFragments(&w, hello, -1, 0)
+	if err != nil || n != len(hello) {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if len(w.chunks) != 2 {
+		t.Fatalf("want exactly 2 chunks for mid-SNI split, got %d", len(w.chunks))
+	}
+	off := sniExtOffset(hello)
+	if off <= 0 {
+		t.Fatal("no SNI extension in hello")
+	}
+	if len(w.chunks[0]) != off+10 {
+		t.Fatalf("chunk 0 len %d, want off+10 (%d)", len(w.chunks[0]), off+10)
+	}
+	if !bytes.Equal(append(w.chunks[0], w.chunks[1]...), hello) {
+		t.Fatal("chunks do not reassemble back into hello")
+	}
+}
+
 // pipeRec is a net.Conn that records its writes.
 type pipeRec struct {
 	net.Conn

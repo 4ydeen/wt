@@ -79,8 +79,28 @@ func pinVerifier(pin []byte) func([][]byte, [][]*x509.Certificate) error {
 // ---------------------------------------------------------------- ClientHello fragmentation
 
 // writeFragments writes p to w in chunks of n bytes with a short gap between them.
+// When n < 0 (e.g. -1), it performs an intelligent split directly inside the TLS ClientHello SNI extension,
+// so neither segment carries a parseable server_name field.
 func writeFragments(w io.Writer, p []byte, n int, gap time.Duration) (int, error) {
-	if n <= 0 || len(p) <= n {
+	if n == 0 || len(p) == 0 {
+		return w.Write(p)
+	}
+	if n < 0 {
+		if off := sniExtOffset(p); off > 0 && off+10 < len(p) {
+			cut := off + 10 // first letter of domain in segment 1, remainder in segment 2
+			m1, err := w.Write(p[:cut])
+			if err != nil {
+				return m1, err
+			}
+			if gap > 0 {
+				time.Sleep(gap)
+			}
+			m2, err := w.Write(p[cut:])
+			return m1 + m2, err
+		}
+		n = 40 // fallback if no SNI extension is located
+	}
+	if len(p) <= n {
 		return w.Write(p)
 	}
 	sent := 0
@@ -107,7 +127,7 @@ type fragConn struct {
 }
 
 func newFragConn(c net.Conn, frag int) net.Conn {
-	if frag <= 0 {
+	if frag == 0 {
 		return c
 	}
 	if tc, ok := c.(*net.TCPConn); ok {
@@ -146,8 +166,8 @@ func newTLSEngine(o TLSClientOptions, alpn string) (*tlsEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	if o.Frag < 0 || o.Frag > 1<<14 {
-		return nil, fmt.Errorf("-tls-frag must be 0..16384, got %d", o.Frag)
+	if o.Frag < -1 || o.Frag > 1<<14 {
+		return nil, fmt.Errorf("-tls-frag must be -1..16384 (-1 = mid-SNI split), got %d", o.Frag)
 	}
 	e := &tlsEngine{o: o, alpn: alpn, fp: fp, logf: o.Logf, noted: map[string]bool{}}
 	if fp == "random" { // one browser per process, like a real client sticks to its own
@@ -183,7 +203,7 @@ func (e *tlsEngine) info() (fp, mode string, ech bool) {
 		if e.ech != nil && e.ech.mode != "off" {
 			mode += "+ech"
 		}
-		if e.o.Frag > 0 {
+		if e.o.Frag != 0 {
 			mode += "+frag"
 		}
 		mode += " (not connected yet)"
@@ -240,7 +260,7 @@ func (e *tlsEngine) dial(ctx context.Context, addr string) (net.Conn, error) {
 			if accepted {
 				m += "+ech"
 			}
-			if e.o.Frag > 0 {
+			if e.o.Frag != 0 {
 				m += "+frag"
 			}
 			e.mode.Store(m)
