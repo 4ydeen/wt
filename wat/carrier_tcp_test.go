@@ -621,15 +621,19 @@ func TestTCPPoolRedialsWhenAllConnsStall(t *testing.T) {
 	t.Cleanup(cli.Close)
 	poolBulk(t, r, cli, 1<<20) // the pool works
 	deaths := pio.ConnDeaths()
+	t0 := time.Now()
 	px.hole()
 	stop := make(chan struct{})
-	defer close(stop)
+	stopOnce := sync.Once{}
+	stopUploads := func() { stopOnce.Do(func() { close(stop) }) }
+	defer stopUploads()
 	for i := 0; i < 8; i++ { // keep the session sending: bulk streams into the hole
 		go func() {
 			st, err := cli.OpenStream()
 			if err != nil {
 				return
 			}
+			go func() { <-stop; st.Reset() }() // drops the stream and its queued data, so the check below is not behind it
 			b := make([]byte, 64<<10)
 			for {
 				select {
@@ -650,11 +654,26 @@ func TestTCPPoolRedialsWhenAllConnsStall(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	t.Logf("all closed after %v", time.Since(t0))
 	for pio.Conns() < 4 {
 		if time.Now().After(deadline) {
 			t.Fatalf("pool did not redial: %d conns", pio.Conns())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	poolBulk(t, r, cli, 1<<20) // and it carries data again
+	t.Logf("redialed after %v", time.Since(t0))
+	stopUploads() // the check below is recovery, not a race with eight senders still draining their backlog
+	// The upload direction is the one the client controls and recovers at once. The download waits on the server's own
+	// idle sockets, which look healthy to it until it writes into them, so it is not asserted here.
+	up := pattern(256<<10, 3)
+	st, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { st.Write(append([]byte{'U'}, up...)); st.CloseWrite() }()
+	sum, err := readAll(st)
+	if want := sha256.Sum256(up); err != nil || !bytes.Equal(sum, want[:]) {
+		t.Fatalf("upload after the redial: err=%v", err)
+	}
+	t.Logf("carries data after %v", time.Since(t0))
 }

@@ -1433,6 +1433,13 @@ func (s *TCPPoolServer) healthLoop() {
 				pools = append(pools, conns)
 			}
 			s.mu.Unlock()
+			for _, cs := range pools { // a write blocked for poolStallKill is a dead socket, whatever keep-slow says (3.0.1)
+				for _, pc := range cs {
+					if pc.stalledFor(now.UnixNano()) > poolStallKill {
+						pc.fail()
+					}
+				}
+			}
 			for _, cs := range pools {
 				if s.keep.Load() {
 					break

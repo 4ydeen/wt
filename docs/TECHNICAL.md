@@ -1805,7 +1805,7 @@ Raw TCP on the same path (8 BBR connections, no tunnel) moved 78 MB/s; 32 connec
   `WAT_NO_DIRECT=1` turns direct mode off.
 - **All connections stalled (3.0.1).** A pool whose connections all stop at once (a middlebox cutting every flow, or a
   path that blackholes) used to wait for the kernel's retransmit limit, about 15 minutes, before redialling. Now
-  every connection stuck longer than 5 s is closed by the health loop even when no healthy one exists, and the
+  every connection stuck longer than 5 s is closed by the health loop (client and server pool alike) even when no healthy one exists, and the
   pool sockets carry `TCP_USER_TIMEOUT` (30 s, `WAT_POOL_USER_TIMEOUT` in seconds, 0 turns it off), so the slots
   redial within seconds. Rate control also holds on a path that delivers nothing, instead of ramping to the maximum.
 - **Startup.** A direct session paces at 2.5x its delivery estimate until the estimate stops growing (a fresh
