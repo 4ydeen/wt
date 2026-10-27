@@ -99,9 +99,9 @@ func validateDesync(cfg DesyncConfig) error {
 		}
 	}
 	switch cfg.Mode {
-	case "", "seq", "ttl", "sum", "seqsum", "rst", "split", "hlen0", "fakeip", "synrst", "ff", "all":
+	case "", "seq", "ttl", "sum", "seqsum", "rst", "split", "hlen0", "fakeip", "synrst", "ff", "all", "paws":
 	default:
-		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum, rst, split, hlen0, fakeip, synrst, ff or all, got %q", cfg.Mode)
+		return fmt.Errorf("wat: -fake-mode must be seq, ttl, sum, seqsum, rst, split, hlen0, fakeip, synrst, ff, all or paws, got %q", cfg.Mode)
 	}
 	if cfg.TTL < 0 || cfg.TTL > 255 {
 		return fmt.Errorf("wat: -fake-ttl must be 0 (auto) or 1..255, got %d", cfg.TTL)

@@ -1241,7 +1241,7 @@ func TestDesyncOptsCapture(t *testing.T) {
 // TestValidateDesyncNewModes pins validation for the modes added with the F&F round: split/hlen0/fakeip/synrst/
 // ff/all, the -fake-ip IPv4 check and the -fake-split range.
 func TestValidateDesyncNewModes(t *testing.T) {
-	for _, m := range []string{"split", "hlen0", "fakeip", "synrst", "ff", "all"} {
+	for _, m := range []string{"split", "hlen0", "fakeip", "synrst", "ff", "all", "paws"} {
 		if err := validateDesync(DesyncConfig{SNI: "a.ir", Mode: m}); err != nil {
 			t.Fatalf("%s: %v", m, err)
 		}
