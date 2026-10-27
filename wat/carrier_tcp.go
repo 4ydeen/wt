@@ -161,7 +161,7 @@ var poolLowat = func() int {
 	if n, err := strconv.Atoi(os.Getenv("WAT_POOL_LOWAT")); err == nil && n >= 16<<10 {
 		return n
 	}
-	return 128 << 10
+	return HostProfile().PoolLowat
 }()
 
 func newPoolConn(c net.Conn) *poolConn {
@@ -864,7 +864,7 @@ func (c *TCPPoolClient) Edges() []EdgeStat {
 
 func newSlotPoolClient(dial func(ctx context.Context, slot int) (net.Conn, error), conns int, hook ...func(ctx context.Context, slot int, inner func(context.Context, int) (net.Conn, error)) (net.Conn, error)) (*TCPPoolClient, error) {
 	if conns <= 0 {
-		conns = DefaultPoolConns
+		conns = HostProfile().DefaultPoolConns
 	}
 	if conns > poolMaxConns {
 		conns = poolMaxConns

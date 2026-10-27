@@ -161,9 +161,9 @@ type Session struct {
 	kexAt        time.Time   // when the fresh key took over in both directions
 	kexDone      bool
 	rxKeys       atomic.Pointer[[2]cipher.AEAD] // {aead, oldAead} while kexDone, else nil: handle's lock-free open (pubRxKeys)
-	kexGrace    time.Duration // old-key grace / stale-exchange expiry (a copy of the kexGrace default; a field so tests can shrink it per session without racing other sessions' pumps)
-	kexGiveUp    time.Duration // client: how long to keep offering before re-arming with fresh keys (same reasoning)
-	probeAfter   time.Duration // client: copies of kexProbeAfter/kexProbeFor (same reasoning)
+	kexGrace     time.Duration                  // old-key grace / stale-exchange expiry (a copy of the kexGrace default; a field so tests can shrink it per session without racing other sessions' pumps)
+	kexGiveUp    time.Duration                  // client: how long to keep offering before re-arming with fresh keys (same reasoning)
+	probeAfter   time.Duration                  // client: copies of kexProbeAfter/kexProbeFor (same reasoning)
 	probeFor     time.Duration
 	mu           sync.Mutex
 	now          time.Time
@@ -216,7 +216,8 @@ type Session struct {
 	stats         Stats
 	openBuf       []byte
 	noWinTune     bool     // tests: behave like a peer that never advertises more than the implicit window
-	winCap        uint64   // per-stream window ceiling this end advertises: cfg.WinMax, or maxStreamWin (stream.go)
+	winCap        uint64   // per-stream window ceiling this end advertises: cfg.WinMax, or auto-tuned from host profile (stream.go)
+	maxSessionWin uint64   // total window growth beyond base windows per session: auto-tuned from host profile (stream.go)
 	winExtra      uint64   // sum over streams of (win - streamWindow): the auto-tuned growth in use
 	winSlack      uint64   // bytes a peer's largest datagram may overshoot the advertised stream window
 	maxPlain      int      // plaintext bytes per datagram: cfg.MaxPayload - header - tag
@@ -225,7 +226,7 @@ type Session struct {
 	rxNonce       [12]byte // handle runs on the receive goroutine only
 	copier        bool     // the carrier copies a datagram inside Send, so the buffer may be reused as soon as Send returns
 	outFree       chan []byte
-	outStack      [][]byte // fast L1-cached buffer recycler for pump goroutine
+	outStack      [][]byte      // fast L1-cached buffer recycler for pump goroutine
 	batcher       BatchSender   // nil: send one datagram at a time
 	backlog       Backlogger    // nil: the carrier has no send queues of its own to report
 	deathIO       DeathReporter // the carrier's own connection-death counter, when it has one (pool carriers)
@@ -336,11 +337,11 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		winSlack: uint64(hi - overhead),
 	}
 	s.pingGap, s.maskFlip = cfg.PingEvery, time.Now()
-	s.winCap = maxStreamWin
+	hp := HostProfile()
+	s.winCap = hp.WinCap
+	s.maxSessionWin = hp.MaxSessionWin
 	if cfg.WinMax > 0 {
-		// clamped to [streamWindow, maxStreamWin]: below the base means "do not auto-tune", and this is a memory
-		// bound, not a way to grow past the default
-		s.winCap = min(max(cfg.WinMax, uint64(streamWindow)), uint64(maxStreamWin))
+		s.winCap = min(max(cfg.WinMax, uint64(streamWindow)), 64<<20)
 	}
 	if !cfg.NoMask {
 		s.hk = hdrMaskKey(cfg.Key)

@@ -68,10 +68,10 @@ func TestStreamWindowAutoTune(t *testing.T) {
 // bound for a small VPS and not a way to grow past the default.
 func TestWinMaxClamped(t *testing.T) {
 	for _, c := range []struct{ in, want uint64 }{
-		{0, maxStreamWin},         // unset: exactly the old behaviour
+		{0, HostProfile().WinCap}, // unset: exactly the old behaviour
 		{1 << 20, streamWindow},   // below the base pins the window at 4 MB, it does not shrink it
 		{5 << 20, 5 << 20},        // in range: used as given
-		{100 << 20, maxStreamWin}, // above the ceiling: clamped down
+		{100 << 20, 64 << 20},     // above the 64 MB ceiling: clamped down
 	} {
 		cli, srv, _, _ := newPair(t, 0, time.Millisecond, 40e6, Config{WinMax: c.in})
 		if cli.winCap != c.want || srv.winCap != c.want {

@@ -215,7 +215,7 @@ func (st *Stream) tuneWindow(now time.Time) {
 	if edge {
 		nw = min(2*st.win, s.winCap)
 	}
-	if nw <= st.win || s.winExtra+(nw-st.win) > maxSessionWin {
+	if nw <= st.win || s.winExtra+(nw-st.win) > s.maxSessionWin {
 		return
 	}
 	s.winExtra += nw - st.win

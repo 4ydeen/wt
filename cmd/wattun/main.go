@@ -82,17 +82,17 @@ func main() {
 	icmpType := flag.String("icmp-type", "echo", "icmp carrier: echo|timestamp|info|mask - the ICMP request type the client sends (the server answers with the matching reply: 8/0, 13/14, 15/16, 17/18); both ends must use the same")
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
-	conns := flag.Int("conns", wat.DefaultPoolConns, "client, tcp/tls carrier: connections in the pool")
+	conns := flag.Int("conns", 0, "client, tcp/tls carrier: connections in the pool (0 = auto-tuned from host hardware: 8 on lean VPS, 16 on 2-CPU/2GB+, 24-32 on 4+ cores)")
 	poolRotate := flag.String("pool-rotate", "0", "client, pool carriers (tcp|tls|ws|wss|h2|grpc): recycle each healthy pool connection after this long, so no flow shows a months-stable lifetime; accepts 30m, 4h or seconds; jittered +/-40% per connection so the redials never line up; 0 = off (2.8.0; a -reverse server dials too, so it honours it since 3.0.2)")
 	poolRotateBytes := flag.String("pool-rotate-bytes", "0", "client, pool carriers, with -pool-rotate or alone: also recycle each healthy pool connection after this many bytes handed to its socket (500MB, 4GB, 300k; 1MB = 1e6); jittered +/-25% like the time axis; whichever limit hits first recycles (2.8.1; a -reverse server honours it since 3.0.2)")
 	tcpCC := flag.String("tcp-cc", wat.PoolTCPCC, "tcp|tls|ws|wss|h2|h2c|grpc: TCP congestion control set on every pool socket, Linux (bbr ignores random loss, the kernel default cubic halves the window on it; 'system' keeps the kernel default; 2.4.18, before: system)")
-	nSess := flag.Int("sessions", 1, "client: independent sessions to the server (1-16), each with its own -conns pool, pacer and session id; new TCP streams go to the least loaded live one, UDP flows stick to one, /speedtest uses all; udp|tcp|tls|ws|wss|h2|h2c|grpc only (not icmp, bonded carriers or -reverse); each counts against the server's 32-session limit (client only, 2.3.0; server unchanged)")
+	nSess := flag.Int("sessions", 0, "client: independent sessions to the server (0 = auto-tuned from host CPU, 1-16), each with its own -conns pool, pacer and session id; new TCP streams go to the least loaded live one, UDP flows stick to one, /speedtest uses all; udp|tcp|tls|ws|wss|h2|h2c|grpc only (not icmp, bonded carriers or -reverse); each counts against the server's 32-session limit (client only, 2.3.0; server unchanged)")
 	tlsCert := flag.String("tls-cert", "", "server, tls carrier: certificate file (empty = self-signed in memory)")
 	tlsKey := flag.String("tls-key", "", "server, tls carrier: private key file")
 	sni := flag.String("sni", "", "client, tls carrier: server name sent in the ClientHello")
 	tlsPin := flag.String("tls-pin", "", "client, tls carrier: hex sha256 of the server certificate to require")
 	mtu := flag.Int("mtu", 0, "datagram size cap incl. header/tag, 256-1400 (tcp|tls|ws|wss|h2|h2c|grpc: up to 16384) (0 = the carrier default: 640 icmp, 1400 udp, 4096 tcp-based)")
-	winMax := flag.Int("win-max", 0, "both ends: cap the per-stream receive window in MB, clamped to 4-16 (0 = 16, the default) (3.0.3). The window is receiver-driven, so this bounds what the PEER's sender buffers per stream: N concurrent bulk streams cost at most N x win-max MB instead of N x 16 MB. Set it on a small VPS (4 = no window auto-tuning). Each end bounds the direction it receives, so set it on both to bound both; a peer that advertises a bigger window still makes this end buffer more")
+	winMax := flag.Int("win-max", 0, "both ends: cap the per-stream receive window in MB, clamped to 4-64 (0 = auto-tuned from host RAM: 4 on lean VPS, 16 on 2-4GB, 32-64 on high-perf VPS) (3.0.3). Windows are receiver-driven, so this bounds what the PEER's sender buffers per stream. Set it explicitly to override auto-tuning")
 	path := flag.String("path", "/wat", "client/server, ws|wss|h2|h2c|grpc carrier: URL path (grpc: service name, requests go to <path>/Tun)")
 	tlsFP := flag.String("fp", "go", "client (also a -reverse server), tls|wss|h2|grpc carriers: TLS ClientHello fingerprint go|chrome|firefox|safari|edge|random; go is the standard library's (client only, 2.2.0; server unchanged)")
 	echMode := flag.String("ech", "off", "client, tls|wss|h2|grpc carriers: Encrypted Client Hello: off|auto|ladder|<base64 ECHConfigList>; auto reads the HTTPS DNS record of the SNI/host name over DNS-over-HTTPS (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9 raced in parallel; the last good config is kept if they all fail); ladder = auto plus a second rung for hijacked networks (2.9.0): when every direct DoH server fails, the query goes through the tunnel's built-in DNS relay (server target port 53, the speed-test pattern), so a wss+ECH tunnel bootstraps on an ICMP-only route; both ends need 2.9.0 (old server: the relay port is just a failed local dial, the ladder falls back to no ECH)")
@@ -228,6 +228,17 @@ func main() {
 		}
 		seen[n] = true
 		anyPool = anyPool || poolCarriers[n]
+	}
+	hp := wat.HostProfile()
+	if *conns <= 0 {
+		*conns = hp.DefaultPoolConns
+	}
+	if *nSess <= 0 {
+		if !server && !*reverse && len(names) == 1 && names[0] != "icmp" {
+			*nSess = hp.DefaultSessions
+		} else {
+			*nSess = 1
+		}
 	}
 	if *reverse && !anyPool && !seen["icmp"] && !seen["udp"] {
 		fmt.Fprintf(os.Stderr, "-reverse needs icmp, udp or a connection-pool carrier (tcp|tls|ws|wss|h2|h2c|grpc), not %q\n", *carrier)
@@ -662,7 +673,8 @@ func main() {
 		portReg.applyLimits(fileCfg.Limits)
 	}
 	go portReg.run()
-	log.Printf("wattun %s up (ident base %d, lanes %d, max %.0f MB/s)", *mode, wat.IdentBase(k), *lanes, *maxMB)
+	log.Printf("wattun %s up (ident base %d, lanes %d, max %.0f MB/s; host: %d CPU, %d MB RAM, %s tier, conns %d, sessions %d)",
+		*mode, wat.IdentBase(k), *lanes, *maxMB, hp.NumCPU, hp.TotalRAMMB, hp.Tier, *conns, *nSess)
 	if tun != nil && len(tun.list) > 1 {
 		log.Printf("%d sessions (new streams go to the least loaded live one)", len(tun.list))
 	}
@@ -815,9 +827,9 @@ func main() {
 			w := &cfgWatcher{path: *cfgPath, known: known, skip: func(k string) bool { return explicit[k] }, interval: 3 * time.Second,
 				onPorts: func(c *fileConfig) []error {
 					if !c.PortsSet { // ports: removed: fall back to -allow-ports/-allow-file, not an empty list
-					al.reset(*allowList)
-					return nil
-				}
+						al.reset(*allowList)
+						return nil
+					}
 					al.setPorts(c.tcpPorts())
 					al.setUDPPorts(c.udpPorts())
 					return nil
