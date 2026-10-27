@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v3.0.2-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v3.1.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -47,6 +47,28 @@ such a pair, and these are the results through that filter:
 One vCPU per server, 82 ms round trip, one run each, so read these as orders of magnitude (the pair also passes ICMP, at 7-10 MB/s). Every one of them is a tunnel
 that **plain tools cannot bring up at all** on this route. Old and new releases work together. Conditions, failures
 and the full list of 92 configurations: [docs/TECHNICAL.md](docs/TECHNICAL.md#field-numbers).
+
+## What changed since 3.0.0
+
+- **Defaults follow the machine (3.1.0).** The program reads the CPU count and the RAM it may use (container limits
+  included) and picks connections, sessions and window sizes by itself: a small VPS stays light, a 2-vCPU / 2 GB+
+  server opens more connections and a second session. The start line shows what it chose; `conns`, `sessions` and the
+  new `win-max` override it. On a 2-vCPU pair with 81 ms between them this takes `tcp` to **1.06 Gbit/s down / 0.98 up**.
+- **Two bugs that hurt real tunnels (3.1.0).** After the first speed test the server's receive loop could hang for good
+  (the tunnel looked up and moved nothing); bonded tunnels sent all bulk traffic over one carrier.
+- **A dead pool recovers in seconds (3.0.1).** If every connection of a `tcp`/`tls`/`ws`/`wss`/`h2`/`grpc` pool stalls
+  together, it redials after about 5 s instead of waiting about 15 minutes; on the test pair upload was back 8-9 s after
+  a total blackhole.
+- **Reverse tunnels no longer keep one connection for hours (3.0.2).** `pool-rotate` now works on the side that dials,
+  so Kharej recycles its connections (the manager sets `30m` on new reverse tunnels). A 20 s rotation kept every
+  connection under 20 s old at 80 MB/s down and 68 MB/s up; the run without it lost all traffic on its 150 s old
+  connections. Add `pool-rotate: 30m` to existing reverse tunnels by hand.
+- **Auto test with two presets (3.0.2).** The manager asks first: *normal* (2-3 minutes) or *anti-censor* (every desync
+  mode, SNI, TLS fragment, fingerprint and ECH variant on every carrier, about 195 variants). `s` skips a variant, `g` a
+  carrier, `q` stops and lets you choose from what was measured.
+- **Looks more like a web server (3.0.2).** HTTP carriers answer with the stock nginx pages, a random throwaway
+  certificate, a Chrome-like WebSocket request, and a random URL path for new tunnels; new `fake-mode: paws`
+  (experimental) and `tls-frag: -1` (split inside the SNI).
 
 ## What changed since 2.5.0
 
@@ -104,6 +126,8 @@ through the tunnel while it is fully loaded; the route's own ping is about 40 ms
 | **TCP / TLS / reverse** (2.5.1, production tunnel with users on it) | **195 MB/s (~1.6 Gbit)** | **276 MB/s (~2.2 Gbit)** | 40-51 ms |
 | **ICMP** (only ping passes on the route) | **up to ~33 MB/s**, the route's maximum | 26 MB/s | 40-45 ms |
 | **Cloudflare CDN** (`wss` + ECH, 4 sessions) | 44-48 MB/s | up to 82 MB/s | 109-116 ms (CDN base 86) |
+| **TCP / TLS / WS** (3.1.0, 2 vCPU pair, 81 ms, 16 streams, raw TCP 1.5 Gbit/s) | **132-143 MB/s (1.06-1.14 Gbit)** | 101-123 MB/s | 94-127 ms down, ~400 up at full load |
+| **Same pair, `tcp` / `tls` + fake-SNI** (`rst`, `synrst`, `paws`) | 110-139 MB/s (0.89-1.11 Gbit) | 96-124 MB/s | same as above |
 
 Plain TCP with no tunnel at all reaches 243 MB/s down on the same route with 16 connections. WatTunnel, encrypted,
 reaches **80 % of that**. Full tables, every version and how each was measured:

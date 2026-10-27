@@ -229,6 +229,9 @@ func main() {
 		seen[n] = true
 		anyPool = anyPool || poolCarriers[n]
 	}
+	if *winMax < 0 || *winMax > 64 {
+		log.Fatalf("-win-max must be 0 (auto) or 4..64 MB, got %d", *winMax)
+	}
 	hp := wat.HostProfile()
 	if *conns <= 0 {
 		*conns = hp.DefaultPoolConns

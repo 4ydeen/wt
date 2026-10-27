@@ -111,6 +111,33 @@ Ping through the tunnel:
 - **2.5.0:** the download was limited by the Iran server's CPU, not the route. The receiving tunnel used 103-117 % of one of its two cores.
 - **2.5.1:** removed a large part of that CPU cost (see [Cheaper stream buffers](#cheaper-stream-buffers-251)). Its download reaches 80 % of what plain, unencrypted TCP gets on the same route with 16 connections.
 
+### Fast pair: every carrier and anti-censor variant (3.1.0, 2026-10-27)
+
+Iran 2 vCPU / 1.9 GB, Kharej 2 vCPU / 3.8 GB, 81 ms apart, host buffers raised to 16 MB with BBR, 16 streams, 1024 MB each way,
+auto-tuned defaults (Iran standard tier: 16 connections, 2 sessions; Kharej highperf). Raw TCP between the two without a tunnel:
+1500 Mbit/s received with 16 and 1509 with 32 streams; delivered UDP about 1280. One run per cell, and this pair's run-to-run spread is
+about 20 % (`tcp` download measured 1057, 1177 and 1320 in three runs), so read differences under 20 % as noise.
+
+| Carrier | Down Mbit/s | Up Mbit/s | | Variant (client `fake-sni www.cloudflare.com`) | Down Mbit/s | Up Mbit/s |
+|---|---|---|---|---|---|---|
+| `tcp` | 1057 | 981 | | `tcp` + `rst` | 1043 | 930 |
+| `tls` | 1140 | 805 | | `tcp` + `synrst` | 1088 | 948 |
+| `ws` | 1132 | 808 | | `tcp` + `paws` | 1113 | 765 |
+| `wss` | 1066 | 676 | | `tls` + `rst` | 885 | 875 |
+| `h2c` | 1131 | 547 | | `tls` + `paws` | 1110 | 991 |
+| `grpc` | 1027 | 670 | | `wss` + `rst` | 1144 | 658 |
+| `udp` | 578 | 542 | | | | |
+
+The desync runs only while a connection is set up, so the variants carry data at their carrier's speed. With the kernel's own buffers
+(208 KB receive buffer, cubic, no BBR) the same runs gave `tcp` 1177 / 1127, `tls` 927 / 1018, `ws` 1058 / 657, `wss` 1129 / 601, `h2c` 487 / 730
+and `grpc` 340 / 516 (down / up): `h2c` and `grpc` need the raised buffers. Full duplex (one 1 GB transfer each way at the same time): 706 up + 679 down
+= 1384 Mbit/s, while raw TCP in both directions at once reached only 268.
+
+Latency during a 512 MB transfer with 16 streams (route alone 81 ms, a `ping` beside it 81-84 ms): downloading 856-1029 Mbit/s the tunnel's
+round trip was 94-127 ms and the server used up to 172 % of its 200 % CPU; uploading 669-730 Mbit/s it was 383-414 ms, the client's memory peaked
+at 1024 MB and the server's at 641 MB. Below saturation `icmp` (114 Mbit/s) stayed at 81.5-85.4 ms. Capping the window made it slower, not
+lighter: `win-max 8` and `4` gave `tcp` 844 / 603 and 757 / 762 Mbit/s here. 2 Gbit/s is not reachable on this pair.
+
 ### ICMP (real filtered route, October 2026)
 
 Real VLESS (xray) traffic went through each tunnel, on the same servers and the same route. WatTunnel numbers are
@@ -489,7 +516,7 @@ All carriers carry the same encrypted session. Pick one with `carrier:` (or `-ca
 |---|---|---|---|---|
 | `icmp` | Only ping passes (Iran today). | 640 bytes | yes (raw socket) | 4 lanes by default (`lanes`). Pacing is delay-based. 640 is the safe default. Raise `mtu` (up to 1400) only after checking that the path passes that size, see [ICMP path limits](#icmp-path-limits-and-pacing). |
 | `udp` | UDP works and you want the lowest CPU and latency. | 1400 bytes | no | Server listens on `listen`; client dials `peer` as `host:port`. |
-| `tcp` | Plain TCP works. | 4096 bytes (up to 16384) | no | A pool of connections (`conns`, default 8). Reliable underneath, the session still repairs drops. |
+| `tcp` | Plain TCP works. | 4096 bytes (up to 16384) | no | A pool of connections (`conns`, default auto: 8, 16 or 24-32 by host since 3.1.0). Reliable underneath, the session still repairs drops. |
 | `tls` | A middlebox must see HTTPS. | 4096 | no | The tcp pool inside TLS 1.3. Self-signed certificate if none is given. Pin the fingerprint with `tls-pin`. |
 | `ws` | Behind a CDN or reverse proxy, port 80. | 4096 | no | WebSocket on `path`. Other requests get a plain 404. |
 | `wss` | Same, with TLS (Cloudflare on 443). | 4096 | no | Set `sni` and `host` to the public name. |
@@ -1239,13 +1266,14 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `bind` | `0.0.0.0` | client | Address of the public listeners. |
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
-| `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
+| `conns` | 0 (auto) | client (server with `reverse`) | Connections in a pool carrier. 0 picks 8 on a lean host, 16 on a standard one, 24-32 on a high-performance one (3.1.0, see "3.1.0: host-aware defaults"); older versions used 8. With `reverse`, Kharej dials this many to Iran. |
 | `pool-rotate` | 0 (off) | client, or the dialing server of a `reverse` tunnel since 3.0.2 (pool carriers: tcp, tls, ws, wss, h2, grpc) | Recycle each healthy pool connection after this long (`30m`, `4h`), so no single flow shows a months-stable lifetime; each connection's actual budget is jittered ±40 % and re-rolled on every recycle, so redials never line up into a detectable period. The session resends anything in flight, so the cost is one redial on one connection at a time. 0 = off. Since 2.8.0. |
 | `pool-rotate-bytes` | 0 (off) | client, or the dialing server of a `reverse` tunnel since 3.0.2 (pool carriers: tcp, tls, ws, wss, h2, grpc) | With or instead of `pool-rotate`: also recycle each healthy pool connection after this many bytes handed to its socket (`500MB`, `4G`, `300k`; decimal units, 1 MB = 10^6). Jittered +/-25 % like the time axis; whichever limit hits first recycles, so the byte axis does not betray the time axis's jitter. 0 = off. Since 2.8.1. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
+| `win-max` | 0 (auto) | both | Cap of the receive window per stream in MB, 4 to 64 (3.0.3). Windows are receiver-driven, so the value bounds what the peer's sender buffers per stream. 0 uses the host tier (4 MB lean, 16 standard, 32 high-performance); the fixed cap before 3.0.3 was 16 MB. |
 | `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp, tcp, tls, ws, wss, h2, h2c and grpc since 2.4.18 (200 from 2.3.0; before that 16 for every carrier; the server's value caps the download). See "ICMP path limits and pacing". |
 | `tcp-cc` | `bbr` | both | Since 2.4.18, Linux. TCP congestion control set on every pool socket (tcp, tls, ws, wss, h2, h2c, grpc). BBR does not back off on random loss; the kernel default (cubic) halves its window on every lost segment. `system` keeps the kernel default. Each end sets it for what it sends. `tcp_cc` in `/stats` shows what the kernel accepted (falls back to the default if the `tcp_bbr` module is missing). |
-| `sessions` | 1 | client | Independent sessions to the server, 1 to 16 (2.3.0, client only; the server is unchanged). See "Several sessions". |
+| `sessions` | 0 (auto) | client | Independent sessions to the server, 1 to 16 (2.3.0, client only; the server is unchanged). 0 picks 1 on a lean host and 2-4 on a host with 2+ CPUs and enough RAM (3.1.0), and always 1 for `icmp`, bonds and `reverse`; older versions used 1. See "Several sessions". |
 | `icmp-type` | `echo` | both | ICMP carrier: `echo`, `timestamp`, `info` or `mask`. Both ends must match. |
 | `loss-ceiling` | false | both | Opt-in loss-aware ceiling for the pacer (see "ICMP path limits and pacing"). Off = delay only. |
 | `slack-ms` | 8 | both | RTT growth tolerated before slowing down. |
@@ -1929,6 +1957,40 @@ Field result, production CDN, 2026-10-12, measured back to back the same morning
 30.4 MB/s on 2.4.3 and 42.9 / 44.7 MB/s on 2.4.5, at 2 and 21 minutes after the restart. Kharej showed no connection
 in backoff, and the p95 of a small request during the loop fell from 1114 ms to 269-549 ms.
 
+## 3.1.0: host-aware defaults and two fixes
+
+- **Defaults follow the host.** At start the program reads the CPU count (`min(NumCPU, GOMAXPROCS)`) and the RAM it may
+  use (`/proc/meminfo`, lowered by a cgroup v1 or v2 memory limit, so a container is not sized by its host; Windows asks
+  the OS; an unknown value counts as lean) and picks a tier. The start line shows it:
+  `host: 2 CPU, 1920 MB RAM, standard tier, conns 16, sessions 2`.
+
+  | Tier | When | Pool `conns` | `sessions` (forward client) | Window cap per stream | Session window growth | `TCP_NOTSENT_LOWAT` |
+  |---|---|---|---|---|---|---|
+  | lean | 1 CPU or up to 1.5 GB | 8 | 1 | 4 MB | 32 MB | 64 KB |
+  | standard | everything between | 16 | 2 (2+ CPUs) | 16 MB | 64 MB | 128 KB |
+  | highperf | 3.5 GB+ and 2+ CPUs | 24 (32 with 4+ CPUs) | 2 (4 with 4+ CPUs) | 32 MB | 128 MB | 256 KB |
+
+  `-conns`, `-sessions`, `-win-max` and `WAT_POOL_LOWAT` always win. `sessions` is chosen only for a forward client with
+  one non-`icmp` carrier. Things to know: a lean host now holds a single stream near 4 MB / RTT (about 44 MB/s at 90 ms),
+  which is about what a one-vCPU box reached in our tests (50 MB/s); a standard host opens twice the sockets of 3.0.x and its memory
+  peaked at 1 GB (client) during a 512 MB upload on a 1.9 GB box, so on a small box that also runs other services set
+  `sessions: 1` or `win-max: 4`.
+- **Fixed: the server's receive loop could wedge for good.** `Server.getBuf` returned a too-small pooled buffer with a
+  blocking send; a concurrent `putBuf` could refill the slot and the only receive goroutine blocked forever. Symptom: the
+  first speed test passed and every later one died with "session closed" while the connections stayed up. Reproduced end
+  to end (1 success then 11 failures), fixed build 12/12 (`TestGetBufNeverBlocks`).
+- **Fixed: bonded sessions pinned bulk streams to a lane the bond does not have.** A bond routes by its own path index,
+  so per-stream pinning sent every bulk packet to carrier 0 (or dropped it on a reverse bond). Pinning is now only used
+  when the carrier is not a path chooser (`TestBondChooserDisablesPin`).
+- **Field numbers, one pair, one day, 16 streams, 1 GB** (2 vCPU each, Iran 1.9 GB, Kharej 3.8 GB, 81 ms, raw TCP between
+  them 1.5 Gbit/s received, host buffers raised to 16 MB with BBR): tcp 1057 down / 981 up Mbit/s, tls 1140 / 805, ws 1132 / 808,
+  wss 1066 / 676, h2c 1131 / 547, grpc 1027 / 670, udp 578 / 542; with fake-SNI `rst`, `synrst` or `paws` on tcp
+  1043-1113 down. Single runs; this pair's run-to-run spread is about 20 %. With the kernel defaults (208 KB receive
+  buffer, cubic) tcp, ws and wss stay above 1 Gbit/s down, but h2c and grpc fall to 487 and 340: raise `net.core.rmem_max`
+  and `tcp_rmem` on both ends for them. Under a 1 Gbit/s load the tunnel's round trip rose from 81 ms to 94-127 ms
+  downloading and 383-414 ms uploading (queueing inside the process); below saturation `icmp` stayed within 4 ms of the
+  route. 2 Gbit/s is not reachable on that pair (the wire itself tops out near 1.5 Gbit/s).
+
 ## 3.0.2: probing resistance and the PAWS marker
 
 - **`fake-mode: paws`.** An in-window fake ClientHello with a valid TCP checksum, so a DPI that checks window and
@@ -2115,6 +2177,8 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **3.1.0: defaults follow the host, two bug fixes.** Update both ends for the first fix (the server hang), any order for the rest. (1) Connections, sessions, window cap and socket low-water mark are chosen from the CPU count and RAM (cgroup limits included): `-conns` and `-sessions` default to 0 = auto, new `-win-max`. (2) The server's receive loop could block for good after the first speed test. (3) Bonded sessions no longer pin bulk streams to a lane that does not exist. See "3.1.0: host-aware defaults".
+- **3.0.2: reverse tunnels recycle connections, auto test presets.** Update both ends. (1) `pool-rotate` / `pool-rotate-bytes` now work on the dialing server of a `reverse` tunnel; the manager writes `pool-rotate: 30m` into new reverse pool tunnels (add it by hand to existing ones). (2) The manager's auto test asks for *normal* or *anti-censor* (every desync mode, SNI, TLS fragment, fingerprint and ECH variant) with skip / stop keys. (3) `fake-mode: paws`, `tls-frag: -1`, the nginx web face, a throwaway TLS certificate, h2/grpc receive window 8 MB, `wattun-manager iran-firewall`. See "3.0.2: probing resistance and the PAWS marker".
 - **3.0.1: no fixed strings in `ws`/`wss`/`h2`/`grpc` tunnels.** Any order of updating works; an existing tunnel keeps its path until you change it on both ends. (1) The manager gives every new `ws`, `wss`, `h2`, `h2c` or `grpc` tunnel (the auto tunnel too) its own URL path, `/api/` plus 12 random hex digits, instead of the `/wat` every install used: a filter could match `GET /wat` with `Upgrade: websocket` on a plain `ws` tunnel as the signature of this tool. The path travels in the token, so Iran follows by itself. To change a running tunnel set the same `path:` on both ends and restart. (2) The `ws` upgrade request now has a browser's header set in a browser's order (`User-Agent`, `Origin`, `Pragma`, `Cache-Control`, `Accept-Encoding`, `Accept-Language`); before it had no `User-Agent` at all. A header you give with `header:` replaces the default of the same name. Both only matter where the request is visible in plain text (`ws`), or where the path is read after the TLS layer (never by a passive filter). For `tls`, `wss`, `h2` and `grpc` the ClientHello is still the Go library's unless you set `fp: chrome` (or `firefox`, `random`): do that on any route that blocks the server's IP after some minutes.
 - **3.0.0: no constant bytes in the packet header, random idle shape, reverse `udp`, DNS-shaped `udp`.** Update both ends for
   reverse `udp`; for the rest any order works. (1) The session id and packet number at the start of every packet are

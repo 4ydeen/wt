@@ -87,8 +87,8 @@ type Config struct {
 	// NoShape turns off the random padding of small packets and the jitter on the idle keepalive (hdrmask.go).
 	NoShape bool
 	// WinMax caps the receive window this end advertises per stream, so it also caps what the peer's sender may
-	// buffer for that stream (stream.go sendCap/writeCap). Clamped to [streamWindow, maxStreamWin], i.e. 4-16 MB;
-	// 0 = maxStreamWin (16 MB), the old behaviour. 4 MB pins the window at the base, i.e. no auto-tuning. Set it on
+	// buffer for that stream (stream.go sendCap/writeCap). Clamped to 4-64 MB; 0 = the
+	// host profile's cap (hardware.go: 4 MB lean, 16 MB standard, 32 MB highperf; a fixed 16 MB before 3.0.3). 4 MB pins the window at the base, i.e. no auto-tuning. Set it on
 	// a small VPS to bound memory: with the default, N concurrent bulk streams let the sender hold up to N x 16 MB,
 	// measured 2026-10-27 as 148-214 MB of live heap for 8 streams on a 894 MB box. Windows are receiver-driven, so
 	// each end bounds the direction it receives; set it on both ends to bound both.
