@@ -1,9 +1,9 @@
 package wat
 
 import (
-	"net"
 	"bytes"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -223,6 +223,53 @@ func TestServerIgnoresReflections(t *testing.T) {
 	}
 }
 
+// A too-small pooled buffer must go back without blocking: a concurrent putBuf can refill the freed slot first, and a
+// blocking send then wedges the server's only receive loop for good (field: every speed test after the first failed,
+// audit 2026-10-27).
+func TestGetBufNeverBlocks(t *testing.T) {
+	srv := &Server{free: make(chan []byte, 1)}
+	srv.free <- make([]byte, 16)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ { // readers take the tiny buffer and find it too small
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					srv.getBuf(make([]byte, 4096))
+				}
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ { // writers race to refill the slot the reader just freed
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					srv.putBuf(make([]byte, 16))
+				}
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("getBuf blocked forever returning a too-small buffer")
+	}
+}
+
 // A draining server serves its sessions to the end but takes no new ones.
 func TestDrain(t *testing.T) {
 	h, srv := newHub(t)
@@ -249,7 +296,8 @@ func TestServerRestart(t *testing.T) {
 	defer a.Close()
 	echoOnce(t, a, 100000, 1)
 	kexWait(t, "the client to switch keys before the restart", func() bool {
-		a.mu.Lock(); defer a.mu.Unlock()
+		a.mu.Lock()
+		defer a.mu.Unlock()
 		return a.kexDone
 	})
 	// a stream that is open while the server dies

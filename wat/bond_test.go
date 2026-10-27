@@ -150,6 +150,32 @@ func (r *linkRaw) SendTo(p []byte, lane int, dst net.Addr) error {
 func (r *linkRaw) Close() error     { r.once.Do(func() { close(r.done) }); return nil }
 func (r *linkRaw) Profile() Profile { return r.l.prof }
 
+// A bonded session must leave path choice to the chooser: its own pin lanes (PinLaneBase+slot) are not chooser paths,
+// so a pinned bulk packet fell back to carrier 0 on the client (BondIO clamps) or was dropped as out of range on a
+// reverse bond (multiSubIO rejects it).
+func TestBondChooserDisablesPin(t *testing.T) {
+	l := newBondLink(t, 0, 1e9)
+	l.prof = Profile{Reliable: true, MTU: directMTU, MaxMTU: 64 << 10}
+	b, err := NewBondIO([]PacketIO{&linkClient{l: l, done: make(chan struct{})}}, BondOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := NewSession(Config{Key: []byte("bond-key"), Direct: true}, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	if cli.chooser == nil {
+		t.Fatal("bonded session has no chooser")
+	}
+	if !cli.cc.direct {
+		t.Fatal("fixture is not on a direct carrier")
+	}
+	if cli.pin {
+		t.Fatal("bonded session pins bulk packets to lanes the chooser cannot route")
+	}
+}
+
 var fastTimings = PathTimings{Silence: 300 * time.Millisecond, ProbeFirst: 200 * time.Millisecond, ProbeMax: time.Second, Ramp: 500 * time.Millisecond, IdleProbe: time.Second}
 
 type bondRig struct {
@@ -724,9 +750,9 @@ func TestBondMuting(t *testing.T) {
 
 func TestRetxFrameReslicing(t *testing.T) {
 	st := &Stream{
-		id:    1,
-		sbase: 0,
-		sbuf:  make([]byte, 16384),
+		id:      1,
+		sbase:   0,
+		sbuf:    make([]byte, 16384),
 		peerMax: 16384,
 	}
 	copy(st.sbuf, bytes.Repeat([]byte("A"), 16384))

@@ -349,7 +349,7 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 	}
 	s.cc.reliable = prof.Reliable
 	s.cc.direct = prof.Reliable && cfg.Direct && !noDirect
-	s.pin = s.cc.direct && !noPin
+	s.pin = s.cc.direct && !noPin && !isChooser(pio) // a chooser routes by its own lanes; PinLaneBase means another path there
 	if prof.Reliable && cfg.MinBps == 2e5 && cfg.InitBps > s.cc.minRate { // default floor: never pace a TCP pool below its start rate
 		s.cc.minRate = min(cfg.InitBps, cfg.MaxBps)
 	}

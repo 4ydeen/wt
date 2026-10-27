@@ -534,7 +534,9 @@ func (srv *Server) getBuf(p []byte) []byte {
 		if cap(b) >= len(p) {
 			return append(b[:0], p...)
 		}
-		srv.free <- b // too small: hand it back, never drain the pool (audit 2026-10-22)
+		// Too small: hand it back without blocking. A blocking send here can find the freed slot refilled by a
+		// concurrent putBuf and wedge the server's only receive loop (audit 2026-10-27).
+		srv.putBuf(b)
 	default:
 	}
 	return append(make([]byte, 0, max(len(p), 2048)), p...)
