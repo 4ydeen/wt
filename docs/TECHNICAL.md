@@ -1033,6 +1033,17 @@ ask which ports Iran may reach (all are allowed; restrict later in the port edit
 itself (off: `wattun` → `s` → `h`). The table is ranked by download plus upload (ties: lower RTT) and accepts Enter (best), `b` (bond the working carriers), `1`-`N`
 (one variant) and `q`. The normal wizard continues at port mapping. The token is saved in `/etc/wattun/NAME.auto`.
 
+**Test presets (3.0.2).** Before the test starts the manager asks what to test. *Normal* (Enter) is the test above, without anti-censor
+variants, about 2-3 minutes. *Anti-censor* (`a`) adds, for every direct pool carrier of the plan (tcp, tls, wss, h2, grpc, ws, h2c): all fake-SNI
+modes (`rst synrst paws seq seqsum sum ttl split hlen0 fakeip ff all auto`) with the first curated SNI, `rst`/`synrst`/`paws` against the other
+curated SNIs and `www.cloudflare.com`, and on the TLS carriers `tls-frag` -1 and 40, the chrome/firefox/safari fingerprints and chrome+ECH when a CDN
+domain is set (about 195 variants for a full plan, 30-60 minutes). Reverse tunnels have no anti-censor variants here: the desync runs on the dialing
+side, which is Kharej for a reverse tunnel. During the test `s` skips the running variant, `g` (anti-censor preset) skips the rest of that carrier's
+anti-censor variants and `q` stops the test; the table then ranks what was measured and the usual choice (Enter, `1`-`N`, `c`, `f`, `q`) follows.
+An anti-censor variant has to beat the plain type by 8 % to rank above it, cannot be joined into a bond, and is written with its `fake-sni`,
+`fake-mode`, `fp`, `ech` and `tls-frag` lines. Unattended runs (`wattun iran --token ... --yes`, `auto-test NAME --yes`) use `--test normal|anti`
+(default normal); `auto-retest` and auto-heal always run normal.
+
 **Auto-heal.** After two failed restart cycles on an auto tunnel, `wattun-manager heal` starts a re-test (1 MB, at most
 once per 30 minutes). It switches to another working variant only when the current one fails, and logs
 `wattun-heal: switched NAME from X to Y`.

@@ -99,7 +99,7 @@ case "${1:-}" in kharej|iran|cdn-tune|auto-test|delete|uninstall|matrix|auto-ret
 esac
 [ "$NONINTERACTIVE" = 1 ] || NONINTERACTIVE=0
 # Answers set by flags (see ni_parse); empty = the wizard's own default
-NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''; NI_FAKESNI=''; NI_FAKEMODE=''; NI_FAKETTL=''; NI_POOLROT=''; NI_POOLBYTES=''; NI_PRESET=''; NI_ECH=''; NI_GOVERNOR=''; NI_DNSLISTEN=''; NI_SRCIP=''; NI_UDPDNS=''
+NI_CARRIER=''; NI_NAME=''; NI_LISTEN=''; NI_PATH=''; NI_ADDR=''; NI_SNI=''; NI_CDN=''; NI_PORTS=''; NI_MBPS=''; NI_FAKESNI=''; NI_FAKEMODE=''; NI_FAKETTL=''; NI_POOLROT=''; NI_POOLBYTES=''; NI_PRESET=''; NI_TEST=''; NI_ECH=''; NI_GOVERNOR=''; NI_DNSLISTEN=''; NI_SRCIP=''; NI_UDPDNS=''
 NI_TOKEN=''; NI_MAP=''; NI_PICK=best; NI_SESSIONS=''; NI_YES=0; NI_POS=()
 ERRN=0
 
@@ -2961,13 +2961,40 @@ AV_LABEL=(); AV_CAR=(); AV_KIND=(); AV_PEER=(); AV_PORT=(); AV_SNI=(); AV_FP=();
 AV_FS=(); AV_FM=() # fake-sni / fake-mode per variant (anti-censor matrix, 2.10.2)
 AR_OK=(); AR_DOWN=(); AR_UP=(); AR_RTT=(); AR_WHY=()
 AT_QUIET=0; AT_MB=2; AT_DIR=''; AT_PID=''; AT_FW=''; AT_ADDR=''; AT_SKIP=''; AT_DLINK=0; AT_SECS=0
+AT_PRESET=normal; AT_STTY=''; AT_KEYS=0; AT_ACT=''; AT_STOP=0; AT_GSKIP=''
 AT_RANK=(); AT_SEL=(); AT_SEL_LABEL=''; AT_SEL_KEY=''; AT_EXTRA=''; AUTO_TOKEN=''
 av_add() { # label carrier kind(d|c|r) peer port sni [fp ech tls-frag [fake-sni fake-mode]] (the last three: CDN variants, wattun >= 2.2.0; last two: matrix)
   AV_LABEL+=("$1"); AV_CAR+=("$2"); AV_KIND+=("$3"); AV_PEER+=("$4"); AV_PORT+=("$5"); AV_SNI+=("$6")
   AV_FP+=("${7:-}"); AV_ECH+=("${8:-}"); AV_FRAG+=("${9:-}")
   AV_FS+=("${10:-}"); AV_FM+=("${11:-}")
 }
-av_key() { echo "${AV_CAR[$1]}/${AV_KIND[$1]}"; }
+av_key() { local k="${AV_CAR[$1]}/${AV_KIND[$1]}"; av_anti "$1" && k+="/${AV_FS[$1]}-${AV_FM[$1]}-${AV_FP[$1]}-${AV_ECH[$1]}-${AV_FRAG[$1]}"; echo "$k"; }
+av_anti() { [ "${AV_KIND[$1]}" = d ] && [ -n "${AV_FS[$1]}${AV_FP[$1]}${AV_ECH[$1]}${AV_FRAG[$1]}" ]; } # a direct variant that carries desync / fingerprint / fragmentation (anti-censor preset)
+# Anti-censor preset: every direct pool carrier of the plan with every desync mode (first curated SNI), the three modes that
+# cleared a filter in the field (rst, synrst, paws) against the other curated SNIs and the Cloudflare edge name, the TLS
+# ClientHello split and fingerprint variants, ECH. Reverse tunnels are not covered: the desync runs on the dialing side,
+# which for a reverse tunnel is Kharej, and this test only controls this server.
+AC_ALLMODES='rst synrst paws seq seqsum sum ttl split hlen0 fakeip ff all auto'
+auto_variants_anti() { # direct plan part
+  local d=$1 c p fs fm first=${AC_SNIS%%,*} others tls
+  others="${AC_SNIS#*,},www.cloudflare.com"
+  for c in tcp tls wss h2 grpc ws h2c; do
+    p=$(plan_port "$d" "$c"); [ -n "$p" ] || continue
+    for fm in $AC_ALLMODES; do
+      av_add "$c $fm $first" "$c" d "$AT_ADDR:$p" '' '' '' '' '' "$first" "$fm"
+    done
+    for fs in ${others//,/ }; do
+      for fm in rst synrst paws; do av_add "$c $fm ${fs#www.}" "$c" d "$AT_ADDR:$p" '' '' '' '' '' "$fs" "$fm"; done
+    done
+    case "$c" in tls|wss|h2|grpc)
+      av_add "$c tls-frag mid-SNI" "$c" d "$AT_ADDR:$p" '' '' '' '' -1
+      av_add "$c tls-frag 40" "$c" d "$AT_ADDR:$p" '' '' '' '' 40
+      for fm in chrome firefox safari; do av_add "$c fp $fm" "$c" d "$AT_ADDR:$p" '' '' "$fm"; done
+      [ -n "$T_SNI" ] && av_add "$c chrome+ech" "$c" d "$AT_ADDR:$p" '' "$T_SNI" chrome auto ;;
+    esac
+  done
+  return 0
+}
 auto_variants() { # T_* from the auto token -> AV_*
   local d r c p
   AV_LABEL=(); AV_CAR=(); AV_KIND=(); AV_PEER=(); AV_PORT=(); AV_SNI=(); AV_FP=(); AV_ECH=(); AV_FRAG=()
@@ -2978,6 +3005,7 @@ auto_variants() { # T_* from the auto token -> AV_*
   for c in udp tcp tls wss h2 grpc ws h2c; do
     p=$(plan_port "$d" "$c"); [ -n "$p" ] && av_add "$c" "$c" d "$AT_ADDR:$p" '' ''
   done
+  [ "$AT_PRESET" = anti ] && auto_variants_anti "$d"
   if [ -n "$T_SNI" ]; then
     for c in wss grpc; do # h2 never connects through Cloudflare
       p=$(plan_port "$d" "$c"); [ -n "$p" ] || continue
@@ -2995,10 +3023,18 @@ auto_variants() { # T_* from the auto token -> AV_*
 }
 at_free_port() { local p=${1:-20500}; while [ "$p" -lt 20700 ] && port_busy "$p" tcp; do p=$((p+1)); done; echo "$p"; }
 at_alive() { [ "$(jget "$(curl -fs --noproxy '*' --max-time 2 "http://127.0.0.1:$1/stats" 2>/dev/null)" alive)" = true ]; }
+at_key() { # non-blocking key poll during a test: s skip this variant, g skip this carrier's anti-censor variants, q stop. rc 0 = a key was taken (AT_ACT)
+  [ "$AT_KEYS" = 1 ] || return 1
+  local k=''
+  IFS= read -rsn1 -t 0.05 k 2>/dev/null || return 1
+  case "$k" in s|S) AT_ACT=skip ;; g|G) AT_ACT=group ;; q|Q) AT_ACT=stop ;; *) return 1 ;; esac
+  return 0
+}
 at_wait() { # metrics-port seconds : wait for the link
   local end=$((SECONDS + $2))
   while :; do
     at_alive "$1" && return 0
+    at_key && return 1
     [ "$SECONDS" -ge "$end" ] && return 1
     kill -0 "$AT_PID" 2>/dev/null || return 1
     sleep 0.5
@@ -3034,6 +3070,7 @@ at_fw_close() {
 }
 at_cleanup() {
   local p
+  [ -n "$AT_STTY" ] && { stty "$AT_STTY" 2>/dev/null; AT_STTY=''; }
   at_kill; at_fw_close
   for p in ${CS_PIDS[@]+"${CS_PIDS[@]}"}; do kill "$p" 2>/dev/null; done
   CS_PIDS=(); [ -n "${CS_DIR:-}" ] && rm -rf "$CS_DIR"; CS_DIR=''
@@ -3062,10 +3099,24 @@ at_start() { # i metrics-port : start a throw-away client for variant i (no -map
   timeout -k 2 "$AT_LIM" "$BIN" "${a[@]}" >"$AT_DIR/client.$i.log" 2>&1 &
   AT_PID=$!
 }
-at_curl() { curl -fs --noproxy '*' --max-time $((AT_MB * 2 > 20 ? AT_MB * 2 : 20)) "http://127.0.0.1:$1/speedtest?dir=$2&mb=$AT_MB" 2>/dev/null; }
+at_curl() { # metrics-port dir -> AT_R (no subshell: AT_ACT must survive) ; a skip/stop key kills the transfer (rc 1)
+  local cp f=${AT_DIR:-/tmp}/curl.$$
+  AT_R=
+  curl -fs --noproxy '*' --max-time $((AT_MB * 2 > 20 ? AT_MB * 2 : 20)) "http://127.0.0.1:$1/speedtest?dir=$2&mb=$AT_MB" >"$f" 2>/dev/null &
+  cp=$!
+  if [ "$AT_KEYS" = 1 ]; then
+    while kill -0 "$cp" 2>/dev/null; do
+      if at_key; then kill "$cp" 2>/dev/null; { wait "$cp"; } 2>/dev/null; rm -f "$f"; return 1; fi
+    done
+  fi
+  { wait "$cp"; } 2>/dev/null; AT_R=$(cat "$f" 2>/dev/null); rm -f "$f"
+}
 at_probe() { # i wait-seconds : fills AR_*[i]
   local i=$1 w=${2:-8} mp r
   AR_OK[$i]=0; AR_DOWN[$i]=0; AR_UP[$i]=0; AR_RTT[$i]=0; AR_WHY[$i]=''
+  [ "$AT_ACT" = stop ] && AT_STOP=1
+  AT_ACT=''
+  [ "$AT_STOP" = 1 ] && { AR_WHY[$i]=skipped; return 0; }
   case " $AT_SKIP " in *" $(av_key "$i") "*) AR_WHY[$i]='in use by this tunnel'; return 0 ;; esac
   if [ "${AV_KIND[$i]}" = r ] && is_pool "${AV_CAR[$i]}"; then
     if listen_blocked tcp "${AV_PORT[$i]}"; then AR_WHY[$i]="port ${AV_PORT[$i]}/tcp is busy here"; return 0; fi
@@ -3076,6 +3127,7 @@ at_probe() { # i wait-seconds : fills AR_*[i]
   at_start "$i" "$mp"
   if ! at_wait "$mp" "$w"; then
     AR_WHY[$i]="no link in $w s"
+    [ -n "$AT_ACT" ] && AR_WHY[$i]=skipped
   else
     [ "${AV_KIND[$i]}" = r ] || AT_DLINK=$((AT_DLINK+1))
     at_measure "$i" "$mp"
@@ -3085,10 +3137,10 @@ at_probe() { # i wait-seconds : fills AR_*[i]
 }
 at_measure() { # i metrics-port : speed test on a running client, fills AR_*[i]
   local i=$1 mp=$2 r
-  r=$(at_curl "$mp" down)
+  at_curl "$mp" down; r=$AT_R
   if [ "$(jget "$r" ok)" = true ]; then
     AR_DOWN[$i]=$(jget "$r" mb_per_s)
-    r=$(at_curl "$mp" up)
+    at_curl "$mp" up; r=$AT_R
     if [ "$(jget "$r" ok)" = true ]; then
       AR_UP[$i]=$(jget "$r" mb_per_s)
       AR_RTT[$i]=$(jget "$(curl -fs --noproxy '*' --max-time 2 "http://127.0.0.1:$mp/stats" 2>/dev/null)" srtt_ms)
@@ -3097,13 +3149,14 @@ at_measure() { # i metrics-port : speed test on a running client, fills AR_*[i]
     fi
   fi
   [ "${AR_OK[$i]}" = 1 ] || AR_WHY[$i]='speed test failed/stalled'
+  [ -n "$AT_ACT" ] && { AR_OK[$i]=0; AR_WHY[$i]=skipped; }
   return 0
 }
 # Reverse pool carriers: Kharej's NAME-r companion starts dialing Iran's r-ports as soon as it knows Iran's IP, and its
 # redial backoff grows while nothing listens. So all reverse clients (and their temporary firewall rules) are started at
 # once, we wait for all of them together, then the speed tests run one at a time on the already-running clients.
 at_pool_batch() { # indices... : probe every reverse pool variant given
-  local i mp base=20500 end pend started=() up=()
+  local i mp base=20500 end pend ks=0 started=() up=()
   for i in "$@"; do
     AR_OK[$i]=0; AR_DOWN[$i]=0; AR_UP[$i]=0; AR_RTT[$i]=0; AR_WHY[$i]=''
     case " $AT_SKIP " in *" $(av_key "$i") "*) AR_WHY[$i]='in use by this tunnel'; continue ;; esac
@@ -3120,8 +3173,9 @@ at_pool_batch() { # indices... : probe every reverse pool variant given
   done
   if [ "${#started[@]}" -gt 0 ]; then
     [ "$AT_QUIET" = 1 ] || at_busy "reverse links (all at once, up to 45 s)"
-    end=$((SECONDS + 45))
+    end=$((SECONDS + 45)); ks=0
     while :; do
+      if at_key; then [ "$AT_ACT" = stop ] && AT_STOP=1; AT_ACT=''; ks=1; break; fi
       pend=0
       for i in "${started[@]}"; do
         [ "${up[$i]:-0}" = 1 ] && continue
@@ -3136,10 +3190,14 @@ at_pool_batch() { # indices... : probe every reverse pool variant given
   fi
   for i in "$@"; do
     if [ -z "${AR_WHY[$i]}" ]; then
-      if [ "${up[$i]:-0}" = 1 ]; then
+      if [ "$AT_STOP" = 1 ]; then AR_WHY[$i]=skipped
+      elif [ "${up[$i]:-0}" = 1 ]; then
         [ "$AT_QUIET" = 1 ] || at_busy "${AV_LABEL[$i]}"
         at_measure "$i" "${AT_MPS[$i]}"
         [ "$AT_QUIET" = 1 ] || at_idle
+        [ "$AT_ACT" = stop ] && AT_STOP=1
+        AT_ACT=''
+      elif [ "$ks" = 1 ]; then AR_WHY[$i]=skipped
       else AR_WHY[$i]='no link in 45 s'; fi
     fi
     [ "$AT_QUIET" = 1 ] || at_print "$i"
@@ -3198,17 +3256,30 @@ auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKI
     fi
   fi
   auto_variants
-  n=${#AV_LABEL[@]}; AT_DLINK=0
+  n=${#AV_LABEL[@]}; AT_DLINK=0; AT_STOP=0; AT_GSKIP=''; AT_ACT=''
+  AT_KEYS=0; [ "$IS_TTY" = 1 ] && [ "$AT_QUIET" != 1 ] && [ -t 0 ] && AT_KEYS=1
+  if [ "$AT_KEYS" = 1 ]; then
+    AT_STTY=$(stty -g 2>/dev/null); stty -echo 2>/dev/null # typed s/g/q must not print between polls; at_cleanup restores
+    while IFS= read -rsn1 -t 0.01 _; do :; done # drop keys typed before the test
+    if [ "$AT_PRESET" = anti ]; then hint "Keys: s = skip this variant   g = skip this carrier's anti-censor variants   q = stop and choose from what was tested"
+    else hint "Keys: s = skip this variant   q = stop and choose from what was tested"; fi
+    echo
+  fi
   for ((i=0; i<n; i++)); do
     kind=${AV_KIND[$i]}
-    if [ "$kind" != "$last" ] && [ "$AT_QUIET" != 1 ]; then
+    if [ "$AT_STOP" = 1 ]; then at_truncate "$i"; break; fi
+    if av_anti "$i" && [ -n "$AT_GSKIP" ] && [ "${AV_CAR[$i]}" = "$AT_GSKIP" ]; then
+      AR_OK[$i]=0; AR_DOWN[$i]=0; AR_UP[$i]=0; AR_RTT[$i]=0; AR_WHY[$i]=skipped; continue
+    fi
+    if av_anti "$i" && [ "$last" != anti ] && [ "$AT_QUIET" != 1 ]; then echo; say "  ${BOLD}Anti-censor variants${RST} (direct, with desync / fingerprint / fragmentation)"; last=anti; fi
+    if [ "$kind" != "$last" ] && [ "$last" != anti ] && [ "$AT_QUIET" != 1 ]; then
       case "$kind" in
         d) say "  ${BOLD}Direct connections${RST}" ;;
         c) echo; say "  ${BOLD}Through the CDN${RST} ($T_SNI)"; [ "$CS_RAN" = 1 ] && cdn_scan_say ;;
         r) echo; say "  ${BOLD}Reverse${RST} (Kharej connects out to this server)" ;;
       esac
     fi
-    last=$kind
+    av_anti "$i" || last=$kind
     if [ "$kind" = r ] && is_pool "${AV_CAR[$i]}"; then
       pool=(); for ((j=i; j<n; j++)); do [ "${AV_KIND[$j]}" = r ] && is_pool "${AV_CAR[$j]}" && pool+=("$j"); done
       at_pool_batch "${pool[@]}"
@@ -3217,12 +3288,22 @@ auto_test() { # needs read_token of an auto token (T_*), AT_QUIET, AT_MB, AT_SKI
     w=8; [ "$kind" = r ] && [ "${AV_CAR[$i]}" = icmp ] && w=30 # Kharej's companion needs a few seconds to start
     [ "$AT_QUIET" = 1 ] || at_busy "${AV_LABEL[$i]}"
     at_probe "$i" "$w"
-    [ "$AT_QUIET" = 1 ] || { at_idle; at_print "$i"; }
+    [ "$AT_QUIET" = 1 ] || { at_idle; [ "${AR_WHY[$i]}" = skipped ] && printf '  %s-%s %-28s %sskipped%s\n' "$GRY" "$RST" "${AV_LABEL[$i]}" "$GRY" "$RST" || at_print "$i"; }
+    case "$AT_ACT" in group) av_anti "$i" && AT_GSKIP=${AV_CAR[$i]} ;; stop) AT_STOP=1; AR_WHY[$i]=skipped ;; esac
+    AT_ACT=''
     if [ "$kind" = c ] && cdn_ok && [ "${AV_KIND[$((i+1))]:-}" != c ]; then cdn_auto_extras; fi
   done
+  AT_KEYS=0
   at_cleanup
   AT_SECS=$((SECONDS-t0))
   return 0
+}
+at_truncate() { # k : keep only the first k variants (the test was stopped before the rest)
+  local k=$1
+  AV_LABEL=("${AV_LABEL[@]:0:$k}"); AV_CAR=("${AV_CAR[@]:0:$k}"); AV_KIND=("${AV_KIND[@]:0:$k}"); AV_PEER=("${AV_PEER[@]:0:$k}")
+  AV_PORT=("${AV_PORT[@]:0:$k}"); AV_SNI=("${AV_SNI[@]:0:$k}"); AV_FP=("${AV_FP[@]:0:$k}"); AV_ECH=("${AV_ECH[@]:0:$k}")
+  AV_FRAG=("${AV_FRAG[@]:0:$k}"); AV_FS=("${AV_FS[@]:0:$k}"); AV_FM=("${AV_FM[@]:0:$k}")
+  AR_OK=("${AR_OK[@]:0:$k}"); AR_DOWN=("${AR_DOWN[@]:0:$k}"); AR_UP=("${AR_UP[@]:0:$k}"); AR_RTT=("${AR_RTT[@]:0:$k}"); AR_WHY=("${AR_WHY[@]:0:$k}")
 }
 at_rank() { # [policy] -> AT_RANK (working variants, best first: policy driven)
   local pol=${1:-${NI_POLICY:-}} i
@@ -3249,7 +3330,8 @@ at_rank() { # [policy] -> AT_RANK (working variants, best first: policy driven)
     bond|speed|*)
       while read -r _ _ i; do [ -n "$i" ] && AT_RANK+=("$i"); done < <(
         for ((i=0; i<${#AV_LABEL[@]}; i++)); do
-          [ "${AR_OK[$i]}" = 1 ] && awk -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%.6f %.3f %d\n", d+u, r, i}'
+          # an anti-censor variant must beat the plain type by 8 % to rank above it (noise, plus its startup cost)
+          [ "${AR_OK[$i]}" = 1 ] && awk -v pen="$(av_anti "$i" && echo 0.92 || echo 1)" -v d="${AR_DOWN[$i]:-0}" -v u="${AR_UP[$i]:-0}" -v r="${AR_RTT[$i]:-0}" -v i="$i" 'BEGIN{printf "%.6f %.3f %d\n", (d+u)*pen, r, i}'
         done | sort -k1,1gr -k2,2g)
       ;;
   esac
@@ -3263,7 +3345,7 @@ at_table() {
     printf '  %s%3s%s  %-28s %7.1f MB/s %7.1f MB/s %4.0f ms\n' "$BOLD$CYN" "$k" "$RST" "${AV_LABEL[$i]}" "${AR_DOWN[$i]:-0}" "${AR_UP[$i]:-0}" "${AR_RTT[$i]:-0}"
   done
   for ((i=0; i<${#AV_LABEL[@]}; i++)); do
-    [ "${AR_OK[$i]}" = 1 ] || printf '  %s  ✘  %-28s %s%s%s\n' "$RED" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"
+    [ "${AR_OK[$i]}" = 1 ] || [ "${AR_WHY[$i]}" = skipped ] || printf '  %s  ✘  %-28s %s%s%s\n' "$RED" "${AV_LABEL[$i]}" "$GRY" "${AR_WHY[$i]}" "$RST"
   done
   hint "${AT_NOTE:-Tested with ${AT_MB} MB each way.} Finished in ${AT_SECS} s."
 }
@@ -3286,12 +3368,16 @@ at_to_t() { # AT_SEL (one index, or several = bond) -> T_CARRIER T_PEER T_PATH T
   T_CARRIER=$c; T_PEER=${AV_PEER[$i]}
   case "$c" in ws|wss|h2|h2c|grpc) T_PATH=$AT_PATH ;; esac
   if [ "${AV_KIND[$i]}" = c ]; then T_SNI=${AV_SNI[$i]}; AT_EXTRA=$(at_cdn_lines "$i"); fi
+  if av_anti "$i"; then
+    T_SNI=${AV_SNI[$i]}; AT_EXTRA=$(at_cdn_lines "$i")
+    [ -n "${AV_FS[$i]}" ] && AT_EXTRA+="${AT_EXTRA:+$'\n'}fake-sni: ${AV_FS[$i]}"$'\n'"fake-mode: ${AV_FM[$i]:-seq}"
+  fi
   [ "${AV_KIND[$i]}" = r ] && T_REV=1
   AT_SEL_LABEL=${AV_LABEL[$i]}; AT_SEL_KEY=$(av_key "$i")
 }
 at_choose() { # rc 0 = chosen (T_* ready), 1 = cancelled
   local n=${#AT_RANK[@]} best=${AT_RANK[0]} bond=() i t num rest bd bu
-  for i in "${AT_RANK[@]}"; do [ "${AV_KIND[$i]}" = d ] && bond+=("$i"); done
+  for i in "${AT_RANK[@]}"; do [ "${AV_KIND[$i]}" = d ] && ! av_anti "$i" && bond+=("$i"); done
   if [ "$NONINTERACTIVE" = 1 ]; then # --pick best (default) | bond | N (row number of the table)
     local def_pick="best"
     local cur_pol=${NI_POLICY:-}
@@ -3351,6 +3437,7 @@ at_rows() { # "1 3 4" or "1,3,4" (rows of the table) -> AT_SEL ; rc 1 with a mes
   [ "${#AT_SEL[@]}" -eq 1 ] && return 0
   for i in "${AT_SEL[@]}"; do
     if [ "${AV_KIND[$i]}" = r ]; then err "${AV_LABEL[$i]} is a reverse connection; it cannot be joined with others. Pick it alone."; return 1; fi
+    if av_anti "$i"; then err "${AV_LABEL[$i]} is an anti-censor variant; it cannot be joined with others. Pick it alone."; return 1; fi
     c=${AV_CAR[$i]}
     case "$cars" in *" $c "*) err "Two rows use $c; a joined tunnel can use each type once."; return 1 ;; esac
     cars+="$c "
@@ -3392,6 +3479,28 @@ at_none() { # nothing worked
   fi
   hint "Also check: the Kharej tunnel is running, the key is current (paste the token again), and Kharej's cloud firewall."
 }
+at_preset_ask() { # -> AT_PRESET normal|anti (--test in unattended runs) ; rc 1 = cancelled
+  AT_PRESET=${NI_TEST:-normal}
+  [ "$NONINTERACTIVE" = 1 ] && return 0
+  local t
+  echo
+  say "  ${BOLD}What should be tested?${RST}"
+  printf '  %s normal: every connection type (direct, CDN, reverse), no anti-censor variants. About 2-3 minutes.\n' "$(key_label Enter)"
+  printf '  %s anti-censor: the normal tests plus EVERY anti-censor variant (all desync modes and SNIs, TLS fragments,\n' "$(key_label a)"
+  printf '      fingerprints, ECH) on every direct carrier. Can take 30-60 minutes; skip a variant, a carrier or stop at any time.\n'
+  printf '  %s cancel\n' "$(key_label q)"
+  for t in 1 2 3 4 5; do
+    printf '  %s?%s Choice %s[Enter]%s ' "$CYN" "$RST" "$GRY" "$RST"
+    key_read
+    case "$KEY" in
+      enter) AT_PRESET=normal; echo; return 0 ;;
+      a|A) AT_PRESET=anti; echo; return 0 ;;
+      q|Q|esc) echo; return 1 ;;
+      *) echo; warn "Press Enter, a or q." ;;
+    esac
+  done
+  return 1
+}
 auto_iran_front() { # token : test everything, ranked table, choose. Leaves T_* ready for the normal flow
   AUTO_TOKEN=$1
   [ -n "$T_AUTO" ] || { err "This auto token has no test plan. Make a new token on Kharej (wattun 2.1.0 or newer)."; return 1; }
@@ -3400,7 +3509,8 @@ auto_iran_front() { # token : test everything, ranked table, choose. Leaves T_* 
   summary_line "CDN domain" "${T_SNI:-none (CDN tests skipped)}"
   summary_line "Kharej allows" "${T_PORTS:-any port}"
   echo
-  hint "Testing from this server, about 2-3 minutes. Nothing is published and no tunnel is touched."
+  at_preset_ask || { warn "Cancelled."; return 1; }
+  hint "Testing from this server. Nothing is published and no tunnel is touched."
   echo
   AT_QUIET=0; AT_MB=8; AT_NOTE=""; AT_SKIP=''; AT_AGAIN=''
   auto_test || { err "Could not prepare the test (is $AUTO_RUN writable?)."; return 1; }
@@ -3471,6 +3581,7 @@ auto_test_cmd() { # name : re-run the test for an existing auto Iran tunnel and 
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac # its own port / ICMP are in use by the running tunnel
   page "Auto test" "$n"
   hint "Current: $cur. The running tunnel is not touched until you choose."
+  at_preset_ask || { warn "Cancelled."; return 0; }
   echo
   auto_test || { err "Could not prepare the test (is $AUTO_RUN writable?)."; return 1; }
   at_rank; auto_refine
@@ -3497,6 +3608,7 @@ auto_retest() { # name : unattended (auto-heal or auto-optimize): 1 MB tests
   AT_QUIET=1; AT_MB=1; AT_NOTE=''; AT_SKIP=''; AT_AGAIN=''
   cur=$(auto_current_key "$n")
   case "$cur" in */r) AT_SKIP=" $cur " ;; esac
+  AT_PRESET=normal
   auto_test || return 1
   at_rank
   if [ "${#AT_RANK[@]}" -eq 0 ]; then logger -t wattun-heal "retest of $n: no connection type works right now"; return 0; fi
@@ -6385,7 +6497,7 @@ ni_parse() {
         else
           NI_GOVERNOR=true
         fi; continue ;;
-      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--sessions|--conns|--mtu|--policy|--fake-sni|--fake-mode|--fake-ttl|--pool-rotate|--pool-rotate-bytes|--preset|--ech|--dns-listen|--src-ip)
+      --carrier|--name|--listen|--path|--addr|--sni|--cdn-domain|--ports|--max-mbps|--token|--map|--pick|--test|--sessions|--conns|--mtu|--policy|--fake-sni|--fake-mode|--fake-ttl|--pool-rotate|--pool-rotate-bytes|--preset|--ech|--dns-listen|--src-ip)
         if [ "$hasv" = 0 ]; then
           [ $# -gt 0 ] || { err "$f needs a value"; return 1; }
           v=$1; shift
@@ -6415,6 +6527,7 @@ ni_parse() {
       --fake-ttl) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -le 255 ] || { err "--fake-ttl: use a hop count 0-255 (0 = auto, got '$v')"; return 1; }; NI_FAKETTL=$v ;;
       --pool-rotate) v_pool_rotate "$v" || return 1; NI_POOLROT=$v ;;
       --pool-rotate-bytes) v_pool_bytes "$v" || return 1; NI_POOLBYTES=$v ;;
+      --test) case "$v" in normal|anti) NI_TEST=$v ;; *) err "--test: use normal or anti (got '$v')"; return 1 ;; esac ;;
       --token) v_token "$v" || return 1; NI_TOKEN=$v ;;
       --map) [ -n "$v" ] || { err "--map needs a list such as 39901:18999,8443:443"; return 1; }; NI_MAP=$v ;;
       --pick) case "$v" in best|bond) NI_PICK=$v ;; *,*) [[ "$v" =~ ^[0-9]+(,[0-9]+)+$ ]] || { err "--pick: rows joined with commas, such as 1,3 (got '$v')"; return 1; }; NI_PICK=$v ;; *) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] || { err "--pick: use best, bond, a row number or rows such as 1,3 (got '$v')"; return 1; }; NI_PICK=$((10#$v)) ;; esac ;;
@@ -6491,7 +6604,7 @@ or NONINTERACTIVE=1). Plain output, errors on stderr, exit code 0 = done, 1 = fa
          [--sni HOST] [--cdn-domain D] [--ports 18999,2000,53/udp] [--max-mbps N] --yes
          creates and starts the Kharej tunnel; the last lines are TUNNEL=NAME and TOKEN=wat1:...
          (--addr skips the public-IP detection; --cdn-domain is for auto; --listen/--path/--sni/--max-mbps for the others)
-  iran --token TOKEN --map 39901:18999[,8443:443] [--name NAME] [--pick best|bond|N|N,N...] [--sessions N] [--max-mbps N] --yes
+  iran --token TOKEN --map 39901:18999[,8443:443] [--name NAME] [--pick best|bond|N|N,N...] [--test normal|anti] [--sessions N] [--max-mbps N] --yes
          creates and starts the Iran tunnel. Auto token: runs the test, --pick chooses a row (default best, bond = all
          working direct carriers, 1,3 = join those rows). CDN token: automatic CDN tuning. Ends with LINK=up|down and TUNNEL=NAME; exit 1 if down.
          --sessions N writes "sessions: N" (only with wattun 2.3.0 or newer; otherwise it is ignored with a warning)
