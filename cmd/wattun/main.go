@@ -270,8 +270,8 @@ func main() {
 	if _, _, err := wat.ParseECHFlag(*echMode); err != nil {
 		log.Fatal(err)
 	}
-	if *tlsFrag < 0 || *tlsFrag > 1<<14 {
-		log.Fatalf("-tls-frag must be 0..16384, got %d", *tlsFrag)
+	if *tlsFrag < -1 || *tlsFrag > 1<<14 {
+		log.Fatalf("-tls-frag must be -1..16384 (-1 = mid-SNI split), got %d", *tlsFrag)
 	}
 	rotateD, err := time.ParseDuration(*poolRotate)
 	if err != nil || rotateD < 0 {
