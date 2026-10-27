@@ -92,6 +92,7 @@ func main() {
 	sni := flag.String("sni", "", "client, tls carrier: server name sent in the ClientHello")
 	tlsPin := flag.String("tls-pin", "", "client, tls carrier: hex sha256 of the server certificate to require")
 	mtu := flag.Int("mtu", 0, "datagram size cap incl. header/tag, 256-1400 (tcp|tls|ws|wss|h2|h2c|grpc: up to 16384) (0 = the carrier default: 640 icmp, 1400 udp, 4096 tcp-based)")
+	winMax := flag.Int("win-max", 0, "both ends: cap the per-stream receive window in MB, clamped to 4-16 (0 = 16, the default) (3.0.3). The window is receiver-driven, so this bounds what the PEER's sender buffers per stream: N concurrent bulk streams cost at most N x win-max MB instead of N x 16 MB. Set it on a small VPS (4 = no window auto-tuning). Each end bounds the direction it receives, so set it on both to bound both; a peer that advertises a bigger window still makes this end buffer more")
 	path := flag.String("path", "/wat", "client/server, ws|wss|h2|h2c|grpc carrier: URL path (grpc: service name, requests go to <path>/Tun)")
 	tlsFP := flag.String("fp", "go", "client (also a -reverse server), tls|wss|h2|grpc carriers: TLS ClientHello fingerprint go|chrome|firefox|safari|edge|random; go is the standard library's (client only, 2.2.0; server unchanged)")
 	echMode := flag.String("ech", "off", "client, tls|wss|h2|grpc carriers: Encrypted Client Hello: off|auto|ladder|<base64 ECHConfigList>; auto reads the HTTPS DNS record of the SNI/host name over DNS-over-HTTPS (1.1.1.1, 1.0.0.1, 8.8.8.8, 9.9.9.9 raced in parallel; the last good config is kept if they all fail); ladder = auto plus a second rung for hijacked networks (2.9.0): when every direct DoH server fails, the query goes through the tunnel's built-in DNS relay (server target port 53, the speed-test pattern), so a wss+ECH tunnel bootstraps on an ICMP-only route; both ends need 2.9.0 (old server: the relay port is just a failed local dial, the ladder falls back to no ECH)")
@@ -556,6 +557,7 @@ func main() {
 		Server: server, Key: k, Paths: *lanes, MaxBps: *maxMB * 1e6, Slack: time.Duration(*slackMs) * time.Millisecond,
 		PingEvery: time.Duration(*pingEvery) * time.Second, NoMask: !*hdrMask, NoShape: !*shape,
 		Logf: log.Printf, Hedge: *hedge, FEC: *fecMode == "auto", MaxPayload: *mtu, Bond: tm,
+		WinMax: uint64(*winMax) << 20,
 		// no CDN can sit in a reverse pool (Kharej dials Iran's IP) or in front of raw tcp/tls: TCP paces (2.4.18)
 		Direct: allReliableDirect(names, *reverse),
 	}

@@ -28,7 +28,7 @@ const (
 	overhead      = hdrLen + tagLen
 	streamWindow  = 4 << 20
 	sendBufMax    = 4 << 20
-	maxStreamWin  = 16 << 20  // auto-tuned window cap per stream (stream.go tuneWindow)
+	maxStreamWin  = 16 << 20  // default auto-tuned window cap per stream; Config.WinMax lowers it (stream.go tuneWindow)
 	maxSessionWin = 64 << 20  // total window growth beyond the 4 MB bases, per session
 	sendStage     = 256 << 10 // Write may buffer this much beyond the peer's window (stream.go writeCap)
 	slowWinMin    = 256 << 10 // a lagging reader's window floor (stream.go tuneSlow)
@@ -86,7 +86,14 @@ type Config struct {
 	NoMask bool
 	// NoShape turns off the random padding of small packets and the jitter on the idle keepalive (hdrmask.go).
 	NoShape bool
-	Logf    func(string, ...any)
+	// WinMax caps the receive window this end advertises per stream, so it also caps what the peer's sender may
+	// buffer for that stream (stream.go sendCap/writeCap). Clamped to [streamWindow, maxStreamWin], i.e. 4-16 MB;
+	// 0 = maxStreamWin (16 MB), the old behaviour. 4 MB pins the window at the base, i.e. no auto-tuning. Set it on
+	// a small VPS to bound memory: with the default, N concurrent bulk streams let the sender hold up to N x 16 MB,
+	// measured 2026-10-27 as 148-214 MB of live heap for 8 streams on a 894 MB box. Windows are receiver-driven, so
+	// each end bounds the direction it receives; set it on both ends to bound both.
+	WinMax uint64
+	Logf   func(string, ...any)
 }
 
 type Stats struct {
@@ -209,6 +216,7 @@ type Session struct {
 	stats         Stats
 	openBuf       []byte
 	noWinTune     bool     // tests: behave like a peer that never advertises more than the implicit window
+	winCap        uint64   // per-stream window ceiling this end advertises: cfg.WinMax, or maxStreamWin (stream.go)
 	winExtra      uint64   // sum over streams of (win - streamWindow): the auto-tuned growth in use
 	winSlack      uint64   // bytes a peer's largest datagram may overshoot the advertised stream window
 	maxPlain      int      // plaintext bytes per datagram: cfg.MaxPayload - header - tag
@@ -328,6 +336,12 @@ func NewSession(cfg Config, pio PacketIO) (*Session, error) {
 		winSlack: uint64(hi - overhead),
 	}
 	s.pingGap, s.maskFlip = cfg.PingEvery, time.Now()
+	s.winCap = maxStreamWin
+	if cfg.WinMax > 0 {
+		// clamped to [streamWindow, maxStreamWin]: below the base means "do not auto-tune", and this is a memory
+		// bound, not a way to grow past the default
+		s.winCap = min(max(cfg.WinMax, uint64(streamWindow)), uint64(maxStreamWin))
+	}
 	if !cfg.NoMask {
 		s.hk = hdrMaskKey(cfg.Key)
 		s.masked.Store(!cfg.Server)

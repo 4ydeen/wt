@@ -63,6 +63,70 @@ func TestStreamWindowAutoTune(t *testing.T) {
 	}
 }
 
+// Config.WinMax bounds the window this end advertises per stream, which is what caps the peer's sender buffering.
+// 0 keeps the old 16 MB default; the value is clamped into [streamWindow, maxStreamWin], because it is a memory
+// bound for a small VPS and not a way to grow past the default.
+func TestWinMaxClamped(t *testing.T) {
+	for _, c := range []struct{ in, want uint64 }{
+		{0, maxStreamWin},         // unset: exactly the old behaviour
+		{1 << 20, streamWindow},   // below the base pins the window at 4 MB, it does not shrink it
+		{5 << 20, 5 << 20},        // in range: used as given
+		{100 << 20, maxStreamWin}, // above the ceiling: clamped down
+	} {
+		cli, srv, _, _ := newPair(t, 0, time.Millisecond, 40e6, Config{WinMax: c.in})
+		if cli.winCap != c.want || srv.winCap != c.want {
+			t.Fatalf("WinMax=%d: winCap client=%d server=%d, want %d", c.in, cli.winCap, srv.winCap, c.want)
+		}
+	}
+}
+
+// The cap must actually hold during a transfer (tuneWindow grows the window every RTT and stops only at winCap), and
+// capping it must not corrupt or truncate the stream. st.win only ever grows, so its final value is the maximum it
+// advertised at any point.
+func TestWinMaxHoldsUnderTransfer(t *testing.T) {
+	const wc = 5 << 20
+	cfg := Config{InitBps: 40e6, MaxBps: 40e6, WinMax: wc}
+	cli, srv, _, _ := newPair(t, 0, 75*time.Millisecond, 40e6, cfg)
+	for _, x := range []*Session{cli, srv} { // a 150 ms RTT needs a first sample, as in oneStreamDown
+		x.mu.Lock()
+		x.cc.srtt, x.cc.rttvar = 150*time.Millisecond, 10*time.Millisecond
+		x.mu.Unlock()
+	}
+	data := pattern(32<<20, 9)
+	go func() {
+		st, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		st.Write(data)
+		st.CloseWrite()
+	}()
+	st, _ := cli.OpenStream()
+	st.Write([]byte{1})
+	st.CloseWrite()
+	done := make(chan []byte, 1)
+	go func() { b, _ := readAll(st); done <- b }()
+	select {
+	case b := <-done:
+		if sha256.Sum256(b) != sha256.Sum256(data) {
+			t.Fatalf("capped window corrupted the stream: got %d bytes, want %d", len(b), len(data))
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatal("timeout")
+	}
+	cli.mu.Lock()
+	win := st.win
+	cli.mu.Unlock()
+	if win > wc {
+		t.Fatalf("advertised window grew past WinMax: %d > %d", win, wc)
+	}
+	if win < streamWindow {
+		t.Fatalf("advertised window fell below the base: %d < %d", win, streamWindow)
+	}
+	t.Logf("32 MB delivered, window held at %.2f MB (cap %.2f MB, default %.2f MB)",
+		float64(win)/1e6, float64(wc)/1e6, float64(maxStreamWin)/1e6)
+}
+
 // A reader slower than the tunnel (a user on a slow last mile) must not park a full 4 MB window at the receiver and
 // another 4 MB at the sender: field 2026-10-12, 180 such streams held ~700 MB on each end (2.4.3).
 func TestSlowReaderBuffersBounded(t *testing.T) {

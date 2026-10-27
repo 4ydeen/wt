@@ -130,7 +130,7 @@ func (st *Stream) Write(b []byte) (int, error) {
 // (a peer that never advertises more than the implicit 4 MB window keeps exactly the old behaviour).
 func (st *Stream) sendCap() int {
 	if st.peerMax > st.sbase+sendBufMax {
-		return int(min(st.peerMax-st.sbase, maxStreamWin))
+		return int(min(st.peerMax-st.sbase, st.s.winCap))
 	}
 	return sendBufMax
 }
@@ -140,7 +140,7 @@ func (st *Stream) sendCap() int {
 func (st *Stream) writeCap() int {
 	room := 0
 	if st.peerMax > st.sbase {
-		room = int(min(st.peerMax-st.sbase, maxStreamWin))
+		room = int(min(st.peerMax-st.sbase, st.s.winCap))
 	}
 	return min(st.sendCap(), room+sendStage)
 }
@@ -208,12 +208,12 @@ func (st *Stream) tuneWindow(now time.Time) {
 	// second case is a lossy multi-connection path (2.4.18): one connection stalled in a TCP retransmit holds the
 	// in-order point back while the others fill the window with out-of-order data, so in-order arrivals per RTT never
 	// reach half the window and a 4 MB window capped one stream at ~18 MB/s on an emulated 100 MB/s path.
-	if st.win >= maxStreamWin || (got < st.win/2 && !edge) || st.rnext-st.consumed > st.win/4 {
+	if st.win >= s.winCap || (got < st.win/2 && !edge) || st.rnext-st.consumed > st.win/4 {
 		return
 	}
-	nw := min(max(2*got, st.win), 2*st.win, maxStreamWin)
+	nw := min(max(2*got, st.win), 2*st.win, s.winCap)
 	if edge {
-		nw = min(2*st.win, maxStreamWin)
+		nw = min(2*st.win, s.winCap)
 	}
 	if nw <= st.win || s.winExtra+(nw-st.win) > maxSessionWin {
 		return
