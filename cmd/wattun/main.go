@@ -83,8 +83,8 @@ func main() {
 	carrier := flag.String("carrier", "icmp", "icmp|udp|tcp|tls|ws|wss|h2|h2c|grpc (all but icmp: client dials -peer host:port, server listens on -listen; h2 through Cloudflare: not supported, use grpc or wss); join several with '+' (icmp+udp+tcp) to bond them into ONE session that survives any one being blocked; then -peer / -listen are the defaults and -peer-NAME / -listen-NAME (e.g. -peer-udp, -listen-tcp, also keys in the config file) override them per carrier")
 	udpListen := flag.String("listen", ":4443", "server, udp carrier: address to listen on")
 	conns := flag.Int("conns", wat.DefaultPoolConns, "client, tcp/tls carrier: connections in the pool")
-	poolRotate := flag.String("pool-rotate", "0", "client, pool carriers (tcp|tls|ws|wss|h2|grpc): recycle each healthy pool connection after this long, so no flow shows a months-stable lifetime; accepts 30m, 4h or seconds; jittered +/-40% per connection so the redials never line up; 0 = off (2.8.0, client only)")
-	poolRotateBytes := flag.String("pool-rotate-bytes", "0", "client, pool carriers, with -pool-rotate or alone: also recycle each healthy pool connection after this many bytes handed to its socket (500MB, 4GB, 300k; 1MB = 1e6); jittered +/-25% like the time axis; whichever limit hits first recycles (2.8.1, client only)")
+	poolRotate := flag.String("pool-rotate", "0", "client, pool carriers (tcp|tls|ws|wss|h2|grpc): recycle each healthy pool connection after this long, so no flow shows a months-stable lifetime; accepts 30m, 4h or seconds; jittered +/-40% per connection so the redials never line up; 0 = off (2.8.0; a -reverse server dials too, so it honours it since 3.0.2)")
+	poolRotateBytes := flag.String("pool-rotate-bytes", "0", "client, pool carriers, with -pool-rotate or alone: also recycle each healthy pool connection after this many bytes handed to its socket (500MB, 4GB, 300k; 1MB = 1e6); jittered +/-25% like the time axis; whichever limit hits first recycles (2.8.1; a -reverse server honours it since 3.0.2)")
 	tcpCC := flag.String("tcp-cc", wat.PoolTCPCC, "tcp|tls|ws|wss|h2|h2c|grpc: TCP congestion control set on every pool socket, Linux (bbr ignores random loss, the kernel default cubic halves the window on it; 'system' keeps the kernel default; 2.4.18, before: system)")
 	nSess := flag.Int("sessions", 1, "client: independent sessions to the server (1-16), each with its own -conns pool, pacer and session id; new TCP streams go to the least loaded live one, UDP flows stick to one, /speedtest uses all; udp|tcp|tls|ws|wss|h2|h2c|grpc only (not icmp, bonded carriers or -reverse); each counts against the server's 32-session limit (client only, 2.3.0; server unchanged)")
 	tlsCert := flag.String("tls-cert", "", "server, tls carrier: certificate file (empty = self-signed in memory)")
@@ -483,7 +483,7 @@ func main() {
 		}
 		if pc != nil {
 			tlsPools = append(tlsPools, pc)
-			if !server && (rotateD > 0 || rotateB > 0) { // churn (2.8.0/2.8.1): client pools only
+			if rotateD > 0 || rotateB > 0 { // churn (2.8.0/2.8.1, 3.0.2): any dialer pool (normal client or reverse server)
 				pc.SetRotate(rotateD, rotateB)
 			}
 		}

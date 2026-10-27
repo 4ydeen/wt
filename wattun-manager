@@ -1671,6 +1671,7 @@ wizard_kharej() {
         if is_rpool "$cr"; then
           echo "peer: $iranip:$listen"
           [ -n "$sni" ] && { echo "sni: $sni"; echo "host: $sni"; }
+          echo "pool-rotate: 30m"
         else echo "peer: $iranip"; fi
       fi
       [ -n "$mbps" ] && echo "max-mbps: $mbps"
@@ -2804,6 +2805,7 @@ companion_create() { # name ip
     echo "peer-icmp: $ip"
     for c in ${rp//,/ }; do echo "peer-${c%%:*}: $ip:${c##*:}"; done
     echo "path: ${T_PATH:-/wat}"
+    echo "pool-rotate: 30m"
     echo "metrics: 127.0.0.1:$m"
     maps_yaml_block
   } >"$tmp"

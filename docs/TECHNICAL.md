@@ -1240,8 +1240,8 @@ The server allowlist is the **target** ports, so Kharej's list contains `443` an
 | `port-offset` | 0 | client | Added to every listen port. Used by the second slot of a handover. |
 | `lanes` | 4 | client | ICMP identifiers to stripe over. |
 | `conns` | 8 | client (server with `reverse`) | Connections in a pool carrier. With `reverse`, Kharej dials this many to Iran. |
-| `pool-rotate` | 0 (off) | client (pool carriers: tcp, tls, ws, wss, h2, grpc) | Recycle each healthy pool connection after this long (`30m`, `4h`), so no single flow shows a months-stable lifetime; each connection's actual budget is jittered ±40 % and re-rolled on every recycle, so redials never line up into a detectable period. The session resends anything in flight, so the cost is one redial on one connection at a time. 0 = off. Since 2.8.0. |
-| `pool-rotate-bytes` | 0 (off) | client (pool carriers: tcp, tls, ws, wss, h2, grpc) | With or instead of `pool-rotate`: also recycle each healthy pool connection after this many bytes handed to its socket (`500MB`, `4G`, `300k`; decimal units, 1 MB = 10^6). Jittered +/-25 % like the time axis; whichever limit hits first recycles, so the byte axis does not betray the time axis's jitter. 0 = off. Since 2.8.1. |
+| `pool-rotate` | 0 (off) | client, or the dialing server of a `reverse` tunnel since 3.0.2 (pool carriers: tcp, tls, ws, wss, h2, grpc) | Recycle each healthy pool connection after this long (`30m`, `4h`), so no single flow shows a months-stable lifetime; each connection's actual budget is jittered ±40 % and re-rolled on every recycle, so redials never line up into a detectable period. The session resends anything in flight, so the cost is one redial on one connection at a time. 0 = off. Since 2.8.0. |
+| `pool-rotate-bytes` | 0 (off) | client, or the dialing server of a `reverse` tunnel since 3.0.2 (pool carriers: tcp, tls, ws, wss, h2, grpc) | With or instead of `pool-rotate`: also recycle each healthy pool connection after this many bytes handed to its socket (`500MB`, `4G`, `300k`; decimal units, 1 MB = 10^6). Jittered +/-25 % like the time axis; whichever limit hits first recycles, so the byte axis does not betray the time axis's jitter. 0 = off. Since 2.8.1. |
 | `mtu` | 0 (carrier default) | both | Datagram size cap, including header and tag. |
 | `max-mbps` | 0 (carrier default) | both | Pacing ceiling, MB/s per direction, per session. 0 = 16 when `icmp` is among the carriers, 1250 (10 Gbit, i.e. no practical cap) for udp, tcp, tls, ws, wss, h2, h2c and grpc since 2.4.18 (200 from 2.3.0; before that 16 for every carrier; the server's value caps the download). See "ICMP path limits and pacing". |
 | `tcp-cc` | `bbr` | both | Since 2.4.18, Linux. TCP congestion control set on every pool socket (tcp, tls, ws, wss, h2, h2c, grpc). BBR does not back off on random loss; the kernel default (cubic) halves its window on every lost segment. `system` keeps the kernel default. Each end sets it for what it sends. `tcp_cc` in `/stats` shows what the kernel accepted (falls back to the default if the `tcp_bbr` module is missing). |
@@ -1942,6 +1942,12 @@ in backoff, and the p95 of a small request during the loop fell from 1114 ms to 
   filter cuts direct flows after ~3 KB unless it is told to forget the flow, `paws` drops the fake correctly but the
   flow is still cut, like `seq`; only `rst` and `synrst` work there. Use it against SNI allowlists that do not track TCP
   timestamps.
+- **Churn on reverse tunnels.** `pool-rotate` and `pool-rotate-bytes` were ignored on a server, so a reverse tunnel's pool (Kharej
+  dials Iran) kept the same TCP connections for hours and was cut after 30-40 minutes under heavy traffic (flow-duration limits).
+  A server that dials (`reverse: true`) now recycles its connections like a client does. The manager writes `pool-rotate: 30m` into
+  new reverse pool tunnels and auto companions; existing tunnels need the key added by hand. On the test pair a 20 s rotation kept
+  every connection under 20 s old and still moved 80 MB/s down / 68 MB/s up; the control run without rotation lost all
+  receive traffic on its 150-second-old connections during the upload phase (one run each, not a proof).
 - **HTTP/2 receive window.** The `h2`, `h2c` and `grpc` servers advertise 8 MB per stream and 32 MB per connection (Go's
   default is 1 MB per stream, which limits one pool connection to about 11 MB/s on a 90 ms path). Applies to the side that
   receives, so it speeds up forward upload and reverse download.
