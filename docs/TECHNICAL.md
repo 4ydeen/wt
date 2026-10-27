@@ -1926,8 +1926,14 @@ in backoff, and the p95 of a small request during the loop fell from 1114 ms to 
   does. The kernel adds a random offset to every connection's `TSval`, so the stale value is derived from the observed
   one; a fixed value would be "older" only about half the time and the server would take the fake as the real stream.
   Without a timestamp option on the connection (`net.ipv4.tcp_timestamps=0` at either end) it sends the `seq` marker
-  instead. `fake-mode: auto` probes it after `rst` and `synrst`. Not field-tested on a filtering route yet: on the
-  open test pair it connects and carries data on tcp, tls and wss.
+  instead. `fake-mode: auto` probes it after `rst` and `synrst`. Needs wattun 3.0.2 on the client only. The server
+  kernel's `TcpExtPAWSEstab` counter rises by one per dropped fake (`nstat -az TcpExtPAWSEstab`). On the test pair, whose
+  filter cuts direct flows after ~3 KB unless it is told to forget the flow, `paws` drops the fake correctly but the
+  flow is still cut, like `seq`; only `rst` and `synrst` work there. Use it against SNI allowlists that do not track TCP
+  timestamps.
+- **HTTP/2 receive window.** The `h2`, `h2c` and `grpc` servers advertise 8 MB per stream and 32 MB per connection (Go's
+  default is 1 MB per stream, which limits one pool connection to about 11 MB/s on a 90 ms path). Applies to the side that
+  receives, so it speeds up forward upload and reverse download.
 - **`tls-frag: -1`.** Splits the ClientHello right after the first character of the SNI, so neither segment holds a
   parseable host name. Any positive N keeps the fixed-size split.
 - **Web server face.** An HTTP carrier server (`ws`, `wss`, `h2`, `h2c`, `grpc`) answers `/` with the default

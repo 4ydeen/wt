@@ -257,6 +257,9 @@ func newHTTPPoolServer(addr string, o HTTPServerOptions, mk func(*httpListener) 
 	protos.SetHTTP2(o.Secure)
 	protos.SetUnencryptedHTTP2(!o.Secure)
 	l.srv = &http.Server{Handler: mk(l), ReadHeaderTimeout: 10 * time.Second, Protocols: &protos,
+		// Go's default 1 MB receive window per stream caps one h2 pool conn at ~11 MB/s on a 90 ms path (field 2026-10-27:
+		// forward h2/grpc upload 19-24 MB/s, reverse download 32, against 37-49 for tcp/tls/ws).
+		HTTP2:    &http.HTTP2Config{MaxReceiveBufferPerStream: 8 << 20, MaxReceiveBufferPerConnection: 32 << 20},
 		ErrorLog: log.New(io.Discard, "", 0)}
 	var serve func() error
 	if o.Secure {
