@@ -87,8 +87,9 @@ func (t *tunnel) pick() *wat.Session {
 	return best
 }
 
-// forFlow is the session of a UDP flow: fixed by a hash of the flow id, so a flow's datagrams stay in order on one
-// session. Only when that session is down does the flow move to the next live one (and stays there while it lives).
+// forFlow picks the session of a new UDP flow: fixed by a hash of the flow id, skipping sessions that are down. The
+// flow remembers the result (cflow.session) and stays there while the flow lives, so a recovering session does not
+// pull it back and reorder its datagrams.
 func (t *tunnel) forFlow(id uint64) *wat.Session {
 	n := len(t.list)
 	if n == 1 {

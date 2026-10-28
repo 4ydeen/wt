@@ -232,6 +232,9 @@ func main() {
 	if *winMax < 0 || *winMax > 64 {
 		log.Fatalf("-win-max must be 0 (auto) or 4..64 MB, got %d", *winMax)
 	}
+	if *pingEvery < 0 || *pingEvery > 60 { // Alive and the server IdleTimeout are 3x this value
+		log.Fatalf("-ping-every must be 0..60 seconds, got %d", *pingEvery)
+	}
 	hp := wat.HostProfile()
 	if *conns <= 0 {
 		*conns = hp.DefaultPoolConns

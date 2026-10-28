@@ -6,7 +6,7 @@
 
 **Encrypted Iran ↔ Kharej port forwarding that keeps working when the network is filtered, even when only ping gets through.**
 
-[![Release](https://img.shields.io/badge/release-v3.1.0-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
+[![Release](https://img.shields.io/badge/release-v3.1.1-blue?style=flat-square)](https://github.com/JohnWatsoon/WatTunnel/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?style=flat-square&logo=go)](go.mod)
 ![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64%20%7C%20windows-lightgrey?style=flat-square)
@@ -50,6 +50,16 @@ and the full list of 92 configurations: [docs/TECHNICAL.md](docs/TECHNICAL.md#fi
 
 ## What changed since 3.0.0
 
+- **Counters stay with their server; the matrix handles bonds (3.1.1).** A config copied to a new VPS starts its
+  lifetime traffic counters from zero instead of showing the old server's total (`wattun-manager reset-traffic NAME`
+  zeroes them on purpose, and deleting a tunnel removes its saved counters). The anti-censor matrix now tests bonded
+  tunnels leg by leg (before it refused them), only offers modes the installed binary really supports (an older binary
+  silently ran `synrst` as `seq`), includes `paws`, and re-measures the top 3 variants at 20 MB so the winner is not
+  noise. The manager now ships inside the signed release checksums, so `install.sh` verifies it like the binary.
+- **Smaller fixes (3.1.1).** The Kharej speed-test button says the test runs on Iran instead of claiming an old
+  version. `-ping-every` is validated (0-60 s) and the liveness/idle limits scale with it. A captured packet can no
+  longer keep a closed server session alive or open a new one. `-sessions` clones keep their `tcp-mimic` hello, and a
+  UDP flow keeps its session while it lives, so a flapping session cannot reorder its datagrams.
 - **Defaults follow the machine (3.1.0).** The program reads the CPU count and the RAM it may use (container limits
   included) and picks connections, sessions and window sizes by itself: a small VPS stays light, a 2-vCPU / 2 GB+
   server opens more connections and a second session. The start line shows what it chose; `conns`, `sessions` and the

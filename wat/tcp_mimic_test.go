@@ -188,6 +188,33 @@ func TestTCPMimicPool(t *testing.T) {
 	}
 }
 
+// -sessions N builds extra pools with Clone; the clone must carry the hello v2 setup along. The server accepts a
+// plain pool id too (old clients), so the check is on the clone's own state, which slotLoop reads.
+func TestTCPMimicClone(t *testing.T) {
+	psk := []byte("pool-clone")
+	srv, err := NewTCPPoolServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.SetObfs(psk)
+	cli, err := NewTCPPoolClient(srv.Addr().String(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	cli.SetObfs(psk, "example.org")
+	clone, err := cli.Clone(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clone.Close()
+	if o := clone.obf.Load(); o == nil || !clone.v2.Load() {
+		t.Fatal("the clone lost the hello v2 setup: its connections would open with the plain pool id")
+	}
+	poolPing(t, clone, srv, 5*time.Second)
+}
+
 func TestTCPMimicCompat(t *testing.T) {
 	old, oldF := mimicFallback, mimicLater
 	mimicFallback, mimicLater = 600*time.Millisecond, 10*time.Second

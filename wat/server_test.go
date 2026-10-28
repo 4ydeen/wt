@@ -336,3 +336,87 @@ func TestServerRestart(t *testing.T) {
 	}
 	echoOnce(t, a, 200000, 2) // new streams on the same client session work
 }
+
+// tapIO copies every datagram a client puts on the wire, so a test can replay it later.
+type tapIO struct {
+	PacketIO
+	mu   sync.Mutex
+	last []byte
+}
+
+func (t *tapIO) Send(p []byte, lane int) error {
+	t.mu.Lock()
+	t.last = append(t.last[:0], p...)
+	t.mu.Unlock()
+	return t.PacketIO.Send(p, lane)
+}
+
+func (t *tapIO) packet() []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.last...)
+}
+
+// A captured packet must not keep its session alive after the client dies, and must not open a new session once the
+// old one has left the table: before 2026-10-28 any packet with a known sid refreshed the idle clock, and admit
+// accepted any valid old packet as a new session.
+func TestServerRejectsSessionReplay(t *testing.T) {
+	h, srv := newHub(t) // IdleTimeout 3 s
+	tap := &tapIO{PacketIO: h.client("rp1", 0, 5*time.Millisecond, 10e6, 90)}
+	a, _ := NewSession(Config{Key: []byte("hub-key"), Paths: 2}, tap)
+	echoOnce(t, a, 50000, 8)
+	time.Sleep(200 * time.Millisecond) // a fresh authenticated packet lands in the tap
+	pkt := tap.packet()
+	if len(pkt) < hdrLen+tagLen+1 {
+		t.Fatalf("captured packet is %d bytes, too short to replay", len(pkt))
+	}
+	a.Close()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tk := time.NewTicker(200 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				select {
+				case h.in <- hubPkt{append([]byte(nil), pkt...), strAddr("rp1"), 0}:
+				default:
+				}
+			}
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.Sessions() != 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n := srv.Sessions(); n != 0 {
+		t.Fatalf("replayed packets kept the dead session alive (%d left)", n)
+	}
+	h.in <- hubPkt{append([]byte(nil), pkt...), strAddr("rp1"), 0} // one more replay: retired pn, must not open a session
+	time.Sleep(300 * time.Millisecond)
+	if n := srv.Sessions(); n != 0 {
+		t.Fatalf("a replayed packet opened a new session")
+	}
+}
+
+// Alive and the server idle timeout follow -ping-every: a raised keepalive gap must not read as a dead link.
+func TestAliveScalesWithPingEvery(t *testing.T) {
+	s := &Session{cfg: Config{PingEvery: 10 * time.Second}}
+	s.lastAuth = time.Now().Add(-20 * time.Second)
+	if !s.Alive() {
+		t.Fatal("20 s of silence with a 10 s ping interval read as dead (limit is 3x = 30 s)")
+	}
+	s.lastAuth = time.Now().Add(-31 * time.Second)
+	if s.Alive() {
+		t.Fatal("silence past 3x PingEvery read as alive")
+	}
+	h := &simHub{in: make(chan hubPkt, 1), downs: map[string]*simDir{}}
+	srv := NewServer(Config{Key: []byte("hub-key"), PingEvery: 40 * time.Second}, h)
+	defer srv.Close()
+	if srv.IdleTimeout < 120*time.Second {
+		t.Fatalf("IdleTimeout %v with a 40 s ping interval, want >= 120 s", srv.IdleTimeout)
+	}
+}

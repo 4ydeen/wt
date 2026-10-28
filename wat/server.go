@@ -41,6 +41,11 @@ type Server struct {
 	MaxSessions int
 	IdleTimeout time.Duration
 
+	// retiredPN: highest packet number the session of a sid that left the table accepted, so a replay of one of its
+	// packets cannot open a new session. retiredQ keeps insertion order for the bound.
+	retiredPN map[uint64]uint64
+	retiredQ  []uint64
+
 	lastRx atomic.Int64 // unix nanoseconds of the newest authenticated packet of any session, kept after it closes
 
 	revive *ReviveEngine // optional handler for out-of-band emergency revival knocks
@@ -51,10 +56,14 @@ type Server struct {
 }
 
 type srvSess struct {
-	s    *Session
-	io   *subIO
-	last atomic.Int64 // unix nanoseconds of the last packet
+	s       *Session
+	io      *subIO
+	created time.Time // janitor fallback until the first authenticated packet sets LastRecv
+	pn      uint64    // packet number the session was admitted with (retire watermark)
 }
+
+// maxRetiredSIDs bounds the replay watermark map. An evicted id may be replayed once.
+const maxRetiredSIDs = 4096
 
 type subIO struct {
 	srv   *Server
@@ -115,6 +124,9 @@ func (b *subIO) Close() error {
 		b.srv.mu.Lock()
 		ss := b.srv.sessions[b.sid]
 		delete(b.srv.sessions, b.sid)
+		if ss != nil {
+			b.srv.retireLocked(b.sid, max(ss.pn, ss.s.LastPN()))
+		}
 		b.srv.mu.Unlock()
 		if ss != nil { // keep Server.LastRecv monotonic: the session no longer feeds it once it leaves the map
 			b.srv.noteRecv(ss.s.LastRecv())
@@ -123,15 +135,37 @@ func (b *subIO) Close() error {
 	return nil
 }
 
+// retireLocked records the highest authenticated packet number of a session that left the table; admit refuses a
+// packet at or below it, so the session's own captured packets cannot create a session again.
+func (srv *Server) retireLocked(sid, pn uint64) {
+	if old, ok := srv.retiredPN[sid]; ok {
+		if pn > old {
+			srv.retiredPN[sid] = pn
+		}
+		return
+	}
+	if len(srv.retiredQ) >= maxRetiredSIDs {
+		delete(srv.retiredPN, srv.retiredQ[0])
+		srv.retiredQ = srv.retiredQ[1:]
+	}
+	srv.retiredPN[sid] = pn
+	srv.retiredQ = append(srv.retiredQ, sid)
+}
+
 func NewServer(cfg Config, raw RawIO) *Server {
 	cfg.Server = true
+	if cfg.PingEvery <= 0 {
+		cfg.PingEvery = 2 * time.Second
+	}
 	if cfg.Boot == 0 {
 		var b [8]byte
 		crand.Read(b[:])
 		cfg.Boot = binary.BigEndian.Uint64(b[:]) | 1
 	}
 	srv := &Server{cfg: cfg, raw: raw, sessions: map[uint64]*srvSess{}, New: make(chan *Session, 64),
-		stop: make(chan struct{}), free: make(chan []byte, 1024), MaxSessions: 32, IdleTimeout: 45 * time.Second}
+		stop: make(chan struct{}), free: make(chan []byte, 1024), MaxSessions: 32, retiredPN: map[uint64]uint64{},
+		// a raised -ping-every means longer silences between authenticated packets (see Alive)
+		IdleTimeout: max(45*time.Second, 3*cfg.PingEvery)}
 	if !cfg.NoMask {
 		srv.hk = hdrMaskKey(cfg.Key)
 	}
@@ -226,7 +260,7 @@ func (srv *Server) Clients() []ClientInfo {
 		if lr := ss.s.LastRecv(); !lr.IsZero() {
 			ci.Age = max(now.Sub(lr), 0)
 		} else {
-			ci.Age = max(now.Sub(time.Unix(0, ss.last.Load())), 0)
+			ci.Age = max(now.Sub(ss.created), 0)
 		}
 		a, _ := ss.io.peer.Load().(net.Addr)
 		if t, ok := a.(*TaggedAddr); ok {
@@ -426,7 +460,6 @@ func (srv *Server) run() {
 				continue
 			}
 		}
-		ss.last.Store(time.Now().UnixNano())
 		select {
 		case ss.io.inbox <- rxPkt{srv.getBuf(p), lane, src}:
 		default: // overloaded: a dropped datagram is just loss
@@ -464,6 +497,9 @@ func (srv *Server) admit(hdr [hdrLen]byte, p []byte, src net.Addr) *srvSess {
 	if ss := srv.sessions[sid]; ss != nil {
 		return ss
 	}
+	if wm, seen := srv.retiredPN[sid]; seen && pn <= wm {
+		return nil // a replay of a packet this server already accepted for that session
+	}
 	io := &subIO{srv: srv, sid: sid, inbox: make(chan rxPkt, 8192), done: make(chan struct{})}
 	cfg := srv.cfg
 	cfg.SID = sid
@@ -483,8 +519,7 @@ func (srv *Server) admit(hdr [hdrLen]byte, p []byte, src net.Addr) *srvSess {
 	if err != nil {
 		return nil
 	}
-	ss := &srvSess{s: s, io: io}
-	ss.last.Store(time.Now().UnixNano())
+	ss := &srvSess{s: s, io: io, created: time.Now(), pn: pn}
 	srv.sessions[sid] = ss
 	go func() { // never blocks admit: a slow New consumer only delays the handoff (select on stop: no leak on Close)
 		select {
@@ -508,10 +543,15 @@ func (srv *Server) janitor() {
 			return
 		case <-tk.C:
 			var dead []*Session
-			cut := time.Now().Add(-srv.IdleTimeout).UnixNano()
+			cut := time.Now().Add(-srv.IdleTimeout)
 			srv.mu.Lock()
 			for _, ss := range srv.sessions {
-				if ss.last.Load() < cut {
+				// authenticated recency only: a replayed or forged packet with a live id refreshes nothing
+				last := ss.s.LastRecv()
+				if last.IsZero() {
+					last = ss.created
+				}
+				if last.Before(cut) {
 					dead = append(dead, ss.s)
 				}
 			}

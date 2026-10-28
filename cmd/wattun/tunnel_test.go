@@ -191,3 +191,30 @@ func TestMultiSessionUDPFlowSticks(t *testing.T) {
 		}
 	}
 }
+
+// A flow keeps the session it was placed on, even one that is not its hash home, and moves only when that session is
+// down; otherwise a session that flaps back to life reorders the flow's datagrams.
+func TestMultiSessionUDPFlowKeepsItsSession(t *testing.T) {
+	tun := newMultiRig(t, 2, 1, newAllow("", "")) // list[2] never comes alive
+	dc := newDgramClient(tun, time.Minute)
+	f := &cflow{id: 7, l: &udpListener{c: dc}}
+	home := f.session()
+	if home == nil || !home.Alive() {
+		t.Fatalf("a new flow got a dead session")
+	}
+	if f.session() != home {
+		t.Fatal("the flow changed session between datagrams")
+	}
+	other := tun.list[0]
+	if other == home {
+		other = tun.list[1]
+	}
+	f.sess = other // pinned by hand: a live session is kept even when the hash points elsewhere
+	if got := f.session(); got != other {
+		t.Fatal("a live pinned session was re-picked")
+	}
+	f.sess = tun.list[2]
+	if got := f.session(); got == tun.list[2] || !got.Alive() {
+		t.Fatal("a dead session was kept")
+	}
+}

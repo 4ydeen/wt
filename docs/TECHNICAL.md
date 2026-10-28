@@ -446,7 +446,8 @@ wattun status          # one line per tunnel
 wattun monitor         # live dashboard
 wattun ports NAME      # edit the port mappings of a tunnel
 wattun test NAME       # connection doctor + speed test
-wattun speedtest NAME  # speed test only (10 MB each way)
+wattun speedtest NAME  # speed test only (10 MB each way; client side)
+wattun reset-traffic NAME  # zero the lifetime traffic counters of a tunnel
 wattun logs NAME       # follow the log
 wattun token NAME      # print the Kharej token
 wattun profile save NAME [tunnel]  # save a tunnel's fake-sni/pool-rotate combination under a name
@@ -739,7 +740,8 @@ transfers: 4 connections 13.8 MB/s down, 4.9 MB/s up; 8 connections 16.6 MB/s do
 the fake and the real hello (tried with a build that had one; all 8 such runs connected) was not needed, so there is
 no such option. `auto`
 picked `seqsum` and failed: its probe tests which marker kills a flow, not whether the real flow then survives;
-`wattun-manager` anti-censor matrix (tunnel page `z`, then `m`) tests `rst` and `synrst` explicitly.
+`wattun-manager` anti-censor matrix (tunnel page `z`, then `m`) tests every mode the installed binary supports,
+`rst`, `synrst` and `paws` included, once per pool leg of a bond (3.1.1).
 
 **Reverse `tcp`** (Iran listens on 47151, Kharej dials, 4 connections, 60 MB down / 20 MB up):
 
@@ -1469,8 +1471,10 @@ parity packet, and an older peer stops parsing at the unknown frame, which sits 
 Both ends count traffic per port (client: the public port users connect to; server: the target port) and expose it
 live in `/stats` under `ports` and on a cheap `/ports` endpoint (needs `-metrics`). Counters are cumulative since
 process start. Since 2.5.0 the `*_total` and `conns_all_time` fields also keep counting across restarts: they are
-saved to `<config>.totals.json` every 30 s and on shutdown (with `-config` only). Delete that file to start them from
-zero.
+saved to `<config>.totals.json` every 30 s and on shutdown (with `-config` only). Since 3.1.1 that file is bound to the
+machine that wrote it (`<config>.totals.json.host`): a config copied to another server starts its counters from zero
+instead of showing the previous server's traffic. `wattun-manager reset-traffic NAME` zeroes them in place (stops the
+tunnel, deletes the file, starts it again).
 
 ```json
 {"20001": {"bytes_up": 0, "bytes_down": 0, "bytes_up_total": 0, "bytes_down_total": 0,
@@ -1533,7 +1537,7 @@ metrics port, even if the port is in the allowlist.
 | `loss_pct` | Loss in the last judged 50 ms interval, percent (0 until 50 packets were sent in one). |
 | `inflight` | Unacknowledged bytes. |
 | `pkts_out`, `pkts_in`, `bytes_out`, `bytes_in` | Totals since the process started. |
-| `bytes_out_total`, `bytes_in_total` | Since 2.5.0. Wire bytes across restarts (saved in `<config>.totals.json`); the manager shows these. |
+| `bytes_out_total`, `bytes_in_total` | Since 2.5.0. Wire bytes across restarts (saved in `<config>.totals.json`); the manager shows these. Since 3.1.1 the file is bound to the writing machine, so a config copied to another server starts from zero (`wattun-manager reset-traffic NAME` zeroes it in place). |
 | `dgram_fragmented`, `dgram_reassembled` | Since 2.5.0. UDP datagrams too big for one packet that were sent in pieces / rebuilt from pieces (needs 2.5.0 on both ends; an older peer drops the pieces). |
 | `retrans` | Retransmitted packets. |
 | `fec_sent`, `fec_recovered` | FEC parity packets sent; packets rebuilt from parity. |
@@ -1580,7 +1584,9 @@ The process also logs a stats line every 10 seconds when something moves (it inc
 On a client, `GET /speedtest?dir=down|up&mb=N` (on the `metrics` address, default 10) moves N MB through
 the live session and returns `{"dir","bytes","seconds","mb_per_s","mbit_per_s","ok","error"}`. The stream asks the
 server for target port 0, which the server answers itself (it sends or absorbs the bytes), so no test service or
-extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or newer.
+extra port is needed and the allowlist is not involved. Both ends need 1.8.1 or newer. Only the client process serves
+the endpoint, because only that side can open streams: on Kharej the manager's speed-test key says so instead of
+reporting a version error (3.1.1), and the live monitor shows current throughput there.
 `wattun test NAME` runs it 10 MB each way. Since 2.3.0 the answer also has `"sessions"`: with `sessions` > 1 the
 test opens one stream on every live session at once, each moving its share of N MB, and reports the total over the
 wall time. N is split between the streams, and each stream carries at most 256 MB, so N is capped at
@@ -1957,6 +1963,39 @@ Field result, production CDN, 2026-10-12, measured back to back the same morning
 30.4 MB/s on 2.4.3 and 42.9 / 44.7 MB/s on 2.4.5, at 2 and 21 minutes after the restart. Kharej showed no connection
 in backoff, and the p95 of a small request during the loop fell from 1114 ms to 269-549 ms.
 
+## 3.1.1: authenticated session aging, machine-bound totals, matrix for bonds
+
+- **The server's session table only trusts authenticated packets.** The janitor used a timestamp updated for every
+  packet that carried a live session id, so forged or replayed junk could keep a dead session in the table. It now uses
+  `Session.LastRecv` (set only after decryption), falling back to the session's creation time, and the server remembers
+  the highest authenticated packet number of a session that left the table (bounded map, 4096 ids): `Server.admit`
+  refuses a packet at or below that watermark, so the session's own captured packets cannot open a new one
+  (`Session.LastPN`, `retiredPN`).
+- **Liveness follows `-ping-every`.** The value is validated (0-60 s). `Alive()` is `max(10 s, 3 × ping-every)` and the
+  server's idle timeout `max(45 s, 3 × ping-every)`, so a raised keepalive interval does not show a healthy tunnel as
+  down (a keepalive gap is 0.6-1.4× the interval and each ping is acked at once).
+- **`-sessions` clones keep the `tcp-mimic` hello.** The hello-v2 parameters moved behind one atomic pointer and `Clone`
+  copies them; before, the extra sessions opened with the plain 8-byte pool id while the first looked like TLS.
+- **A UDP flow pins its session.** The flow picks a session on its first datagram and keeps it while it lives
+  (`cflow.session`). Re-picking per datagram let a flapping session (down, then live again) pull the flow back and
+  reorder it.
+- **Lifetime totals are bound to their machine.** `<config>.totals.json` is paired with `<config>.totals.json.host`
+  (`/etc/machine-id`): see [Per-port traffic and limits](#per-port-traffic-and-limits). `wattun-manager reset-traffic
+  NAME` zeroes the counters in place, and deleting a tunnel removes its totals and quota files with the config.
+- **Installer: the manager is a signed release asset.** `build.sh` copies `wattun-manager` into `dist/` and includes it
+  in the RSA-signed `SHA256SUMS`; `install.sh` fetches it from the release and checks its hash like the binary's, and
+  only falls back to `raw.githubusercontent` for releases that predate the asset (never through `WAT_PROXY`).
+- **Anti-censor matrix.** Modes are version-gated: an older binary silently treats unknown modes as `seq`, so offering
+  `synrst` or `paws` to it reported a false winner. `paws` joined the list, bonded tunnels are tested leg by leg (each
+  pool leg is a throw-away client; the winner's `fake-sni`/`fake-mode` then apply to every pool leg, plus `ech` when the
+  winner carries it), and each variant moves 8 MB per direction with the top 3 re-measured at 20 MB before ranking.
+- **Manager polish.** The Kharej speed test says the test runs on Iran instead of claiming an old binary (the endpoint
+  exists only in the client process). The tunnel page has a Kharej "Change Iran Address" and an Iran "Change Listen
+  Port" for reverse tunnels; pasting a new token rewrites the whole connection (carrier, peer, reverse, listen, path,
+  firewall) instead of leaving stale fields. The bonding menu only adds or removes carriers on auto tunnels, reading
+  each carrier's port from the plan. `h2c` can be chosen directly (key `0`). The dashboard marks a live direct pool
+  tunnel with no disguise as `[anti-censor off]`.
+
 ## 3.1.0: host-aware defaults and two fixes
 
 - **Defaults follow the host.** At start the program reads the CPU count (`min(NumCPU, GOMAXPROCS)`) and the RAM it may
@@ -2177,6 +2216,7 @@ shipped.
 Update **both** servers for every release, unless an entry says otherwise. Versions 2.4.9 to 2.4.16 were steps
 toward one fix for CDN tunnels that got slower over time. If you are on any of them, go straight to 2.4.17 or later.
 
+- **3.1.1: machine-bound counters, bonded matrix, signed manager.** Any order of updating works. (1) Lifetime traffic totals are bound to the machine that wrote them, so a config copied to a new VPS starts from zero; `wattun-manager reset-traffic NAME` zeroes them on purpose and deleting a tunnel removes its counters and quota files. (2) The anti-censor matrix tests bonds leg by leg, offers only modes the installed binary supports, adds `paws`, and re-measures the top 3 at 20 MB. (3) The manager is shipped in the signed release checksums and verified by `install.sh`. (4) The server ages sessions by authenticated packets only; a captured packet can no longer revive or reopen one. (5) `-sessions` clones keep the `tcp-mimic` hello; each UDP flow pins its session; `-ping-every` is validated and liveness scales with it. See "3.1.1: authenticated session aging".
 - **3.1.0: defaults follow the host, two bug fixes.** Update both ends for the first fix (the server hang), any order for the rest. (1) Connections, sessions, window cap and socket low-water mark are chosen from the CPU count and RAM (cgroup limits included): `-conns` and `-sessions` default to 0 = auto, new `-win-max`. (2) The server's receive loop could block for good after the first speed test. (3) Bonded sessions no longer pin bulk streams to a lane that does not exist. See "3.1.0: host-aware defaults".
 - **3.0.2: reverse tunnels recycle connections, auto test presets.** Update both ends. (1) `pool-rotate` / `pool-rotate-bytes` now work on the dialing server of a `reverse` tunnel; the manager writes `pool-rotate: 30m` into new reverse pool tunnels (add it by hand to existing ones). (2) The manager's auto test asks for *normal* or *anti-censor* (every desync mode, SNI, TLS fragment, fingerprint and ECH variant) with skip / stop keys. (3) `fake-mode: paws`, `tls-frag: -1`, the nginx web face, a throwaway TLS certificate, h2/grpc receive window 8 MB, `wattun-manager iran-firewall`. See "3.0.2: probing resistance and the PAWS marker".
 - **3.0.1: no fixed strings in `ws`/`wss`/`h2`/`grpc` tunnels.** Any order of updating works; an existing tunnel keeps its path until you change it on both ends. (1) The manager gives every new `ws`, `wss`, `h2`, `h2c` or `grpc` tunnel (the auto tunnel too) its own URL path, `/api/` plus 12 random hex digits, instead of the `/wat` every install used: a filter could match `GET /wat` with `Upgrade: websocket` on a plain `ws` tunnel as the signature of this tool. The path travels in the token, so Iran follows by itself. To change a running tunnel set the same `path:` on both ends and restart. (2) The `ws` upgrade request now has a browser's header set in a browser's order (`User-Agent`, `Origin`, `Pragma`, `Cache-Control`, `Accept-Encoding`, `Accept-Language`); before it had no `User-Agent` at all. A header you give with `header:` replaces the default of the same name. Both only matter where the request is visible in plain text (`ws`), or where the path is read after the TLS layer (never by a passive filter). For `tls`, `wss`, `h2` and `grpc` the ClientHello is still the Go library's unless you set `fp: chrome` (or `firefox`, `random`): do that on any route that blocks the server's IP after some minutes.

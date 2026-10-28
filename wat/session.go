@@ -1845,12 +1845,12 @@ func (s *Session) CarrierStats() []CarrierStat {
 // IO returns the underlying PacketIO of the session.
 func (s *Session) IO() PacketIO { return s.io }
 
-// Alive reports whether an authenticated packet from the peer arrived in the last 10 s. The peer pings at least
-// every 2 s, so an idle but working link stays alive.
+// Alive reports whether an authenticated packet from the peer arrived recently. A keepalive gap is 0.6-1.4x
+// PingEvery (nextPingGap) and each ping is acked at once, so 3x PingEvery covers a raised -ping-every.
 func (s *Session) Alive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.lastAuth.IsZero() && time.Since(s.lastAuth) < 10*time.Second
+	return !s.lastAuth.IsZero() && time.Since(s.lastAuth) < max(10*time.Second, 3*s.cfg.PingEvery)
 }
 
 // LastRecv is when the last authenticated packet from the peer arrived (zero: none yet). Unlike Alive's clock it is
@@ -1859,6 +1859,13 @@ func (s *Session) LastRecv() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastAuth
+}
+
+// LastPN is the highest packet number this session authenticated, used as the replay watermark when it closes.
+func (s *Session) LastPN() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rxLargest
 }
 
 // young: the packet is small, or carries only the first bytes of its streams (handshakes, requests, replies):

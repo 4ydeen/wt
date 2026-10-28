@@ -718,17 +718,27 @@ type TCPPoolClient struct {
 	failing    bool          // a failure was logged and no connection came up since
 	deaths     atomic.Uint64 // this pool's own connection deaths (ConnDeaths)
 
-	obfKey []byte       // SetObfs: PSK of the hello v2 (nil: the plain 8-byte pool id)
-	obfSNI string       // name in the hello's ClientHello
-	v2     atomic.Bool  // the next connections open with hello v2 (flipped by mimicWatch against an older listener)
-	lastRx atomic.Int64 // unix ns of the last packet received (mimicWatch)
-	upAt   atomic.Int64 // unix ns of the last connection that came up
+	obf    atomic.Pointer[obfsCfg] // SetObfs: hello v2 parameters (nil: the plain 8-byte pool id)
+	v2     atomic.Bool             // the next connections open with hello v2 (flipped by mimicWatch against an older listener)
+	lastRx atomic.Int64            // unix ns of the last packet received (mimicWatch)
+	upAt   atomic.Int64            // unix ns of the last connection that came up
+}
+
+// obfsCfg is the hello v2 setup, published as one pointer so the slot goroutines started by the constructor never
+// read a half-written value.
+type obfsCfg struct {
+	key []byte
+	sni string
 }
 
 // SetObfs makes every new connection open with the TLS-shaped hello v2 and mask its frame lengths (see tcp_mimic.go),
 // keyed by psk and naming sni (empty: www.cloudflare.com). Call it right after the pool is built, before traffic.
 func (c *TCPPoolClient) SetObfs(psk []byte, sni string) {
-	c.obfKey, c.obfSNI = psk, sni
+	c.setObfs(&obfsCfg{key: psk, sni: sni})
+}
+
+func (c *TCPPoolClient) setObfs(o *obfsCfg) {
+	c.obf.Store(o)
 	c.v2.Store(true)
 	c.wg.Add(1)
 	go c.mimicWatch()
@@ -1007,7 +1017,7 @@ func (c *TCPPoolClient) sleep(d time.Duration) bool {
 }
 
 func (c *TCPPoolClient) push(p []byte) bool {
-	if c.obfKey != nil {
+	if c.obf.Load() != nil {
 		c.lastRx.Store(time.Now().UnixNano())
 	}
 	select {
@@ -1036,8 +1046,8 @@ func (c *TCPPoolClient) slotLoop(i int) {
 		var txm, rxm *chacha20.Cipher
 		if err == nil {
 			hello := c.id[:]
-			if c.obfKey != nil && c.v2.Load() {
-				if h, t, r, herr := buildMimicHello(c.obfKey, c.obfSNI, c.id); herr == nil {
+			if o := c.obf.Load(); o != nil && c.v2.Load() {
+				if h, t, r, herr := buildMimicHello(o.key, o.sni, c.id); herr == nil {
 					hello, txm, rxm = h, t, r
 				}
 			}
@@ -1318,6 +1328,9 @@ func (c *TCPPoolClient) Clone(slotOffset int) (*TCPPoolClient, error) {
 	}
 	n.ps, n.tlsFn = c.ps, c.tlsFn
 	n.hook.Store(c.hook.Load()) // the fake-SNI wrapper rides along, like every other dial-path setting
+	if o := c.obf.Load(); o != nil {
+		n.setObfs(o) // -tcp-mimic: the clone's connections must look like TLS too
+	}
 	n.keepSlow.Store(c.keepSlow.Load())
 	n.maxBackoff.Store(c.maxBackoff.Load())
 	n.rotate.Store(c.rotate.Load())

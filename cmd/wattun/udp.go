@@ -39,9 +39,10 @@ type cflow struct {
 	src  netip.AddrPort
 	l    *udpListener
 	last atomic.Int64
+	sess *wat.Session // chosen once, kept while it lives: re-picking per datagram lets a flapping session reorder the flow
 }
 
-// dgramClient is the client-side UDP forwarder for the tunnel's sessions; each flow sticks to one (tunnel.forFlow).
+// dgramClient is the client-side UDP forwarder for the tunnel's sessions; each flow sticks to one session (cflow.session).
 type dgramClient struct {
 	tun  *tunnel
 	idle time.Duration
@@ -154,8 +155,17 @@ func (l *udpListener) readLoop() {
 		}
 		f.last.Store(time.Now().UnixNano())
 		l.stat.dgram(true, n)
-		l.c.tun.forFlow(f.id).SendDatagram(f.id, l.target, buf[:n]) // full queue / oversize: dropped and counted by the session
+		f.session().SendDatagram(f.id, l.target, buf[:n]) // full queue / oversize: dropped and counted by the session
 	}
+}
+
+// session is the flow's session: chosen on first use (or when it dies) and then kept for the flow's life, so a
+// session that flaps does not pull the flow back and reorder its datagrams. readLoop is its only caller.
+func (f *cflow) session() *wat.Session {
+	if f.sess == nil || !f.sess.Alive() {
+		f.sess = f.l.c.tun.forFlow(f.id)
+	}
+	return f.sess
 }
 
 func (l *udpListener) newFlow(src netip.AddrPort) *cflow {

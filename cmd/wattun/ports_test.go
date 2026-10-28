@@ -274,3 +274,28 @@ func TestTotalsPersist(t *testing.T) {
 		t.Fatalf("session totals %d/%d", in, out)
 	}
 }
+
+// Totals belong to the machine that wrote them: a config copied to another server starts from zero.
+func TestTotalsResetOnAnotherMachine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.totals.json")
+	saved := hostID
+	defer func() { hostID = saved }()
+
+	hostID = "machine-a"
+	a := newRegistry()
+	a.loadTotals(path, func() (uint64, uint64) { return 1000, 2000 })
+	a.get("c", 20001).add(true, 300)
+	a.save()
+
+	hostID = "machine-b"
+	b := newRegistry()
+	b.loadTotals(path, func() (uint64, uint64) { return 7, 9 })
+	if in, out := b.sessionTotals(7, 9); in != 7 || out != 9 {
+		t.Fatalf("foreign totals leaked into this machine: %d/%d", in, out)
+	}
+	b.get("c", 20001)
+	m := b.snapshot("c")["20001"].(map[string]any)
+	if m["bytes_up_total"] != int64(0) || m["bytes_down_total"] != int64(0) {
+		t.Fatalf("per-port totals from another machine: %v", m)
+	}
+}

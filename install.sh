@@ -368,7 +368,7 @@ resolve_tag() {
   [[ "$u" =~ ^v[0-9]+\.[0-9]+ ]] || return 1
   TAG=$u
 }
-TAG=''; PREV_WARN=0; MGR_FALLBACK=0; FROM_DIST=0; DL_BASE=''
+TAG=''; PREV_WARN=0; MGR_FROM_REL=0; FROM_DIST=0; DL_BASE=''
 human_size() { awk -v b="$1" 'BEGIN{printf "%.1f MB", b/1048576}'; }
 
 SIG_PUB=$(cat <<'PEM'
@@ -424,13 +424,19 @@ step_stage2_retrieve_payload() {
     fi
   fi
 
-  # Retrieve manager payload
+  # Retrieve manager payload. From a release it must come from that same release (and is checked against the signed
+  # SHA256SUMS in stage 3); raw.githubusercontent is only a fallback for releases that predate the asset, never
+  # through a proxy.
   if [ -f "$HERE/wattun-manager" ]; then
     cp "$HERE/wattun-manager" "$TMP/mgr"
+  elif [ -n "$DL_BASE" ] && fetch "$DL_BASE/wattun-manager" "$TMP/mgr"; then
+    MGR_FROM_REL=1
   elif fetch "https://raw.githubusercontent.com/$REPO/${WAT_MGR_REF:-main}/wattun-manager" "$TMP/mgr"; then
-    MGR_FALLBACK=1
+    [ -n "$PROXY" ] && { ERRMSG="this release does not ship wattun-manager; refusing to fetch it unsigned through WAT_PROXY"; return 1; }
+    DETAIL="$DETAIL, manager from main (not in the signed release)"
   elif [ -n "$TAG" ] && fetch "https://raw.githubusercontent.com/$REPO/$TAG/wattun-manager" "$TMP/mgr"; then
-    :
+    [ -n "$PROXY" ] && { ERRMSG="this release does not ship wattun-manager; refusing to fetch it unsigned through WAT_PROXY"; return 1; }
+    DETAIL="$DETAIL, manager from $TAG (not in the signed release)"
   else
     ERRMSG="could not download wattun-manager"; return 1
   fi
@@ -465,6 +471,10 @@ step_verify_sig() {
     ERRMSG="release RSA signature failed verification (download tampered with)"; return 1
   fi
   grep -qx -- "$got  $NAME" "$sums" || { ERRMSG="binary hash missing from signed SHA256SUMS"; return 1; }
+  if [ "$MGR_FROM_REL" = 1 ]; then
+    got=$(sha256sum "$TMP/mgr" | awk '{print $1}')
+    grep -qx -- "$got  wattun-manager" "$sums" || { ERRMSG="manager hash missing from signed SHA256SUMS"; return 1; }
+  fi
   DETAIL="$DETAIL, RSA signature verified"
 }
 

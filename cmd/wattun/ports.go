@@ -368,11 +368,32 @@ func (r *registry) loadQuota(path string) {
 	r.mu.Unlock()
 }
 
+// hostID identifies this machine; a totals file written elsewhere belongs to another server's traffic, and showing
+// it here (a config copied to a new VPS) reads as a broken counter. Empty = unknown, the check is skipped.
+var hostID = func() string {
+	for _, p := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
+		if b, err := os.ReadFile(p); err == nil {
+			if s := strings.TrimSpace(string(b)); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}()
+
 // loadTotals reads the lifetime totals; sess reports this process's session bytes for the "session" entry.
 func (r *registry) loadTotals(path string, sess func() (in, out uint64)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.totPath, r.sess, r.tot = path, sess, map[string][3]int64{}
+	if hostID != "" {
+		idPath := path + ".host"
+		if b, err := os.ReadFile(idPath); err == nil && strings.TrimSpace(string(b)) != hostID {
+			log.Printf("traffic totals %s: written on another machine, starting from zero", path)
+			_ = os.Remove(path)
+		}
+		_ = os.WriteFile(idPath, []byte(hostID+"\n"), 0o600)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return

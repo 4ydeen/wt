@@ -27,6 +27,9 @@ for a in $ARCHES; do
   printf '%s  %s\n' "$sum" "${out##*/}" > "$out.sha256"
   echo "wattun $VER $os/$arch $sum"
 done
+# The manager is a release asset too: install.sh installs only the copy whose hash is in the signed list, so keep it
+# in dist/ before the checksums are made.
+if [ -f wattun-manager ]; then cp wattun-manager dist/wattun-manager; fi
 # The release's signed checksum list: install.sh verifies the RSA signature against the public key baked into it,
 # so a download that went through WAT_PROXY (or any tampered copy) cannot pair a swapped binary with its own
 # checksum. WAT_SIGN_KEY: the private PEM itself (the release workflow passes the secret's contents) or a path to it.
